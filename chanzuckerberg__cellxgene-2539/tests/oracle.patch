@@ -1,0 +1,512 @@
+diff --git a/.github/workflows/push_tests.yml b/.github/workflows/push_tests.yml
+index a2463c0c0..ef8d6827e 100644
+--- a/.github/workflows/push_tests.yml
++++ b/.github/workflows/push_tests.yml
+@@ -46,10 +46,12 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - uses: actions/checkout@v2
+-      - name: Set up Python 3.7
+-        uses: actions/setup-python@v4
++      - name: Set up Python 3.7 (pyenv)  # pyenv needed for mlflow in cli annotate tests
++        uses: gabrielfalcao/pyenv-action@v9
+         with:
+-          python-version: 3.7
++          default: 3.7
++          command: pip install -U pip  # upgrade pip after installing python
++      - run: pip install virtualenv  # virtualenv needed for mlflow in cli annotate tests
+       - name: Python cache
+         uses: actions/cache@v1
+         with:
+diff --git a/.gitignore b/.gitignore
+index c49d7b43d..342d715bb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -54,3 +54,6 @@ client/.eslintcache
+ 
+ # E2E Testing
+ ignoreE2E*
++
++# annotate subcmd
++.models_cache
+diff --git a/MANIFEST.in b/MANIFEST.in
+index 3a3b5b2bb..84759a92c 100644
+--- a/MANIFEST.in
++++ b/MANIFEST.in
+@@ -3,5 +3,6 @@ recursive-include server/common/web/static *
+ 
+ include server/requirements.txt
+ include server/requirements-prepare.txt
++include server/requirements-annotate.txt
+ include server/converters/schema/hgnc_complete_set.txt.gz
+ include server/converters/schema/schema_definitions/*
+diff --git a/scripts/launch_and_open b/scripts/launch_and_open
+new file mode 100755
+index 000000000..853534e96
+--- /dev/null
++++ b/scripts/launch_and_open
+@@ -0,0 +1,16 @@
++#!/usr/bin/expect -f
++
++# Mac only! (depends upon `open` command)
++
++set h5ad [lindex $argv 0]
++puts "$h5ad"
++
++spawn cellxgene launch $h5ad
++
++set timeout 10
++expect -indices -re "Please go to (http:\/\/localhost:\[0-9\]+)" {
++    set url $expect_out(1,string)
++    exec >@stdout 2>@stderr open $url
++}
++
++interact
+diff --git a/server/annotate/__init__.py b/server/annotate/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/server/annotate/annotation_types.py b/server/annotate/annotation_types.py
+new file mode 100644
+index 000000000..c67b4d4df
+--- /dev/null
++++ b/server/annotate/annotation_types.py
+@@ -0,0 +1,5 @@
++from enum import Enum
++
++
++class AnnotationType(Enum):
++    CELL_TYPE = "cell_type"
+diff --git a/server/cli/annotate.py b/server/cli/annotate.py
+new file mode 100644
+index 000000000..abaac16a8
+--- /dev/null
++++ b/server/cli/annotate.py
+@@ -0,0 +1,231 @@
++import functools
++import json
++import os.path
++import shlex
++import shutil
++import subprocess
++import sys
++from subprocess import STDOUT, PIPE
++from tempfile import NamedTemporaryFile
++
++import click
++import pandas as pd
++from click import BadParameter
++
++from server.annotate.annotation_types import AnnotationType
++from server.common.utils.data_locator import DataLocator
++from server.common.utils.utils import sort_options
++
++
++def annotate_args(func):
++    @functools.wraps(func)
++    def wrapper(*args, **kwargs):
++        return func(*args, **kwargs)
++
++    return wrapper
++
++
++@sort_options
++@click.command(
++    short_help="Annotate H5AD file columns. Run `cellxgene annotation --help` for more information.",
++    options_metavar="<options>",
++)
++@click.option(
++    "-i",
++    "--input-h5ad-file",
++    required=True,
++    type=str,
++    help="The input H5AD file containing the missing annotations.",
++)
++@click.option(
++    "-m",
++    "--model-url",
++    required=True,
++    help="The URL of the model used to prediction annotated labels. May be a local filesystem directory "
++    "or S3 path (s3://)",
++)
++@click.option(
++    "-l",
++    "--counts-layer",
++    help="If specified, raw counts will be read from the AnnData layer of the specified name. If unspecified, "
++    "raw counts will be read from `X` matrix, unless 'raw.X' exists, in which case that will be used.",
++)
++@click.option(
++    "-g",
++    "--gene-column-name",
++    help="The name of the `var` column that contains gene identifiers. The values in this column will be used to match "
++    "genes between the query and reference datasets. If not specified, the gene identifiers are expected to exist "
++    "in `var.index`.",
++)
++# TODO: Useful if we want to support discoverability of models
++# @click.option(
++#     "-r",
++#     "--model-repository",
++#     help="The base URL of the model repository. Maybe a local filesystem directory or S3 path (s3://)"
++# )
++# TODO: Useful if we want to support other, future annotation types, beyond "Cell Type". Currently hidden
++@click.option(
++    "-a",
++    "--annotation-type",
++    type=click.Choice([t.value for t in AnnotationType]),
++    default=AnnotationType.CELL_TYPE.value,
++    show_default=True,
++    hidden=True,  # Remove if we add support for more annotation types
++    help="The type of annotation to perform. This model to be used will be inferred from the annotation type.",
++)
++@click.option(
++    "-c",
++    "--annotation-prefix",
++    type=str,
++    default="cxg",
++    show_default=True,
++    help="An optional prefix used to form the names of: 1) new `obs` annotation columns that will store the predicted "
++    "annotation values and confidence scores, 2) `obsm` embeddings (reference and umap embedding), and "
++    "3) `uns` metadata for the prediction operation",
++)
++@click.option(
++    "-n",
++    "--run-name",
++    type=str,
++    help="An optional run name that will be used as a suffix to form the names of new `obs` annotation columns that "
++    "will store the predicted annotation values and confidence scores. This can be used to allow multiple "
++    "annotation predictions to be run on a single AnnData object.",
++)
++@click.option(
++    "-u",
++    "--update-h5ad-file",
++    is_flag=True,
++    help="Flag indicating whether to update the input h5ad file with annotation values.  This option is mutually "
++    "exclusive with --output-h5ad-file.",
++)
++@click.option(
++    "-o",
++    "--output-h5ad-file",
++    help="The output H5AD file that will contain the generated annotation values. This option is mutually "
++    "exclusive with --update-h5ad-file.",
++)
++@click.option("--use-model-cache/--no-use-model-cache", default=True)
++@click.option(
++    "--use-gpu/--no-use-gpu",
++    default=True,
++    help="Whether to use a GPU for annotation operations (highly recommended, if available).",
++)
++# TODO: This is a cell type model-specific arg, so not ideal to specify here as a hardcoded option
++@click.option(
++    "--classifier",
++    default="default",
++    help="For cell type annotation, the classifier level to use. The classifier is model-dependent, so refer to "
++    "documentation for the specified model for valid values.",
++)
++# TODO: This is a cell type model-specific arg, so not ideal to specify here as a hardcoded option
++@click.option(
++    "--organism",
++    type=click.Choice(["Homo sapiens", "Mus musculus"], case_sensitive=True),
++    default="Homo sapiens",
++    help="For cell type annotation, the organism of the dataset. Used to normalize gene names to HGLC conventions when "
++    "an annotation model has been trained using data from different organism.",
++)
++@click.option(
++    "--model-cache-dir",
++    default=".models_cache",
++    help="Local directory used to store model files that are retrieved from a remote location. Model files will "
++    "be read from this directory first, if they exist, to avoid repeating large downloads.",
++)
++@click.option(
++    "--mlflow-env-manager",
++    type=click.Choice(["virtualenv", "conda", "local"]),
++    default="virtualenv",
++    help="Annotation model prediction will be installed and executed in the specified type of environment. MacOS users "
++    "on Apple Silicon (arm64, M1, M2, etc.) are recommended to use 'conda' to avoid Python package installation "
++    "errors. If 'conda' is specified then cellxgene must also have been installed within a conda environment",
++)
++@click.help_option("--help", "-h", help="Show this message and exit.")
++def annotate(**cli_args):
++    _validate_options(cli_args)
++
++    print(f"Reading query dataset {cli_args['input_h5ad_file']}...")
++
++    annotation_prefix = "_".join(
++        filter(None, [cli_args.get("annotation_prefix"), cli_args.get("annotation_type"), cli_args.get("run_name")])
++    )
++
++    output_h5ad_file = cli_args["input_h5ad_file"] if cli_args["update_h5ad_file"] else cli_args["output_h5ad_file"]
++
++    model_url = cli_args.get("model_url")
++    local_model_path = _retrieve_model(cli_args.get("model_cache_dir"), model_url, cli_args.get("use_model_cache"))
++
++    print(f"Annotating {cli_args.get('input_h5ad_file')} with {cli_args.get('annotation_type')}...")
++
++    if cli_args["annotation_type"] == AnnotationType.CELL_TYPE.value:
++        predict_args = dict(
++            query_dataset_h5ad_path=cli_args.get("input_h5ad_file"),
++            output_h5ad_path=output_h5ad_file,
++            annotation_prefix=annotation_prefix,
++            counts_layer=cli_args.get("counts_layer"),
++            gene_column_name=cli_args.get("gene_column_name"),
++            classifier=cli_args.get("classifier"),
++            organism=cli_args.get("organism"),
++            use_gpu=cli_args.get("use_gpu"),
++        )
++        # Drop args that have values of `None` as these will cause problems when passing into MLflow predict, since it
++        # ultimately gets converted into 1-row Pandas DataFrame (None is interpreted as a float type column!)
++        predict_args = dict([(k, v) for k, v in predict_args.items() if v is not None])
++
++        # Invoke prediction using MLflow cli, as a separate process.
++        # This fully prepares the Python environment that is needed for executing the model.
++        # The Python environment will be reused after it is setup once.
++        with NamedTemporaryFile(buffering=0) as predict_args_file:
++            # write the mlflow predict arguments to a csv file, which will be passed to mlflow cmd
++            pd.DataFrame([json.dumps(predict_args)]).to_csv(predict_args_file, index=None)
++            predict_args_file.seek(0)
++
++            # run mlflow prediction in subprocess
++            predict_cmd = (
++                f"mlflow models predict "
++                f"--env-manager {cli_args['mlflow_env_manager']} "
++                f"--model-uri {local_model_path} "
++                f"--content-type csv --input-path {predict_args_file.name}"
++            )
++            p = subprocess.Popen(
++                args=shlex.split(predict_cmd), stdin=predict_args_file, text=True, bufsize=0, stdout=PIPE, stderr=STDOUT
++            )
++
++            # display mlflow process output as it runs
++            for line in p.stdout:
++                print(line.rstrip())
++
++            p.wait()
++            if p.returncode == 0:
++                print(f"Wrote annotations to {cli_args.get('output_h5ad_file')}")
++            else:
++                print("Annotation failed!")
++    else:
++        raise BadParameter(f"unknown annotation type {cli_args['annotation_type']}")
++
++
++def _retrieve_model(model_cache_dir, model_url, use_cache=True):
++    local_cache_model_path = os.path.join(model_cache_dir, os.path.splitext(os.path.basename(model_url))[0])
++    if not os.path.exists(local_cache_model_path) or not use_cache:
++        print(f"Retrieving model from {model_url}")
++        # download from remote source
++        with DataLocator(model_url).local_handle() as model_archive_local_path:
++            # unpack archive to local cache dir
++            shutil.unpack_archive(model_archive_local_path, local_cache_model_path)
++    else:
++        print(f"Using cached model at {local_cache_model_path}")
++
++    return local_cache_model_path
++
++
++def _validate_options(cli_args):
++    # TODO(atolopko): Use cloup library for this logic
++    if cli_args["update_h5ad_file"] and cli_args["output_h5ad_file"]:
++        click.echo("--update_h5ad_file and --output_h5ad_file are mutually exclusive")
++        sys.exit(1)
++    if not (cli_args["update_h5ad_file"] or cli_args["output_h5ad_file"]):
++        click.echo("--update_h5ad_file or --output_h5ad_file must be specified")
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    annotate()
+diff --git a/server/cli/cli.py b/server/cli/cli.py
+index 15c3b3bde..260d3d3de 100644
+--- a/server/cli/cli.py
++++ b/server/cli/cli.py
+@@ -1,5 +1,6 @@
+ import click
+ 
++from .annotate import annotate
+ from .launch import launch
+ from .prepare import prepare
+ from .upgrade import log_upgrade_check
+@@ -31,4 +32,5 @@ def cli(upgrade_check):
+ 
+ 
+ cli.add_command(launch)
++cli.add_command(annotate)
+ cli.add_command(prepare)
+diff --git a/server/requirements-annotate.txt b/server/requirements-annotate.txt
+new file mode 100644
+index 000000000..97982e03d
+--- /dev/null
++++ b/server/requirements-annotate.txt
+@@ -0,0 +1,2 @@
++mlflow
++scanpy
+diff --git a/server/requirements-dev.txt b/server/requirements-dev.txt
+index 9b4bbd973..f5f54a034 100644
+--- a/server/requirements-dev.txt
++++ b/server/requirements-dev.txt
+@@ -7,3 +7,4 @@ python-jose>=3.2.0
+ twine>=1.12.1
+ -r requirements.txt
+ -r requirements-prepare.txt
++-r requirements-annotate.txt
+diff --git a/server/requirements.txt b/server/requirements.txt
+index fb78f26c1..2f39bf2d2 100644
+--- a/server/requirements.txt
++++ b/server/requirements.txt
+@@ -15,7 +15,7 @@ fsspec>=0.4.4,<0.8.0
+ gunicorn>=20.0.4
+ h5py>=3.0.0
+ numba>=0.51.2
+-numpy>=1.17.5
++numpy>=1.17.5,<=1.22
+ packaging>=20.0
+ pandas>=1.0,!=1.1  # pandas 1.1 breaks tests, https://github.com/pandas-dev/pandas/issues/35446
+ PyYAML>=5.4  # CVE-2020-14343
+diff --git a/setup.py b/setup.py
+index 4ce399060..18072a57d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -9,6 +9,9 @@
+ with open("server/requirements-prepare.txt") as fh:
+     requirements_prepare = fh.read().splitlines()
+ 
++with open("server/requirements-annotate.txt") as fh:
++    requirements_annotate = fh.read().splitlines()
++
+ setup(
+     name="cellxgene",
+     version="1.0.1",
+@@ -40,5 +43,5 @@
+         "Topic :: Scientific/Engineering :: Bio-Informatics",
+     ],
+     entry_points={"console_scripts": ["cellxgene = server.cli.cli:cli"]},
+-    extras_require=dict(prepare=requirements_prepare),
++    extras_require=dict(prepare=requirements_prepare, annotate=requirements_annotate),
+ )
+diff --git a/test/unit/cli/mlflow_model_fixture.py b/test/unit/cli/mlflow_model_fixture.py
+new file mode 100644
+index 000000000..5a67f0a9f
+--- /dev/null
++++ b/test/unit/cli/mlflow_model_fixture.py
+@@ -0,0 +1,20 @@
++import shutil
++from tempfile import TemporaryDirectory, mkstemp
++
++import mlflow
++
++
++def write_model(model) -> str:
++    with TemporaryDirectory() as mlflow_model_dir:
++        mlflow.pyfunc.save_model(mlflow_model_dir, python_model=model)
++        return shutil.make_archive(mkstemp()[1], "zip", mlflow_model_dir)
++
++
++class FakeModel(mlflow.pyfunc.PythonModel):
++    def __init__(self, input_to_output: dict = {}):
++        self.input_to_output = input_to_output
++
++    def predict(self, context, model_input) -> None:
++        # this stdout output is useful for validating the input in a test, noting that this model will be invoked in a
++        # subprocess, so stdout is one means of communicating information back to the test code
++        print(f"__MODEL_INPUT__={model_input.iloc[0][0]}")
+diff --git a/test/unit/cli/test_annotate.py b/test/unit/cli/test_annotate.py
+new file mode 100644
+index 000000000..bc0c1ca41
+--- /dev/null
++++ b/test/unit/cli/test_annotate.py
+@@ -0,0 +1,97 @@
++import unittest
++from tempfile import mkstemp
++
++from click.testing import CliRunner
++
++from server.cli.annotate import annotate
++from test.unit.cli.mlflow_model_fixture import FakeModel, write_model
++
++
++class TestCliAnnotate(unittest.TestCase):
++    def test__annotate__loads_and_runs(self):
++        """
++        Invokes the `annotate` subcommand of cellxgene CLI, using a CliRunner() programmatic invocation.
++
++        This tests the happy path case:
++        1) Command line options are parsed;
++        2) An MLflow model zip archive can be read in (from local disk), unpacked, and invoked;
++        3) The correct options are passed to the MLflow model.
++        4) The annotate subcommand exits successfully.
++
++        This does not verify model output or predictions (it's a fake MLflow model, after all); it's up to the real model
++        to output its predictions as it wants, but this is specific to the model and so not tested here.
++
++        The  CliRunner() invokes the subcommand in a subprocess, and the annotate subcommand itself invokes the MLflow
++        model in yet another subprocess. So while this test can help determine if everything is working, it is not a
++        simple matter to debug in the case of a failure. However, the stdout/stderr of the MLflow process is captured
++        by the CliRunner() subprocess, so errors can be inspected in result.stdout when debugging this test. Hope this
++        helps!
++        """
++
++        _, query_dataset_file_path = mkstemp()
++        model = FakeModel()
++        model_file_path = write_model(model)
++
++        result = CliRunner().invoke(
++            annotate,
++            [
++                "--input-h5ad-file",
++                query_dataset_file_path,
++                "--model-url",
++                model_file_path,
++                "--output-h5ad-file",
++                f"{query_dataset_file_path}.output",
++            ],
++        )
++
++        # to help debugging, show the output from the CliRunner and MLflow stdout
++        if result.exit_code:
++            print(result.stdout)
++
++        self.assertEqual(0, result.exit_code, "runs successfully")
++
++        # The FakeModel will print it inputs to stdout, as "__MODEL_INPUT__={...}", allowing us to assert that it received valid inputs.
++        self.assertIn(
++            "__MODEL_INPUT__={"
++            f'"query_dataset_h5ad_path": "{query_dataset_file_path}", '
++            f'"output_h5ad_path": "{query_dataset_file_path}.output", '
++            '"annotation_prefix": "cxg_cell_type", "classifier": "default", '
++            '"organism": "Homo sapiens", "use_gpu": true}',
++            result.stdout,
++            "inputs passed correctly",
++        )
++
++    def test__annotate__verifies_mutually_exclusive_options(self):
++        required_options = ["--input-h5ad-file", "some.h5ad", "--model-url", "some_url"]
++        result = CliRunner().invoke(
++            annotate,
++            required_options + [],
++        )
++
++        self.assertNotEqual(0, result.exit_code, "aborts with non-success code")
++        self.assertIn(
++            "--update_h5ad_file or --output_h5ad_file must be specified",
++            result.stdout,
++            "error message displayed",
++        )
++
++        result = CliRunner().invoke(
++            annotate, required_options + ["--output-h5ad-file", "some_arg", "--update-h5ad-file"]
++        )
++
++        self.assertNotEqual(0, result.exit_code, "aborts with non-success code")
++        self.assertIn(
++            "--update_h5ad_file and --output_h5ad_file are mutually exclusive",
++            result.stdout,
++            "error message displayed",
++        )
++
++
++# TODO:
++# Test annotate cli args more comprehensively
++# Test server.cli.annotate._validate_options
++# Test model caching feature works
++# Test model loading from s3 works (maybe w/just a real model)
++
++if __name__ == "__main__":
++    unittest.main()

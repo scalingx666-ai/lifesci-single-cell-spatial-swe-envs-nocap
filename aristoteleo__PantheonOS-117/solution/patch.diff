@@ -1,0 +1,1232 @@
+diff --git a/pantheon/chatroom/projects.py b/pantheon/chatroom/projects.py
+index fd46ae314..15f202556 100644
+--- a/pantheon/chatroom/projects.py
++++ b/pantheon/chatroom/projects.py
+@@ -59,10 +59,16 @@ def __init__(self, active_path: Optional[str] = None):
+         self._registry_path = _registry_path()
+         self._projects: dict[str, ProjectInfo] = {}
+         self._active_path: Optional[str] = None
++        # The "home" project — the directory the server was started in (work_dir).
++        # The UI is always "in" some project; when no project is otherwise active
++        # (e.g. the active one was just removed), we fall back to home rather than
++        # leaving the UI with "No Project".
++        self._default_path: Optional[str] = None
+         self._load()
+ 
+         if active_path:
+             resolved = str(Path(active_path).resolve())
++            self._default_path = resolved
+             self.register(resolved)
+             self.set_active(resolved)
+ 
+@@ -91,10 +97,25 @@ def _save(self):
+     def active_project(self) -> Optional[ProjectInfo]:
+         if self._active_path and self._active_path in self._projects:
+             return self._projects[self._active_path]
+-        # Fallback: if cwd is set but not registered, auto-register it
++        # Fallback: if active is set but not registered, auto-register it
+         if self._active_path and Path(self._active_path).is_dir():
+             self.register(self._active_path)
+             return self._projects.get(self._active_path)
++        # Never leave the UI projectless: fall back to the home (work_dir) project.
++        if self._default_path and Path(self._default_path).is_dir():
++            if self._default_path not in self._projects:
++                self.register(self._default_path)
++            self._active_path = self._default_path
++            return self._projects.get(self._default_path)
++        return None
++
++    @property
++    def default_project(self) -> Optional[ProjectInfo]:
++        """The home (work_dir) project — owns chats that have no project."""
++        if self._default_path and self._default_path in self._projects:
++            return self._projects[self._default_path]
++        if self._default_path and Path(self._default_path).is_dir():
++            return self.register(self._default_path)
+         return None
+ 
+     def list_projects(self) -> list[dict]:
+@@ -126,7 +147,11 @@ def remove(self, path: str) -> bool:
+         if resolved in self._projects:
+             del self._projects[resolved]
+             if self._active_path == resolved:
+-                self._active_path = None
++                # Don't orphan the active pointer — fall back to home (work_dir)
++                # so the UI stays "in" a project.
++                self._active_path = (
++                    self._default_path if self._default_path != resolved else None
++                )
+             self._save()
+             return True
+         return False
+diff --git a/pantheon/chatroom/room.py b/pantheon/chatroom/room.py
+index e9653c75b..5b2fd1eb7 100644
+--- a/pantheon/chatroom/room.py
++++ b/pantheon/chatroom/room.py
+@@ -21,6 +21,7 @@
+     TeamConfig,
+ )
+ from pantheon.internal.memory import MemoryManager, _ALL_CONTEXTS
++from pantheon.chatroom.routed_memory import ProjectRoutedMemoryManager, project_memory_dir
+ from pantheon.settings import get_settings
+ from pantheon.team import PantheonTeam
+ from pantheon.toolset import ToolSet, tool
+@@ -103,7 +104,10 @@ def __init__(
+         # ChatRoom specific initialization (before endpoint setup for workspace_path default)
+         # Convert to absolute path BEFORE Endpoint creation (Endpoint does os.chdir)
+         self.memory_dir = Path(memory_dir).resolve()
+-        self.memory_manager = MemoryManager(self.memory_dir)
++        # Per-project memory routing: list/new follow the active project; per-chat
++        # ops follow each chat to its own project's .pantheon/memory. The work_dir
++        # is "home" (owns chats with no project of their own).
++        self.memory_manager = ProjectRoutedMemoryManager(self.memory_dir)
+ 
+         # Determine endpoint connection mode based on type
+         if isinstance(endpoint, str):
+@@ -144,6 +148,16 @@ def __init__(
+             self._auto_created_endpoint = False
+ 
+         self._endpoint_service = None
++        # Connection pool keyed by endpoint service_id (supports multiple
++        # endpoints, one per project). ChatRoom reaches endpoints over the
++        # INTERNAL backend (PANTHEON_INTERNAL_BACKEND, e.g. local TCP) while its
++        # own outward worker stays on the primary backend (NATS) for the frontend.
++        self._endpoint_services: dict = {}
++        self._internal_backend = None
++        # Per-project endpoint subprocesses: project_path -> {service_id, proc, log}
++        self._project_endpoints: dict = {}
++        # Per-project spawn locks so concurrent tool calls don't duplicate-spawn.
++        self._project_endpoint_locks: dict = {}
+ 
+         # NATS streaming (optional)
+         self._nats_adapter = None
+@@ -159,6 +173,18 @@ def __init__(
+         from pantheon.settings import get_settings as _get_settings
+         _ws = workspace_path or str(_get_settings().workspace)
+         self.project_manager = ProjectManager(active_path=_ws)
++        # Point memory routing at the registered projects + the active one so
++        # list_chats shows the active project's own chats and per-chat ops can
++        # find any chat in any project.
++        try:
++            self.memory_manager.set_search_dirs(
++                [project_memory_dir(p["path"]) for p in self.project_manager.list_projects()]
++            )
++            _active = self.project_manager.active_project
++            if _active:
++                self.memory_manager.set_active_dir(project_memory_dir(_active.path))
++        except Exception as _e:
++            logger.warning(f"[memory routing] init failed: {_e}")
+ 
+         self.description = description
+ 
+@@ -184,21 +210,180 @@ def __init__(
+         # Plugin system (memory, learning, compression)
+         self._init_plugins()
+ 
+-    async def _get_endpoint_service(self):
+-        """Get endpoint service object (instance or RemoteService)."""
+-        if self._endpoint_embed:
+-            # Embed mode: directly return instance
++    def _get_internal_backend(self):
++        """Backend ChatRoom uses to reach endpoints. Defaults to the global
++        backend, but PANTHEON_INTERNAL_BACKEND (e.g. "tcp") lets ChatRoom talk
++        to endpoints over a local transport while its own outward worker stays
++        on the primary backend (NATS) for the frontend."""
++        if self._internal_backend is None:
++            import os
++            from pantheon.remote import RemoteBackendFactory
++
++            internal = os.getenv("PANTHEON_INTERNAL_BACKEND")
++            if internal:
++                from pantheon.remote.factory import RemoteConfig
++
++                self._internal_backend = RemoteBackendFactory.create_backend(
++                    RemoteConfig.from_config(backend=internal)
++                )
++            else:
++                self._internal_backend = RemoteBackendFactory.create_backend()
++        return self._internal_backend
++
++    async def _get_endpoint_service(self, endpoint_service_id: str | None = None):
++        """Get endpoint service object (embedded instance or a pooled RemoteService).
++
++        Pass endpoint_service_id to route to a specific endpoint (multi-project);
++        defaults to self.endpoint_service_id.
++        """
++        sid = endpoint_service_id or self.endpoint_service_id
++        # Embedded fast-path only for the owned/default endpoint
++        if self._endpoint_embed and (endpoint_service_id is None or sid == self.endpoint_service_id):
+             return self._endpoint
+-        else:
+-            # Process mode: lazy connect to remote service
+-            if self._endpoint_service is None:
+-                from pantheon.remote import RemoteBackendFactory
++        # Connection pool keyed by service_id
++        svc = self._endpoint_services.get(sid)
++        if svc is None:
++            backend = self._get_internal_backend()
++            svc = await backend.connect(sid)
++            self._endpoint_services[sid] = svc
++        return svc
++
++    async def _ensure_project_endpoint(self, project_path: str) -> str:
++        """Lazily spawn a dedicated endpoint subprocess for a project directory
++        and return its service_id. Each project gets its own endpoint process
++        (own work_dir), so multiple projects run concurrently. The endpoint's
++        primary worker uses the internal backend (e.g. local TCP) for ChatRoom;
++        its secondary worker stays on NATS for the frontend (dual-channel).
++
++        A per-project lock serializes concurrent callers so the same project is
++        spawned exactly once (otherwise parallel tool calls race and create
++        duplicate endpoints that fight over the same service_id / registry)."""
++        project_path = str(Path(project_path).resolve())
++        lock = self._project_endpoint_locks.get(project_path)
++        if lock is None:
++            lock = asyncio.Lock()
++            self._project_endpoint_locks[project_path] = lock
++        async with lock:
++            existing = self._project_endpoints.get(project_path)
++            if existing is not None:
++                proc = existing.get("proc")
++                if proc is None or proc.returncode is None:
++                    return existing["service_id"]
++                # process died — drop and respawn
++                self._project_endpoints.pop(project_path, None)
++                self._endpoint_services.pop(existing["service_id"], None)
++            return await self._spawn_project_endpoint(project_path)
++
++    async def _spawn_project_endpoint(self, project_path: str) -> str:
++        """Spawn a per-project endpoint subprocess and wait until ready.
++        Always called under the project's lock (see _ensure_project_endpoint)."""
++        import os
++        import sys
++        import hashlib
++
++        id_hash = "proj-" + hashlib.sha256(project_path.encode()).hexdigest()[:16]
++        sid = generate_service_id(id_hash)
++        Path(project_path).mkdir(parents=True, exist_ok=True)
++        log_dir = Path(project_path) / ".pantheon" / "logs"
++        log_dir.mkdir(parents=True, exist_ok=True)
++        log_file = log_dir / "endpoint-subprocess.log"
++
++        env = dict(os.environ)
++        internal = os.getenv("PANTHEON_INTERNAL_BACKEND", "tcp")
++        env["PANTHEON_REMOTE_BACKEND"] = internal  # endpoint primary = internal transport (ChatRoom side)
++        env.setdefault("PANTHEON_FRONTEND_BACKEND", "nats")  # endpoint secondary = frontend
++
++        cmd = [
++            sys.executable, "-m", "pantheon.endpoint", "start",
++            "--workspace_path", project_path, "--id_hash", id_hash,
++        ]
++        logger.info(f"[multi-project] spawning endpoint for {project_path} (sid={sid[:12]}…)")
++        log_fh = open(log_file, "w", encoding="utf-8")
++        proc = await asyncio.create_subprocess_exec(
++            *cmd, env=env, stdout=log_fh, stderr=asyncio.subprocess.STDOUT
++        )
+ 
+-                self._backend = RemoteBackendFactory.create_backend()
+-                self._endpoint_service = await self._backend.connect(
+-                    self.endpoint_service_id
++        backend = self._get_internal_backend()
++        ready = False
++        for _ in range(600):  # up to ~60s
++            if proc.returncode is not None:
++                raise RuntimeError(
++                    f"endpoint for {project_path} exited (code={proc.returncode}); see {log_file}"
+                 )
+-            return self._endpoint_service
++            try:
++                svc = await backend.connect(sid)
++                await svc.invoke("_ping")
++                ready = True
++                break
++            except Exception:
++                await asyncio.sleep(0.1)
++        if not ready:
++            proc.terminate()
++            raise TimeoutError(f"endpoint for {project_path} not ready in 60s; see {log_file}")
++
++        self._project_endpoints[project_path] = {
++            "service_id": sid, "proc": proc, "log": str(log_file),
++        }
++        logger.info(f"[multi-project] endpoint ready for {project_path} (sid={sid[:12]}…)")
++        return sid
++
++    def _is_home_dir(self, p) -> bool:
++        """Is `p` the home (work_dir) project? Home uses the default endpoint."""
++        try:
++            home = self.project_manager.default_project
++            return bool(home) and Path(home.path).resolve() == Path(p).resolve()
++        except Exception:
++            return False
++
++    async def _resolve_endpoint_for_chat(self, session_id: str | None) -> str | None:
++        """Resolve which endpoint a chat should use so its tools AND file panel
++        see the right project's files.
++
++        Priority: (1) the chat's explicit workspace_path dir, else (2) the project
++        that OWNS the chat's memory (per-project memory — concurrency-safe: a chat
++        running in A always routes to A even while you view B), else (3) for a
++        draft / no chat, the ACTIVE project you're currently "in". Home → None
++        (the default endpoint)."""
++        if session_id:
++            try:
++                memory = await run_func(self.memory_manager.get_memory, session_id)
++                project = memory.extra_data.get("project", {})
++                if isinstance(project, dict):
++                    wpath = project.get("workspace_path")
++                    if wpath and Path(wpath).is_dir() and not self._is_home_dir(wpath):
++                        return await self._ensure_project_endpoint(wpath)
++            except Exception as e:
++                logger.debug(f"[multi-project] resolve endpoint for {session_id}: {e}")
++            # No explicit workspace_path (e.g. legacy chat) → the project whose
++            # memory store holds this chat.
++            try:
++                mdir = self.memory_manager.mgr_for_chat(session_id).path
++                pdir = Path(mdir).parent.parent
++                if pdir.is_dir() and not self._is_home_dir(pdir):
++                    return await self._ensure_project_endpoint(str(pdir))
++            except Exception as e:
++                logger.debug(f"[multi-project] resolve by memory dir for {session_id}: {e}")
++            return None
++        # Draft / no chat → the active project (you're "in" it).
++        try:
++            active = self.project_manager.active_project
++            if active and active.path and Path(active.path).is_dir() and not self._is_home_dir(active.path):
++                return await self._ensure_project_endpoint(active.path)
++        except Exception as e:
++            logger.debug(f"[multi-project] resolve endpoint for active project: {e}")
++        return None
++
++    async def _shutdown_project_endpoints(self):
++        """Terminate all per-project endpoint subprocesses (cleanup)."""
++        for _path, entry in list(self._project_endpoints.items()):
++            proc = entry.get("proc")
++            if proc is not None and proc.returncode is None:
++                try:
++                    proc.terminate()
++                except Exception:
++                    pass
++            self._endpoint_services.pop(entry.get("service_id"), None)
++        self._project_endpoints.clear()
+ 
+     def _embedded_endpoint_ready(self) -> bool:
+         if not self._endpoint_embed or self._endpoint is None:
+@@ -227,10 +412,14 @@ def _endpoint_not_ready_response(self) -> dict:
+             "ready": False,
+         }
+ 
+-    async def _call_endpoint_method(self, endpoint_method_name: str, **kwargs):
++    async def _call_endpoint_method(
++        self, endpoint_method_name: str, endpoint_service_id: str | None = None, **kwargs
++    ):
+         from pantheon.utils.misc import call_endpoint_method
+ 
+-        endpoint_service = await self._get_endpoint_service()
++        endpoint_service = await self._get_endpoint_service(
++            endpoint_service_id=endpoint_service_id
++        )
+         return await call_endpoint_method(
+             endpoint_service, endpoint_method_name=endpoint_method_name, **kwargs
+         )
+@@ -639,6 +828,7 @@ async def _ensure_services(
+         self,
+         service_type: str,
+         required_services: list[str],
++        endpoint_service_id: str | None = None,
+     ):
+         """Ensure required services (MCP servers or ToolSets) are started."""
+         if not required_services:
+@@ -653,6 +843,7 @@ async def _ensure_services(
+             )
+             result = await self._call_endpoint_method(
+                 endpoint_method_name="manage_service",
++                endpoint_service_id=endpoint_service_id,
+                 action="start",
+                 service_type=service_type,
+                 name=required_services,
+@@ -678,9 +869,10 @@ async def _create_team_from_template(
+ 
+         logger.info(f"🏗️ Creating team from template '{template_name}'")
+ 
+-        # Connect to endpoint service
++        # Connect to endpoint service — route to the chat's per-project endpoint
+         endpoint_t0 = time.perf_counter()
+-        endpoint_service = await self._get_endpoint_service()
++        endpoint_sid = await self._resolve_endpoint_for_chat(chat_id)
++        endpoint_service = await self._get_endpoint_service(endpoint_service_id=endpoint_sid)
+         log_startup_profile(
+             "ChatRoom team endpoint resolved in "
+             f"{time.perf_counter() - endpoint_t0:.3f}s "
+@@ -702,14 +894,14 @@ async def _create_team_from_template(
+ 
+         # ===== STEP 2: Compute and ensure all required services =====
+         ensure_mcp_t0 = time.perf_counter()
+-        await self._ensure_services("mcp", list(required_mcp_servers))
++        await self._ensure_services("mcp", list(required_mcp_servers), endpoint_service_id=endpoint_sid)
+         log_startup_profile(
+             "ChatRoom team ensure MCP finished in "
+             f"{time.perf_counter() - ensure_mcp_t0:.3f}s "
+             f"(template={template_name}, mcp_servers={list(required_mcp_servers)})"
+         )
+         ensure_toolset_t0 = time.perf_counter()
+-        await self._ensure_services("toolset", list(required_toolsets))
++        await self._ensure_services("toolset", list(required_toolsets), endpoint_service_id=endpoint_sid)
+         log_startup_profile(
+             "ChatRoom team ensure ToolSets finished in "
+             f"{time.perf_counter() - ensure_toolset_t0:.3f}s "
+@@ -917,6 +1109,7 @@ async def set_endpoint(self, endpoint_service_id: str) -> dict:
+             # Force reconnection on next use and drop cached teams bound to the old endpoint.
+             self._endpoint_service = None
+             self._backend = None
++            self._endpoint_services.clear()
+             self.chat_teams.clear()
+ 
+             # Sanity-check connectivity immediately to fail fast.
+@@ -1104,9 +1297,14 @@ async def proxy_toolset(
+                 except Exception as e:
+                     logger.debug(f"Could not inject workdir for session {session_id}: {e}")
+ 
++            # Route to the chat's per-project endpoint (multi-project); falls
++            # back to the default endpoint when the chat has no isolated project.
++            endpoint_sid = await self._resolve_endpoint_for_chat(session_id)
++
+             # Use unified endpoint call method
+             result = await self._call_endpoint_method(
+                 endpoint_method_name="proxy_toolset",
++                endpoint_service_id=endpoint_sid,
+                 method_name=method_name,
+                 args=args or {},
+                 toolset_name=toolset_name,
+@@ -1425,6 +1623,30 @@ async def delete_chat(self, chat_id: str):
+             logger.error(f"Error deleting chat: {e}")
+             return {"success": False, "message": str(e)}
+ 
++    def _chat_has_running_bg_tasks(self, chat_id: str) -> bool:
++        """Whether a chat has at least one in-flight background task.
++
++        Background tasks are asyncio tasks owned by the chat's agents and can
++        outlive the agent turn that spawned them — the main loop returns (and
++        the persisted "running" flag flips False) while the task keeps running.
++        The team is retained in ``self.chat_teams``, so the UI busy indicator can
++        reflect this post-loop work by consulting it. Cheap: O(1) miss for chats
++        with no cached team (the common case).
++        """
++        team = self.chat_teams.get(chat_id)
++        if team is None:
++            return False
++        try:
++            for agent in team.agents.values():
++                mgr = getattr(agent, "_bg_manager", None)
++                if mgr is None:
++                    continue
++                if any(t.status == "running" for t in mgr.list_tasks()):
++                    return True
++        except Exception as e:
++            logger.debug(f"bg-task check failed for {chat_id}: {e}")
++        return False
++
+     @tool
+     async def list_chats(self, project_name: str | None = None) -> dict:
+         """List all the chats, optionally filtered by project.
+@@ -1473,11 +1695,18 @@ async def list_chats(self, project_name: str | None = None) -> dict:
+                 chat_config = extra_data.get("chat_config", None)
+                 team_template = extra_data.get("team_template", None)
+ 
++                # UI busy flag = main agent loop active OR an in-flight background
++                # task (which outlives the loop). Response-only OR — does not touch
++                # the persisted "running" flag; chat()'s busy-guard keys off
++                # self.threads, not this. Lets the sidebar / project-switcher keep
++                # showing background work after the agent turn returns.
++                bg_running = self._chat_has_running_bg_tasks(id)
+                 chats.append(
+                     {
+                         "id": id,
+                         "name": item["name"],
+-                        "running": extra_data.get("running", False),
++                        "running": bool(extra_data.get("running", False)) or bg_running,
++                        "has_background_tasks": bg_running,
+                         "last_activity_date": extra_data.get(
+                             "last_activity_date", None
+                         ),
+@@ -1898,15 +2127,49 @@ async def list_projects(self) -> dict:
+         """List all registered projects."""
+         return {"projects": self.project_manager.list_projects()}
+ 
++    @tool
++    async def list_running_chats(self) -> dict:
++        """Running chats across ALL projects, with each chat's project.
++
++        The chat list (list_chats) is scoped to the active project's own memory,
++        so the UI project switcher needs this separate, cross-project view to show
++        which OTHER projects currently have work in flight (running indicator).
++        """
++        running = []
++        for chat_id in list(self.threads.keys()):
++            project = None
++            # Derive the project from WHERE the chat's memory lives (per-project
++            # memory is authoritative). The chat's own metadata may lack a
++            # name/workspace_path (e.g. created in a project without being tagged),
++            # so the memory dir is the reliable signal for the running indicator.
++            try:
++                mdir = self.memory_manager.mgr_for_chat(chat_id).path
++                pdir = Path(mdir).parent.parent  # <proj>/.pantheon/memory → <proj>
++                info = self.project_manager.get_project(str(pdir))
++                if info:
++                    project = {"name": info.name, "workspace_path": info.path}
++                elif Path(pdir).is_dir():
++                    project = {"name": Path(pdir).name, "workspace_path": str(pdir)}
++            except Exception as e:
++                logger.debug(f"[list_running_chats] project for {chat_id}: {e}")
++            running.append({"chat_id": chat_id, "project": project})
++        return {"running": running}
++
+     @tool
+     async def get_active_project(self) -> dict:
+-        """Get the currently active project."""
++        """Get the currently active project plus the home (work_dir) project.
++
++        `home` owns chats that have no project of their own (legacy / isolated
++        chats), so the UI can show them while you are "in" the home project.
++        """
+         p = self.project_manager.active_project
++        home = self.project_manager.default_project
++        home_d = home.to_dict() if home else None
+         if not p:
+-            return {"active": None}
++            return {"active": None, "home": home_d}
+         d = p.to_dict()
+         d["is_active"] = True
+-        return {"active": d}
++        return {"active": d, "home": home_d}
+ 
+     @tool
+     async def register_project(self, path: str, name: str = "") -> dict:
+@@ -1935,6 +2198,30 @@ async def remove_project(self, path: str) -> dict:
+         ok = self.project_manager.remove(path)
+         return {"success": ok, "message": "Removed" if ok else "Not found"}
+ 
++    @tool
++    async def set_active_project(self, path: str) -> dict:
++        """Record the active project WITHOUT a heavy context switch — no chdir,
++        no settings/memory/template singleton reset.
++
++        For multi-project view-switching: each chat runs in its own per-project
++        endpoint, so switching the *viewed* project must NOT interrupt running
++        chats or reset the default endpoint. Use this from the UI project
++        switcher; use switch_project only when the default endpoint must follow.
++        """
++        resolved = str(Path(path).resolve())
++        if not Path(resolved).is_dir():
++            return {"success": False, "message": f"Directory does not exist: {resolved}"}
++        info = self.project_manager.get_project(resolved) or self.project_manager.register(resolved)
++        self.project_manager.set_active(resolved)
++        # Route list/new chats to this project's own memory store (entering a
++        # project shows its own chats). Per-chat ops still follow each chat to its
++        # own store, so running chats in other projects are unaffected.
++        self.memory_manager.set_active_dir(project_memory_dir(resolved))
++        self.memory_manager.set_search_dirs(
++            [project_memory_dir(p["path"]) for p in self.project_manager.list_projects()]
++        )
++        return {"success": True, "project": info.to_dict()}
++
+     @tool
+     async def switch_project(self, path: str) -> dict:
+         """Switch the active project to a different directory.
+@@ -1973,10 +2260,14 @@ async def switch_project(self, path: str) -> dict:
+             pantheon_dir.mkdir(parents=True, exist_ok=True)
+             (pantheon_dir / "memory").mkdir(parents=True, exist_ok=True)
+ 
+-            # 4. Switch MemoryManager
++            # 4. Point memory routing at the new project (keep the router so
++            # per-chat routing + other projects' stores stay intact).
+             new_memory_dir = pantheon_dir / "memory"
+             self.memory_dir = new_memory_dir
+-            self.memory_manager = MemoryManager(new_memory_dir)
++            self.memory_manager.set_active_dir(new_memory_dir)
++            self.memory_manager.set_search_dirs(
++                [project_memory_dir(p["path"]) for p in self.project_manager.list_projects()]
++            )
+             logger.info(f"[switch_project] memory → {new_memory_dir}")
+ 
+             # 5. Reload TemplateManager (reads dirs from settings)
+diff --git a/pantheon/chatroom/routed_memory.py b/pantheon/chatroom/routed_memory.py
+new file mode 100644
+index 000000000..30dd1dbe6
+--- /dev/null
++++ b/pantheon/chatroom/routed_memory.py
+@@ -0,0 +1,120 @@
++"""Per-project memory routing.
++
++A chat's memory lives in *its own project's* ``.pantheon/memory`` directory. This
++manager presents the same surface as :class:`MemoryManager` but routes every
++operation to the right project store:
++
++- **per-chat ops** (``get_memory`` / ``save_one`` / ``delete_memory`` /
++  ``update_memory_name``) route to whichever project dir actually holds the chat
++  (searched on disk, then cached). So a chat running in project A always
++  reads/writes A's store even after you switch the active project to B — no
++  global manager to get out of sync, hence concurrency-safe.
++- **list + new-chat ops** (``list_memory_metadata`` / ``new_memory`` / ``path``)
++  target the *active* project dir (set via :meth:`set_active_dir`). Entering a
++  project therefore lists that project's own chats, and new chats are created in
++  it.
++
++This replaces the historical conflation where "project" was merely a grouping
++tag on a single central memory store.
++"""
++
++from pathlib import Path
++
++from loguru import logger
++
++from pantheon.internal.memory import MemoryManager
++
++
++def project_memory_dir(project_path: str | Path) -> str:
++    """The memory dir for a project directory: ``<project>/.pantheon/memory``."""
++    return str(Path(project_path).resolve() / ".pantheon" / "memory")
++
++
++class ProjectRoutedMemoryManager:
++    def __init__(self, home_dir: str | Path, use_jsonl: bool = True):
++        self._home_dir = str(Path(home_dir).resolve())
++        self._active_dir = self._home_dir
++        self._use_jsonl = use_jsonl
++        self._managers: dict[str, MemoryManager] = {}
++        self._chat_dir: dict[str, str] = {}
++        self._search_dirs: list[str] = []
++        self._mgr(self._home_dir)  # eagerly create home
++
++    # ---- manager cache ----------------------------------------------------
++    def _mgr(self, d: str | Path) -> MemoryManager:
++        key = str(Path(d).resolve())
++        m = self._managers.get(key)
++        if m is None:
++            Path(key).mkdir(parents=True, exist_ok=True)
++            m = MemoryManager(key, use_jsonl=self._use_jsonl)
++            self._managers[key] = m
++        return m
++
++    # ---- active / search dirs --------------------------------------------
++    def set_active_dir(self, d: str | Path) -> None:
++        self._active_dir = str(Path(d).resolve())
++        self._mgr(self._active_dir)
++
++    @property
++    def active_dir(self) -> str:
++        return self._active_dir
++
++    def set_search_dirs(self, dirs) -> None:
++        out: list[str] = []
++        for d in dirs:
++            try:
++                out.append(str(Path(d).resolve()))
++            except Exception:
++                continue
++        self._search_dirs = out
++
++    # ---- per-chat routing -------------------------------------------------
++    def _exists_in(self, chat_id: str, d: str) -> bool:
++        base = Path(d)
++        return any(
++            (base / f"{chat_id}{ext}").exists()
++            for ext in (".jsonl", ".json", ".meta.json")
++        )
++
++    def _dir_for_chat(self, chat_id: str) -> str:
++        cached = self._chat_dir.get(chat_id)
++        if cached and self._exists_in(chat_id, cached):
++            return cached
++        for cand in [self._active_dir, self._home_dir, *self._search_dirs]:
++            if self._exists_in(chat_id, cand):
++                self._chat_dir[chat_id] = cand
++                return cand
++        # Unknown (brand-new chat not yet on disk) → active project.
++        return self._active_dir
++
++    def mgr_for_chat(self, chat_id: str) -> MemoryManager:
++        return self._mgr(self._dir_for_chat(chat_id))
++
++    # ---- delegated MemoryManager surface ---------------------------------
++    # per-chat (routed by chat_id)
++    def get_memory(self, id: str, auto_fix: bool = False):
++        return self.mgr_for_chat(id).get_memory(id, auto_fix)
++
++    def save_one(self, memory_id: str):
++        return self.mgr_for_chat(memory_id).save_one(memory_id)
++
++    def delete_memory(self, id: str):
++        result = self.mgr_for_chat(id).delete_memory(id)
++        self._chat_dir.pop(id, None)
++        return result
++
++    def update_memory_name(self, memory_id: str, name: str):
++        return self.mgr_for_chat(memory_id).update_memory_name(memory_id, name)
++
++    # active-targeted
++    def new_memory(self, name: str | None = None):
++        memory = self._mgr(self._active_dir).new_memory(name)
++        self._chat_dir[memory.id] = self._active_dir
++        return memory
++
++    def list_memory_metadata(self, include_errors: bool = False):
++        return self._mgr(self._active_dir).list_memory_metadata(include_errors)
++
++    @property
++    def path(self):
++        return self._mgr(self._active_dir).path
+diff --git a/pantheon/endpoint/core.py b/pantheon/endpoint/core.py
+index cffb0d484..ca96bfb46 100644
+--- a/pantheon/endpoint/core.py
++++ b/pantheon/endpoint/core.py
+@@ -115,6 +115,11 @@ def __init__(
+             **kwargs,
+         )
+ 
++        # Dual-channel: the Endpoint serves ChatRoom over the primary backend
++        # (e.g. local TCP) and the frontend over NATS simultaneously. ToolSet.run
++        # honors this when PANTHEON_FRONTEND_BACKEND differs from the primary.
++        self._enable_frontend_channel = True
++
+     @staticmethod
+     def default_config() -> EndpointConfig:
+         """Get default endpoint configuration from Settings."""
+diff --git a/pantheon/remote/backend/__init__.py b/pantheon/remote/backend/__init__.py
+index 3d8dbf113..cc40e9d76 100644
+--- a/pantheon/remote/backend/__init__.py
++++ b/pantheon/remote/backend/__init__.py
+@@ -9,6 +9,13 @@
+ except ImportError:
+     pass
+ 
++try:
++    from .tcp import TCPBackend
++
++    BackendRegistry.register("tcp", TCPBackend)
++except ImportError:
++    pass
++
+ __all__ = [
+     "RemoteBackend",
+     "RemoteService",
+diff --git a/pantheon/remote/backend/tcp.py b/pantheon/remote/backend/tcp.py
+new file mode 100644
+index 000000000..9c623ee1a
+--- /dev/null
++++ b/pantheon/remote/backend/tcp.py
+@@ -0,0 +1,398 @@
++"""
++Local TCP Remote Backend
++========================
++A transport-local alternative to the NATS backend for ChatRoom<->Endpoint RPC.
++Implements the same RemoteBackend / RemoteService / RemoteWorker interface but
++routes over localhost TCP instead of a NATS broker, so multiple endpoint
++processes can run in one sandbox without crossing the (public, central) NATS.
++
++Wire protocol
++-------------
++- Framing:   4-byte big-endian length prefix + cloudpickle payload.
++- Request:   {"method": str, "parameters": dict, "correlation_id": str}
++- Response:  {"correlation_id": str, "result": Any}  or
++             {"correlation_id": str, "error": str}
++
++Concurrency / multiplexing
++--------------------------
++A single persistent connection carries many in-flight requests. The client tags
++each request with a correlation_id, keeps a {cid: Future} map, and a background
++reader task dispatches each response to its Future. The worker handles every
++request in its own task and writes the response (tagged with the same cid) under
++a per-connection write lock, so concurrent invokes never cross-talk or block one
++another.
++
++Service discovery
++-----------------
++File registry at <registry_dir>/<service_id>.json holding {host, port, ...}.
++The worker writes it on run(); the client reads it on connect(). Default dir is
++$PANTHEON_TCP_REGISTRY or ~/.pantheon/tcp-registry (shared within a sandbox).
++
++Streaming
++---------
++get_or_create_stream is intentionally unimplemented: ChatRoom<->Endpoint is pure
++request/reply. Chat-token and notebook streaming flow ChatRoom->frontend over
++NATS, not this transport.
++"""
++import asyncio
++import json
++import os
++import struct
++import time
++import uuid
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Optional
++
++import cloudpickle
++from funcdesc import parse_func
++
++from pantheon.utils.log import logger
++from pantheon.utils.misc import run_func, generate_service_id
++from .base import (
++    RemoteBackend,
++    RemoteService,
++    RemoteWorker,
++    ServiceInfo,
++    StreamType,
++    StreamChannel,
++)
++
++_LEN = struct.Struct(">I")
++
++
++def _default_registry_dir() -> str:
++    env = os.getenv("PANTHEON_TCP_REGISTRY")
++    if env:
++        return env
++    base = os.getenv("HOME") or os.getenv("USERPROFILE") or "/tmp"
++    return str(Path(base) / ".pantheon" / "tcp-registry")
++
++
++async def _read_frame(reader: asyncio.StreamReader) -> bytes:
++    hdr = await reader.readexactly(4)
++    (n,) = _LEN.unpack(hdr)
++    return await reader.readexactly(n)
++
++
++async def _write_frame(writer: asyncio.StreamWriter, payload: bytes, lock: asyncio.Lock):
++    # Lock guards a full (length-prefix + payload) write so concurrent responders
++    # on one connection never interleave their bytes.
++    async with lock:
++        writer.write(_LEN.pack(len(payload)) + payload)
++        await writer.drain()
++
++
++# ----------------------------- Worker (server side) -----------------------------
++class TCPRemoteWorker(RemoteWorker):
++    def __init__(self, backend: "TCPBackend", service_name: str, description: str = "", **kwargs):
++        self._backend = backend
++        self._service_name = service_name
++        self._description = description
++        self._host = kwargs.get("host", "127.0.0.1")
++        self._port = int(kwargs.get("port", 0))  # 0 => OS assigns a free port
++        id_hash = kwargs.get("id_hash") or f"{service_name}_{uuid.uuid4().hex[:8]}"
++        self._service_id = generate_service_id(str(id_hash))
++        self._registry_dir = Path(backend.registry_dir)
++        self._functions: Dict[str, Callable] = {}
++        self._running = False
++        self._server: Optional[asyncio.AbstractServer] = None
++        self._activity_callback: Optional[Callable[[], dict]] = None
++        self._on_ready: Optional[asyncio.Event] = None
++        # Parity with NATS worker: auto-register ping for connection checks.
++        self.register(self._ping)
++
++    def set_activity_callback(self, callback: Callable[[], dict]):
++        self._activity_callback = callback
++
++    async def _ping(self) -> dict:
++        from pantheon import __version__
++        result = {"status": "ok", "service_id": self._service_id, "version": __version__}
++        if self._activity_callback:
++            try:
++                result.update(self._activity_callback())
++            except Exception:
++                pass
++        return result
++
++    def register(self, func: Callable, **kwargs):
++        self._functions[func.__name__] = func
++
++    async def run(self):
++        self._registry_dir.mkdir(parents=True, exist_ok=True)
++        self._server = await asyncio.start_server(self._handle_client, self._host, self._port)
++        addr = self._server.sockets[0].getsockname()
++        self._host, self._port = addr[0], addr[1]
++        self._write_registry()
++        self._running = True
++        logger.info(
++            f"[TCPWorker] {self._service_name} ({self._service_id[:12]}…) "
++            f"listening on {self._host}:{self._port}"
++        )
++        if self._on_ready is not None:
++            self._on_ready.set()
++        try:
++            async with self._server:
++                await self._server.serve_forever()
++        except asyncio.CancelledError:
++            pass
++
++    def _write_registry(self):
++        data = {
++            "service_id": self._service_id,
++            "service_name": self._service_name,
++            "description": self._description,
++            "host": self._host,
++            "port": self._port,
++            "pid": os.getpid(),
++            "registered_at": time.time(),
++        }
++        f = self._registry_dir / f"{self._service_id}.json"
++        tmp = f.with_suffix(".json.tmp")
++        tmp.write_text(json.dumps(data))
++        os.replace(tmp, f)  # atomic publish
++
++    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
++        wlock = asyncio.Lock()
++        try:
++            while True:
++                data = await _read_frame(reader)
++                # Concurrent dispatch: each request runs in its own task; the
++                # response carries its correlation_id so replies may return out
++                # of order without the client confusing them.
++                asyncio.create_task(self._process_and_respond(data, writer, wlock))
++        except (asyncio.IncompleteReadError, ConnectionResetError):
++            pass
++        except Exception as e:
++            logger.error(f"[TCPWorker] client handler error: {e}")
++        finally:
++            try:
++                writer.close()
++            except Exception:
++                pass
++
++    async def _process_and_respond(self, data: bytes, writer: asyncio.StreamWriter, wlock: asyncio.Lock):
++        cid = None
++        method = None
++        try:
++            msg = cloudpickle.loads(data)
++            cid = msg.get("correlation_id")
++            method = msg.get("method")
++            params = msg.get("parameters") or {}
++            if method not in self._functions:
++                await self._respond(writer, wlock, {
++                    "correlation_id": cid,
++                    "error": f"Method {method} not found on service {self._service_id}",
++                })
++                return
++            result = await run_func(self._functions[method], **params)
++            await self._respond(writer, wlock, {"correlation_id": cid, "result": result})
++        except Exception as e:
++            import traceback
++            logger.error(
++                f"[TCPWorker] error processing {method}: {e}\n{traceback.format_exc()}"
++            )
++            await self._respond(writer, wlock, {"correlation_id": cid, "error": str(e)})
++
++    async def _respond(self, writer, wlock, obj):
++        try:
++            await _write_frame(writer, cloudpickle.dumps(obj), wlock)
++        except Exception as e:
++            logger.error(f"[TCPWorker] failed to send response: {e}")
++
++    async def stop(self):
++        self._running = False
++        if self._server:
++            self._server.close()
++            try:
++                await self._server.wait_closed()
++            except Exception:
++                pass
++        f = self._registry_dir / f"{self._service_id}.json"
++        try:
++            if f.exists():
++                f.unlink()
++        except Exception:
++            pass
++
++    def get_service_info(self) -> ServiceInfo:
++        functions_description = {}
++        for name, func in self._functions.items():
++            try:
++                functions_description[name] = parse_func(func)
++            except Exception:
++                functions_description[name] = {
++                    "name": name,
++                    "description": getattr(func, "__doc__", ""),
++                    "parameters": [],
++                }
++        return ServiceInfo(
++            service_id=self._service_id,
++            service_name=self._service_name,
++            description=self._description,
++            functions_description=functions_description,
++        )
++
++    @property
++    def service_id(self) -> str:
++        return self._service_id
++
++    @property
++    def service_name(self) -> str:
++        return self._service_name
++
++    @property
++    def servers(self) -> List[str]:
++        return [f"tcp://{self._host}:{self._port}"]
++
++    @property
++    def functions(self) -> Dict[str, tuple]:
++        return {
++            name: (func, getattr(func, "__doc__", ""))
++            for name, func in self._functions.items()
++        }
++
++
++# ----------------------------- Service (client side) -----------------------------
++class TCPService(RemoteService):
++    def __init__(
++        self,
++        service_id: str,
++        host: str,
++        port: int,
++        registry_dir: str,
++        timeout: float | None = None,
++        **kwargs,
++    ):
++        self.service_id = service_id
++        self._host = host
++        self._port = port
++        self._registry_dir = Path(registry_dir)
++        if timeout is not None:
++            self.timeout = timeout
++        else:
++            try:
++                from pantheon.settings import get_settings
++                self.timeout = get_settings().tool_timeout
++            except Exception:
++                self.timeout = 3600
++        self._reader: Optional[asyncio.StreamReader] = None
++        self._writer: Optional[asyncio.StreamWriter] = None
++        self._wlock = asyncio.Lock()
++        self._conn_lock = asyncio.Lock()
++        self._pending: Dict[str, asyncio.Future] = {}
++        self._reader_task: Optional[asyncio.Task] = None
++        self._service_info = ServiceInfo(service_id, "", "", {})
++
++    async def _ensure_connected(self):
++        if self._writer is not None and not self._writer.is_closing():
++            return
++        async with self._conn_lock:
++            if self._writer is not None and not self._writer.is_closing():
++                return
++            self._reader, self._writer = await asyncio.open_connection(self._host, self._port)
++            self._reader_task = asyncio.create_task(self._read_loop())
++
++    async def _read_loop(self):
++        try:
++            while True:
++                data = await _read_frame(self._reader)
++                resp = cloudpickle.loads(data)
++                cid = resp.get("correlation_id")
++                fut = self._pending.pop(cid, None)
++                if fut is not None and not fut.done():
++                    fut.set_result(resp)
++        except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.CancelledError):
++            pass
++        except Exception as e:
++            logger.error(f"[TCPService] read loop error: {e}")
++        finally:
++            exc = ConnectionError(f"TCP connection to service {self.service_id} closed")
++            for fut in list(self._pending.values()):
++                if not fut.done():
++                    fut.set_exception(exc)
++            self._pending.clear()
++            self._writer = None
++
++    async def invoke(self, method: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
++        if parameters is None:
++            parameters = {}
++        await self._ensure_connected()
++        cid = uuid.uuid4().hex
++        fut: asyncio.Future = asyncio.get_event_loop().create_future()
++        self._pending[cid] = fut
++        payload = cloudpickle.dumps(
++            {"method": method, "parameters": parameters, "correlation_id": cid}
++        )
++        try:
++            await _write_frame(self._writer, payload, self._wlock)
++        except Exception as e:
++            self._pending.pop(cid, None)
++            raise ConnectionError(f"Failed to send request to {self.service_id}: {e}")
++        try:
++            resp = await asyncio.wait_for(fut, timeout=self.timeout)
++        except asyncio.TimeoutError:
++            self._pending.pop(cid, None)
++            raise Exception(f"Timeout calling {method} on {self.service_id}")
++        if resp.get("error"):
++            raise Exception(resp["error"])
++        return resp.get("result")
++
++    async def close(self):
++        if self._reader_task:
++            self._reader_task.cancel()
++        if self._writer:
++            try:
++                self._writer.close()
++            except Exception:
++                pass
++        self._writer = None
++
++    @property
++    def service_info(self) -> ServiceInfo:
++        return self._service_info
++
++    async def fetch_service_info(self) -> ServiceInfo:
++        f = self._registry_dir / f"{self.service_id}.json"
++        if not f.exists():
++            raise RuntimeError(
++                f"Service '{self.service_id}' not found in TCP registry {self._registry_dir}"
++            )
++        d = json.loads(f.read_text())
++        self._service_info = ServiceInfo(
++            d["service_id"], d.get("service_name", ""), d.get("description", ""), {}
++        )
++        return self._service_info
++
++
++# ----------------------------- Backend (factory) -----------------------------
++class TCPBackend(RemoteBackend):
++    def __init__(self, registry_dir: str | None = None, **kwargs):
++        self.registry_dir = registry_dir or _default_registry_dir()
++        Path(self.registry_dir).mkdir(parents=True, exist_ok=True)
++
++    async def connect(self, service_id: str, **kwargs) -> RemoteService:
++        f = Path(self.registry_dir) / f"{service_id}.json"
++        if not f.exists():
++            raise ConnectionError(
++                f"Service '{service_id}' not found in TCP registry {self.registry_dir}"
++            )
++        d = json.loads(f.read_text())
++        # Drop transport keys we set ourselves so they don't clash with kwargs.
++        for k in ("server_urls",):
++            kwargs.pop(k, None)
++        return TCPService(service_id, d["host"], int(d["port"]), self.registry_dir, **kwargs)
++
++    def create_worker(self, service_name: str, **kwargs) -> RemoteWorker:
++        return TCPRemoteWorker(self, service_name, **kwargs)
++
++    @property
++    def servers(self) -> List[str]:
++        return [f"tcp-local://{self.registry_dir}"]
++
++    async def get_or_create_stream(
++        self, stream_id: str, stream_type: StreamType = StreamType.CUSTOM, **kwargs
++    ) -> StreamChannel:
++        raise NotImplementedError(
++            "TCP backend does not implement streaming. ChatRoom<->Endpoint is pure "
++            "request/reply; chat/notebook streaming flows to the frontend over NATS."
++        )
+diff --git a/pantheon/remote/factory.py b/pantheon/remote/factory.py
+index 1b7c39e58..d59113059 100644
+--- a/pantheon/remote/factory.py
++++ b/pantheon/remote/factory.py
+@@ -138,6 +138,13 @@ def user_jwt_cb():
+             except ValueError:
+                 logger.warning(f"Invalid NATS_CONNECT_TIMEOUT value: {connect_timeout}, using default")
+ 
++    elif backend == "tcp":
++        # Local TCP transport for ChatRoom<->Endpoint (no NATS broker).
++        config = {}
++        registry_dir = remote_config.get("registry_dir") or os.getenv("PANTHEON_TCP_REGISTRY")
++        if registry_dir:
++            config["registry_dir"] = registry_dir
++
+     else:
+         raise ValueError(f"Unknown backend: {backend}")
+ 
+@@ -190,6 +197,13 @@ def register_backends():
+ 
+         BackendRegistry.register("nats", NATSBackend)
+ 
++        try:
++            from .backend.tcp import TCPBackend
++
++            BackendRegistry.register("tcp", TCPBackend)
++        except ImportError:
++            pass
++
+ 
+ # Auto-register backends on import
+ RemoteBackendFactory.register_backends()
+diff --git a/pantheon/toolset.py b/pantheon/toolset.py
+index ed66507fd..2ea4d5522 100644
+--- a/pantheon/toolset.py
++++ b/pantheon/toolset.py
+@@ -1,6 +1,7 @@
+ import asyncio
+ import inspect
+ import json
++import os
+ import sys
+ from abc import ABC
+ from contextlib import asynccontextmanager
+@@ -399,6 +400,31 @@ async def run(self, log_level: str | None = None, remote: bool = True):
+                 self.worker.register(method, **tool_kwargs)
+             logger.info(f"[ToolSet.run] Registered {len(self._functions)} tools")
+ 
++            # ===== Optional dual-channel: a secondary worker on another backend =====
++            # Lets the Endpoint answer ChatRoom over the primary (e.g. local TCP)
++            # backend AND the frontend over NATS at the same time, on the SAME
++            # service_id. Opt-in via `_enable_frontend_channel` (Endpoint sets it)
++            # + PANTHEON_FRONTEND_BACKEND differing from the primary backend.
++            self._frontend_worker = None
++            self._frontend_backend = None
++            if getattr(self, "_enable_frontend_channel", False):
++                primary_name = os.getenv("PANTHEON_REMOTE_BACKEND") or "nats"
++                frontend_name = os.getenv("PANTHEON_FRONTEND_BACKEND") or "nats"
++                if frontend_name != primary_name:
++                    from .remote.factory import RemoteConfig
++                    self._frontend_backend = RemoteBackendFactory.create_backend(
++                        RemoteConfig.from_config(backend=frontend_name)
++                    )
++                    self._frontend_worker = self._frontend_backend.create_worker(
++                        self._service_name, **self._worker_kwargs
++                    )
++                    for _n, (_m, _k) in self._functions.items():
++                        self._frontend_worker.register(_m, **_k)
++                    logger.info(
++                        f"[ToolSet.run] Dual-channel enabled: primary={primary_name} "
++                        f"+ frontend={frontend_name} worker (same service_id)"
++                    )
++
+             # Run custom setup
+             logger.info(f"[ToolSet.run] Running setup...")
+             await self.run_setup()
+@@ -410,7 +436,10 @@ async def run(self, log_level: str | None = None, remote: bool = True):
+             logger.info(f"Service ID: {self.service_id}")
+             logger.info(f"[ToolSet.run] Starting worker.run() (NATS subscribe)...")
+             try:
+-                await self.worker.run()
++                if self._frontend_worker is not None:
++                    await asyncio.gather(self.worker.run(), self._frontend_worker.run())
++                else:
++                    await self.worker.run()
+             finally:
+                 # Cleanup on shutdown
+                 await self.cleanup()
+diff --git a/pantheon/toolsets/notebook/integrated_notebook.py b/pantheon/toolsets/notebook/integrated_notebook.py
+index eedf733c0..dda50bc44 100644
+--- a/pantheon/toolsets/notebook/integrated_notebook.py
++++ b/pantheon/toolsets/notebook/integrated_notebook.py
+@@ -128,8 +128,21 @@ async def run_setup(self):
+         # Initialize remote backend only when streaming is allowed
+         if allow_streaming and self.remote_backend is None:
+             try:
+-                self.remote_backend = RemoteBackendFactory.create_backend()
+-                logger.info("Auto-created remote backend from environment")
++                # Streaming targets the frontend, which speaks NATS. When the
++                # primary backend is a local transport (e.g. TCP) that can't
++                # stream, use PANTHEON_FRONTEND_BACKEND for the stream channel.
++                import os
++                frontend_name = os.getenv("PANTHEON_FRONTEND_BACKEND")
++                primary_name = os.getenv("PANTHEON_REMOTE_BACKEND") or "nats"
++                if frontend_name and frontend_name != primary_name:
++                    from pantheon.remote.factory import RemoteConfig
++                    self.remote_backend = RemoteBackendFactory.create_backend(
++                        RemoteConfig.from_config(backend=frontend_name)
++                    )
++                    logger.info(f"Auto-created frontend backend ({frontend_name}) for streaming")
++                else:
++                    self.remote_backend = RemoteBackendFactory.create_backend()
++                    logger.info("Auto-created remote backend from environment")
+             except Exception as e:
+                 logger.warning(f"No remote backend available: {e}")
+ 

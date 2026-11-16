@@ -1,0 +1,1379 @@
+diff --git a/README.md b/README.md
+index 47ef1d5..0d5a481 100644
+--- a/README.md
++++ b/README.md
+@@ -21,7 +21,7 @@ Python distribution in [Miniconda](https://conda.io/miniconda.html) or
+ [anaconda](https://www.continuum.io/downloads):
+ 
+ ```
+-conda create -n schpf_p37 python=3.7 scikit-learn numba=0.45 pandas
++conda create -n schpf_p37 python=3.7 scikit-learn numba=0.50 pandas
+ 
+ # for newer anaconda versions
+ conda activate schpf_p37
+@@ -40,6 +40,19 @@ cd scHPF
+ pip install .
+ ```
+ 
++### Testing your installation
++This step important because not all micro-versions of numba play nicely with
++all micro versions of Python or numpy, and sometimes issues vary across
++machines. Testing will catch some but not all such issues.  From the scHPF base
++directory do:
++```
++conda install pytest
++pytest
++```
++Please get in touch if tests fail, or if you get segmentation faults or very
++long train times that and no automatic parallelization, and I'm happy to try to
++help. 
++
+ ## Quick Start: Command Line Interface
+ 
+ 1. [Prepare your data](https://schpf.readthedocs.io/en/latest/prep-cli.html). 
+diff --git a/bin/scHPF b/bin/scHPF
+index 670fe75..807b479 100644
+--- a/bin/scHPF
++++ b/bin/scHPF
+@@ -1,26 +1,46 @@
+ #! /usr/bin/env python
+ 
+ import os
++import sys
+ import argparse
+ import json
+ import time
++from functools import partial
++
++if not sys.warnoptions:
++    import warnings
++    warnings.simplefilter("ignore")
+ 
+ import numpy as np
+ import pandas as pd
+ from scipy.io import mmread, mmwrite
+ from scipy.sparse import coo_matrix
++import joblib
+ 
+-from schpf import scHPF, load_model, save_model, run_trials
++from schpf import scHPF, run_trials, run_trials_pool
+ from schpf.util import max_pairwise_table, mean_cellscore_fraction_list
+ from schpf.preprocessing import load_coo, load_and_filter, load_like
+ from schpf.preprocessing import split_validation_cells
+ 
+ def _parser():
++    # usage = """scHPF <command> [<args>]
++
++# The most commonly used scHPF commands are:
++    # prep    Prepare data
++    # train   Train a model from data
++    # score   Get cell-scores, gene-scores, and other data
++
++# Some advanced scHPF commands are:
++    # prep-like    Prepare data with the same genes & order as other data
++    # project      Project data onto a pre-trained model
++    # train-pool   Train a model, parallelized at the level of trials
++    # """
+     parser = argparse.ArgumentParser()
+     subparsers = parser.add_subparsers(dest='cmd')
+ 
+     ### Preprocess command
+-    prep = subparsers.add_parser('prep')
++    prep = subparsers.add_parser('prep',
++            help='Prepare data for training')
+     # data
+     prep.add_argument('-i', '--input', required=True,
+             help='Input data. Currently accepts either: (1) a whitespace-'
+@@ -82,7 +102,9 @@ def _parser():
+ 
+ 
+     #### Prepare like
+-    prep_like = subparsers.add_parser('prep-like')
++    prep_like = subparsers.add_parser('prep-like', 
++            help='Prepare a data set like another (ie with the same genes in'
++            ' the same order)')
+     # data
+     prep_like.add_argument('-i', '--input', required=True,
+             help='Input data to format. Currently accepts either: (1) a'
+@@ -112,7 +134,9 @@ def _parser():
+ 
+ 
+     ###### Train command
+-    train = subparsers.add_parser('train')
++    train = subparsers.add_parser('train',
++            help='Train a model with automatic parallelization across'
++            ' computations with numba')
+     # data and saving
+     train.add_argument('-i', '--input', required=True,
+             help="Training data. Expects either the mtx file output by the "
+@@ -140,9 +164,6 @@ def _parser():
+             ' Expects same format as ``-i/--input``. Training data used by'
+             ' default.'
+             )
+-    # train.add_argument('-vnz', '--validation-nonzero', 
+-            # help='Validation data of selected nonzero entries. Must have same '
+-            # 'format (either mtx or tsv) as input. [Default None]' )
+     train.add_argument('-M', '--max-iter', type=int, default=1000,
+             help='Maximum iterations. [Default 1000].')
+     train.add_argument('-m', '--min-iter', type=int, default=30,
+@@ -158,18 +179,56 @@ def _parser():
+             'if loss is worse than `better_than_n_ago`*`check-freq` training '
+             'steps ago and getting worse. Normally not necessary to change.')
+     train.add_argument('-a', type=float, default=0.3,
+-            help='Value for hyperparameter a. [Default 0.3]')
++            help='Value for hyperparameter a. Setting to -2 will auto-set to'
++            ' 1/sqrt(nfactors)[Default 0.3]')
+     train.add_argument('-c', type=float, default=0.3,
+-            help='Value for hyperparameter c. [Default 0.3]')
++            help='Value for hyperparameter c. Setting to -2 will auto-set to'
++            ' 1/sqrt(nfactors)[Default 0.3]')
++    train.add_argument('--float32', action='store_true',
++            help="Use 32-bit floats instead of default 64-bit floats in"
++            " variational distrubtions")
++    train.add_argument('-bs', '--batchsize', default=0, type=int,
++            help="Number of cells to use per training round. All cells used if"
++            " 0. Note that using batches changes the order of updates during"
++            " inference.")
++    train.add_argument('-sl', '--smooth-loss', default=1, type=int,
++            help="Average loss over the last `--smooth-loss` interations."
++            " Intended for when using minibatches, where int(ncells/batchsize)"
++            " is a reasonable value"
++            )
++    train.add_argument('-bts', '--beta-theta-simultaneous', action='store_true',
++            help="If False (default), compute beta update, then compute theta"
++            " based on the updated beta. Note that if batching is used, this"
++            " order is reverse. If True, update both beta and theta based on"
++            " values from the last training round. The later slows the rate of"
++            " convergence and sometimes results in better log-likelihoods, but"
++            " may increase convergence time, especially for large numbers of"
++            " cells."
++            )
++    train.add_argument('-sa', '--save-all', action='store_true',
++            help="Save all trials")
++    train.add_argument('-rp', '--reproject', action='store_true',
++            help="Reproject data onto fixed global (gene) parameters after"
++            " convergence, but before model selection. Recommended with"
++            " batching")
+     train.add_argument('--quiet', dest='verbose', action='store_false', 
+             default=True, help="Don't print intermediate llh.")
+-    train.add_argument('--float32', action='store_true',
+-            help="Use 32-bit floats instead of default 64-bit floats in "
+-            "variational distrubtions")
++
++    ###### train with trials in threadpool
++    train_pool = subparsers.add_parser('train-pool', parents=[train], 
++            add_help=False, conflict_handler='resolve')
++    train_pool.add_argument('--njobs', type=int, default=0,
++            help='Max number of processes to spawn. 0 will use the minimum of'
++            ' all available cores and ntrials.')
++    # Required model hyperparameter
++    train_pool.add_argument('-k', '--nfactors', nargs='+', type=int, 
++        required=True, help='Number of factors.')
+ 
+ 
+     ### Score command
+-    score = subparsers.add_parser('score')
++    score = subparsers.add_parser('score',
++            help='Create useful files such as gene scores, cell scores, and'
++            ' ranked gene lists in txt format.')
+     score.add_argument('-m', '--model', required=True,
+             help='Saved scHPF model from train command. Should have extension' 
+             '`.joblib`')
+@@ -193,8 +252,10 @@ def _parser():
+         )
+ 
+ 
++
+     # ###### Project command
+-    proj = subparsers.add_parser('project')
++    proj = subparsers.add_parser('project',
++            help='Project new data onto a trained model.')
+     # data and saving
+     proj.add_argument('-m', '--model', required=True,
+             help='The model to project onto.')
+@@ -233,10 +294,15 @@ if __name__=='__main__':
+     parser = _parser()
+     args = parser.parse_args()
+ 
++    # print help if no subparser given
++    if len(sys.argv)==1:
++        parser.print_help(sys.stderr)
++        sys.exit(1)
++
+     # setup paths and prefixes
+ 
+     if args.outdir is None:
+-        if args.cmd in ['prep', 'prep-like', 'train']:
++        if args.cmd in ['prep', 'prep-like', 'train', 'train-pool']:
+             args.outdir = args.input.rsplit('/', 1)[0]
+         elif args.cmd=='project':
+             args.outdir = args.model.rsplit('/',1)[0]
+@@ -301,7 +367,7 @@ if __name__=='__main__':
+             json.dump(args.__dict__, f, indent=2)
+ 
+ 
+-    elif args.cmd == 'train':
++    elif args.cmd in ['train', 'train-pool']:
+         # load data
+         print( 'Loading data.....' )
+         load_fnc = mmread if args.input.endswith('.mtx') else load_coo
+@@ -311,6 +377,13 @@ if __name__=='__main__':
+         msg = '.....found {} cells and {} genes in {}'.format(
+                 ncells, ngenes, args.input)
+         print(msg)
++
++        if args.batchsize and ncells > args.batchsize and not args.reproject:
++            msg = '\nWARNING: running with minibatches but without reproject.' \
++                + ' We recommend adding the --reproject flag when running with'\
++                + ' batches to synchronize cell variational distributions. \n'
++            print(msg)
++
+         if args.validation_cells is not None:
+             vcells = load_fnc(args.validation_cells)
+             msg = '.....found {} validation cells and {} genes in {}'.format(
+@@ -329,31 +402,77 @@ if __name__=='__main__':
+         print('Running trials.....' )
+         dtype = np.float32 if args.float32 else np.float64
+         model_kwargs = dict(a=args.a, c=args.c)
+-        model = run_trials(train, vcells=vcells,
+-                    nfactors=args.nfactors, ntrials=args.ntrials,
+-                    min_iter=args.min_iter, max_iter=args.max_iter,
+-                    check_freq=args.check_freq, epsilon=args.epsilon,
+-                    better_than_n_ago=args.better_than_n_ago,
+-                    dtype=dtype, verbose=args.verbose,
+-                    model_kwargs=model_kwargs)
+-
+-        # save the model
+-        model_outprefix = '{}scHPF_K{}_{}trials'.format(
+-                    outprefix, args.nfactors, args.ntrials)
+-        if vcells is None:
+-            print('Saving best model.....')
+-            save_model(model, model_outprefix + '.joblib')
++
++        if args.cmd == 'train':
++            run_fnc = run_trials
++        else:
++            if args.njobs < 0:
++                msg = 'njobs must be an int >= 0, received {}'
++                raise ValueError(msg.format(args.njobs))
++            run_fnc = partial(run_trials_pool, njobs=args.njobs)
++
++        # TODO get rid of repeated code
++        reject = None
++        if args.save_all:
++            model, reject = run_fnc(train, vcells=vcells, 
++                        nfactors=args.nfactors, ntrials=args.ntrials,
++                        min_iter=args.min_iter, max_iter=args.max_iter,
++                        check_freq=args.check_freq, epsilon=args.epsilon,
++                        better_than_n_ago=args.better_than_n_ago, dtype=dtype,
++                        verbose=args.verbose, model_kwargs=model_kwargs,
++                        return_all=True, reproject=args.reproject,
++                        batchsize=args.batchsize,
++                        beta_theta_simultaneous=args.beta_theta_simultaneous,
++                        loss_smoothing=args.smooth_loss
++                        )
++        else:
++            model = run_fnc(train, vcells=vcells, nfactors=args.nfactors, 
++                        ntrials=args.ntrials, min_iter=args.min_iter,
++                        max_iter=args.max_iter, check_freq=args.check_freq,
++                        epsilon=args.epsilon,
++                        better_than_n_ago=args.better_than_n_ago, dtype=dtype,
++                        verbose=args.verbose, model_kwargs=model_kwargs,
++                        return_all=False, reproject=args.reproject,
++                        batchsize=args.batchsize,
++                        beta_theta_simultaneous=args.beta_theta_simultaneous,
++                        loss_smoothing=args.smooth_loss
++                        )
++
++        # save the model/models
++        if isinstance(args.nfactors, int):
++            klist = [args.nfactors]
++            model = [model]
++            if reject is not None:
++                reject = [reject]
+         else:
+-            print('Saving best model (training data).....')
+-            save_model(model, model_outprefix + '.train.joblib')
++            klist = args.nfactors
++        for i, (K,m) in enumerate(zip(klist, model)):
++            model_outprefix = '{}scHPF_K{}{}_{}trials'.format(
++                    outprefix, K, 
++                    f'_b{args.batchsize}' if ncells > args.batchsize else '', 
++                    args.ntrials)
++            if vcells is None:
++                print('Saving best model ({} factors).....'.format(K))
++                joblib.dump(m, model_outprefix + '.joblib')
++            else:
++                print('Saving best model (training data, {} factors).....'\
++                        .format(K))
++                joblib.dump(m, model_outprefix + '.train.joblib')
++
++                print('Computing final validation projection ({} factors)....'\
++                        .format(K))
++                projection = m.project(vcells, replace=False)
++                print('Saving validation projection.....({} factors)'.format(K))
++                joblib.dump(projection, 
++                        model_outprefix + '.validation_proj.joblib')
++            if args.save_all:
++                for j,r in enumerate(reject[i]):
++                    joblib.dump(r, model_outprefix + f'_reject{j+1}.joblib')
+ 
+-            print('Computing final validation projection....')
+-            projection = model.project(vcells, replace=False)
+-            print('Saving validation projection.....')
+-            save_model(projection, model_outprefix + '.validaton_proj.joblib')
+ 
+         print('Writing commandline arguments to file.....')
+         cmdfile = '{}train_commandline_args.json'.format(outprefix)
++        print(cmdfile)
+         if os.path.exists(cmdfile):
+             cmdfile = '{}train_commandline_args.{}.json'.format(outprefix, 
+                     time.strftime("%Y%m%d-%H%M%S"))
+@@ -365,7 +484,7 @@ if __name__=='__main__':
+ 
+     elif args.cmd == 'score':
+         print('Loading model.....')
+-        model = load_model(args.model)
++        model = joblib.load(args.model)
+ 
+         print('Calculating scores.....')
+         cell_score = model.cell_score()
+@@ -386,14 +505,6 @@ if __name__=='__main__':
+         table = max_pairwise_table(gene_score, 
+                 ntop_list=[50,100,150,200,250,300,350,400,450,500])
+         table.to_csv(outprefix + 'maximum_overlaps.txt', sep='\t', index=False)
+-        # # Make second table w/percent cutoffs
+-        # percents = [0.005, 0.01, 0.02, 0.03,0.04, 0.05]
+-        # p_ntop = [int(p*len(gene_score)) for p in percents]
+-        # table2 = max_pairwise_table(gene_score, ntop_list=p_ntop)
+-        # table2['percent'] = percents # add percent column
+-        # table2 = table2[['percent'] + list(table2.columns[:-1])] # reorder columns
+-        # table2.to_csv(outprefix + 'maximum_overlaps.percent.txt', sep='\t', 
+-                # index=False)
+ 
+         if args.genefile is not None:
+             print('Ranking genes.....')
+@@ -424,7 +535,7 @@ if __name__=='__main__':
+ 
+     elif args.cmd == 'project':
+         print('Loading reference model.....')
+-        model = load_model(args.model)
++        model = joblib.load(args.model)
+         print('Loading data.....')
+         load_fnc = mmread if args.input.endswith('.mtx') else load_coo
+         proj_data = load_fnc(args.input)
+@@ -440,7 +551,7 @@ if __name__=='__main__':
+             outprefix += '{}.'.format('recalc_bp')
+         proj_out = '{}{}.proj.joblib'.format(outprefix, 
+                 args.model.rsplit('.',1)[0].split('/')[-1])
+-        save_model(projection, proj_out)
++        joblib.dump(projection, proj_out)
+ 
+         print('Writing commandline arguments to file.....')
+         cmdfile = '{}project_commandline_args.json'.format(outprefix)
+diff --git a/docs/changelog.rst b/docs/changelog.rst
+index 3f943a7..c23034b 100644
+--- a/docs/changelog.rst
++++ b/docs/changelog.rst
+@@ -4,6 +4,15 @@
+ Changelog
+ *********
+ 
++0.4.0
++=====
++- train-pool for training parallelized at the level of trials rather than
++  computations
++- reproject and save all options during training
++- add separate joblib dependency (should be installed w/scikit-learn,
++  scikit.externals.joblib is deprecated)
++
++
+ 0.3.0
+ =====
+ 
+diff --git a/docs/install.rst b/docs/install.rst
+index 31fa345..6e53931 100644
+--- a/docs/install.rst
++++ b/docs/install.rst
+@@ -9,7 +9,7 @@ Environment & Dependencies
+ 
+ scHPF requires Python >= 3.6 and the packages:
+ 
+-*   numba (:ref:`version requirement depends on python version<numba>`, but will be safe with 0.45)
++*   numba (:ref:`version requirement depends on python version<numba>`, but will be safe with 0.45, and probably 0.45+)
+ *   scikit-learn
+ *   pandas
+ *   (optional) loompy
+@@ -22,7 +22,7 @@ its stripped-down version `miniconda`_):
+ 
+ .. code:: bash
+ 
+-    conda create -n schpf_p37 python=3.7 scikit-learn numba=0.45 pandas
++    conda create -n schpf_p37 python=3.7 scikit-learn numba=0.50 pandas numpy=1.18
+ 
+     # for newer anaconda versions
+     conda activate schpf_p37
+@@ -33,23 +33,38 @@ its stripped-down version `miniconda`_):
+     pip install -U loompy
+ 
+ 
++
+ .. _numba:
+ 
+-numba compatibility
+--------------------
++numba/Python compatibility
++--------------------------
+ Certain micro-versions of Python and numba do not play well together, resulting
+ in segmentation faults and/or horrible performance (at least for the ops scHPF
+-uses).  In our experience, micro-version combos that avoid these issues seem to
+-be:
++uses).  In our experience, micro-version combos that avoid these issues are
++listed below, as well as known-bad combination, but note this is not an
++exhaustive list:
+ 
+-**Python <=3.7.3**
+-    Compatible numba: 0.39, 0.40, 0.44, 0.45
++**Python 3.7.9**
++    Compatible numba:  0.45-0.50
++
++    DO NOT USE: 0.44 or earlier
++**Python 3.7.5 - 3.7.8**
++    Not tested
+ **Python 3.7.4**
+     Compatible numba: 0.44, 0.45
+ 
+-*Please* let us know about any weird errors/slowness your experience so we can 
++    DO NOT USE: 0.43 or earlier
++**Python <=3.7.3**
++    Compatible numba: 0.39, 0.40, 0.44, 0.45
++
++    DO NOT USE: 0.41-0.43
++
++*Please* let me know about any weird errors/slowness you experience so we can 
+ document!
+ 
++
++
++
+ Installing scHPF 
+ ================
+ 
+@@ -61,3 +76,19 @@ install.
+     git clone git@github.com:simslab/scHPF.git
+     cd scHPF
+     pip install .
++
++
++.. _tests:
++
++Test your installation
++----------------------
++Highly recommended, as this will catch some annoying problems with python/numba/numpy incompatibilities. From your scHPF home directory:
++
++
++.. code:: bash
++
++    conda install pytest
++    pytest
++
++
++If any tests fail, please get in touch and I'll be happy to help.
+diff --git a/docs/train-cli.rst b/docs/train-cli.rst
+index f550da5..209a443 100644
+--- a/docs/train-cli.rst
++++ b/docs/train-cli.rst
+@@ -20,8 +20,8 @@ A typical command to train an scHPF model (using data prepared by the
+ 
+ This command performs approximate Bayesian inference on scHPF with, in this
+ instance, seven factors and five different random initializations. scHPF will
+-automatically select the trial with the highest log-likelihood, and save the
+-model in the OUTDIR in a serialized `joblib`_ file.
++automatically select the trial with the lowest negative log-likelihood, and
++save the model in the OUTDIR in a serialized `joblib`_ file.
+ 
+ Input file format
+ =================
+diff --git a/schpf/_version.py b/schpf/_version.py
+index 1ca87cf..d7f446d 100644
+--- a/schpf/_version.py
++++ b/schpf/_version.py
+@@ -1 +1 @@
+-__version__='0.3.0'
++__version__='0.5.0'
+diff --git a/schpf/hpf_numba.py b/schpf/hpf_numba.py
+index 011a365..4b7fef3 100644
+--- a/schpf/hpf_numba.py
++++ b/schpf/hpf_numba.py
+@@ -3,6 +3,11 @@
+ import ctypes
+ import numpy as np
+ from scipy.sparse import coo_matrix
++try:
++    from scipy.misc import logsumexp
++except ImportError:
++    from scipy.special import logsumexp
++
+ import numba
+ from numba.extending import get_cython_function_address as getaddr
+ 
+@@ -109,6 +114,17 @@ def compute_Xphi_data(X_data, X_row, X_col,
+     return Xphi
+ 
+ 
++def compute_Xphi_data_numpy(X, theta, beta, theta_ix=None):
++    """Single-threaded version of compute_Xphi_data
++    """
++    if theta_ix is None:
++        logrho = theta.e_logx[X.row, :] + beta.e_logx[X.col, :]
++    else:
++        logrho = theta.e_logx[theta_ix,:][X.row, :] + beta.e_logx[X.col,:]
++    logphi = logrho - logsumexp(logrho, axis=1)[:,None]
++    return X.data[:,None] * np.exp(logphi)
++
++
+ @numba.njit(fastmath=True) #results unstable with prange. don't do it.
+ def compute_loading_shape_update(Xphi_data, X_keep, nkeep, shape_prior):
+     """Compute gamma shape updates for theta or beta using numba
+diff --git a/schpf/loss.py b/schpf/loss.py
+index 90577dc..b3b64f0 100644
+--- a/schpf/loss.py
++++ b/schpf/loss.py
+@@ -8,6 +8,7 @@
+ 
+ import functools
+ import numpy as np
++from scipy.special import gammaln
+ 
+ from schpf.hpf_numba import compute_pois_llh
+ 
+@@ -84,7 +85,7 @@ def _projection_loss_function(*, a, ap, bp, c, cp, dp, eta, beta, **kwargs):
+         pmodel.beta = beta
+ 
+         # defaults if not given
+-        if 'reinit' not in proj_kwargs: prj_kwargs['reinit'] = False
++        if 'reinit' not in proj_kwargs: proj_kwargs['reinit'] = False
+         if 'max_iter' not in proj_kwargs: proj_kwargs['max_iter'] = 10
+         if 'min_iter' not in proj_kwargs: proj_kwargs['min_iter'] = 10
+         if 'check_freq' not in proj_kwargs:
+@@ -103,7 +104,7 @@ def _projection_loss_function(*, a, ap, bp, c, cp, dp, eta, beta, **kwargs):
+ 
+ #### Loss functions
+ 
+-def pois_llh_pointwise(X, *, theta, beta, **kwargs):
++def pois_llh_pointwise(X, *, theta, beta, single_process=False, **kwargs):
+     """Poisson log-likelihood for each nonzero entry
+ 
+     Parameters
+@@ -112,6 +113,8 @@ def pois_llh_pointwise(X, *, theta, beta, **kwargs):
+         Data to compute Poisson log likelihood of. Assumed to be nonzero.
+     theta : HPF_Gamma
+     beta : HPF_Gamma
++    single_process: bool, optiona (Default: False)
++        use single-threaded version of llh
+     **kwargs : dict, optional
+         extra arguments not used in this loss function
+ 
+@@ -126,17 +129,17 @@ def pois_llh_pointwise(X, *, theta, beta, **kwargs):
+     must be passed to the function as a keyword argument, and the function
+     will accept unused keyword args.
+     """
+-    try:
++    if single_process:
++        e_rate = (theta.e_x[X.row] *  beta.e_x[X.col]).sum(axis=1)
++        llh = X.data * np.log(e_rate) - e_rate - gammaln(X.data + 1)
++    else:
+         llh = compute_pois_llh(X.data, X.row, X.col,
+                                 theta.vi_shape, theta.vi_rate,
+                                 beta.vi_shape, beta.vi_rate)
+-    except NameError:
+-        e_rate = (theta.e_x[X.row] *  beta.e_x[X.col]).sum(axis=1)
+-        llh = X.data * np.log(e_rate) - e_rate - gammaln(X.data + 1)
+     return llh
+ 
+ 
+-def mean_negative_pois_llh(X, *, theta, beta, **kwargs):
++def mean_negative_pois_llh(X, *, theta, beta, single_process=False, **kwargs):
+     """Mean Poisson log-likelihood for each nonzero entry
+ 
+     Parameters
+@@ -145,6 +148,8 @@ def mean_negative_pois_llh(X, *, theta, beta, **kwargs):
+         Data to compute Poisson log likelihood of. Assumed to be nonzero.
+     theta : HPF_Gamma
+     beta : HPF_Gamma
++    single_process: bool, optional (Default: False)
++        use single-threaded version of pointwise loss
+     **kwargs : dict, optional
+         extra arguments not used in this loss function
+ 
+@@ -159,4 +164,5 @@ def mean_negative_pois_llh(X, *, theta, beta, **kwargs):
+     must be passed to the function as a keyword argument, and the function
+     will accept unused keyword args.
+     """
+-    return np.mean( -pois_llh_pointwise(X=X, theta=theta, beta=beta) )
++    return np.mean( -pois_llh_pointwise(X=X, theta=theta, beta=beta,
++        single_process=single_process) )
+diff --git a/schpf/preprocessing.py b/schpf/preprocessing.py
+index f3d1e1d..957b1e2 100644
+--- a/schpf/preprocessing.py
++++ b/schpf/preprocessing.py
+@@ -476,10 +476,10 @@ def load_like(infile, reference, by_gene_name=False,
+             )[genelist_col]
+     # select input column and process names unless told not to
+     if no_split_on_dot:
+-        ingenes = genes[genelist_col]
++        ingenes = candidate_names
+     else:
+         ref = ref.str.split('.').str[0]
+-        ingenes = genes[genelist_col].str.split('.').str[0]
++        ingenes = candidate_names.str.split('.').str[0]
+ 
+     perm = []
+     try:
+diff --git a/schpf/scHPF_.py b/schpf/scHPF_.py
+index 240c3c5..dcb327c 100644
+--- a/schpf/scHPF_.py
++++ b/schpf/scHPF_.py
+@@ -1,7 +1,8 @@
+ #!/usr/bin/env python
+-
+ from copy import deepcopy
+ from warnings import warn
++from functools import partial
++from multiprocessing import cpu_count
+ 
+ import numpy as np
+ from scipy.sparse import coo_matrix
+@@ -12,10 +13,13 @@
+     from scipy.special import logsumexp
+ 
+ from sklearn.base import BaseEstimator
+-from sklearn.externals import joblib
++import joblib
++from joblib import Parallel, delayed
++
+ 
+ # TODO warn if can't import, and allow computation with slow
+ from schpf.hpf_numba import *
++from schpf.util import minibatch_ix_generator
+ import schpf.loss as ls
+ import schpf
+ 
+@@ -265,6 +269,56 @@ def __init__(
+         self.loss = []
+ 
+ 
++    @property
++    def a(self):
++        try:
++            return self._a
++        except AttributeError:
++            msg = 'Automatically using a=0.3. If you are loading a model'
++            msg += ' generated with scHPF version < 0.5 and set a custom value'
++            msg += ' for a, you must manually reset it and re-save the model.'
++            warn(msg, RuntimeWarning)
++            return 0.3
++
++
++    @a.setter
++    def a(self, val):
++        if val == -2:
++            if self.nfactors is None:
++                raise ValueError('Can only set a as a function of nfactors when'
++                        ' nfactors is not None')
++            else:
++                self._a = 1/np.sqrt(self.nfactors)
++        else:
++            assert val > 0
++            self._a = val
++
++
++    @property
++    def c(self):
++        try:
++            return self._c
++        except AttributeError:
++            msg = 'Automatically using c=0.3. If you are loading a model '
++            msg += ' generated with scHPF version < 0.5 and set a custom value'
++            msg += ' for c, you must manually reset it and re-save the model.'
++            warn(msg, RuntimeWarning)
++            return 0.3
++
++
++    @c.setter
++    def c(self, val):
++        if val == -2:
++            if self.nfactors is None:
++                raise ValueError('Can only set a as a function of nfactors when'
++                        ' nfactors is not None')
++            else:
++                self._c = 1/np.sqrt(self.nfactors)
++        else:
++            assert val > 0
++            self._c = val
++
++
+     @property
+     def ngenes(self):
+         return self.eta.dims[0] if self.eta is not None else None
+@@ -338,7 +392,28 @@ def pois_llh_pointwise(self, X, theta=None, beta=None):
+         return ls.pois_llh_pointwise(X=X, theta=theta, beta=beta)
+ 
+ 
+-    def mean_negative_pois_llh(X, theta=None, beta=None, **kwargs):
++    def cellmean_negative_pois_llh(self, X, theta=None, beta=None):
++        """Convenience method for mean negative llh of nonzero entries,
++           averaged by cell
++
++        """
++        theta = self.theta if theta is None else theta
++        assert(theta.vi_shape.shape[0] == X.shape[0])
++        beta = self.beta if beta is None else beta
++        llh_pointwise= self.pois_llh_pointwise(X=X, theta=theta, beta=beta)
++
++        llh_csr = coo_matrix((-llh_pointwise, (X.row,X.col)), shape=X.shape).tocsr()
++        sums = llh_csr.sum(axis=1).A1
++        counts = np.diff(llh_csr.indptr)
++        averages = sums/counts
++
++        assert(averages.shape[0] == theta.vi_shape.shape[0])
++        return averages
++
++
++
++
++    def mean_negative_pois_llh(self, X, theta=None, beta=None, **kwargs):
+         """Convenience method for mean negative llh of nonzero entries
+ 
+         """
+@@ -370,7 +445,7 @@ def fit(self, X, **kwargs):
+         return self
+ 
+ 
+-    def project(self, X, recalc_bp=False, replace=False, min_iter=2, max_iter=30,
++    def project(self, X, recalc_bp=False, replace=False, min_iter=2, max_iter=50,
+             check_freq=2, **kwargs):
+         """Project new cells into latent space
+ 
+@@ -450,7 +525,9 @@ def _score(self, capacity, loading):
+ 
+     def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+             min_iter=None, max_iter=None, epsilon=None, check_freq=None,
+-            checkstep_function=None, verbose=None):
++            single_process=False, checkstep_function=None, verbose=None,
++            batchsize=None, beta_theta_simultaneous=False,
++            loss_smoothing=1):
+         """Combined internal fit/transform function
+ 
+         Parameters
+@@ -485,6 +562,8 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+         check_freq : int, optional (Default: None)
+             Replaces self.check_freq if given.  Useful when projecting
+             new data onto an existing scHPF model.
++        single_process : bool, optional (Default: False)
++            Use single-threaded versions of updates
+         checkstep_function : function  (optional, default None)
+             A function that takes arguments bp, dp, xi, eta, theta, beta,
+             and t and, if given, is called at check_interval. Intended use
+@@ -492,6 +571,17 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+             hardcoded data, but is unrestricted.  Use at own risk.
+         verbose: bool (optional, default None)
+             If not None, overrides self.verbose
++        batchsize: int, optional (Default 0)
++            number of cells per batch. When 0, all cells are used
++        beta_theta_simultaneous: bool, option (Default False)
++            Should updates for beta and theta be computed simultaneously.
++            If False, beta is updated first, and theta is updated using
++            that beta
++        loss_smoothing: int, optional (Default: 1)
++            Smooth loss up to `loss_smoothing` check frequencies ago. 1 results
++            in no smoothing. Intended to be used with batching when assessing
++            convergence based on training loss, where a good value might be
++            int(ncells/n_batches)
+ 
+         Returns
+         -------
+@@ -512,6 +602,8 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+         loss : list
+             loss at each checkstep
+         """
++        assert loss_smoothing > 0
++
+         # local (convenience) vars for model
+         nfactors, (ncells, ngenes) = self.nfactors, X.shape
+         a, ap, c, cp = self.a, self.ap, self.c, self.cp
+@@ -531,8 +623,16 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+             loss_function = ls.loss_function_for_data(
+                     ls.mean_negative_pois_llh, X)
+ 
++        # setup batch_ix iterator
++        if batchsize is not None and batchsize > 1 and batchsize <= ncells:
++            batched = True
++            batch_ix_generator = minibatch_ix_generator(ncells, batchsize)
++        else:
++            batched = False
++            batch_ix_generator = None
++
+         ## init
+-        loss, pct_change = [], []
++        loss, unsmoothed_loss, pct_change = [], [], []
+         # check variable overrides
+         min_iter = self.min_iter if min_iter is None else min_iter
+         max_iter = self.max_iter if max_iter is None else max_iter
+@@ -540,29 +640,78 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+         check_freq = self.check_freq if check_freq is None else check_freq
+         verbose = self.verbose if verbose is None else verbose
+         for t in range(max_iter):
++            # setup batching
++            if batch_ix_generator is None:
++                batch_ix = np.arange(X.shape[0])
++                batchsize = ncells
++                X_batch = X
++            else:
++                batch_ix = next(batch_ix_generator)
++                X_batch = X.tocsr()[batch_ix,:].tocoo()
++
+             if t==0 and reinit: #randomize phi for first iteration
+                 random_phi = np.random.dirichlet( np.ones(nfactors),
+-                        X.data.shape[0])
+-                Xphi_data = X.data[:,None] * random_phi
++                        X_batch.data.shape[0])
++                Xphi_data = X_batch.data[:,None] * random_phi
+             else:
+-                Xphi_data = compute_Xphi_data(X.data, X.row, X.col,
+-                                            theta.vi_shape, theta.vi_rate,
+-                                            beta.vi_shape, beta.vi_rate)
+-
+-            # gene updates (if not frozen)
+-            if not freeze_genes:
+-                beta.vi_shape = compute_loading_shape_update(Xphi_data, X.col,
+-                        ngenes, c)
+-                beta.vi_rate = compute_loading_rate_update(eta.vi_shape,
+-                        eta.vi_rate, theta.vi_shape, theta.vi_rate)
+-                eta.vi_rate = dp + beta.e_x.sum(1)
+-
+-            # cell updates
+-            theta.vi_shape = compute_loading_shape_update(Xphi_data, X.row,
+-                                                          ncells, a)
+-            theta.vi_rate = compute_loading_rate_update(xi.vi_shape, xi.vi_rate,
+-                    beta.vi_shape, beta.vi_rate)
+-            xi.vi_rate = bp + theta.e_x.sum(1)
++                if single_process:
++                    Xphi_data = compute_Xphi_data_numpy(X_batch, theta, beta,
++                            theta_ix=batch_ix)
++                else:
++                    Xphi_data = compute_Xphi_data(
++                            X_batch.data, X_batch.row, X_batch.col,
++                            theta.vi_shape[batch_ix], theta.vi_rate[batch_ix],
++                            beta.vi_shape, beta.vi_rate)
++
++            if beta_theta_simultaneous:
++                # calculate gene updates but don't assign yet
++                if not freeze_genes:
++                    bvs = compute_loading_shape_update(Xphi_data,
++                            X_batch.col, ngenes, c)
++                    bvr = compute_loading_rate_update(eta.vi_shape,
++                            eta.vi_rate, theta.vi_shape[batch_ix],
++                            theta.vi_rate[batch_ix])
++                # cell updates
++                theta.vi_shape[batch_ix] = compute_loading_shape_update(
++                        Xphi_data, X_batch.row, batchsize, a)
++                theta.vi_rate[batch_ix] = compute_loading_rate_update(
++                        xi.vi_shape[batch_ix], xi.vi_rate[batch_ix],
++                        beta.vi_shape, beta.vi_rate)
++                xi.vi_rate[batch_ix] = bp + theta.e_x[batch_ix].sum(1)
++                # make gene updates
++                if not freeze_genes:
++                    beta.vi_shape = bvs
++                    beta.vi_rate = bvr
++                    eta.vi_rate = dp + beta.e_x.sum(1)
++
++            else:
++                if batched:
++                    # cell updates, must do first for batching
++                    theta.vi_shape[batch_ix] = compute_loading_shape_update(
++                            Xphi_data, X_batch.row, batchsize, a)
++                    theta.vi_rate[batch_ix] = compute_loading_rate_update(
++                            xi.vi_shape[batch_ix], xi.vi_rate[batch_ix],
++                            beta.vi_shape, beta.vi_rate)
++                    xi.vi_rate[batch_ix] = bp + theta.e_x[batch_ix].sum(1)
++
++                if not freeze_genes:
++                    #gene updates
++                    beta.vi_shape = compute_loading_shape_update(Xphi_data,
++                            X_batch.col, ngenes, c)
++                    beta.vi_rate = compute_loading_rate_update(eta.vi_shape,
++                            eta.vi_rate, theta.vi_shape[batch_ix],
++                            theta.vi_rate[batch_ix])
++                    eta.vi_rate = dp + beta.e_x.sum(1)
++
++                if not batched:
++                    # cell updates, doing after gene updates when not batched
++                    # for legacy consistency
++                    theta.vi_shape[batch_ix] = compute_loading_shape_update(
++                            Xphi_data, X_batch.row, batchsize, a)
++                    theta.vi_rate[batch_ix] = compute_loading_rate_update(
++                            xi.vi_shape[batch_ix], xi.vi_rate[batch_ix],
++                            beta.vi_shape, beta.vi_rate)
++                    xi.vi_rate[batch_ix] = bp + theta.e_x[batch_ix].sum(1)
+ 
+ 
+             # record llh/percent change and check for convergence
+@@ -574,14 +723,18 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+                     curr = loss_function(
+                                 a=a, ap=ap, bp=bp, c=c, cp=cp, dp=dp,
+                                 xi=xi, eta=eta, theta=theta, beta=beta)
+-                    loss.append(curr)
++                    unsmoothed_loss.append(curr)
++                    if len(unsmoothed_loss) > loss_smoothing:
++                        unsmoothed_loss = unsmoothed_loss[1:]
++                    # normally this is just curr as loss_smoothing=1 by default
++                    loss.append(np.mean(unsmoothed_loss))
+                 except NameError as e:
+                     print('Invalid loss function')
+                     raise e
+ 
+                 # calculate percent change
+                 try:
+-                    prev = loss[-2]
++                    curr, prev = loss[-1], loss[-2]
+                     pct_change.append(100 * (curr - prev) / np.abs(prev))
+                 except IndexError:
+                     pct_change.append(100)
+@@ -611,7 +764,8 @@ def _fit(self, X, freeze_genes=False, reinit=True, loss_function=None,
+                     # (don't waste time on a bad run)
+                     if len(loss) > self.better_than_n_ago \
+                             and self.better_than_n_ago:
+-                        nprev = loss[-self.better_than_n_ago]
++                        nprev = loss[-self.better_than_n_ago] \
++                                if len(loss)>self.better_than_n_ago else loss[0]
+                         worse_than_n_ago = np.abs(nprev) < np.abs(curr)
+                         getting_worse = np.abs(prev) < np.abs(curr)
+                         if worse_than_n_ago and getting_worse:
+@@ -823,7 +977,13 @@ def run_trials(X, nfactors,
+         vcells = None,
+         vX = None,
+         loss_function=None,
+-        model_kwargs = {}
++        model_kwargs = {},
++        return_all = False,
++        reproject = False,
++        reproject_kwargs = {},
++        batchsize=0,
++        beta_theta_simultaneous=False,
++        loss_smoothing=1
+         ):
+     """
+     Train with multiple random initializations, selecting model with best loss
+@@ -860,23 +1020,42 @@ def run_trials(X, nfactors,
+     vX : coo_matrix, optional (Default None)
+         nonzero entries from the cells in vX
+     loss_function : function, optional (Default None)
+-        A loss function that accepts data, model variational parameters,
+-        and model hyperparameters.  Note this is distinct from the
+-        `loss_function` argument in scHPF._fit (called by scHPF.fit and
+-        scHPF.project), which assumes a fixed reference to data is included
+-        in the function and *does not* accept data as an argument.
++        A loss function to asses convergence that accepts data, model
++        variational parameters, and model hyperparameters.  Note this is
++        distinct from the `loss_function` argument in scHPF._fit (called by
++        scHPF.fit and scHPF.project), which assumes a fixed reference to data
++        is included in the function and *does not* accept data as an argument.
+     model_kwargs: dict, optional (Default {})
+         dictionary of additional keyword arguments for model
+         initialization
+-
++    return_all: bool, optional (Default False)
++        return all models
++    reproject: bool, optional (Default False)
++        Reproject the data onto the frozen gene variables before calculating
++        loss. The reprojected loss will be added to the end of loss as a
++        sublist. Note that this reprojection will *not* use the `loss_function`
++        argument, and instead use the default provided log likelihood
++    reproject_kwargs: dict, optional (Default {'replace':True})
++        Only used if `reproject` is True. Keyword args for scHPF.project.
++        'replace':True cannot be changed, and will be overwritten if given
++    batchsize: int, optional (Defualt 0)
++        Number of cells to use per training round. All cells used if 0.
++    loss_smoothing: int, optional (Default: 1)
++        Smooth loss up to `loss_smoothing` check frequencies ago. 1 results in
++        no smoothing. Intended to be used with batching when assessing
++        convergence based on training loss, where a good value might be
++        int(ncells/n_batches)
+ 
+     Returns
+     -------
+     best_model: scHPF
+         The model with the best loss facter `ntrials` random initializations
+         and training runs
++    rejected_models: list, optional
++        Rejected models, ordered by decreasing loss . Only returned if
++        return_all is True
+     """
+-    ngenes = X.shape[1]
++    ncells, ngenes = X.shape
+     if ngenes >= 20000:
+         msg = 'WARNING: you are running scHPF with {} genes,'.format(ngenes)
+         msg += ' which is more than the ~20k protein coding genes in the'
+@@ -885,17 +1064,24 @@ def run_trials(X, nfactors,
+         print(msg)
+ 
+     # get the loss function for any data
+-    if loss_function is None: loss_function = ls.mean_negative_pois_llh
++    if loss_function is None:
++        loss_function = partial(ls.mean_negative_pois_llh,
++                single_process=False)
+ 
+     # check data we're using for loss
+-    if vcells is not None: assert X.shape[1] == vcells.shape[1]
+-    if vX is not None: assert vX.shape == X.shape
+-    else: vX = X
++    if vcells is not None:
++        assert X.shape[1] == vcells.shape[1]
++    if vX is not None:
++        assert vX.shape == X.shape
++    else:
++        vX = X
+     # setup loss fnc w/data (will be overridden if vcells is not None)
+     data_loss_function = ls.loss_function_for_data(loss_function, vX)
++    # setup smoothed_loss if using batches
+ 
+     # run trials
+     best_loss, best_model, best_t = np.finfo(np.float64).max, None, None
++    models, losses = [], [] # only used if return_all
+     for t in range(ntrials):
+         # make a new model
+         model = scHPF(nfactors=nfactors,
+@@ -926,17 +1112,221 @@ def checkstep_function(**kwargs):
+ 
+         # fit the model
+         model.fit(X, loss_function=data_loss_function,
+-                  checkstep_function=checkstep_function)
++                  checkstep_function=checkstep_function,
++                  batchsize=batchsize, loss_smoothing=loss_smoothing,
++                  beta_theta_simultaneous=beta_theta_simultaneous)
++        if reproject:
++            print('Reprojecting data...')
++            reproject_kwargs['replace'] = True
++            reproject_kwargs['reinit'] = False
++            proj_loss = model.project(X, **reproject_kwargs)
++            model.loss.append(proj_loss)
++            loss = proj_loss[-1]
++        else:
++            loss = model.loss[-1]
+ 
+-        loss = model.loss[-1]
+         if loss < best_loss:
+             best_model = model
+             best_loss = loss
+             best_t = t
+             if verbose:
+                 print('New best!'.format(t))
++        if return_all:
++            models.append(model)
++            losses.append(loss)
+         if verbose:
+             print('Trial {0} loss: {1:.6f}'.format(t, loss))
+             print('Best loss: {0:.6f} (trial {1})'.format(best_loss, best_t))
+ 
+-    return best_model
++    if return_all:
++        return_order = np.argsort(losses)
++        ordered_models = [models[i] for i in return_order]
++        assert ordered_models[0] == best_model
++        return best_model, ordered_models[1:]
++    else:
++        return best_model
++
++
++# TODO deal with verbosity
++def run_trials_pool(X, nfactors,
++        ntrials=5,
++        njobs=0,
++        max_threads=None,
++        min_iter=30,
++        max_iter=1000,
++        check_freq=10,
++        epsilon=0.001,
++        better_than_n_ago=5,
++        dtype=np.float64,
++        verbose=True,
++        vcells = None,
++        vX = None,
++        loss_function=None,
++        model_kwargs = {},
++        return_all = False,
++        reproject = False,
++        reproject_kwargs = {},
++        batchsize=0,
++        beta_theta_simultaneous=False,
++        loss_smoothing=1
++        ):
++    """
++    Train with multiple random initializations, selecting model with best loss.
++    Parallelization is done at the trial level rather than within computations
++
++    As scHPF uses non-convex optimization, it benefits from training with
++    multiple random initializations to avoid local minima.
++
++    Parameters
++    ----------
++    X: coo_matrix
++        Data to fit
++    nfactors: int or list of ints
++        Number of factors (K), may be a list for multiple k
++    ntrials : int,  optional (Default 5)
++        Number of random initializations for training
++    njobs : int, optional (Default 0)
++        Maximum number of threads in the threadpool.  0 will use all available.
++    min_iter: int, optional (Default 30)
++        Minimum number of interations for training.
++    max_iter: int, optional (Default 1000):
++        Maximum number of interations for training.
++    check_freq: int, optional (Default 10)
++        Number of training iterations between calculating loss.
++    epsilon: float, optional (Default 0.001)
++        Percent change of loss for convergence.
++    better_than_n_ago: int, optional (Default 5)
++        Stop condition if loss is getting worse.  Stops training if loss
++        is worse than `better_than_n_ago`*`check_freq` training steps
++        ago and getting worse.
++    dtype : datatype, optional (Default np.float64)
++        np.float64 or np.float32
++    verbose: bool, optional (Default True)
++        verbose
++    vcells : coo_matrix, optional (Default None)
++        cells to use in a validation loss function
++    vX : coo_matrix, optional (Default None)
++        nonzero entries from the cells in vX
++    loss_function : function, optional (Default None)
++        A loss function that accepts data, model variational parameters,
++        and model hyperparameters.  Note this is distinct from the
++        `loss_function` argument in scHPF._fit (called by scHPF.fit and
++        scHPF.project), which assumes a fixed reference to data is included
++        in the function and *does not* accept data as an argument.
++    model_kwargs: dict, optional (Default {})
++        dictionary of additional keyword arguments for model
++        initialization
++    return_all: bool, optional (Default False)
++        return all models
++    reproject: bool, optional (Default False)
++        Reproject the data onto the frozen gene variables before calculating
++        loss. The reprojected loss will be added to the end of loss as a
++        sublist. Note that this reprojection will *not* use the `loss_function`
++        argument, and instead use the default provided log likelihood
++    reproject_kwargs: dict, optional (Default {'replace':True})
++        Only used if `reproject` is True. Keyword args for scHPF.project.
++        'replace':True cannot be changed, and will be overwritten if given
++    batchsize: int, optional (Defualt 0)
++            Number of cells to use per training round. All cells used if 0.
++    loss_smoothing: int, optional (Default: 1)
++        Smooth loss up to `loss_smoothing` check frequencies ago. 1 results in
++        no smoothing. Intended to be used with batching when assessing
++        convergence based on training loss, where a good value might be
++        int(ncells/n_batches)
++
++
++    Returns
++    -------
++    best_models: list(scHPF)
++        The model with the best loss facter `ntrials` random initializations
++        and training runs for each value in nfactors
++    rejected_models: list(list(scHPF)), optional
++        Rejected models, ordered by corresponding nfactors and then by
++        decreasing loss . Only returned if return_all is True
++    """
++    ngenes = X.shape[1]
++    if ngenes >= 20000:
++        msg = 'WARNING: you are running scHPF with {} genes,'.format(ngenes)
++        msg += ' which is more than the ~20k protein coding genes in the'
++        msg += ' human genome. We suggest running scHPF on protein-coding'
++        msg += ' genes only.'
++        print(msg)
++
++    # get the loss function for any data
++    if loss_function is None:
++        loss_function = partial(ls.mean_negative_pois_llh,
++                single_process=True)
++
++    # check data we're using for loss
++    if vcells is not None:
++        assert X.shape[1] == vcells.shape[1]
++    if vX is not None:
++        assert vX.shape == X.shape
++    else:
++        vX = X
++    # setup loss fnc w/data (will be overridden if vcells is not None)
++    data_loss_function = ls.loss_function_for_data(loss_function, vX)
++
++    # only need to create once because will be copied to processes
++    # override the loss function data if we have vcells
++    # (must be redone for each new model)
++    if vcells is not None:
++        proj_kwargs = dict(reinit=False,
++                            min_iter=1,
++                            max_iter=min(10, check_freq),
++                            check_freq= check_freq+1,
++                            verbose=False
++                            )
++        data_loss_function = ls.projection_loss_function(
++                loss_function, vcells, nfactors,
++                proj_kwargs=proj_kwargs)
++
++
++    # function to fit model
++    def fit_model(nfactors):
++        model = scHPF(nfactors=nfactors,
++                    min_iter=min_iter, max_iter=max_iter,
++                    check_freq=check_freq, epsilon=epsilon,
++                    better_than_n_ago=better_than_n_ago,
++                    verbose=False, dtype=dtype,
++                    **model_kwargs
++                    )
++        # fit the model
++        model.fit(X, loss_function=data_loss_function,
++                  checkstep_function=None, single_process=True,
++                  batchsize=batchsize, loss_smoothing=loss_smoothing)
++        if reproject:
++            # print('Reprojecting data...')
++            reproject_kwargs['replace'] = True
++            proj_loss = model.project(X, loss_function=data_loss_function,
++                    **reproject_kwargs)
++            model.loss.append(proj_loss)
++        return model
++
++    # get nfactors for every trial
++    if isinstance(nfactors, int):
++        nfactors = [nfactors]
++    trial_nfactors = [t for trial_set in [[K]*ntrials for K in nfactors] \
++            for t in trial_set]
++
++    # set max processes if not given
++    if njobs == 0: njobs = min(cpu_count(), len(trial_nfactors))
++
++    # training
++    with Parallel(n_jobs=njobs, verbose=10) as pool: # make the pool
++        candidates = pool( delayed(fit_model)(K)  for K in trial_nfactors)
++
++    # get the best model for every K
++    ordered_best, ordered_reject = [], []
++    for i,K in enumerate(nfactors):
++        my_candidates = candidates[i*ntrials : (i+1)*ntrials]
++        loss = [m.loss[-1][-1] if reproject else m.loss[-1] for m in
++                my_candidates]
++        # print(list(zip([m.nfactors for m in my_candidates],loss)))
++        best_ix = np.argmin(loss)
++        ordered_best.append(my_candidates[best_ix])
++        ordered_reject.append([my_candidates[i] for i in np.argsort(loss)[1:]])
++    if return_all:
++        return ordered_best, ordered_reject
++    else:
++        return ordered_best
+diff --git a/schpf/util.py b/schpf/util.py
+index 2c2da0d..a2ad318 100644
+--- a/schpf/util.py
++++ b/schpf/util.py
+@@ -213,3 +213,19 @@ def insert_coo_rows(a, b, b_indices):
+             (np.hstack(data), np.hstack(indices), np.array(indptr)),
+             out_shape).tocoo()
+     return ab
++
++
++def minibatch_ix_generator(ncells, batchsize):
++    assert ncells >= batchsize # allow equalitiy for testing
++    ixs = np.arange(ncells)
++    np.random.shuffle(ixs)
++    start = 0
++    while True:
++        stop = start + batchsize
++        if stop > ncells:
++            stop = stop % ncells
++            res = np.hstack([ixs[start:ncells], ixs[0:stop]])
++        else:
++            res = ixs[start:stop]
++        start = stop % ncells # need mod for case where ncells=batchsize
++        yield res
+diff --git a/setup.py b/setup.py
+index 5e4be37..759d45d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -8,16 +8,18 @@
+ 
+ requires = ['scikit-learn',
+             "numba >= 0.39, !=0.41, !=0.42, !=0.43; python_version<='3.7.3'",
+-            "numba >= 0.44; python_version>='3.7.4'",
++            "numba >= 0.44; python_version=='3.7.4'",
++            "numba >= 0.45; python_version>'3.7.4'",
+             'scipy >= 1.1',
+             'numpy',
+-            'pandas'
++            'pandas',
++            'joblib'
+             ]
+ 
+ tests_require = ['pytest']
+ extras_require = {
+         'loompy' : ['loompy'],
+-        'docs' : ['sphinx-argparse']
++        'docs' : ['sphinx-argparse'],
+         }
+ 
+ setup(
+diff --git a/tests/test_inference.py b/tests/test_inference.py
+index 65ef0b9..baf0ada 100644
+--- a/tests/test_inference.py
++++ b/tests/test_inference.py
+@@ -51,6 +51,10 @@ def compute_Xphi_numpy(X, theta, beta):
+                 model.beta.vi_shape, model.beta.vi_rate),
+             Xphi,
+             rtol=1e-5 if model.dtype==np.float32 else 1e-7, atol=0)
++    assert_allclose(
++            hpf_numba.compute_Xphi_data_numpy(data, model.theta, model.beta),
++            Xphi,
++            rtol=1e-5 if model.dtype==np.float32 else 1e-7, atol=0)
+ 
+ 
+ def test_compute_theta_shape_numba(model, Xphi, data):
+diff --git a/tests/test_preprocessing.py b/tests/test_preprocessing.py
+index 01d2c34..fa3fa5e 100644
+--- a/tests/test_preprocessing.py
++++ b/tests/test_preprocessing.py
+@@ -48,6 +48,7 @@ def test_load_txt(ngene_cols):
+     assert coo.shape[0]  == NCELLS + 2 - ngene_cols
+ 
+ 
++# TODO add loom and test, also check that this works since passed shouldn't?
+ def test_load_like(tmp_path):
+     gene_file = str(tmp_path / 'genes.txt')
+ 
+diff --git a/tests/test_scHPF_model.py b/tests/test_scHPF_model.py
+index cdd89ac..0b6cbd6 100644
+--- a/tests/test_scHPF_model.py
++++ b/tests/test_scHPF_model.py
+@@ -74,6 +74,19 @@ def test__setup_freeze(model, data):
+     assert bp3 != bp2
+ 
+ 
++def test__set_ac(model_uninit):
++    model_uninit.nfactors = None
++    with pytest.raises(ValueError):
++        model_uninit.a = -2
++    with pytest.raises(ValueError):
++        model_uninit.c = -2
++
++    model_uninit.nfactors = 15
++    model_uninit.a = -2
++    assert model_uninit.a == 1/np.sqrt(15)
++    model_uninit.c = -2
++    assert model_uninit.c == 1/np.sqrt(15)
++
+ @pytest.mark.parametrize('a_dims', [[5,], [5,10]])
+ @pytest.mark.parametrize('dtype', [np.float64, np.float32])
+ def test_HPF_Gamma_combine(a_dims, dtype):
+@@ -190,5 +203,6 @@ def test_combine_across_cells(data, dtype):
+     assert_equal(ab.beta, b.beta)
+ 
+ 
++# TODO write this, also do for run_trials_pool
+ # def test_run_trials(data):
+     # pass

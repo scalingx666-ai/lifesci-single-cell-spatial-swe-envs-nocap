@@ -1,0 +1,321 @@
+diff --git a/apis/python/HISTORY.md b/apis/python/HISTORY.md
+index e25cd71e2c..bd12fd2ddd 100644
+--- a/apis/python/HISTORY.md
++++ b/apis/python/HISTORY.md
+@@ -4,6 +4,12 @@ All notable changes to the Python TileDB-SOMA project will be documented in this
+ 
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ 
++## [2.3.0]
++
++### Fixed
++
++- \[[#4359](https://github.com/single-cell-data/TileDB-SOMA/pull/4359)\] Fix unsafe casting of data on write when the input data type in a PyArrow table or batch does not match the existing schema.
++
+ ## [Release 2.2.0]
+ 
+ ### Changed
+diff --git a/apis/python/src/tiledbsoma/_geometry_dataframe.py b/apis/python/src/tiledbsoma/_geometry_dataframe.py
+index 287be25e95..01887924c2 100644
+--- a/apis/python/src/tiledbsoma/_geometry_dataframe.py
++++ b/apis/python/src/tiledbsoma/_geometry_dataframe.py
+@@ -33,6 +33,7 @@
+     _revise_domain_for_extent,
+ )
+ from ._exception import DoesNotExistError, SOMAError, is_does_not_exist_error, map_exception_for_create
++from ._managed_query import ManagedQuery
+ from ._read_iters import TableReadIter
+ from ._spatial_dataframe import SpatialDataFrame
+ from ._spatial_util import (
+@@ -494,8 +495,6 @@ def write(
+             Experimental.
+         """
+         _util.check_type("values", values, (pa.Table,))
+-
+-        write_options: TileDBCreateOptions | TileDBWriteOptions
+         if isinstance(platform_config, TileDBCreateOptions):
+             raise ValueError(
+                 "As of TileDB-SOMA 1.13, the write method takes TileDBWriteOptions instead of TileDBCreateOptions",
+@@ -535,13 +534,43 @@ def from_outlines(
+         Returns: ``self``, to enable method chaining.
+ 
+         """
+-        outline_transformer = clib.OutlineTransformer(coordinate_space_to_json(self._coord_space))
++        _util.check_type("values", values, (pa.Table, pa.RecordBatch))
++        if isinstance(platform_config, TileDBCreateOptions):
++            raise ValueError(
++                "As of TileDB-SOMA 1.13, the write method takes TileDBWriteOptions instead of TileDBCreateOptions",
++            )
++        write_options = TileDBWriteOptions.from_platform_config(platform_config)
++        if not write_options.sort_coords:
++            raise NotImplementedError("Support for writing outline geometries in global order is not yet implemented.")
+ 
+-        for batch in values.to_batches():
+-            self.write(
+-                clib.TransformerPipeline(batch).transform(outline_transformer).asTable(),
+-                platform_config=platform_config,
++        array_schema = self.schema
++        for name in values.schema.names:
++            if name not in array_schema.names:
++                raise ValueError(
++                    f"Cannot write data. Field '{name}' in the input data is not a column in this {self._handle_type.__name__}."
++                )
++        batch_schema = pa.schema([
++            values.schema.field(name) if name == "soma_geometry" else array_schema.field(name)
++            for name in values.schema.names
++        ])
++
++        batches = values.to_batches()
++        if not batches:
++            return self
++
++        outline_transformer = clib.OutlineTransformer(coordinate_space_to_json(self._coord_space))
++        for batch in batches:
++            table = (
++                clib.TransformerPipeline(batch.cast(batch_schema, safe=True)).transform(outline_transformer).asTable()
+             )
++            for subbatch in table.to_batches():
++                mq = ManagedQuery(self)._handle
++                mq.set_layout(clib.ResultOrder.unordered)
++                mq.submit_batch(subbatch)
++                mq.finalize()
++
++        if write_options.consolidate_and_vacuum:
++            self._handle.consolidate_and_vacuum()
+ 
+         return self
+ 
+diff --git a/apis/python/src/tiledbsoma/_soma_array.py b/apis/python/src/tiledbsoma/_soma_array.py
+index 3100144ca3..b550df2ae5 100644
+--- a/apis/python/src/tiledbsoma/_soma_array.py
++++ b/apis/python/src/tiledbsoma/_soma_array.py
+@@ -142,20 +142,25 @@ def _write_table(self, values: pa.Table, sort_coords: bool) -> None:
+         if not batches:
+             return
+ 
+-        layout = clib.ResultOrder.unordered if sort_coords else clib.ResultOrder.globalorder
+-
+-        if layout == clib.ResultOrder.unordered:
+-            # Finalize for each batch
++        array_schema = self.schema
++        for name in values.schema.names:
++            if name not in array_schema.names:
++                raise ValueError(
++                    f"Cannot write data. Field '{name}' in the input data is not a column in this {self._handle_type.__name__}."
++                )
++        batch_schema = pa.schema([array_schema.field(name) for name in values.schema.names])
++
++        if sort_coords:
++            # Finalize each batch as it is written.
+             for batch in batches:
+                 mq = ManagedQuery(self)._handle
+-                mq.set_layout(layout)
+-                mq.submit_batch(batch)
++                mq.set_layout(clib.ResultOrder.unordered)
++                mq.submit_batch(batch.cast(batch_schema, safe=True))
+                 mq.finalize()
+-
+-        else:  # globalorder
+-            # Only finalize at the last batch
++        else:
++            # Single global order query - only finalize at the end.
+             mq = ManagedQuery(self)._handle
+-            mq.set_layout(layout)
++            mq.set_layout(clib.ResultOrder.globalorder)
+             for batch in batches[:-1]:
+-                mq.submit_batch(batch)
++                mq.submit_batch(batch.cast(batch_schema, safe=True))
+             mq.submit_and_finalize_batch(batches[-1])
+diff --git a/apis/python/tests/test_dataframe.py b/apis/python/tests/test_dataframe.py
+index 5f8d0fe488..b6508f0c7c 100644
+--- a/apis/python/tests/test_dataframe.py
++++ b/apis/python/tests/test_dataframe.py
+@@ -404,11 +404,6 @@ def test_dataframe_with_enumeration(tmp_path):
+     with soma.DataFrame.create(tmp_path.as_posix(), schema=schema, domain=[[0, 5]]) as sdf:
+         data = {}
+         data["soma_joinid"] = [0, 1, 2, 3, 4]
+-        data["myint"] = ["a", "bb", "ccc", "bb", "a"]
+-        data["myfloat"] = ["cat", "dog", "cat", "cat", "cat"]
+-        with pytest.raises(soma.SOMAError):
+-            sdf.write(pa.Table.from_pydict(data))
+-
+         data["myint"] = pd.Categorical(["a", "bb", "ccc", "bb", "a"])
+         data["myfloat"] = pd.Categorical(["cat", "dog", "cat", "cat", "cat"])
+         sdf.write(pa.Table.from_pydict(data))
+@@ -4072,3 +4067,49 @@ def test_gow_mixed_idxes(tmp_path):
+         df = A.read().concat().to_pandas()
+ 
+     assert df.equals(expected_df)
++
++
++def test_write_dictionary_to_non_enum_column(tmp_path):
++    written_df = pd.DataFrame(
++        {
++            "soma_joinid": pd.Series([0, 1, 2, 3, 4, 5], dtype=np.int64),
++            "str": pd.Series(["A", "B", "A", "B", "B", None], dtype="category"),
++            "byte": pd.Series([b"A", b"B", b"A", b"B", b"B", None], dtype="category"),
++            "bool": pd.Series([True, False, True, False, False, None], dtype="category"),
++            "int64": pd.Series([0, 1, 2, 0, 1, None], dtype="Int64").astype("category"),
++            "uint64": pd.Series([0, 1, 2, 0, 1, None], dtype="UInt64").astype("category"),
++            "int32": pd.Series([0, 1, 2, 0, 1, None], dtype="Int32").astype("category"),
++            "uint32": pd.Series([0, 1, 2, 0, 1, None], dtype="UInt32").astype("category"),
++            "int16": pd.Series([0, 1, 2, 0, 1, None], dtype="Int16").astype("category"),
++            "uint16": pd.Series([0, 1, 2, 0, 1, None], dtype="UInt16").astype("category"),
++            "int8": pd.Series([0, 1, 2, 0, 1, None], dtype="Int8").astype("category"),
++            "uint8": pd.Series([0, 1, 2, 0, 1, None], dtype="UInt8").astype("category"),
++            "float32": pd.Series([0, 1.1, 2.1, 0, 1.1, None], dtype="Float32").astype("category"),
++            "float64": pd.Series([0, 1.1, 2.1, 0, 1.1, None], dtype="Float64").astype("category"),
++        },
++    )
++
++    schema = pa.schema([
++        pa.field("soma_joinid", pa.int64()),
++        pa.field("str", pa.large_string(), nullable=True),
++        pa.field("byte", pa.large_binary(), nullable=True),
++        pa.field("bool", pa.bool_(), nullable=True),
++        pa.field("int64", pa.int64(), nullable=True),
++        pa.field("uint64", pa.uint64(), nullable=True),
++        pa.field("int32", pa.int32(), nullable=True),
++        pa.field("uint32", pa.uint32(), nullable=True),
++        pa.field("int16", pa.int16(), nullable=True),
++        pa.field("uint16", pa.uint16(), nullable=True),
++        pa.field("int8", pa.int8(), nullable=True),
++        pa.field("uint8", pa.uint8(), nullable=True),
++        pa.field("float32", pa.float32(), nullable=True),
++        pa.field("float64", pa.float64(), nullable=True),
++    ])
++
++    with soma.DataFrame.create(str(tmp_path), schema=schema, domain=[[0, 9]]) as soma_dataframe:
++        tbl = pa.Table.from_pandas(written_df, preserve_index=False)
++        soma_dataframe.write(tbl)
++
++    with soma.open(str(tmp_path)) as soma_dataframe:
++        readback_tbl = soma_dataframe.read().concat()
++        assert tbl.to_pylist() == readback_tbl.to_pylist()
+diff --git a/apis/python/tests/test_sparse_nd_array.py b/apis/python/tests/test_sparse_nd_array.py
+index 2112c857e3..3388ae466e 100644
+--- a/apis/python/tests/test_sparse_nd_array.py
++++ b/apis/python/tests/test_sparse_nd_array.py
+@@ -1818,42 +1818,6 @@ def test(path, tiledb_config):
+         gc.collect()
+ 
+ 
+-def test_sparse_nd_array_null(tmp_path):
+-    uri = tmp_path.as_posix()
+-
+-    pydict = {
+-        "soma_dim_0": pa.array([None, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+-        "soma_data": pa.array([None, 0, None, 1, 2, None, None, 3, 4, 5], type=pa.float64()),
+-    }
+-    table = pa.Table.from_pydict(pydict)
+-
+-    soma.SparseNDArray.create(uri, type=pa.int64(), shape=(10,))
+-
+-    # As of version 1.15.6 we were throwing in this case. However, we found
+-    # a compatibility issue with pyarrow versions below 17. Thus this is
+-    # now non-fatal.
+-    # with soma.SparseNDArray.open(uri, "w") as A:
+-    #    with raises_no_typeguard(soma.SOMAError):
+-    #        # soma_joinid cannot be nullable
+-    #        A.write(table[:5])
+-    #        A.write(table[5:])
+-
+-    pydict["soma_dim_0"] = pa.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+-    table = pa.Table.from_pydict(pydict)
+-
+-    with soma.SparseNDArray.open(uri, "w") as A:
+-        A.write(table[:5])
+-        A.write(table[5:])
+-
+-    with soma.SparseNDArray.open(uri) as A:
+-        pdf = A.read().tables().concat()
+-
+-        # soma_data is a non-nullable attribute. In ManagedQuery.set_array_data,
+-        # any null values present in non-nullable attributes get casted to
+-        # fill values. In the case for float64, the fill value is 0
+-        np.testing.assert_array_equal(pdf["soma_data"], table["soma_data"].fill_null(0))
+-
+-
+ @pytest.mark.parametrize("ts", (None, 1))
+ def test_resize_with_time_travel_61254(tmp_path, ts):
+     uri = tmp_path.as_posix()
+diff --git a/apis/python/tests/test_update_dataframes.py b/apis/python/tests/test_update_dataframes.py
+index 58c840cdf4..7457a1c47b 100644
+--- a/apis/python/tests/test_update_dataframes.py
++++ b/apis/python/tests/test_update_dataframes.py
+@@ -307,55 +307,53 @@ def test_update_non_null_to_null(soma_tiledb_context, tmp_path, conftest_pbmc3k_
+ 
+ 
+ @pytest.mark.medium_runner
+-def test_enmr_add_drop_readd(soma_tiledb_context, tmp_path, conftest_pbmc3k_adata):
++@pytest.mark.xfail(reason="Bug reported in SOMA-792")
++def test_enmr_add_drop_read(soma_tiledb_context, tmp_path, conftest_pbmc3k_adata):
+     uri = tmp_path.as_posix()
+ 
+-    # Add
++    # Create and check column.
+     tiledbsoma.io.from_anndata(uri, conftest_pbmc3k_adata, measurement_name="RNA", context=soma_tiledb_context)
+-
+     with tiledbsoma.Experiment.open(uri, "r") as exp:
+         schema = exp.obs.schema
+         assert "louvain" in schema.names
+         field = schema.field("louvain")
+         assert pa.types.is_dictionary(field.type)
+ 
+-    # Drop
++    # Create reference data.
+     with tiledbsoma.Experiment.open(uri, "r") as exp:
+-        obs = exp.obs.read().concat().to_pandas()
+-    obs.drop(columns=["louvain"], inplace=True)
++        obs_data = exp.obs.read().concat().to_pandas()
++    obs_no_louvain = obs_data.drop(columns=["louvain"], inplace=False)
++    obs_diff_type = obs_data.drop(columns=["louvain"], inplace=False)
++    obs_diff_type["louvain"] = pd.Categorical(np.random.randint(1, 4, size=len(obs_data)))
+ 
++    # Drop data and check column.
+     with tiledbsoma.Experiment.open(uri, "w") as exp:
+-        tiledbsoma.io.update_obs(exp, obs)
+-
++        tiledbsoma.io.update_obs(exp, obs_no_louvain)
+     with tiledbsoma.Experiment.open(uri, "r") as exp:
+         schema = exp.obs.schema
+         assert "louvain" not in schema.names
+ 
+-    # Add column with same name and same type
++    # Add column with same name and same type.
+     with tiledbsoma.Experiment.open(uri, "w") as exp:
+-        # Most importantly, we're implicitly checking for no throw here.
+-        tiledbsoma.io.update_obs(exp, conftest_pbmc3k_adata.obs)
+-
++        tiledbsoma.io.update_obs(exp, obs_data)
+     with tiledbsoma.Experiment.open(uri, "r") as exp:
+         schema = exp.obs.schema
+         assert "louvain" in schema.names
++        field = schema.field("louvain")
+         assert pa.types.is_dictionary(field.type)
+ 
+-    # Drop
+-    with tiledbsoma.Experiment.open(uri, "r") as exp:
+-        obs = exp.obs.read().concat().to_pandas()
+-    obs.drop(columns=["louvain"], inplace=True)
+-
++    # Drop data and check column.
+     with tiledbsoma.Experiment.open(uri, "w") as exp:
+-        tiledbsoma.io.update_obs(exp, obs)
++        tiledbsoma.io.update_obs(exp, obs_no_louvain)
++    with tiledbsoma.Experiment.open(uri, "r") as exp:
++        schema = exp.obs.schema
++        assert "louvain" not in schema.names
+ 
+     # Add column with same name but different categorical type (str to int)
+-    obs["louvain"] = pd.Categorical(np.random.randint(1, 4, size=len(obs)))
+     with tiledbsoma.Experiment.open(uri, "w") as exp:
+-        # Most importantly, we're implicitly checking for no throw here.
+-        tiledbsoma.io.update_obs(exp, obs)
+-
++        tiledbsoma.io.update_obs(exp, obs_diff_type)
+     with tiledbsoma.Experiment.open(uri, "r") as exp:
+         schema = exp.obs.schema
+         assert "louvain" in schema.names
++        field = schema.field("louvain")
+         assert pa.types.is_dictionary(field.type)

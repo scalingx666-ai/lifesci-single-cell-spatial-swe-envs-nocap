@@ -1,0 +1,2642 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 823aac85c..1d37c5e54 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,6 +84,7 @@ if (RSC_BUILD_EXTENSIONS)
+   add_nb_cuda_module(_ligrec_cuda       src/rapids_singlecell/_cuda/ligrec/ligrec.cu)
+   add_nb_cuda_module(_pv_cuda           src/rapids_singlecell/_cuda/pv/pv.cu)
+   add_nb_cuda_module(_edistance_cuda    src/rapids_singlecell/_cuda/edistance/edistance.cu)
++  add_nb_cuda_module(_sinkhorn_cuda     src/rapids_singlecell/_cuda/sinkhorn/sinkhorn.cu)
+   add_nb_cuda_module(_guide_assignment_cuda src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu)
+   add_nb_cuda_module(_pseudobulk_cuda   src/rapids_singlecell/_cuda/pseudobulk/pseudobulk.cu)
+   add_nb_cuda_module(_hvg_cuda          src/rapids_singlecell/_cuda/hvg/hvg.cu)
+diff --git a/docs/release-notes/0.15.2.md b/docs/release-notes/0.15.2.md
+index d7ff46236..1f56e6cd1 100644
+--- a/docs/release-notes/0.15.2.md
++++ b/docs/release-notes/0.15.2.md
+@@ -4,8 +4,10 @@
+ ```
+ * Add `ptg.GuideAssignment.assign_mixture_model` for crispat-style Poisson-Gaussian guide assignment. The CUDA/nanobind implementation writes pertpy-compatible labels to `adata.obs` and stores both pertpy-style and crispat-style model readouts in `adata.var` {pr}`637` {smaller}`S Dicks`
+ * Add pseudobulk based distance metrics to {class}`~rapids_singlecell.ptg.Distance`: ``euclidean``, ``root_mean_squared_error``, ``mse``, ``mean_absolute_error``, ``pearson_distance``, ``cosine_distance``, ``r2_distance``. Matches ``pertpy.tl.Distance`` {pr}`676` {smaller}`S Dicks`
++* Add ``wasserstein`` metric to {class}`~rapids_singlecell.ptg.Distance` {pr}`683` {smaller}`S Dicks`
+ * ``tl.draw_graph`` now exposes the ``random_state`` parameter of ``cugraph.layout.force_atlas2`` {pr}`681` {smaller}`J Pintar`
+ 
+ ```{rubric} Bug fixes
+ ```
+ * Fixes per-batch clip threshold in `pp.highly_variable_genes(flavor="pearson_residuals", batch_key=...)`: each batch now uses its own `sqrt(n_cells_in_batch)` instead of silently reusing the first batch's value {pr}`674` {smaller}`A Mikaeili`
++* {class}`~rapids_singlecell.ptg.Distance` drops unused (zero-cell) ``groupby`` categories for all metrics; ``edistance`` previously returned ``NaN`` for empty categories {pr}`683` {smaller}`S Dicks`
+diff --git a/src/rapids_singlecell/_cuda/sinkhorn/kernels_sinkhorn.cuh b/src/rapids_singlecell/_cuda/sinkhorn/kernels_sinkhorn.cuh
+new file mode 100644
+index 000000000..c5044248f
+--- /dev/null
++++ b/src/rapids_singlecell/_cuda/sinkhorn/kernels_sinkhorn.cuh
+@@ -0,0 +1,291 @@
++#pragma once
++
++#include <cstdint>
++
++#include <cuda_runtime.h>
++
++// Batched log-domain Sinkhorn kernels -- ragged (flat, no-padding) layout.
++// Everything is stored flat with per-pair int64 offsets (cost_off/f_off/g_off)
++// and int32 sizes (n/m); no masks. row2pair/col2pair map a flat row/column to
++// its pair so update_f runs one block per global row and update_g one thread
++// per global column. Per-pair conv[b] short-circuits converged pairs.
++
++namespace sinkhorn {
++
++template <typename T>
++__device__ __forceinline__ T sk_neg();
++template <>
++__device__ __forceinline__ float sk_neg<float>() {
++    return -1e30f;
++}
++template <>
++__device__ __forceinline__ double sk_neg<double>() {
++    return -1e300;
++}
++
++// Update one running (max, sum) log-sum-exp state with a new term ``m``.
++template <typename T>
++__device__ __forceinline__ void lse_acc(T m, T& rmax, T& rsum) {
++    if (m > rmax) {
++        rsum = rsum * exp(rmax - m) + T(1);
++        rmax = m;
++    } else {
++        rsum += exp(m - rmax);
++    }
++}
++
++// Merge a second log-sum-exp state (m2, s2) into (m1, s1) in place. The
++// identity state is (sk_neg, 0). Used by the block reduction in update_f.
++template <typename T>
++__device__ __forceinline__ void lse_merge(T& m1, T& s1, T m2, T s2) {
++    T mc = m1 > m2 ? m1 : m2;
++    T sc = 0;
++    if (m1 > sk_neg<T>()) sc += s1 * exp(m1 - mc);
++    if (m2 > sk_neg<T>()) sc += s2 * exp(m2 - mc);
++    m1 = (mc <= sk_neg<T>()) ? sk_neg<T>() : mc;
++    s1 = (mc <= sk_neg<T>()) ? T(0) : sc;
++}
++
++// eps[b] = scale * std(C) over pair b's contiguous cost block; floored.
++// Grid: B (one block per pair). Block: BLOCK.
++template <typename T, int BLOCK>
++__global__ void auto_eps_kernel(const T* __restrict__ cost,
++                                const int64_t* __restrict__ cost_off,
++                                const int* __restrict__ n,
++                                const int* __restrict__ m, T scale, T floor,
++                                T* __restrict__ eps) {
++    const int b = blockIdx.x;
++    const T* Cb = cost + cost_off[b];
++    const int64_t size = (int64_t)n[b] * m[b];
++    T s1 = 0, s2 = 0;
++    for (int64_t k = threadIdx.x; k < size; k += BLOCK) {
++        const T c = Cb[k];
++        s1 += c;
++        s2 += c * c;
++    }
++    // Block reduction of (s1, s2): warp shuffles, then one cross-warp pass.
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        s1 += __shfl_down_sync(0xffffffff, s1, offset);
++        s2 += __shfl_down_sync(0xffffffff, s2, offset);
++    }
++    __shared__ T r1[32];
++    __shared__ T r2[32];
++    if ((threadIdx.x & 31) == 0) {
++        r1[threadIdx.x >> 5] = s1;
++        r2[threadIdx.x >> 5] = s2;
++    }
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        const int nwarps = blockDim.x >> 5;
++        T v1 = (threadIdx.x < nwarps) ? r1[threadIdx.x] : (T)0;
++        T v2 = (threadIdx.x < nwarps) ? r2[threadIdx.x] : (T)0;
++#pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            v1 += __shfl_down_sync(0xffffffff, v1, offset);
++            v2 += __shfl_down_sync(0xffffffff, v2, offset);
++        }
++        if (threadIdx.x == 0) {
++            const T sz = (T)(size > 0 ? size : 1);
++            const T mean = v1 / sz;
++            const T var = fmax(v2 / sz - mean * mean, T(0));
++            eps[b] = fmax(scale * sqrt(var), floor);
++        }
++    }
++}
++
++// g[b, j] = eps * (log_b - LSE_i (-C[i, j] + f[i]) / eps).
++// Grid over the flat columns (one thread per global column); col2pair maps it
++// to its pair. omega is the over-relaxation factor (omega == 1 = plain
++// Sinkhorn, does not read the old g).
++template <typename T>
++__global__ void update_g_kernel(
++    const T* __restrict__ cost, const int64_t* __restrict__ cost_off,
++    const int* __restrict__ n, const int* __restrict__ m,
++    const T* __restrict__ f, const int64_t* __restrict__ f_off,
++    T* __restrict__ g, const int64_t* __restrict__ g_off,
++    const int* __restrict__ col2pair, const T* __restrict__ eps,
++    const T* __restrict__ log_b, const int* __restrict__ conv, T omega,
++    int64_t total_cols) {
++    const int64_t c = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
++    if (c >= total_cols) return;
++    const int b = col2pair[c];
++    if (conv[b]) return;
++    const int j = (int)(c - g_off[b]);
++    const int n_b = n[b], m_b = m[b];
++    const T* Cb = cost + cost_off[b];
++    const T* fb = f + f_off[b];
++    const T inv_eps = T(1) / eps[b];
++    T rmax = sk_neg<T>(), rsum = 0;
++    for (int i = 0; i < n_b; ++i)
++        lse_acc<T>((-Cb[(int64_t)i * m_b + j] + fb[i]) * inv_eps, rmax, rsum);
++    const T lse = rsum > T(0) ? log(rsum) + rmax : sk_neg<T>();
++    const T new_g = eps[b] * (log_b[b] - lse);
++    T* gb = g + g_off[b];
++    gb[j] = (omega == T(1)) ? new_g : (T(1) - omega) * gb[j] + omega * new_g;
++}
++
++// f[b, i] = eps * (log_a - LSE_j (-C[i, j] + g[j]) / eps).
++// Grid = total flat rows (one block per global row); row2pair maps it to its
++// pair; the block cooperatively reduces over that pair's m columns.
++template <typename T, int BLOCK>
++__global__ void update_f_kernel(
++    const T* __restrict__ cost, const int64_t* __restrict__ cost_off,
++    const int* __restrict__ m, const T* __restrict__ g,
++    const int64_t* __restrict__ g_off, T* __restrict__ f,
++    const int64_t* __restrict__ f_off, const int* __restrict__ row2pair,
++    const T* __restrict__ eps, const T* __restrict__ log_a,
++    const int* __restrict__ conv, T omega, int64_t total_rows) {
++    const int64_t r = blockIdx.x;
++    if (r >= total_rows) return;
++    const int b = row2pair[r];
++    if (conv[b]) return;
++    const int64_t i = r - f_off[b];
++    const int m_b = m[b];
++    const T* Cbi = cost + cost_off[b] + i * m_b;
++    const T* gb = g + g_off[b];
++    const T inv_eps = T(1) / eps[b];
++    T rmax = sk_neg<T>(), rsum = 0;
++    for (int j = threadIdx.x; j < m_b; j += BLOCK)
++        lse_acc<T>((-Cbi[j] + gb[j]) * inv_eps, rmax, rsum);
++    // Block log-sum-exp reduction: warp shuffles, then one cross-warp pass.
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        T om = __shfl_down_sync(0xffffffff, rmax, offset);
++        T os = __shfl_down_sync(0xffffffff, rsum, offset);
++        lse_merge<T>(rmax, rsum, om, os);
++    }
++    __shared__ T wmax[32];
++    __shared__ T wsum[32];
++    if ((threadIdx.x & 31) == 0) {
++        wmax[threadIdx.x >> 5] = rmax;
++        wsum[threadIdx.x >> 5] = rsum;
++    }
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        const int nwarps = blockDim.x >> 5;
++        T vm = (threadIdx.x < nwarps) ? wmax[threadIdx.x] : sk_neg<T>();
++        T vs = (threadIdx.x < nwarps) ? wsum[threadIdx.x] : T(0);
++#pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            T om = __shfl_down_sync(0xffffffff, vm, offset);
++            T os = __shfl_down_sync(0xffffffff, vs, offset);
++            lse_merge<T>(vm, vs, om, os);
++        }
++        if (threadIdx.x == 0) {
++            const T lse = vs > T(0) ? log(vs) + vm : sk_neg<T>();
++            const T new_f = eps[b] * (log_a[b] - lse);
++            T* fb = f + f_off[b];
++            fb[i] = (omega == T(1)) ? new_f
++                                    : (T(1) - omega) * fb[i] + omega * new_f;
++        }
++    }
++}
++
++// Fused gather + squared-Euclidean cost: block t does the TILE x TILE tile
++// (tile_pair/tile_i0/tile_j0) of one pair, streaming D in FEAT_TILE chunks so
++// shared memory is independent of D. The shared row stride MUST be FEAT_TILE+1
++// (odd) -- a multiple-of-32 stride collapses the tile columns into one bank.
++template <typename T, int TILE, int FEAT_TILE>
++__global__ void pairwise_cost_kernel(
++    const T* __restrict__ emb, const int* __restrict__ cidx_l,
++    const int64_t* __restrict__ f_off, const int* __restrict__ cidx_r,
++    const int64_t* __restrict__ g_off, const int* __restrict__ n,
++    const int* __restrict__ m, const int64_t* __restrict__ cost_off,
++    const int* __restrict__ tile_pair, const int* __restrict__ tile_i0,
++    const int* __restrict__ tile_j0, T* __restrict__ cost, int D) {
++    const int t = blockIdx.x;
++    const int b = tile_pair[t];
++    const int i0 = tile_i0[t];
++    const int j0 = tile_j0[t];
++    const int n_b = n[b], m_b = m[b];
++    const int* cl = cidx_l + f_off[b];
++    const int* cr = cidx_r + g_off[b];
++    const int ti = threadIdx.y;
++    const int tj = threadIdx.x;
++    constexpr int FS = FEAT_TILE + 1;
++    extern __shared__ __align__(sizeof(double)) unsigned char smem_raw[];
++    T* Xs = reinterpret_cast<T*>(smem_raw);  // TILE * FS
++    T* Ys = Xs + TILE * FS;                  // TILE * FS
++    const int tid = ti * TILE + tj;
++    const int nthreads = TILE * TILE;
++    const int gi = i0 + ti, gj = j0 + tj;
++    T s = T(0);
++    for (int f0 = 0; f0 < D; f0 += FEAT_TILE) {
++        const int fcount = D - f0 < FEAT_TILE ? D - f0 : FEAT_TILE;
++        for (int r = 0; r < TILE; ++r) {
++            const int rl = cl[i0 + r < n_b ? i0 + r : n_b - 1];
++            for (int d = tid; d < fcount; d += nthreads)
++                Xs[r * FS + d] = emb[(int64_t)rl * D + f0 + d];
++            const int rr = cr[j0 + r < m_b ? j0 + r : m_b - 1];
++            for (int d = tid; d < fcount; d += nthreads)
++                Ys[r * FS + d] = emb[(int64_t)rr * D + f0 + d];
++        }
++        __syncthreads();
++        if (gi < n_b && gj < m_b) {
++            for (int d = 0; d < fcount; ++d) {
++                const T diff = Xs[ti * FS + d] - Ys[tj * FS + d];
++                s += diff * diff;
++            }
++        }
++        __syncthreads();
++    }
++    if (gi < n_b && gj < m_b) cost[cost_off[b] + (int64_t)gi * m_b + gj] = s;
++}
++
++// Per-pair convergence: one block per pair (no atomics -- each owns its
++// conv[b]). Reduces the pair's f/g segments for max single-iteration change and
++// max magnitude, sets conv[b] if change/(scale+1) < tol. Caller snapshots
++// f_prev/g_prev.
++template <typename T, int BLOCK>
++__global__ void converged_kernel(
++    const T* __restrict__ f, const T* __restrict__ f_prev,
++    const int64_t* __restrict__ f_off, const int* __restrict__ n,
++    const T* __restrict__ g, const T* __restrict__ g_prev,
++    const int64_t* __restrict__ g_off, const int* __restrict__ m, T tol,
++    int* __restrict__ conv) {
++    const int b = blockIdx.x;
++    if (conv[b]) return;
++    const int n_b = n[b], m_b = m[b];
++    const T* fb = f + f_off[b];
++    const T* fp = f_prev + f_off[b];
++    const T* gb = g + g_off[b];
++    const T* gp = g_prev + g_off[b];
++    T change = 0, scale = 0;
++    for (int i = threadIdx.x; i < n_b; i += BLOCK) {
++        const T v = fb[i];
++        change = fmax(change, fabs(v - fp[i]));
++        scale = fmax(scale, fabs(v));
++    }
++    for (int j = threadIdx.x; j < m_b; j += BLOCK) {
++        const T v = gb[j];
++        change = fmax(change, fabs(v - gp[j]));
++        scale = fmax(scale, fabs(v));
++    }
++    // Block max-reduction: warp shuffles, then one cross-warp pass.
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        change = fmax(change, __shfl_down_sync(0xffffffff, change, offset));
++        scale = fmax(scale, __shfl_down_sync(0xffffffff, scale, offset));
++    }
++    __shared__ T sc[32];
++    __shared__ T ss[32];
++    if ((threadIdx.x & 31) == 0) {
++        sc[threadIdx.x >> 5] = change;
++        ss[threadIdx.x >> 5] = scale;
++    }
++    __syncthreads();
++    if (threadIdx.x < 32) {
++        const int nwarps = blockDim.x >> 5;
++        T c = (threadIdx.x < nwarps) ? sc[threadIdx.x] : T(0);
++        T s = (threadIdx.x < nwarps) ? ss[threadIdx.x] : T(0);
++#pragma unroll
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            c = fmax(c, __shfl_down_sync(0xffffffff, c, offset));
++            s = fmax(s, __shfl_down_sync(0xffffffff, s, offset));
++        }
++        if (threadIdx.x == 0 && c / (s + T(1)) < tol) conv[b] = 1;
++    }
++}
++
++}  // namespace sinkhorn
+diff --git a/src/rapids_singlecell/_cuda/sinkhorn/sinkhorn.cu b/src/rapids_singlecell/_cuda/sinkhorn/sinkhorn.cu
+new file mode 100644
+index 000000000..a07b90ec0
+--- /dev/null
++++ b/src/rapids_singlecell/_cuda/sinkhorn/sinkhorn.cu
+@@ -0,0 +1,161 @@
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++#include "../nb_types.h"
++#include "kernels_sinkhorn.cuh"
++
++using namespace nb::literals;
++
++namespace {
++constexpr int SINKHORN_BLOCK = 256;
++}  // namespace
++
++// RAGGED (jagged) batched Sinkhorn bindings -- no padding, no masks. Pairs are
++// stored flat with per-pair int64 offsets (cost_off / f_off / g_off) and int32
++// sizes (n / m); row2pair / col2pair map flat rows / columns back to their
++// pair. Each binding launches one kernel on the caller-supplied stream so the
++// Python driver can dispatch work to several devices' streams.
++
++template <typename T, typename Device>
++static void def_kernels(nb::module_& m) {
++    constexpr int BLOCK = SINKHORN_BLOCK;
++
++    // eps[b] = scale * std(cost block b), floored.
++    m.def(
++        "auto_eps",
++        [](gpu_array_c<const T, Device> cost,
++           gpu_array_c<const int64_t, Device> cost_off,
++           gpu_array_c<const int, Device> n, gpu_array_c<const int, Device> m,
++           double scale, double floor, gpu_array_c<T, Device> eps,
++           std::uintptr_t stream_ptr) {
++            const int B = (int)n.shape(0);
++            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
++            sinkhorn::auto_eps_kernel<T, BLOCK><<<B, BLOCK, 0, stream>>>(
++                cost.data(), cost_off.data(), n.data(), m.data(),
++                static_cast<T>(scale), static_cast<T>(floor), eps.data());
++            CUDA_CHECK_LAST_ERROR(auto_eps_kernel);
++        },
++        "cost"_a, "cost_off"_a, "n"_a, "m"_a, "scale"_a, "floor"_a, "eps"_a,
++        "stream"_a = 0);
++
++    // g update: one thread per flat column.
++    m.def(
++        "update_g",
++        [](gpu_array_c<const T, Device> cost,
++           gpu_array_c<const int64_t, Device> cost_off,
++           gpu_array_c<const int, Device> n, gpu_array_c<const int, Device> m,
++           gpu_array_c<const T, Device> f,
++           gpu_array_c<const int64_t, Device> f_off, gpu_array_c<T, Device> g,
++           gpu_array_c<const int64_t, Device> g_off,
++           gpu_array_c<const int, Device> col2pair,
++           gpu_array_c<const T, Device> eps, gpu_array_c<const T, Device> log_b,
++           gpu_array_c<const int, Device> conv, double omega,
++           std::uintptr_t stream_ptr) {
++            const int64_t total_cols = (int64_t)col2pair.shape(0);
++            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
++            const unsigned int grid =
++                (unsigned int)((total_cols + BLOCK - 1) / BLOCK);
++            sinkhorn::update_g_kernel<T><<<grid, BLOCK, 0, stream>>>(
++                cost.data(), cost_off.data(), n.data(), m.data(), f.data(),
++                f_off.data(), g.data(), g_off.data(), col2pair.data(),
++                eps.data(), log_b.data(), conv.data(), static_cast<T>(omega),
++                total_cols);
++            CUDA_CHECK_LAST_ERROR(update_g_kernel);
++        },
++        "cost"_a, "cost_off"_a, "n"_a, "m"_a, "f"_a, "f_off"_a, "g"_a,
++        "g_off"_a, "col2pair"_a, "eps"_a, "log_b"_a, "conv"_a, "omega"_a = 1.0,
++        "stream"_a = 0);
++
++    // f update: one block per flat row.
++    m.def(
++        "update_f",
++        [](gpu_array_c<const T, Device> cost,
++           gpu_array_c<const int64_t, Device> cost_off,
++           gpu_array_c<const int, Device> m, gpu_array_c<const T, Device> g,
++           gpu_array_c<const int64_t, Device> g_off, gpu_array_c<T, Device> f,
++           gpu_array_c<const int64_t, Device> f_off,
++           gpu_array_c<const int, Device> row2pair,
++           gpu_array_c<const T, Device> eps, gpu_array_c<const T, Device> log_a,
++           gpu_array_c<const int, Device> conv, double omega,
++           std::uintptr_t stream_ptr) {
++            const int64_t total_rows = (int64_t)row2pair.shape(0);
++            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
++            sinkhorn::update_f_kernel<T, BLOCK>
++                <<<(unsigned int)total_rows, BLOCK, 0, stream>>>(
++                    cost.data(), cost_off.data(), m.data(), g.data(),
++                    g_off.data(), f.data(), f_off.data(), row2pair.data(),
++                    eps.data(), log_a.data(), conv.data(),
++                    static_cast<T>(omega), total_rows);
++            CUDA_CHECK_LAST_ERROR(update_f_kernel);
++        },
++        "cost"_a, "cost_off"_a, "m"_a, "g"_a, "g_off"_a, "f"_a, "f_off"_a,
++        "row2pair"_a, "eps"_a, "log_a"_a, "conv"_a, "omega"_a = 1.0,
++        "stream"_a = 0);
++
++    // Per-pair convergence: one block per pair (no atomics), sets conv[b].
++    m.def(
++        "check_convergence",
++        [](gpu_array_c<const T, Device> f, gpu_array_c<const T, Device> f_prev,
++           gpu_array_c<const int64_t, Device> f_off,
++           gpu_array_c<const int, Device> n, gpu_array_c<const T, Device> g,
++           gpu_array_c<const T, Device> g_prev,
++           gpu_array_c<const int64_t, Device> g_off,
++           gpu_array_c<const int, Device> m_sizes, double tol,
++           gpu_array_c<int, Device> conv, std::uintptr_t stream_ptr) {
++            const int B = (int)n.shape(0);
++            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
++            sinkhorn::converged_kernel<T, BLOCK><<<B, BLOCK, 0, stream>>>(
++                f.data(), f_prev.data(), f_off.data(), n.data(), g.data(),
++                g_prev.data(), g_off.data(), m_sizes.data(),
++                static_cast<T>(tol), conv.data());
++            CUDA_CHECK_LAST_ERROR(converged_kernel);
++        },
++        "f"_a, "f_prev"_a, "f_off"_a, "n"_a, "g"_a, "g_prev"_a, "g_off"_a,
++        "m"_a, "tol"_a, "conv"_a, "stream"_a = 0);
++
++    // Fused gather + squared-Euclidean cost build over the flat tile schedule.
++    m.def(
++        "build_cost",
++        [](gpu_array_c<const T, Device> emb,
++           gpu_array_c<const int, Device> cidx_l,
++           gpu_array_c<const int64_t, Device> f_off,
++           gpu_array_c<const int, Device> cidx_r,
++           gpu_array_c<const int64_t, Device> g_off,
++           gpu_array_c<const int, Device> n, gpu_array_c<const int, Device> m,
++           gpu_array_c<const int64_t, Device> cost_off,
++           gpu_array_c<const int, Device> tile_pair,
++           gpu_array_c<const int, Device> tile_i0,
++           gpu_array_c<const int, Device> tile_j0, gpu_array_c<T, Device> cost,
++           std::uintptr_t stream_ptr) {
++            const int num_tiles = (int)tile_pair.shape(0);
++            const int D = (int)emb.shape(1);
++            cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
++            // shared = 2*TILE*(FEAT_TILE+1)*sizeof(T), independent of D; the +1
++            // stride avoids bank conflicts (see kernel).
++            constexpr int TILE = 16;
++            constexpr int FEAT_TILE = 128;
++            dim3 block(TILE, TILE);
++            size_t shmem = (size_t)2 * TILE * (FEAT_TILE + 1) * sizeof(T);
++            sinkhorn::pairwise_cost_kernel<T, TILE, FEAT_TILE>
++                <<<(unsigned int)num_tiles, block, shmem, stream>>>(
++                    emb.data(), cidx_l.data(), f_off.data(), cidx_r.data(),
++                    g_off.data(), n.data(), m.data(), cost_off.data(),
++                    tile_pair.data(), tile_i0.data(), tile_j0.data(),
++                    cost.data(), D);
++            CUDA_CHECK_LAST_ERROR(pairwise_cost_kernel);
++        },
++        "emb"_a, "cidx_l"_a, "f_off"_a, "cidx_r"_a, "g_off"_a, "n"_a, "m"_a,
++        "cost_off"_a, "tile_pair"_a, "tile_i0"_a, "tile_j0"_a, "cost"_a,
++        "stream"_a = 0);
++}
++
++template <typename Device>
++void register_bindings(nb::module_& m) {
++    def_kernels<double, Device>(m);
++    def_kernels<float, Device>(m);
++}
++
++NB_MODULE(_sinkhorn_cuda, m) {
++    REGISTER_GPU_BINDINGS(register_bindings, m);
++}
+diff --git a/src/rapids_singlecell/pertpy_gpu/_distance.py b/src/rapids_singlecell/pertpy_gpu/_distance.py
+index 8a745fd70..af13b8a27 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_distance.py
++++ b/src/rapids_singlecell/pertpy_gpu/_distance.py
+@@ -28,6 +28,7 @@ class MeanVar(NamedTuple):
+     "pearson_distance",
+     "cosine_distance",
+     "r2_distance",
++    "wasserstein",
+ ]
+ 
+ SUPPORTED_METRICS = [
+@@ -39,6 +40,7 @@ class MeanVar(NamedTuple):
+     "pearson_distance",
+     "cosine_distance",
+     "r2_distance",
++    "wasserstein",
+ ]
+ 
+ 
+@@ -63,6 +65,10 @@ class Distance:
+     - ``"cosine_distance"``: Cosine distance between group mean vectors.
+     - ``"r2_distance"``: One minus the coefficient of determination between
+         group mean vectors.
++    - ``"wasserstein"``: Entropy-regularized 2-Wasserstein via Sinkhorn.
++        Squared-Euclidean ground cost; per-pair auto-epsilon defaulting to
++        ``0.05 * std(C)`` to match OTT-JAX. Returns OTT's
++        ``reg_ot_cost`` value.
+ 
+     Parameters
+     ----------
+@@ -82,11 +88,12 @@ class Distance:
+     iteration. This scales better for large datasets (O(n) vs O(n²) memory)
+     and leverages multi-GPU parallelism for each bootstrap iteration.
+ 
+-    Only ``"edistance"`` uses multi-GPU. Pseudobulk metrics aggregate cells
+-    into K group-mean vectors before computing distances, and the resulting
+-    K×K kernel is cheap enough on a single GPU that distributing it is not
+-    worth the cost. Passing ``multi_gpu=True`` for those metrics falls back
+-    to a single device with a warning.
++    ``"edistance"`` and ``"wasserstein"`` use multi-GPU (pairs are split across
++    devices). Pseudobulk metrics aggregate cells into K group-mean vectors
++    before computing distances, and the resulting K×K kernel is cheap enough on
++    a single GPU that distributing it is not worth the cost. Passing
++    ``multi_gpu=True`` for those metrics falls back to a single device with a
++    warning.
+ 
+     Examples
+     --------
+@@ -103,8 +110,15 @@ def __init__(
+         metric: Metric = "edistance",
+         layer_key: str | None = None,
+         obsm_key: str | None = None,
++        **kwargs,
+     ):
+-        """Initialize Distance calculator with specified metric."""
++        """Initialize Distance calculator with specified metric.
++
++        Extra keyword arguments are forwarded to the selected metric's
++        constructor, exposing metric-specific options (e.g. ``relaxation`` for
++        ``metric="wasserstein"``). Passing an option the chosen metric does not
++        accept raises ``TypeError``.
++        """
+         if layer_key is not None and obsm_key is not None:
+             raise ValueError(
+                 "Cannot use 'layer_key' and 'obsm_key' at the same time.\n"
+@@ -116,6 +130,7 @@ def __init__(
+         self.metric = metric
+         self.layer_key = layer_key
+         self.obsm_key = obsm_key
++        self._metric_kwargs = kwargs
+         self._metric_impl = None
+         self._initialize_metric()
+ 
+@@ -129,6 +144,17 @@ def _initialize_metric(self):
+             self._metric_impl = EDistanceMetric(
+                 layer_key=self.layer_key,
+                 obsm_key=self.obsm_key,
++                **self._metric_kwargs,
++            )
++        elif self.metric == "wasserstein":
++            from rapids_singlecell.pertpy_gpu._metrics._wasserstein import (
++                WassersteinMetric,
++            )
++
++            self._metric_impl = WassersteinMetric(
++                layer_key=self.layer_key,
++                obsm_key=self.obsm_key,
++                **self._metric_kwargs,
+             )
+         elif self.metric in SUPPORTED_METRICS:
+             from rapids_singlecell.pertpy_gpu._metrics._pseudobulk import (
+@@ -139,6 +165,7 @@ def _initialize_metric(self):
+                 metric_name=self.metric,
+                 layer_key=self.layer_key,
+                 obsm_key=self.obsm_key,
++                **self._metric_kwargs,
+             )
+         else:
+             raise ValueError(
+diff --git a/src/rapids_singlecell/pertpy_gpu/_metrics/_base_metric.py b/src/rapids_singlecell/pertpy_gpu/_metrics/_base_metric.py
+index d53b6d112..17b36544c 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_metrics/_base_metric.py
++++ b/src/rapids_singlecell/pertpy_gpu/_metrics/_base_metric.py
+@@ -6,7 +6,7 @@
+ import cupy as cp
+ import numpy as np
+ 
+-from rapids_singlecell._utils import parse_device_ids
++from rapids_singlecell._utils import _create_category_index_mapping, parse_device_ids
+ from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
+ 
+ if TYPE_CHECKING:
+@@ -70,6 +70,49 @@ def _get_embedding(self, adata: AnnData) -> np.ndarray | cp.ndarray:
+             return data
+         return np.asarray(data)
+ 
++    def _subset_to_groups(
++        self,
++        adata: AnnData,
++        groupby: str,
++        needed_groups: Sequence[str] | None,
++    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[str]]:
++        """Subset the embedding to ``groupby`` and build its category mapping.
++
++        Unused (zero-cell) categories are always dropped so they never become
++        empty groups. When ``needed_groups`` is given, only those cells are kept
++        and a requested group with no cells raises ``ValueError``.
++
++        Returns
++        -------
++        embedding
++            Cell embeddings (CuPy) for the kept cells; input dtype preserved.
++        cat_offsets, cell_indices
++            Category offsets and the cell indices grouped by category.
++        groups_list
++            Ordered group names matching the category indices.
++        """
++        obs_col = adata.obs[groupby]
++        embedding_raw = self._get_embedding(adata)
++
++        if needed_groups is not None:
++            mask = obs_col.isin(needed_groups).values
++            obs_col = obs_col[mask].cat.remove_unused_categories()
++            embedding = cp.asarray(embedding_raw[mask])
++        else:
++            obs_col = obs_col.cat.remove_unused_categories()
++            embedding = cp.asarray(embedding_raw)
++
++        groups_list = list(obs_col.cat.categories)
++        if needed_groups is not None:
++            missing = sorted(set(needed_groups) - set(groups_list))
++            if missing:
++                raise ValueError(f"No cells found for groups: {missing}")
++        group_labels = cp.array(obs_col.cat.codes.values, dtype=cp.int32)
++        cat_offsets, cell_indices = _create_category_index_mapping(
++            group_labels, len(groups_list)
++        )
++        return embedding, cat_offsets, cell_indices, groups_list
++
+     @staticmethod
+     def _parse_contrasts(adata: AnnData, contrasts) -> tuple[str, list[str]]:
+         """Validate a contrasts DataFrame and decompose its columns.
+@@ -96,7 +139,7 @@ def _resolve_onesided_inputs(
+         """Validate `selected_group`, normalize to a list, compute `needed` groups.
+ 
+         Asserts that ``groupby`` is categorical and that every entry in
+-        ``selected_group`` is one of its categories.
++        ``selected_group`` is one of its categories with at least one cell.
+ 
+         Returns
+         -------
+@@ -120,6 +163,12 @@ def _resolve_onesided_inputs(
+                 f"Selected groups {missing} not found in groupby '{groupby}'"
+             )
+ 
++        empty = set(selected_groups) - set(
++            adata.obs[groupby].cat.remove_unused_categories().cat.categories.values
++        )
++        if empty:
++            raise ValueError(f"No cells found for selected groups: {sorted(empty)}")
++
+         needed = None
+         if groups is not None:
+             needed = list(set(groups) | set(selected_groups))
+diff --git a/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py b/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py
+index 0ab5b214b..c7ace0553 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py
++++ b/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py
+@@ -12,7 +12,6 @@
+ from rapids_singlecell._cuda import _edistance_cuda as _ed
+ from rapids_singlecell._utils import (
+     _calculate_blocks_per_pair,
+-    _create_category_index_mapping,
+     _split_pairs,
+ )
+ from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
+@@ -55,50 +54,6 @@ def __init__(
+         """Initialize energy distance metric."""
+         super().__init__(layer_key=layer_key, obsm_key=obsm_key)
+ 
+-    def _subset_to_groups(
+-        self,
+-        adata: AnnData,
+-        groupby: str,
+-        needed_groups: Sequence[str] | None,
+-    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[str]]:
+-        """Subset embedding and category mapping to only the needed groups.
+-
+-        Parameters
+-        ----------
+-        adata
+-            Annotated data matrix
+-        groupby
+-            Key in adata.obs for grouping
+-        needed_groups
+-            Group names to keep
+-
+-        Returns
+-        -------
+-        embedding
+-            Cell embeddings for the subset
+-        cat_offsets
+-            Category offsets for the subset
+-        cell_indices
+-            Cell indices for the subset
+-        groups_list
+-            Ordered group names matching the category indices
+-        """
+-        obs_col = adata.obs[groupby]
+-        embedding_raw = self._get_embedding(adata)
+-
+-        if needed_groups is not None:
+-            mask = obs_col.isin(needed_groups).values
+-            obs_col = obs_col[mask].cat.remove_unused_categories()
+-            embedding = cp.asarray(embedding_raw[mask])
+-        else:
+-            embedding = cp.asarray(embedding_raw)
+-
+-        groups_list = list(obs_col.cat.categories)
+-        group_labels = cp.array(obs_col.cat.codes.values, dtype=cp.int32)
+-        k = len(groups_list)
+-        cat_offsets, cell_indices = _create_category_index_mapping(group_labels, k)
+-        return embedding, cat_offsets, cell_indices, groups_list
+-
+     def pairwise(
+         self,
+         adata: AnnData,
+diff --git a/src/rapids_singlecell/pertpy_gpu/_metrics/_sinkhorn.py b/src/rapids_singlecell/pertpy_gpu/_metrics/_sinkhorn.py
+new file mode 100644
+index 000000000..1d3e86716
+--- /dev/null
++++ b/src/rapids_singlecell/pertpy_gpu/_metrics/_sinkhorn.py
+@@ -0,0 +1,145 @@
++"""Batched log-domain Sinkhorn solver over a ragged (flat, no-padding) layout.
++
++Pairs of point clouds are stored flat with per-pair int64 offsets; the CUDA
++kernels (``_sinkhorn_cuda``: build_cost, auto_eps, update_g, update_f,
++check_convergence) solve a whole batch at once. The Python iteration loop
++(:func:`run_async`) dispatches per-iteration launches to several devices'
++streams and reads per-pair convergence at the end of each ``check_every``-step.
++The per-pair return matches OTT-JAX's ``reg_ot_cost = f@a + g@b + eps*(log n_a +
++log n_b)`` for uniform marginals.
++"""
++
++from __future__ import annotations
++
++import cupy as cp
++
++from rapids_singlecell._cuda import _sinkhorn_cuda as _sk
++
++# Defaults match OTT-JAX/pertpy (eps scale 0.05, max_iter 2000). tol is our
++# potential-change criterion, not OTT's marginal threshold; 1e-4 gives ~5e-6
++# reg_ot_cost accuracy (tighter than OTT's default), so don't loosen it.
++DEFAULT_EPSILON_SCALE = 0.05
++DEFAULT_MAX_ITER = 2000
++DEFAULT_TOL = 1e-4
++DEFAULT_CHECK_EVERY = 20
++DEFAULT_RELAXATION = 1.0
++EPSILON_FLOOR = 1e-12
++
++
++def make_state(layout: dict, cost: cp.ndarray, *, epsilon_scale: float) -> dict:
++    """Build per-pair solver state (auto-eps + potentials) on the current device."""
++    dtype = cost.dtype
++    if dtype not in (cp.float32, cp.float64):
++        raise TypeError(f"Sinkhorn supports float32/float64; got {dtype}")
++    n = layout["n"]
++    m = layout["m"]
++    B = int(layout["B"])
++    total_rows = int(layout["total_rows"])
++    total_cols = int(layout["total_cols"])
++
++    na_s = cp.maximum(n, 1).astype(dtype)
++    nb_s = cp.maximum(m, 1).astype(dtype)
++    log_a = (-cp.log(na_s)).astype(dtype)
++    log_b = (-cp.log(nb_s)).astype(dtype)
++
++    eps = cp.empty(B, dtype=dtype)
++    _sk.auto_eps(
++        cost,
++        layout["cost_off"],
++        n,
++        m,
++        float(epsilon_scale),
++        float(EPSILON_FLOOR),
++        eps,
++        cp.cuda.get_current_stream().ptr,
++    )
++
++    return {
++        "cost": cost,
++        "cost_off": layout["cost_off"],
++        "f_off": layout["f_off"],
++        "g_off": layout["g_off"],
++        "n": n,
++        "m": m,
++        "row2pair": layout["row2pair"],
++        "col2pair": layout["col2pair"],
++        "na_s": na_s,
++        "nb_s": nb_s,
++        "log_a": log_a,
++        "log_b": log_b,
++        "eps": eps,
++        "B": B,
++        "dtype": dtype,
++        "f": cp.zeros(total_rows, dtype=dtype),
++        "g": cp.zeros(total_cols, dtype=dtype),
++        "f_prev": cp.zeros(total_rows, dtype=dtype),
++        "g_prev": cp.zeros(total_cols, dtype=dtype),
++        "conv": cp.zeros(B, dtype=cp.int32),
++    }
++
++
++def _step(st, *, will_check, tol, omega=DEFAULT_RELAXATION):
++    """Queue one Sinkhorn iteration (no host sync). omega in [1, 2) over-relaxes."""
++    f, g = st["f"], st["g"]
++    cost, conv, eps = st["cost"], st["conv"], st["eps"]
++    co, fo, go = st["cost_off"], st["f_off"], st["g_off"]
++    n, m, r2p, c2p = st["n"], st["m"], st["row2pair"], st["col2pair"]
++    sp = cp.cuda.get_current_stream().ptr
++    if will_check:
++        # Snapshot for the single-iteration change measured by check_convergence.
++        cp.copyto(st["f_prev"], f)
++        cp.copyto(st["g_prev"], g)
++    _sk.update_g(cost, co, n, m, f, fo, g, go, c2p, eps, st["log_b"], conv, omega, sp)
++    _sk.update_f(cost, co, m, g, go, f, fo, r2p, eps, st["log_a"], conv, omega, sp)
++    if will_check:
++        _sk.check_convergence(
++            f, st["f_prev"], fo, n, g, st["g_prev"], go, m, float(tol), conv, sp
++        )
++
++
++def _segment_sum(values: cp.ndarray, starts: cp.ndarray, total: int) -> cp.ndarray:
++    """Per-pair sum over contiguous segments via a float64 prefix-sum difference.
++
++    Deterministic (unlike atomic scatter-add, which would make the bootstrap
++    variance vary run to run) and float64-accumulated for float32 potentials.
++    """
++    pref = cp.concatenate(
++        [cp.zeros(1, dtype=cp.float64), cp.cumsum(values.astype(cp.float64))]
++    )
++    ends = cp.concatenate([starts[1:], cp.asarray([total], dtype=starts.dtype)])
++    return pref[ends] - pref[starts]
++
++
++def finalize(st) -> cp.ndarray:
++    """Per-pair reg_ot_cost from the converged potentials (current stream)."""
++    na, nb = st["na_s"], st["nb_s"]
++    fsum = _segment_sum(st["f"], st["f_off"], int(st["f"].size))
++    gsum = _segment_sum(st["g"], st["g_off"], int(st["g"].size))
++    reg = fsum / na + gsum / nb + st["eps"] * (cp.log(na) + cp.log(nb))
++    return reg.astype(st["dtype"])
++
++
++def run_async(units, *, max_iter, tol, check_every, omega=DEFAULT_RELAXATION):
++    """Run the Sinkhorn loop across ``units`` (one per device) as a multi-stream
++    queue: dispatch ``check_every`` iters to each stream, sync, read per-pair
++    convergence, and stop once every pair on every unit has converged.
++    """
++    cev = max(int(check_every), 1)
++    it = 0
++    while it < max_iter:
++        n = min(cev, max_iter - it)
++        for k in range(n):
++            will_check = k == n - 1
++            for u in units:
++                with cp.cuda.Device(u["dev"]), u["stream"]:
++                    _step(u["state"], will_check=will_check, tol=tol, omega=omega)
++        it += n
++        for u in units:
++            with cp.cuda.Device(u["dev"]):
++                u["stream"].synchronize()
++        done = True
++        for u in units:
++            with cp.cuda.Device(u["dev"]):
++                done = done and bool(u["state"]["conv"].all().get())
++        if done:
++            break
+diff --git a/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py b/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py
+new file mode 100644
+index 000000000..a9c856c2f
+--- /dev/null
++++ b/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py
+@@ -0,0 +1,893 @@
++"""GPU-accelerated entropic 2-Wasserstein between groups of cells.
++
++Pairs are split across GPUs and solved in memory-bounded batches by the ragged
++batched Sinkhorn (see ``_sinkhorn`` and the ``_sinkhorn_cuda`` kernels).
++"""
++
++from __future__ import annotations
++
++import warnings
++from typing import TYPE_CHECKING
++
++import cupy as cp
++import numpy as np
++import pandas as pd
++
++from rapids_singlecell._cuda import _sinkhorn_cuda as _sk
++from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
++
++from ._base_metric import BaseMetric, parse_device_ids
++from ._sinkhorn import (
++    DEFAULT_CHECK_EVERY,
++    DEFAULT_EPSILON_SCALE,
++    DEFAULT_MAX_ITER,
++    DEFAULT_RELAXATION,
++    DEFAULT_TOL,
++    finalize,
++    make_state,
++    run_async,
++)
++
++if TYPE_CHECKING:
++    from collections.abc import Sequence
++
++    from anndata import AnnData
++
++# Per-batch cost-array byte budget. Fixed, not a fraction of free memory: under
++# an RMM pool allocator cudaMemGetInfo is unreliable (degenerates the batch).
++COST_BUDGET_BYTES = 8 * 1024**3
++MAX_BATCH = 4096
++# Max per-device work excess over ideal before round-robin batch assignment is
++# rejected for the work-balanced split (see _plan_device_batches).
++DEVICE_WORK_IMBALANCE_TOL = 0.2
++COST_TILE = 16  # must match constexpr int TILE in sinkhorn.cu
++# Over-relaxation: omega 1 = plain Sinkhorn; (1, 2) is the convergent SOR range.
++MIN_RELAXATION = 1.0
++MAX_RELAXATION = 2.0
++
++
++def _build_ragged_layout(
++    cat_offsets: cp.ndarray,
++    cell_indices: cp.ndarray,
++    rows_h: np.ndarray,
++    cols_h: np.ndarray,
++    *,
++    n_h: np.ndarray,
++    m_h: np.ndarray,
++    dtype,
++    rng: cp.random.Generator | None = None,
++) -> dict:
++    """Build the flat ragged index layout for one batch on the current device.
++
++    ``rows_h`` / ``cols_h`` (host group indices, smaller group as rows) and
++    ``n_h`` / ``m_h`` (host sizes) drive the build. Offsets and flat lengths are
++    computed host-side so the device work never syncs (lets devices' builds
++    overlap). ``rng`` resamples cells with replacement for the bootstrap.
++    """
++    B = len(rows_h)
++    n64 = n_h.astype(np.int64)
++    m64 = m_h.astype(np.int64)
++    cost_sizes = n64 * m64
++
++    def _excl_cumsum(sizes: np.ndarray) -> tuple[np.ndarray, int]:
++        off = np.zeros(B, dtype=np.int64)
++        if B > 1:
++            off[1:] = np.cumsum(sizes)[:-1]
++        return off, int(sizes.sum())
++
++    cost_off_h, total_cost = _excl_cumsum(cost_sizes)
++    f_off_h, total_rows = _excl_cumsum(n64)
++    g_off_h, total_cols = _excl_cumsum(m64)
++
++    n = cp.asarray(n_h.astype(np.int32))
++    m = cp.asarray(m_h.astype(np.int32))
++    cost_off = cp.asarray(cost_off_h)
++    f_off = cp.asarray(f_off_h)
++    g_off = cp.asarray(g_off_h)
++
++    # Flat row/column -> pair via searchsorted on the internal start offsets.
++    row2pair = cp.searchsorted(
++        f_off[1:], cp.arange(total_rows, dtype=cp.int64), side="right"
++    ).astype(cp.int32)
++    col2pair = cp.searchsorted(
++        g_off[1:], cp.arange(total_cols, dtype=cp.int64), side="right"
++    ).astype(cp.int32)
++
++    # Flat tile schedule (one TILE x TILE tile per block in build_cost).
++    ntn_h = (n_h.astype(np.int64) + COST_TILE - 1) // COST_TILE
++    ntm_h = (m_h.astype(np.int64) + COST_TILE - 1) // COST_TILE
++    tpp_h = ntn_h * ntm_h
++    tile_off_h, total_tiles = _excl_cumsum(tpp_h)
++    tile_off = cp.asarray(tile_off_h)
++    ntm = cp.asarray(ntm_h)
++    tile_pair = cp.searchsorted(
++        tile_off[1:], cp.arange(total_tiles, dtype=cp.int64), side="right"
++    ).astype(cp.int32)
++    t_local = cp.arange(total_tiles, dtype=cp.int64) - tile_off[tile_pair]
++    ntm_p = ntm[tile_pair]
++    tile_i0 = ((t_local // ntm_p) * COST_TILE).astype(cp.int32)
++    tile_j0 = ((t_local % ntm_p) * COST_TILE).astype(cp.int32)
++
++    # Flat gather indices into cell_indices (per-pair group offset + local pos).
++    offs_row = cat_offsets[cp.asarray(rows_h)].astype(cp.int64)
++    offs_col = cat_offsets[cp.asarray(cols_h)].astype(cp.int64)
++    if rng is None:
++        loc_r = cp.arange(total_rows, dtype=cp.int64) - f_off[row2pair]
++        loc_c = cp.arange(total_cols, dtype=cp.int64) - g_off[col2pair]
++    else:
++        # Resample with replacement to each group's own size (bootstrap).
++        loc_r = (
++            rng.random(total_rows, dtype=dtype) * n[row2pair].astype(dtype)
++        ).astype(cp.int64)
++        loc_c = (
++            rng.random(total_cols, dtype=dtype) * m[col2pair].astype(dtype)
++        ).astype(cp.int64)
++    gather_f = offs_row[row2pair] + loc_r
++    gather_g = offs_col[col2pair] + loc_c
++    cidx_l = cp.ascontiguousarray(cell_indices[gather_f].astype(cp.int32))
++    cidx_r = cp.ascontiguousarray(cell_indices[gather_g].astype(cp.int32))
++
++    return {
++        "B": B,
++        "n": n,
++        "m": m,
++        "cost_off": cost_off,
++        "f_off": f_off,
++        "g_off": g_off,
++        "row2pair": row2pair,
++        "col2pair": col2pair,
++        "tile_pair": tile_pair,
++        "tile_i0": tile_i0,
++        "tile_j0": tile_j0,
++        "cidx_l": cidx_l,
++        "cidx_r": cidx_r,
++        "total_cost": total_cost,
++        "total_rows": total_rows,
++        "total_cols": total_cols,
++        "total_tiles": total_tiles,
++    }
++
++
++def _launch_build_cost(
++    emb: cp.ndarray, layout: dict, cost: cp.ndarray, stream_ptr: int
++) -> None:
++    """Fill the flat ``cost`` array for a ragged ``layout`` (one kernel launch)."""
++    _sk.build_cost(
++        emb,
++        layout["cidx_l"],
++        layout["f_off"],
++        layout["cidx_r"],
++        layout["g_off"],
++        layout["n"],
++        layout["m"],
++        layout["cost_off"],
++        layout["tile_pair"],
++        layout["tile_i0"],
++        layout["tile_j0"],
++        cost,
++        stream_ptr,
++    )
++
++
++def _split_positions_by_work(
++    n_left_host: np.ndarray,
++    n_right_host: np.ndarray,
++    n_devices: int,
++) -> list[int]:
++    """Partition pair positions into ``n_devices`` contiguous segments of equal
++    cumulative work (``n_left * n_right``); returns ``n_devices + 1`` boundaries.
++    """
++    n = len(n_left_host)
++    if n_devices <= 1 or n == 0:
++        return [0, n]
++    work = n_left_host.astype(np.int64) * n_right_host.astype(np.int64)
++    cum = np.cumsum(work)
++    total = int(cum[-1])
++    bounds = [0]
++    for k in range(1, n_devices):
++        target = total * k / n_devices
++        idx = int(np.searchsorted(cum, target, side="right"))
++        bounds.append(min(max(idx, bounds[-1]), n))
++    bounds.append(n)
++    return bounds
++
++
++def _plan_batches(
++    start: int,
++    stop: int,
++    n_row_host: np.ndarray,
++    n_col_host: np.ndarray,
++    itemsize: int,
++) -> list[tuple[int, int]]:
++    """Greedily pack ``[start, stop)`` into ``(batch_start, batch_stop)`` batches,
++    each capped by ``COST_BUDGET_BYTES`` of true cost cells (no padding) and
++    ``MAX_BATCH`` pairs. A single oversized pair gets its own batch.
++    """
++    budget_cells = max(COST_BUDGET_BYTES // itemsize, 1)
++    plans = []
++    i = start
++    while i < stop:
++        cells = int(n_row_host[i]) * int(n_col_host[i])
++        j = i + 1
++        while j < stop and (j - i) < MAX_BATCH:
++            nxt = int(n_row_host[j]) * int(n_col_host[j])
++            if cells + nxt > budget_cells:
++                break
++            cells += nxt
++            j += 1
++        plans.append((i, j))
++        i = j
++    return plans
++
++
++def _plan_device_batches(
++    n_row_host: np.ndarray,
++    n_col_host: np.ndarray,
++    itemsize: int,
++    n_devices: int,
++) -> list[list[tuple[int, int]]]:
++    """Assign batches to devices, choosing the split per workload.
++
++    Round-robin dealing gives equal batch counts (equal rounds, no idle tail) and
++    balances work well when batches are many and small; the work-split (equal
++    cumulative ``n*m`` per device) is needed when a few big batches would
++    otherwise land on one device. Prefer round-robin when its estimated work
++    imbalance is within ``DEVICE_WORK_IMBALANCE_TOL``, else fall back.
++    """
++    n_pairs = len(n_row_host)
++    if n_devices <= 1 or n_pairs == 0:
++        return [_plan_batches(0, n_pairs, n_row_host, n_col_host, itemsize)]
++
++    all_batches = _plan_batches(0, n_pairs, n_row_host, n_col_host, itemsize)
++    work = n_row_host.astype(np.int64) * n_col_host.astype(np.int64)
++    round_robin = [all_batches[i::n_devices] for i in range(n_devices)]
++    loads = [sum(int(work[s:e].sum()) for (s, e) in plan) for plan in round_robin]
++    ideal = sum(loads) / n_devices
++    if ideal > 0 and max(loads) / ideal - 1 <= DEVICE_WORK_IMBALANCE_TOL:
++        return round_robin
++
++    bounds = _split_positions_by_work(n_row_host, n_col_host, n_devices)
++    return [
++        _plan_batches(bounds[i], bounds[i + 1], n_row_host, n_col_host, itemsize)
++        for i in range(n_devices)
++    ]
++
++
++class WassersteinMetric(BaseMetric):
++    """GPU-accelerated 2-Wasserstein distance (entropic, Sinkhorn).
++
++    Returns OTT-JAX's ``reg_ot_cost`` value: the regularized OT objective
++    at convergence with uniform marginals and squared-Euclidean cost.
++
++    The Sinkhorn solver configuration (auto epsilon = ``0.05 * std(C)``,
++    ``max_iter`` 2000, ``tol`` 1e-4) is fixed to the OTT-JAX / pertpy defaults
++    and is not user-tunable, matching upstream pertpy's zero-config Wasserstein.
++    The one exception is ``relaxation`` (see below), which has no pertpy
++    equivalent.
++
++    Parameters
++    ----------
++    layer_key
++        Key in ``adata.layers`` for cell data. Mutually exclusive with
++        ``obsm_key``.
++    obsm_key
++        Key in ``adata.obsm`` for embeddings (default: ``'X_pca'``).
++    relaxation
++        Over-relaxation factor. ``1.0`` (default) is plain Sinkhorn and matches
++        OTT-JAX. Values in ``(1, 2)`` cut the iteration count (~halved near
++        ``1.5``) for a small change in the converged value; too large diverges
++        (hits the iteration cap and warns). Leave at ``1.0`` for exact results.
++
++    References
++    ----------
++    Cuturi, M. (2013). Sinkhorn distances: Lightspeed computation of
++    optimal transport. NeurIPS.
++    """
++
++    supports_multi_gpu: bool = True
++
++    def __init__(
++        self,
++        *,
++        layer_key: str | None = None,
++        obsm_key: str | None = "X_pca",
++        relaxation: float = DEFAULT_RELAXATION,
++    ):
++        super().__init__(layer_key=layer_key, obsm_key=obsm_key)
++        if not MIN_RELAXATION <= relaxation < MAX_RELAXATION:
++            raise ValueError(
++                f"relaxation must be in [{MIN_RELAXATION}, {MAX_RELAXATION}); "
++                f"got {relaxation}."
++            )
++        # Fixed to OTT-JAX / pertpy defaults (not user-tunable); eps is auto.
++        self.epsilon_scale = DEFAULT_EPSILON_SCALE
++        self.max_iter = DEFAULT_MAX_ITER
++        self.tol = DEFAULT_TOL
++        self.relaxation = relaxation
++
++    def _solve_pairs(
++        self,
++        embedding: cp.ndarray,
++        cat_offsets: cp.ndarray,
++        cell_indices: cp.ndarray,
++        pair_left: list[int],
++        pair_right: list[int],
++        *,
++        dtype,
++        device_ids: list[int] | None = None,
++    ) -> cp.ndarray:
++        """Solve all (i, j) Sinkhorn problems, returning a flat ``(n_pairs,)`` array.
++
++        Each pair is oriented larger-group-as-columns (the OT cost is symmetric)
++        so the cooperative ``update_f`` reduction runs on the big axis. Pairs are
++        split across ``device_ids`` and solved in batch-rounds, with per-iteration
++        launches interleaved across devices' streams so the GPUs overlap.
++        """
++        if device_ids is None:
++            device_ids = [0]
++        n_pairs = len(pair_left)
++        if n_pairs == 0:
++            return cp.zeros(0, dtype=dtype)
++
++        pl_host = np.asarray(pair_left, dtype=np.int32)
++        pr_host = np.asarray(pair_right, dtype=np.int32)
++        group_sizes = (cat_offsets[1:] - cat_offsets[:-1]).astype(cp.int32)
++        # Group sizes to host (one sync) -> all batch planning is host-only.
++        n_left = group_sizes[cp.asarray(pl_host)].get()
++        n_right = group_sizes[cp.asarray(pr_host)].get()
++        # Orient larger group as columns.
++        swap = n_left > n_right
++        rows = np.where(swap, pr_host, pl_host)
++        cols = np.where(swap, pl_host, pr_host)
++        n_row = np.minimum(n_left, n_right)
++        n_col = np.maximum(n_left, n_right)
++        itemsize = cp.dtype(dtype).itemsize
++
++        plans = _plan_device_batches(n_row, n_col, itemsize, len(device_ids))
++
++        out = cp.empty(n_pairs, dtype=dtype)
++        home = device_ids[0]
++
++        # Move the shared inputs to each participating device once.
++        streams: dict[int, cp.cuda.Stream] = {}
++        inputs: dict[int, tuple] = {}
++        for di, dev in enumerate(device_ids):
++            if not plans[di]:
++                continue
++            with cp.cuda.Device(dev):
++                streams[dev] = cp.cuda.Stream(non_blocking=True)
++                with streams[dev]:
++                    inputs[dev] = (
++                        cp.ascontiguousarray(cp.asarray(embedding)),
++                        cp.asarray(cat_offsets),
++                        cp.asarray(cell_indices),
++                    )
++
++        # Grow-only per-device cost buffers, reused across rounds (avoids a fresh
++        # cudaMalloc per round; safe since a round finishes before the next).
++        cost_bufs: dict[int, cp.ndarray] = {}
++        converged = True
++        for r in range(max((len(p) for p in plans), default=0)):
++            batch = [
++                (dev, *plans[di][r])
++                for di, dev in enumerate(device_ids)
++                if r < len(plans[di])
++            ]
++
++            # Phases are kept separate (layout/alloc, then cost kernels, then
++            # solve) so the per-device kernels launch back-to-back and overlap.
++            # Phase 1: per-device ragged layout.
++            preps = []
++            for dev, start, stop in batch:
++                _, off, idx = inputs[dev]
++                with cp.cuda.Device(dev), streams[dev]:
++                    layout = _build_ragged_layout(
++                        off,
++                        idx,
++                        rows[start:stop],
++                        cols[start:stop],
++                        n_h=n_row[start:stop],
++                        m_h=n_col[start:stop],
++                        dtype=dtype,
++                    )
++                preps.append((dev, start, stop, layout))
++
++            # Phase 2: build cost into the reusable buffers.
++            units: list[dict] = []
++            for dev, start, stop, layout in preps:
++                emb = inputs[dev][0]
++                with cp.cuda.Device(dev), streams[dev]:
++                    need = layout["total_cost"]
++                    buf = cost_bufs.get(dev)
++                    if buf is None or buf.size < need:
++                        buf = cp.empty(need, dtype=dtype)
++                        cost_bufs[dev] = buf
++                    cost = buf[:need]
++                    _launch_build_cost(emb, layout, cost, streams[dev].ptr)
++                units.append(
++                    {
++                        "dev": dev,
++                        "stream": streams[dev],
++                        "start": start,
++                        "stop": stop,
++                        "cost": cost,
++                        "layout": layout,
++                    }
++                )
++
++            # Phase 3: per-pair solver state.
++            for u in units:
++                with cp.cuda.Device(u["dev"]), u["stream"]:
++                    u["state"] = make_state(
++                        u["layout"],
++                        u["cost"],
++                        epsilon_scale=self.epsilon_scale,
++                    )
++
++            # Phase 4: solve across the round's units, then gather.
++            run_async(
++                units,
++                max_iter=self.max_iter,
++                tol=self.tol,
++                check_every=DEFAULT_CHECK_EVERY,
++                omega=self.relaxation,
++            )
++            for u in units:
++                with cp.cuda.Device(u["dev"]), u["stream"]:
++                    u["reg"] = finalize(u["state"])
++            for u in units:
++                with cp.cuda.Device(u["dev"]):
++                    u["stream"].synchronize()
++            with cp.cuda.Device(home):
++                for u in units:
++                    out[u["start"] : u["stop"]] = cp.asarray(u["reg"])
++            for u in units:
++                with cp.cuda.Device(u["dev"]):
++                    converged = converged and bool(u["state"]["conv"].all().get())
++
++        if not converged:
++            self._warn_not_converged()
++        return out
++
++    def _bootstrap_solve(
++        self,
++        embedding: cp.ndarray,
++        cat_offsets: cp.ndarray,
++        cell_indices: cp.ndarray,
++        pair_left: list[int],
++        pair_right: list[int],
++        *,
++        n_bootstrap: int,
++        random_state: int,
++        dtype,
++        device: int,
++    ) -> tuple[cp.ndarray, cp.ndarray]:
++        """Bootstrap per-pair mean/variance of W by resampling cells.
++
++        Expands the pairs into ``n_pairs * n_bootstrap`` units (resampled with
++        replacement) and solves them in deterministic memory-bounded chunks on one
++        device. Chunk boundaries don't depend on data, so the single advancing RNG
++        is reproducible for a given ``random_state``. Variance is population
++        (ddof=0), matching pertpy.
++        """
++        if n_bootstrap < 1:
++            raise ValueError(f"n_bootstrap must be >= 1, got {n_bootstrap}")
++        n_pairs = len(pair_left)
++        if n_pairs == 0:
++            empty = cp.zeros(0, dtype=dtype)
++            return empty, empty
++        with cp.cuda.Device(device):
++            emb = cp.ascontiguousarray(cp.asarray(embedding))
++            offs = cp.asarray(cat_offsets)
++            cidx = cp.asarray(cell_indices)
++            # Sizes/orientation on the host so the per-chunk build never syncs.
++            co_h = cp.asnumpy(offs)
++            sizes_h = np.diff(co_h)
++            pl_h = np.asarray(pair_left, dtype=np.int64)
++            pr_h = np.asarray(pair_right, dtype=np.int64)
++            n_l = sizes_h[pl_h]
++            n_r = sizes_h[pr_h]
++            swap = n_l > n_r  # orient larger group as columns
++            row_grp = np.where(swap, pr_h, pl_h)
++            col_grp = np.where(swap, pl_h, pr_h)
++            n_row = np.minimum(n_l, n_r)
++            n_col = np.maximum(n_l, n_r)
++            # Expand each pair into n_bootstrap independently-resampled units.
++            rows_u = np.repeat(row_grp, n_bootstrap)
++            cols_u = np.repeat(col_grp, n_bootstrap)
++            nrow_u = np.repeat(n_row, n_bootstrap)
++            ncol_u = np.repeat(n_col, n_bootstrap)
++            n_units = n_pairs * n_bootstrap
++
++            reg = cp.empty(n_units, dtype=dtype)
++            itemsize = cp.dtype(dtype).itemsize
++            plans = _plan_batches(0, n_units, nrow_u, ncol_u, itemsize)
++            rng = cp.random.default_rng(random_state)
++            stream = cp.cuda.get_current_stream()
++            converged = True
++            for u0, u1 in plans:
++                layout = _build_ragged_layout(
++                    offs,
++                    cidx,
++                    rows_u[u0:u1],
++                    cols_u[u0:u1],
++                    n_h=nrow_u[u0:u1],
++                    m_h=ncol_u[u0:u1],
++                    dtype=dtype,
++                    rng=rng,
++                )
++                cost = cp.empty(layout["total_cost"], dtype=dtype)
++                _launch_build_cost(emb, layout, cost, stream.ptr)
++                st = make_state(layout, cost, epsilon_scale=self.epsilon_scale)
++                run_async(
++                    [{"dev": device, "stream": stream, "state": st}],
++                    max_iter=self.max_iter,
++                    tol=self.tol,
++                    check_every=DEFAULT_CHECK_EVERY,
++                    omega=self.relaxation,
++                )
++                reg[u0:u1] = finalize(st)
++                converged = converged and bool(st["conv"].all().get())
++            if not converged:
++                self._warn_not_converged()
++            reg = reg.reshape(n_pairs, n_bootstrap)
++            return reg.mean(axis=1), reg.var(axis=1)
++
++    def bootstrap_arrays(
++        self,
++        X: np.ndarray | cp.ndarray,
++        Y: np.ndarray | cp.ndarray,
++        *,
++        n_bootstrap: int = 100,
++        random_state: int = 0,
++    ) -> tuple[float, float]:
++        """Bootstrap mean/variance of W between two arrays (``Distance.bootstrap``)."""
++        Xc = cp.asarray(X)
++        Yc = cp.asarray(Y)
++        if len(Xc) == 0 or len(Yc) == 0:
++            raise ValueError("Neither X nor Y can be empty.")
++        if Xc.dtype != Yc.dtype:
++            Yc = Yc.astype(Xc.dtype)
++        n_a, n_b = Xc.shape[0], Yc.shape[0]
++        emb = cp.ascontiguousarray(cp.concatenate([Xc, Yc], axis=0))
++        cat_offsets = cp.asarray([0, n_a, n_a + n_b], dtype=cp.int32)
++        cell_indices = cp.arange(n_a + n_b, dtype=cp.int32)
++        mean, var = self._bootstrap_solve(
++            emb,
++            cat_offsets,
++            cell_indices,
++            [0],
++            [1],
++            n_bootstrap=n_bootstrap,
++            random_state=random_state,
++            dtype=emb.dtype,
++            device=cp.cuda.runtime.getDevice(),
++        )
++        return float(mean[0]), float(var[0])
++
++    def bootstrap(
++        self,
++        adata: AnnData,
++        groupby: str,
++        group_a: str,
++        group_b: str,
++        *,
++        n_bootstrap: int = 100,
++        random_state: int = 0,
++        multi_gpu: bool | list[int] | str | None = None,
++    ) -> tuple[float, float]:
++        """Bootstrap mean/variance of W between two groups in ``adata``."""
++        mean_df, var_df = self.pairwise(
++            adata,
++            groupby,
++            groups=[group_a, group_b],
++            bootstrap=True,
++            n_bootstrap=n_bootstrap,
++            random_state=random_state,
++            multi_gpu=multi_gpu,
++        )
++        return float(mean_df.loc[group_a, group_b]), float(var_df.loc[group_a, group_b])
++
++    def _warn_not_converged(self) -> None:
++        warnings.warn(
++            f"Sinkhorn did not converge in {self.max_iter} iterations "
++            f"(tol={self.tol}).",
++            RuntimeWarning,
++            stacklevel=3,
++        )
++
++    def pairwise(
++        self,
++        adata: AnnData,
++        groupby: str,
++        *,
++        groups: Sequence[str] | None = None,
++        bootstrap: bool = False,
++        n_bootstrap: int = 100,
++        random_state: int = 0,
++        multi_gpu: bool | list[int] | str | None = None,
++    ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
++        """Pairwise Wasserstein between all groups in ``groupby``.
++
++        Returns a symmetric K×K DataFrame with zero on the diagonal. With
++        ``bootstrap=True`` returns ``(mean_df, var_df)``, the per-pair mean and
++        (population) variance over ``n_bootstrap`` cell resamples. Bootstrap is
++        computed on a single GPU (the resamples are batched into the solver).
++        """
++        device_ids = parse_device_ids(multi_gpu=multi_gpu)
++
++        _assert_categorical_obs(adata, key=groupby)
++        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
++            adata, groupby, groups
++        )
++        k = len(groups_list)
++
++        # Upper-triangle pairs (i < j); diagonal is 0
++        pair_left: list[int] = []
++        pair_right: list[int] = []
++        for i in range(k):
++            for j in range(i + 1, k):
++                pair_left.append(i)
++                pair_right.append(j)
++
++        def _to_matrix(flat: cp.ndarray, name: str) -> pd.DataFrame:
++            mat = cp.zeros((k, k), dtype=embedding.dtype)
++            if pair_left:
++                il = cp.asarray(pair_left, dtype=cp.intp)
++                jr = cp.asarray(pair_right, dtype=cp.intp)
++                mat[il, jr] = flat
++                mat[jr, il] = flat
++            df = pd.DataFrame(mat.get(), index=groups_list, columns=groups_list)
++            df.index.name = groupby
++            df.columns.name = groupby
++            df.name = name
++            return df
++
++        if bootstrap:
++            mean, var = self._bootstrap_solve(
++                embedding,
++                cat_offsets,
++                cell_indices,
++                pair_left,
++                pair_right,
++                n_bootstrap=n_bootstrap,
++                random_state=random_state,
++                dtype=embedding.dtype,
++                device=device_ids[0],
++            )
++            return (
++                _to_matrix(mean, "pairwise wasserstein"),
++                _to_matrix(var, "pairwise wasserstein (var)"),
++            )
++
++        flat = self._solve_pairs(
++            embedding,
++            cat_offsets,
++            cell_indices,
++            pair_left,
++            pair_right,
++            dtype=embedding.dtype,
++            device_ids=device_ids,
++        )
++        return _to_matrix(flat, "pairwise wasserstein")
++
++    def onesided_distances(
++        self,
++        adata: AnnData,
++        groupby: str,
++        selected_group: str | Sequence[str],
++        *,
++        groups: Sequence[str] | None = None,
++        bootstrap: bool = False,
++        n_bootstrap: int = 100,
++        random_state: int = 0,
++        multi_gpu: bool | list[int] | str | None = None,
++    ) -> (
++        pd.Series
++        | pd.DataFrame
++        | tuple[pd.Series, pd.Series]
++        | tuple[pd.DataFrame, pd.DataFrame]
++    ):
++        device_ids = parse_device_ids(multi_gpu=multi_gpu)
++
++        selected_groups, single_control, needed = self._resolve_onesided_inputs(
++            adata, groupby, selected_group, groups
++        )
++        embedding, cat_offsets, cell_indices, groups_list = self._subset_to_groups(
++            adata, groupby, needed
++        )
++        k = len(groups_list)
++        group_map = {v: i for i, v in enumerate(groups_list)}
++        selected_indices = [group_map[sg] for sg in selected_groups]
++
++        pair_left: list[int] = []
++        pair_right: list[int] = []
++        for si in selected_indices:
++            for j in range(k):
++                if j == si:
++                    continue
++                pair_left.append(si)
++                pair_right.append(j)
++
++        def _to_df(flat: cp.ndarray) -> pd.DataFrame:
++            flat_cpu = flat.get()
++            ed_cols: dict[str, np.ndarray] = {}
++            cursor = 0
++            for ii, si in enumerate(selected_indices):
++                col = np.zeros(k, dtype=flat_cpu.dtype)
++                for j in range(k):
++                    if j == si:
++                        continue
++                    col[j] = flat_cpu[cursor]
++                    cursor += 1
++                ed_cols[selected_groups[ii]] = col
++            df = pd.DataFrame(ed_cols, index=groups_list)
++            df.index.name = groupby
++            df.columns.name = "selected_group"
++            return df
++
++        if bootstrap:
++            mean, var = self._bootstrap_solve(
++                embedding,
++                cat_offsets,
++                cell_indices,
++                pair_left,
++                pair_right,
++                n_bootstrap=n_bootstrap,
++                random_state=random_state,
++                dtype=embedding.dtype,
++                device=device_ids[0],
++            )
++            mean_df, var_df = _to_df(mean), _to_df(var)
++            if single_control:
++                return mean_df[selected_groups[0]], var_df[selected_groups[0]]
++            return mean_df, var_df
++
++        flat = self._solve_pairs(
++            embedding,
++            cat_offsets,
++            cell_indices,
++            pair_left,
++            pair_right,
++            dtype=embedding.dtype,
++            device_ids=device_ids,
++        )
++        df = _to_df(flat)
++        if single_control:
++            return df[selected_groups[0]]
++        return df
++
++    def contrast_distances(
++        self,
++        adata: AnnData,
++        contrasts: pd.DataFrame,
++        *,
++        multi_gpu: bool | list[int] | str | None = None,
++    ) -> pd.DataFrame:
++        device_ids = parse_device_ids(multi_gpu=multi_gpu)
++        groupby, split_by = self._parse_contrasts(adata, contrasts)
++        embedding_raw = self._get_embedding(adata)
++
++        all_cols = [groupby, *split_by]
++        grouped = adata.obs.groupby(all_cols, observed=True)
++        group_indices = grouped.indices
++
++        target_vals = contrasts[groupby].values
++        ref_vals = contrasts["reference"].values
++        split_arrays = [contrasts[col].values for col in split_by]
++
++        cond_to_idx: dict[tuple, int] = {}
++        contrast_pairs: list[tuple[int, int]] = []
++        for i in range(len(contrasts)):
++            if split_by:
++                split_vals = tuple(arr[i] for arr in split_arrays)
++                target_key = (target_vals[i], *split_vals)
++                ref_key = (ref_vals[i], *split_vals)
++            else:
++                target_key = (target_vals[i],)
++                ref_key = (ref_vals[i],)
++            for key in (target_key, ref_key):
++                if key not in cond_to_idx:
++                    cond_to_idx[key] = len(cond_to_idx)
++            contrast_pairs.append((cond_to_idx[target_key], cond_to_idx[ref_key]))
++
++        # Build a unified (cat_offsets, cell_indices) layout — one "group" per
++        # unique contrast condition. Skip empty conditions safely.
++        offsets_host = [0]
++        all_cells: list[np.ndarray] = []
++        for key, _ in sorted(cond_to_idx.items(), key=lambda kv: kv[1]):
++            lookup_key = key[0] if len(key) == 1 else key
++            cell_idx = group_indices.get(lookup_key)
++            if cell_idx is None:
++                raise ValueError(f"No cells found for contrast condition {lookup_key}")
++            all_cells.append(np.asarray(cell_idx, dtype=np.int64))
++            offsets_host.append(offsets_host[-1] + len(cell_idx))
++
++        flat_cell_idx = (
++            np.concatenate(all_cells) if all_cells else np.array([], dtype=np.int64)
++        )
++        cat_offsets = cp.asarray(offsets_host, dtype=cp.int32)
++        cell_indices = cp.asarray(flat_cell_idx, dtype=cp.int32)
++        embedding = cp.asarray(embedding_raw)
++        dtype = embedding.dtype
++
++        # Deduplicate canonical pairs (i, j) with i < j
++        canon_to_flat: dict[tuple[int, int], int] = {}
++        pair_left: list[int] = []
++        pair_right: list[int] = []
++        for idx_a, idx_b in contrast_pairs:
++            if idx_a == idx_b:
++                continue
++            canon = (min(idx_a, idx_b), max(idx_a, idx_b))
++            if canon not in canon_to_flat:
++                canon_to_flat[canon] = len(canon_to_flat)
++                pair_left.append(canon[0])
++                pair_right.append(canon[1])
++
++        flat = self._solve_pairs(
++            embedding,
++            cat_offsets,
++            cell_indices,
++            pair_left,
++            pair_right,
++            dtype=dtype,
++            device_ids=device_ids,
++        )
++        flat_cpu = flat.get()
++
++        distances = np.empty(len(contrast_pairs), dtype=np.float64)
++        for n, (idx_a, idx_b) in enumerate(contrast_pairs):
++            if idx_a == idx_b:
++                distances[n] = 0.0
++                continue
++            canon = (min(idx_a, idx_b), max(idx_a, idx_b))
++            distances[n] = flat_cpu[canon_to_flat[canon]]
++
++        result = contrasts.copy()
++        result["wasserstein"] = distances
++        return result
++
++    def compute_distance(
++        self,
++        X: np.ndarray | cp.ndarray,
++        Y: np.ndarray | cp.ndarray,
++    ) -> float:
++        Xc = cp.asarray(X)
++        Yc = cp.asarray(Y)
++        if len(Xc) == 0 or len(Yc) == 0:
++            raise ValueError("Neither X nor Y can be empty.")
++        if Xc.dtype != Yc.dtype:
++            Yc = Yc.astype(Xc.dtype)
++
++        n_a, n_b = int(Xc.shape[0]), int(Yc.shape[0])
++        emb = cp.ascontiguousarray(cp.concatenate([Xc, Yc], axis=0))
++        cat_offsets = cp.asarray([0, n_a, n_a + n_b], dtype=cp.int32)
++        cell_indices = cp.arange(n_a + n_b, dtype=cp.int32)
++        # Single pair (groups 0 and 1), smaller group oriented as rows.
++        if n_a <= n_b:
++            rows_h, cols_h, n_h, m_h = (0, 1, n_a, n_b)
++        else:
++            rows_h, cols_h, n_h, m_h = (1, 0, n_b, n_a)
++        layout = _build_ragged_layout(
++            cat_offsets,
++            cell_indices,
++            np.array([rows_h], dtype=np.int64),
++            np.array([cols_h], dtype=np.int64),
++            n_h=np.array([n_h], dtype=np.int64),
++            m_h=np.array([m_h], dtype=np.int64),
++            dtype=emb.dtype,
++        )
++        cost = cp.empty(layout["total_cost"], dtype=emb.dtype)
++        stream = cp.cuda.get_current_stream()
++        _launch_build_cost(emb, layout, cost, stream.ptr)
++        st = make_state(layout, cost, epsilon_scale=self.epsilon_scale)
++        run_async(
++            [{"dev": cp.cuda.runtime.getDevice(), "stream": stream, "state": st}],
++            max_iter=self.max_iter,
++            tol=self.tol,
++            check_every=DEFAULT_CHECK_EVERY,
++            omega=self.relaxation,
++        )
++        if not bool(st["conv"].all().get()):
++            self._warn_not_converged()
++        return float(finalize(st)[0])
+diff --git a/tests/pertpy/test_distance_wasserstein.py b/tests/pertpy/test_distance_wasserstein.py
+new file mode 100644
+index 000000000..6d6567f9c
+--- /dev/null
++++ b/tests/pertpy/test_distance_wasserstein.py
+@@ -0,0 +1,817 @@
++from __future__ import annotations
++
++import cupy as cp
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData
++
++from rapids_singlecell.pertpy_gpu import Distance, MeanVar
++from rapids_singlecell.pertpy_gpu._metrics._sinkhorn import (
++    finalize,
++    make_state,
++    run_async,
++)
++from rapids_singlecell.pertpy_gpu._metrics._wasserstein import (
++    WassersteinMetric,
++    _build_ragged_layout,
++    _launch_build_cost,
++)
++
++
++def _make_grouped_adata(
++    *,
++    n_groups: int = 4,
++    cells_per_group: int = 20,
++    n_features: int = 8,
++    shift: float = 1.0,
++    seed: int = 0,
++    dtype: type = np.float32,
++) -> AnnData:
++    rng = np.random.default_rng(seed)
++    total = n_groups * cells_per_group
++    X = rng.normal(size=(total, n_features)).astype(dtype)
++    for g in range(n_groups):
++        X[g * cells_per_group : (g + 1) * cells_per_group] += g * shift
++
++    labels = [f"g{i}" for i in range(n_groups) for _ in range(cells_per_group)]
++    obs = pd.DataFrame(
++        {"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(n_groups)])}
++    )
++    adata = AnnData(X.copy(), obs=obs)
++    adata.obsm["X_pca"] = X.copy()
++    return adata
++
++
++def _cpu_sinkhorn(
++    X: np.ndarray,
++    Y: np.ndarray,
++    *,
++    eps: float,
++    max_iter: int = 5000,
++    tol: float = 1e-10,
++) -> float:
++    """Reference: numpy log-domain Sinkhorn, returning OTT-style reg_ot_cost."""
++    n_a, n_b = X.shape[0], Y.shape[0]
++    C = ((X[:, None, :] - Y[None, :, :]) ** 2).sum(-1)
++    log_a = -np.log(n_a) * np.ones(n_a)
++    log_b = -np.log(n_b) * np.ones(n_b)
++    f = np.zeros(n_a)
++    g = np.zeros(n_b)
++    for _ in range(max_iter):
++        # g update
++        M = (-C + f[:, None]) / eps
++        g_new = eps * (log_b - _logsumexp(M, axis=0))
++        # f update
++        M = (-C + g_new[None, :]) / eps
++        f_new = eps * (log_a - _logsumexp(M, axis=1))
++        if max(np.max(np.abs(f_new - f)), np.max(np.abs(g_new - g))) < tol:
++            f = f_new
++            g = g_new
++            break
++        f, g = f_new, g_new
++    reg = float(np.sum(f) / n_a + np.sum(g) / n_b + eps * (np.log(n_a) + np.log(n_b)))
++    return reg
++
++
++def _logsumexp(x, axis):
++    m = np.max(x, axis=axis, keepdims=True)
++    return np.log(np.exp(x - m).sum(axis=axis)) + np.squeeze(m, axis=axis)
++
++
++def _ragged_solve(pairs, *, eps=None, max_iter=5000, tol=1e-10, omega=1.0):
++    """Solve a list of ``(X, Y)`` pairs through the ragged Sinkhorn path.
++
++    Concatenates the pairs into one embedding (each pair is two groups), builds
++    the flat no-padding layout the production code uses, and runs the solver.
++    Returns ``(reg_ot_cost (n_pairs,), state)``. ``eps`` (scalar or per-pair)
++    overrides the regularization; otherwise it is auto ``0.05 * std(C)``.
++    """
++    dtype = cp.asarray(pairs[0][0]).dtype
++    blocks = []
++    offs = [0]
++    rows_h, cols_h, n_h, m_h = [], [], [], []
++    g = 0
++    for X, Y in pairs:
++        Xc = cp.ascontiguousarray(cp.asarray(X, dtype=dtype))
++        Yc = cp.ascontiguousarray(cp.asarray(Y, dtype=dtype))
++        blocks += [Xc, Yc]
++        na, nb = int(Xc.shape[0]), int(Yc.shape[0])
++        start = offs[-1]
++        offs += [start + na, start + na + nb]
++        gx, gy = g, g + 1
++        g += 2
++        # Orient the smaller group as rows (matches the production path).
++        if na <= nb:
++            rows_h.append(gx), cols_h.append(gy), n_h.append(na), m_h.append(nb)
++        else:
++            rows_h.append(gy), cols_h.append(gx), n_h.append(nb), m_h.append(na)
++    emb = cp.ascontiguousarray(cp.concatenate(blocks, axis=0))
++    cat_offsets = cp.asarray(offs, dtype=cp.int32)
++    cell_indices = cp.arange(offs[-1], dtype=cp.int32)
++    layout = _build_ragged_layout(
++        cat_offsets,
++        cell_indices,
++        np.asarray(rows_h, dtype=np.int64),
++        np.asarray(cols_h, dtype=np.int64),
++        n_h=np.asarray(n_h, dtype=np.int64),
++        m_h=np.asarray(m_h, dtype=np.int64),
++        dtype=dtype,
++    )
++    cost = cp.empty(layout["total_cost"], dtype=dtype)
++    stream = cp.cuda.get_current_stream()
++    _launch_build_cost(emb, layout, cost, stream.ptr)
++    st = make_state(layout, cost, epsilon_scale=0.05)
++    if eps is not None:
++        st["eps"][:] = cp.asarray(eps, dtype=dtype)
++    run_async(
++        [{"dev": cp.cuda.runtime.getDevice(), "stream": stream, "state": st}],
++        max_iter=max_iter,
++        tol=tol,
++        check_every=20,
++        omega=omega,
++    )
++    return finalize(st), st
++
++
++# ---------------------------------------------------------------------------
++# Sinkhorn solver unit tests (ragged / no-padding layout)
++# ---------------------------------------------------------------------------
++
++
++def test_ragged_sinkhorn_matches_cpu_reference_single_pair() -> None:
++    rng = np.random.default_rng(0)
++    n_a, n_b, d = 25, 30, 6
++    X = rng.normal(size=(n_a, d)).astype(np.float64)
++    Y = rng.normal(size=(n_b, d)).astype(np.float64)
++    Y[:] += 0.5
++
++    eps = 0.1
++    cpu_val = _cpu_sinkhorn(X, Y, eps=eps)
++    out, _ = _ragged_solve([(X, Y)], eps=eps, max_iter=5000, tol=1e-10)
++    np.testing.assert_allclose(float(out[0]), cpu_val, rtol=1e-6, atol=1e-6)
++
++
++def test_ragged_sinkhorn_batch_matches_individual() -> None:
++    """A ragged batch of heterogeneous pairs equals solving each pair alone.
++
++    The ragged layout stores every pair flat with no padding, so this is the
++    no-padding analogue of the old "padded == unpadded" check: differently sized
++    pairs packed into one batch must not contaminate each other.
++    """
++    rng = np.random.default_rng(1)
++    shapes = [(20, 30, 5), (40, 25, 5), (15, 50, 5), (35, 35, 5)]
++    pairs = [
++        (
++            rng.normal(size=(n_a, d)).astype(np.float64),
++            rng.normal(size=(n_b, d)).astype(np.float64),
++        )
++        for n_a, n_b, d in shapes
++    ]
++
++    batched, _ = _ragged_solve(pairs, max_iter=10000, tol=1e-10)
++    singles = np.array(
++        [float(_ragged_solve([p], max_iter=10000, tol=1e-10)[0][0]) for p in pairs]
++    )
++    np.testing.assert_allclose(batched.get(), singles, rtol=1e-7, atol=1e-7)
++
++
++def test_ragged_sinkhorn_auto_epsilon_uses_std() -> None:
++    """Auto-eps should equal scale * std(C), matching OTT-JAX convention."""
++    rng = np.random.default_rng(2)
++    X = rng.normal(size=(30, 6)).astype(np.float64)
++    Y = rng.normal(size=(40, 6)).astype(np.float64)
++    C = ((X[:, None, :] - Y[None, :, :]) ** 2).sum(-1)
++    expected_eps = 0.05 * float(np.std(C))
++
++    auto_val, st = _ragged_solve([(X, Y)], max_iter=5000, tol=1e-10)
++    np.testing.assert_allclose(float(st["eps"][0]), expected_eps, rtol=1e-6)
++    fixed_val, _ = _ragged_solve([(X, Y)], eps=expected_eps, max_iter=5000, tol=1e-10)
++    np.testing.assert_allclose(float(auto_val[0]), float(fixed_val[0]), rtol=1e-10)
++
++
++def test_ragged_sinkhorn_rejects_non_float_cost() -> None:
++    """make_state guards the cost dtype (float32/float64 only)."""
++    cat_offsets = cp.asarray([0, 8, 18], dtype=cp.int32)
++    cell_indices = cp.arange(18, dtype=cp.int32)
++    layout = _build_ragged_layout(
++        cat_offsets,
++        cell_indices,
++        np.array([0], dtype=np.int64),
++        np.array([1], dtype=np.int64),
++        n_h=np.array([8], dtype=np.int64),
++        m_h=np.array([10], dtype=np.int64),
++        dtype=cp.float64,
++    )
++    int_cost = cp.ones(layout["total_cost"], dtype=cp.int32)
++    with pytest.raises(TypeError):
++        make_state(layout, int_cost, epsilon_scale=0.05)
++
++
++# ---------------------------------------------------------------------------
++# Reference-value tests through the public API at default config (the way
++# users actually call it). Each value is checked against the numpy reference
++# Sinkhorn run to convergence at the same auto-epsilon (0.05 * std(C)) the
++# default path uses. rtol=1e-4 leaves ~20x margin over the observed error
++# (~5e-6) while still catching a default-config regression (e.g. a looser
++# default tol). float64 isolates algorithm accuracy from float32 rounding.
++# ---------------------------------------------------------------------------
++
++
++def _auto_eps(X: np.ndarray, Y: np.ndarray) -> float:
++    """The per-pair auto-epsilon the default solver uses: 0.05 * std(C)."""
++    C = ((X[:, None, :] - Y[None, :, :]) ** 2).sum(-1)
++    return 0.05 * float(np.std(C))
++
++
++def test_pairwise_matches_reference_default_config() -> None:
++    n_groups, cpg = 4, 20
++    adata = _make_grouped_adata(
++        n_groups=n_groups, cells_per_group=cpg, n_features=8, seed=0, dtype=np.float64
++    )
++    df = Distance(metric="wasserstein").pairwise(adata, groupby="group")
++    X = adata.obsm["X_pca"]
++    for i in range(n_groups):
++        for j in range(i + 1, n_groups):
++            Xi = X[i * cpg : (i + 1) * cpg]
++            Xj = X[j * cpg : (j + 1) * cpg]
++            ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
++            np.testing.assert_allclose(
++                df.loc[f"g{i}", f"g{j}"], ref, rtol=1e-4, atol=1e-4
++            )
++
++
++def test_onesided_matches_reference_default_config() -> None:
++    n_groups, cpg = 4, 20
++    adata = _make_grouped_adata(
++        n_groups=n_groups, cells_per_group=cpg, n_features=8, seed=0, dtype=np.float64
++    )
++    s = Distance(metric="wasserstein").onesided_distances(adata, "group", "g0")
++    X = adata.obsm["X_pca"]
++    Xi = X[0:cpg]
++    for j in range(1, n_groups):
++        Xj = X[j * cpg : (j + 1) * cpg]
++        ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
++        np.testing.assert_allclose(s[f"g{j}"], ref, rtol=1e-4, atol=1e-4)
++
++
++def test_compute_distance_matches_reference_default_config() -> None:
++    rng = np.random.default_rng(1)
++    X = rng.normal(size=(25, 6)).astype(np.float64)
++    Y = (rng.normal(size=(30, 6)) + 0.5).astype(np.float64)
++    val = Distance(metric="wasserstein")(X, Y)  # public call -> compute_distance
++    ref = _cpu_sinkhorn(X, Y, eps=_auto_eps(X, Y))
++    np.testing.assert_allclose(val, ref, rtol=1e-4, atol=1e-4)
++
++
++# ---------------------------------------------------------------------------
++# True upstream parity: rapids_singlecell == pertpy (OTT-JAX) across the whole
++# public API (pairwise, onesided, single call). Gated on pertpy (heavy jax/ott
++# dependency); skipped where it is not installed. Both use a squared-Euclidean
++# cost and the same auto-epsilon (0.05 * std(C) is exactly OTT's PointCloud
++# default), so values agree to ~1e-6. rtol=1e-4 leaves ~25x margin and still
++# catches a divergent cost or epsilon (which differ by orders of magnitude).
++# ---------------------------------------------------------------------------
++
++
++def test_matches_pertpy_ott_parity() -> None:
++    pytest.importorskip("pertpy")
++    from pertpy.tools import Distance as PertpyDistance
++
++    adata = _make_grouped_adata(
++        n_groups=4, cells_per_group=20, n_features=8, seed=0, dtype=np.float64
++    )
++    ours = Distance(metric="wasserstein")
++    upstream = PertpyDistance(metric="wasserstein", obsm_key="X_pca")
++
++    # pairwise: full K x K matrix
++    rp = ours.pairwise(adata, groupby="group")
++    pp = upstream.pairwise(adata, groupby="group", show_progressbar=False).loc[
++        rp.index, rp.columns
++    ]
++    np.testing.assert_allclose(rp.values, pp.values, rtol=1e-4, atol=1e-4)
++
++    # onesided: distances from one group to the rest (compare the other groups)
++    rs = ours.onesided_distances(adata, "group", "g0")
++    ps = upstream.onesided_distances(
++        adata, groupby="group", selected_group="g0", show_progressbar=False
++    )
++    others = [g for g in rs.index if g != "g0" and g in ps.index]
++    np.testing.assert_allclose(
++        rs.reindex(others).values, ps.reindex(others).values, rtol=1e-4, atol=1e-4
++    )
++
++    # single call (X, Y)
++    X = adata.obsm["X_pca"][:20]
++    Y = adata.obsm["X_pca"][20:40]
++    np.testing.assert_allclose(ours(X, Y), float(upstream(X, Y)), rtol=1e-4, atol=1e-4)
++
++
++# ---------------------------------------------------------------------------
++# Distance(metric="wasserstein") API tests
++# ---------------------------------------------------------------------------
++
++
++def test_distance_wasserstein_initialization() -> None:
++    distance = Distance(metric="wasserstein")
++    assert distance.metric == "wasserstein"
++    assert distance.obsm_key == "X_pca"
++
++
++def test_relaxation_option() -> None:
++    """Over-relaxation (omega > 1) reaches the same fixed point; bounds enforced.
++
++    Also exercises Distance(**kwargs) forwarding of metric-specific options.
++    """
++    adata = _make_grouped_adata(
++        n_groups=4,
++        cells_per_group=30,
++        n_features=8,
++        shift=1.0,
++        seed=3,
++        dtype=np.float64,
++    )
++    base = Distance(metric="wasserstein").pairwise(adata, "group")  # omega = 1
++    d_accel = Distance(metric="wasserstein", relaxation=1.5)  # forwarded via **kwargs
++    assert d_accel._metric_impl.relaxation == 1.5
++    accel = d_accel.pairwise(adata, "group")  # over-relaxed
++    # SOR converges to the same fixed point (just in fewer iterations)
++    np.testing.assert_allclose(accel.values, base.values, rtol=1e-3, atol=1e-3)
++    # bounds: must be in [1, 2)
++    with pytest.raises(ValueError):
++        Distance(metric="wasserstein", relaxation=2.5)
++    with pytest.raises(ValueError):
++        Distance(metric="wasserstein", relaxation=0.5)
++
++
++@pytest.mark.parametrize("omega", [1.2, 1.4, 1.6])
++def test_relaxation_converges_across_omega(omega) -> None:
++    """Over-relaxation across [1, ~1.7) reaches the same fixed point as omega=1."""
++    adata = _make_grouped_adata(
++        n_groups=4,
++        cells_per_group=25,
++        n_features=8,
++        shift=1.0,
++        seed=3,
++        dtype=np.float64,
++    )
++    base = Distance(metric="wasserstein").pairwise(adata, "group")
++    accel = Distance(metric="wasserstein", relaxation=omega).pairwise(adata, "group")
++    np.testing.assert_allclose(accel.values, base.values, rtol=1e-5, atol=1e-5)
++
++
++def test_high_omega_diverges_gracefully() -> None:
++    """Too-large omega (past the divergence cliff) hits the iteration cap and
++    warns, but stays finite and never crashes -- on both the pairwise and the
++    bootstrap solve paths."""
++    adata = _make_grouped_adata(
++        n_groups=4,
++        cells_per_group=25,
++        n_features=8,
++        shift=1.0,
++        seed=3,
++        dtype=np.float64,
++    )
++    d = Distance(metric="wasserstein", relaxation=1.99)
++    with pytest.warns(RuntimeWarning, match="did not converge"):
++        df = d.pairwise(adata, "group")
++    assert np.all(np.isfinite(df.values))  # diverged but finite, no crash
++    wm = WassersteinMetric(relaxation=1.99)
++    with pytest.warns(RuntimeWarning, match="did not converge"):
++        mean, var = wm.bootstrap(
++            adata, "group", "g0", "g1", n_bootstrap=5, random_state=0
++        )
++    assert np.isfinite(mean) and var >= 0
++
++
++def test_distance_wasserstein_pairwise_shape_and_diag() -> None:
++    adata = _make_grouped_adata(n_groups=4, cells_per_group=15, n_features=6, seed=10)
++    distance = Distance(metric="wasserstein")
++    df = distance.pairwise(adata, groupby="group")
++
++    assert isinstance(df, pd.DataFrame)
++    assert df.shape == (4, 4)
++    np.testing.assert_allclose(np.diag(df.values), 0.0, atol=1e-8)
++    np.testing.assert_allclose(df.values, df.values.T, rtol=0, atol=1e-6)
++    assert np.all(np.isfinite(df.values))
++
++
++def test_distance_wasserstein_pairwise_monotonic_in_separation() -> None:
++    """Pairs farther apart in feature space should have larger distance."""
++    adata = _make_grouped_adata(
++        n_groups=4, cells_per_group=20, n_features=8, shift=1.0, seed=21
++    )
++    distance = Distance(metric="wasserstein")
++    df = distance.pairwise(adata, groupby="group")
++    # g0-g3 (shift 3) > g0-g1 (shift 1)
++    assert df.loc["g0", "g3"] > df.loc["g0", "g1"]
++    assert df.loc["g0", "g2"] > df.loc["g0", "g1"]
++
++
++def test_distance_wasserstein_compute_distance_matches_pairwise() -> None:
++    adata = _make_grouped_adata(n_groups=3, cells_per_group=18, n_features=5, seed=33)
++    distance = Distance(metric="wasserstein")
++    df = distance.pairwise(adata, groupby="group")
++
++    cells = adata.obsm["X_pca"]
++    groups = adata.obs["group"].values
++    A = cells[groups == "g0"]
++    B = cells[groups == "g1"]
++    direct = distance(A, B)
++    # Sinkhorn convergence path differs slightly; allow small tol.
++    np.testing.assert_allclose(direct, df.loc["g0", "g1"], rtol=5e-4, atol=1e-4)
++
++
++def test_distance_wasserstein_onesided_single_control() -> None:
++    adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=6, seed=4)
++    distance = Distance(metric="wasserstein")
++    s = distance.onesided_distances(adata, groupby="group", selected_group="g0")
++    assert isinstance(s, pd.Series)
++    assert len(s) == 4
++    assert s.loc["g0"] == pytest.approx(0.0, abs=1e-8)
++    assert np.all(s.values >= -1e-6)
++
++
++def test_distance_wasserstein_onesided_multi_control_matches_single() -> None:
++    adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=6, seed=5)
++    distance = Distance(metric="wasserstein")
++    df = distance.onesided_distances(
++        adata, groupby="group", selected_group=["g0", "g2"]
++    )
++    assert isinstance(df, pd.DataFrame)
++    assert df.shape == (4, 2)
++
++    s0 = distance.onesided_distances(adata, groupby="group", selected_group="g0")
++    s2 = distance.onesided_distances(adata, groupby="group", selected_group="g2")
++    np.testing.assert_allclose(df["g0"].values, s0.values, rtol=1e-3, atol=1e-3)
++    np.testing.assert_allclose(df["g2"].values, s2.values, rtol=1e-3, atol=1e-3)
++
++
++def test_distance_wasserstein_contrast_distances() -> None:
++    adata = _make_grouped_adata(n_groups=4, cells_per_group=15, n_features=5, seed=6)
++    distance = Distance(metric="wasserstein")
++    contrasts = Distance.create_contrasts(adata, groupby="group", selected_group="g0")
++    result = distance.contrast_distances(adata, contrasts=contrasts)
++    assert "wasserstein" in result.columns
++    assert len(result) == 3
++    assert np.all(np.isfinite(result["wasserstein"].values))
++    assert np.all(result["wasserstein"].values > 0)
++
++
++def test_distance_wasserstein_pairwise_subset_groups() -> None:
++    adata = _make_grouped_adata(n_groups=5, cells_per_group=15, n_features=5, seed=7)
++    distance = Distance(metric="wasserstein")
++    df_sub = distance.pairwise(adata, groupby="group", groups=["g0", "g2", "g4"])
++    assert df_sub.shape == (3, 3)
++    assert list(df_sub.columns) == ["g0", "g2", "g4"]
++
++
++# ---------------------------------------------------------------------------
++# Bootstrap (resample cells with replacement). Wasserstein has no structural
++# shortcut like edistance, so each resample is a full re-solve, batched on one
++# GPU. Stochastic, so checks are structural (var>=0, reproducible, mean ~ point
++# estimate) rather than exact-value -- same approach as the edistance suite.
++# ---------------------------------------------------------------------------
++
++
++def test_bootstrap_pairwise_variance_and_reproducible() -> None:
++    adata = _make_grouped_adata(n_groups=3, cells_per_group=25, n_features=6, seed=1)
++    distance = Distance(metric="wasserstein")
++    mean1, var1 = distance.pairwise(
++        adata, groupby="group", bootstrap=True, n_bootstrap=30, random_state=7
++    )
++    assert isinstance(mean1, pd.DataFrame) and isinstance(var1, pd.DataFrame)
++    np.testing.assert_allclose(np.diag(mean1.values), 0.0, atol=1e-8)
++    assert np.all(var1.values >= 0)
++    assert np.all(var1.values[~np.eye(3, dtype=bool)] > 0)  # off-diagonal var > 0
++    # same seed -> identical mean and variance
++    mean2, var2 = distance.pairwise(
++        adata, groupby="group", bootstrap=True, n_bootstrap=30, random_state=7
++    )
++    np.testing.assert_array_equal(mean1.values, mean2.values)
++    np.testing.assert_array_equal(var1.values, var2.values)
++
++
++def test_bootstrap_mean_close_to_point_estimate() -> None:
++    adata = _make_grouped_adata(
++        n_groups=3, cells_per_group=60, n_features=8, shift=1.0, seed=2
++    )
++    distance = Distance(metric="wasserstein")
++    point = distance.pairwise(adata, groupby="group")
++    boot_mean, _ = distance.pairwise(
++        adata, groupby="group", bootstrap=True, n_bootstrap=100, random_state=2
++    )
++    np.testing.assert_allclose(boot_mean.values, point.values, rtol=0.3, atol=0.5)
++
++
++def test_bootstrap_arrays_and_onesided() -> None:
++    adata = _make_grouped_adata(n_groups=4, cells_per_group=25, n_features=6, seed=3)
++    distance = Distance(metric="wasserstein")
++    X = adata.obsm["X_pca"][:25]
++    Y = adata.obsm["X_pca"][25:50]
++    r = distance.bootstrap(X, Y, n_bootstrap=40, random_state=5)
++    assert isinstance(r, MeanVar) and r.variance >= 0
++    assert r == distance.bootstrap(X, Y, n_bootstrap=40, random_state=5)  # reproducible
++    np.testing.assert_allclose(r.mean, distance(X, Y), rtol=0.3, atol=0.5)
++    ms, vs = distance.onesided_distances(
++        adata,
++        groupby="group",
++        selected_group="g0",
++        bootstrap=True,
++        n_bootstrap=30,
++        random_state=5,
++    )
++    assert isinstance(ms, pd.Series) and isinstance(vs, pd.Series)
++    assert ms.loc["g0"] == pytest.approx(0.0, abs=1e-8)
++    assert np.all(vs.values >= 0)
++
++
++def test_bootstrap_adata_method_and_multicontrol() -> None:
++    adata = _make_grouped_adata(n_groups=4, cells_per_group=20, n_features=6, seed=4)
++    # adata-based bootstrap(group_a, group_b) -> (mean, var) floats
++    mean, var = WassersteinMetric().bootstrap(
++        adata, "group", "g0", "g1", n_bootstrap=20, random_state=1
++    )
++    assert isinstance(mean, float) and isinstance(var, float) and var >= 0
++    # multi-control onesided bootstrap -> (DataFrame, DataFrame)
++    md, vd = Distance(metric="wasserstein").onesided_distances(
++        adata, "group", ["g0", "g2"], bootstrap=True, n_bootstrap=20, random_state=1
++    )
++    assert isinstance(md, pd.DataFrame) and isinstance(vd, pd.DataFrame)
++    assert list(md.columns) == ["g0", "g2"]
++    assert np.all(vd.values >= 0)
++
++
++def test_bootstrap_guards() -> None:
++    """Non-positive n_bootstrap raises; an empty workload (no pairs) is a no-op."""
++    distance = Distance(metric="wasserstein")
++    rng = np.random.default_rng(0)
++    X = rng.normal(size=(10, 5)).astype(np.float32)
++    Y = rng.normal(size=(12, 5)).astype(np.float32)
++    with pytest.raises(ValueError):
++        distance.bootstrap(X, Y, n_bootstrap=0)
++    # single-group adata -> no pairs -> bootstrap pairwise must not crash
++    adata = _make_grouped_adata(n_groups=1, cells_per_group=12, seed=2)
++    mean, var = distance.pairwise(adata, "group", bootstrap=True, n_bootstrap=5)
++    assert mean.shape == (1, 1)
++    assert float(mean.iloc[0, 0]) == 0.0 and float(var.iloc[0, 0]) == 0.0
++
++
++# ---------------------------------------------------------------------------
++# edist-parity coverage: dtypes, layer_key, output/axioms, groups filtering,
++# contrasts, __call__, invalid-group. Block-size and triangle-inequality are
++# intentionally not ported (Sinkhorn has no block-size dual path; entropic W2
++# is not a metric).
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++def test_pairwise_correctness_dtypes(dtype) -> None:
++    cpg = 15
++    adata = _make_grouped_adata(
++        n_groups=3, cells_per_group=cpg, n_features=6, seed=4, dtype=dtype
++    )
++    df = Distance(metric="wasserstein").pairwise(adata, "group")
++    X = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
++    rtol = 1e-4 if dtype == np.float32 else 1e-5
++    for i in range(3):
++        for j in range(i + 1, 3):
++            Xi, Xj = X[i * cpg : (i + 1) * cpg], X[j * cpg : (j + 1) * cpg]
++            ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
++            np.testing.assert_allclose(df.iloc[i, j], ref, rtol=rtol, atol=1e-4)
++
++
++def test_float32_matches_float64() -> None:
++    """float32 and float64 pairwise agree within float32 precision.
++
++    Same input values (float32), one run upcast to float64, so this isolates the
++    solver dtype. Observed max rel diff ~2e-7 (auto-eps keeps it well
++    conditioned); rtol=1e-5 leaves ~50x margin.
++    """
++    base = _make_grouped_adata(
++        n_groups=5,
++        cells_per_group=30,
++        n_features=10,
++        shift=1.5,
++        seed=2,
++        dtype=np.float32,
++    )
++    distance = Distance(metric="wasserstein")
++    df32 = distance.pairwise(base, "group")
++    base64 = base.copy()
++    base64.obsm["X_pca"] = base.obsm["X_pca"].astype(np.float64)
++    df64 = distance.pairwise(base64, "group")
++    np.testing.assert_allclose(df32.values, df64.values, rtol=1e-5, atol=1e-5)
++
++
++def test_high_dimensional_embedding() -> None:
++    """pairwise with a large feature dim (D >> FEAT_TILE) builds the cost and
++    matches the reference. The fused cost kernel streams features, so shared
++    memory stays bounded regardless of D -- the previous full-D cache overflowed
++    the per-block shared-memory limit for large D (e.g. raw-feature layers)."""
++    D, cpg = 2048, 20
++    adata = _make_grouped_adata(
++        n_groups=3,
++        cells_per_group=cpg,
++        n_features=D,
++        shift=0.3,
++        seed=4,
++        dtype=np.float64,
++    )
++    df = Distance(metric="wasserstein").pairwise(adata, "group")  # -> build_cost
++    X = adata.obsm["X_pca"]
++    for i in range(3):
++        for j in range(i + 1, 3):
++            Xi, Xj = X[i * cpg : (i + 1) * cpg], X[j * cpg : (j + 1) * cpg]
++            ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
++            np.testing.assert_allclose(df.iloc[i, j], ref, rtol=1e-4, atol=1e-4)
++
++
++def test_layer_key_matches_reference() -> None:
++    rng = np.random.default_rng(7)
++    ng, cpg, nf = 3, 15, 6
++    data = rng.normal(size=(ng * cpg, nf)).astype(np.float64)
++    labels = [f"g{i}" for i in range(ng) for _ in range(cpg)]
++    obs = pd.DataFrame(
++        {"group": pd.Categorical(labels, categories=[f"g{i}" for i in range(ng)])}
++    )
++    adata = AnnData(np.zeros((ng * cpg, nf), np.float32), obs=obs)
++    adata.layers["counts"] = data
++    df = Distance(metric="wasserstein", layer_key="counts").pairwise(adata, "group")
++    Xi, Xj = data[:cpg], data[cpg : 2 * cpg]
++    ref = _cpu_sinkhorn(Xi, Xj, eps=_auto_eps(Xi, Xj))
++    np.testing.assert_allclose(df.loc["g0", "g1"], ref, rtol=1e-4, atol=1e-4)
++
++
++def test_pairwise_output_format_and_axioms() -> None:
++    adata = _make_grouped_adata(
++        n_groups=4,
++        cells_per_group=20,
++        n_features=8,
++        shift=1.5,
++        seed=3,
++        dtype=np.float64,
++    )
++    df = Distance(metric="wasserstein").pairwise(adata, "group")
++    assert list(df.index) == list(df.columns) == [f"g{i}" for i in range(4)]
++    assert df.index.name == "group" and df.columns.name == "group"
++    np.testing.assert_allclose(np.diag(df.values), 0.0, atol=1e-8)  # definiteness
++    np.testing.assert_allclose(df.values, df.values.T, atol=1e-6)  # symmetry
++    assert np.all(df.values[~np.eye(4, dtype=bool)] > 0)  # positivity (distinct groups)
++
++
++def test_groups_filter_values_match_full() -> None:
++    adata = _make_grouped_adata(n_groups=5, cells_per_group=15, n_features=5, seed=7)
++    distance = Distance(metric="wasserstein")
++    full = distance.pairwise(adata, "group")
++    sub = distance.pairwise(adata, "group", groups=["g0", "g2", "g4"])
++    for a in ["g0", "g2", "g4"]:
++        for b in ["g0", "g2", "g4"]:
++            np.testing.assert_allclose(
++                sub.loc[a, b], full.loc[a, b], rtol=1e-4, atol=1e-4
++            )
++
++
++def test_onesided_invalid_group_raises() -> None:
++    adata = _make_grouped_adata(n_groups=3, cells_per_group=10)
++    with pytest.raises(ValueError):
++        Distance(metric="wasserstein").onesided_distances(
++            adata, "group", selected_group="nope"
++        )
++
++
++def test_unused_categories_and_singletons() -> None:
++    """Zero-cell (unused) categories are dropped; a single-cell group still
++    works; requesting a group with no cells raises."""
++    rng = np.random.default_rng(0)
++    sizes = {"g0": 15, "g1": 1, "g2": 15}  # g1 is a singleton
++    blocks, labels = [], []
++    for i, (g, n) in enumerate(sizes.items()):
++        blocks.append((rng.normal(size=(n, 6)) + i).astype(np.float32))
++        labels += [g] * n
++    X = np.vstack(blocks)
++    # categorical also lists 'gZ', which has zero cells (unused)
++    obs = pd.DataFrame(
++        {"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}
++    )
++    adata = AnnData(X.copy(), obs=obs)
++    adata.obsm["X_pca"] = X.copy()
++    distance = Distance(metric="wasserstein")
++    df = distance.pairwise(adata, "group")
++    assert list(df.index) == ["g0", "g1", "g2"]  # unused 'gZ' dropped
++    assert np.all(np.isfinite(df.values))  # singleton 'g1' handled
++    np.testing.assert_allclose(np.diag(df.values), 0.0, atol=1e-8)
++    with pytest.raises(ValueError):  # requesting a zero-cell group
++        distance.pairwise(adata, "group", groups=["g0", "gZ"])
++
++
++def test_call_api_basic_and_cupy() -> None:
++    adata = _make_grouped_adata(n_groups=3, cells_per_group=15, seed=8)
++    distance = Distance(metric="wasserstein")
++    X = adata.obsm["X_pca"][:15]
++    Y = adata.obsm["X_pca"][15:30]
++    d_np = distance(X, Y)
++    assert isinstance(d_np, float) and np.isfinite(d_np)
++    d_cp = distance(cp.asarray(X), cp.asarray(Y))
++    np.testing.assert_allclose(d_np, d_cp, rtol=1e-5, atol=1e-5)
++
++
++def test_call_and_bootstrap_input_handling() -> None:
++    distance = Distance(metric="wasserstein")
++    rng = np.random.default_rng(0)
++    X = rng.normal(size=(20, 6)).astype(np.float32)
++    Y = rng.normal(size=(25, 6)).astype(
++        np.float64
++    )  # different dtype -> cast internally
++    assert np.isfinite(distance(X, Y))
++    assert distance.bootstrap(X, Y, n_bootstrap=10, random_state=0).variance >= 0
++    with pytest.raises(ValueError):  # empty input
++        distance(X[:0], Y)
++    with pytest.raises(ValueError):
++        distance.bootstrap(X[:0], Y, n_bootstrap=5)
++
++
++def test_contrast_self_distance_zero_and_no_split() -> None:
++    rng = np.random.default_rng(9)
++    n = 12
++    emb = rng.normal(size=(n * 2, 5)).astype(np.float32)
++    obs = pd.DataFrame({"treatment": pd.Categorical(["ctrl"] * n + ["drugA"] * n)})
++    adata = AnnData(emb.copy(), obs=obs)
++    adata.obsm["X_pca"] = emb.copy()
++    distance = Distance(metric="wasserstein")
++    contrasts = Distance.create_contrasts(
++        adata, groupby="treatment", selected_group="ctrl"
++    )
++    res = distance.contrast_distances(adata, contrasts=contrasts)
++    assert len(res) == 1 and np.all(np.isfinite(res["wasserstein"].values))
++    self_c = pd.DataFrame({"treatment": ["ctrl"], "reference": ["ctrl"]})
++    res0 = distance.contrast_distances(adata, contrasts=self_c)
++    assert res0["wasserstein"].iloc[0] == pytest.approx(0.0, abs=1e-7)
++
++
++def test_contrast_distances_with_split_by() -> None:
++    rng = np.random.default_rng(9)
++    n = 12
++    emb = rng.normal(size=(n * 4, 5)).astype(np.float32)
++    obs = pd.DataFrame(
++        {
++            "treatment": pd.Categorical(
++                ["ctrl"] * n + ["drugA"] * n + ["ctrl"] * n + ["drugA"] * n
++            ),
++            "celltype": pd.Categorical(["T"] * n * 2 + ["B"] * n * 2),
++        }
++    )
++    adata = AnnData(emb.copy(), obs=obs)
++    adata.obsm["X_pca"] = emb.copy()
++    distance = Distance(metric="wasserstein")
++    contrasts = Distance.create_contrasts(
++        adata, groupby="treatment", selected_group="ctrl", split_by="celltype"
++    )
++    res = distance.contrast_distances(adata, contrasts=contrasts)
++    assert "wasserstein" in res.columns and len(res) == 2
++    assert np.all(np.isfinite(res["wasserstein"].values))
++
++
++requires_2_gpus = pytest.mark.skipif(
++    cp.cuda.runtime.getDeviceCount() < 2,
++    reason="multi-GPU test requires >= 2 GPUs",
++)
++
++
++@requires_2_gpus
++def test_distance_wasserstein_multi_gpu_pairwise_matches_single() -> None:
++    """Splitting pairs across GPUs must give the same result as one GPU.
++
++    Convergence is decided per pair (inside the fused kernel), so the result is
++    independent of how pairs are split across devices — bitwise identical here.
++    """
++    adata = _make_grouped_adata(n_groups=8, cells_per_group=40, n_features=10, seed=11)
++    distance = Distance(metric="wasserstein")
++    df1 = distance.pairwise(adata, groupby="group", multi_gpu=False)
++    df2 = distance.pairwise(adata, groupby="group", multi_gpu=[0, 1])
++    np.testing.assert_allclose(df2.values, df1.values, rtol=1e-5, atol=1e-5)
++
++
++@requires_2_gpus
++def test_distance_wasserstein_multi_gpu_onesided_matches_single() -> None:
++    adata = _make_grouped_adata(n_groups=6, cells_per_group=40, n_features=8, seed=12)
++    distance = Distance(metric="wasserstein")
++    s1 = distance.onesided_distances(
++        adata, groupby="group", selected_group="g0", multi_gpu=False
++    )
++    s2 = distance.onesided_distances(
++        adata, groupby="group", selected_group="g0", multi_gpu=[0, 1]
++    )
++    np.testing.assert_allclose(s2.values, s1.values, rtol=1e-5, atol=1e-5)
++
++
++@requires_2_gpus
++def test_distance_wasserstein_multi_gpu_contrast_matches_single() -> None:
++    adata = _make_grouped_adata(n_groups=6, cells_per_group=30, n_features=6, seed=13)
++    distance = Distance(metric="wasserstein")
++    contrasts = Distance.create_contrasts(adata, groupby="group", selected_group="g0")
++    r1 = distance.contrast_distances(adata, contrasts=contrasts, multi_gpu=False)
++    r2 = distance.contrast_distances(adata, contrasts=contrasts, multi_gpu=[0, 1])
++    np.testing.assert_allclose(
++        r2["wasserstein"].values, r1["wasserstein"].values, rtol=1e-5, atol=1e-5
++    )
+diff --git a/tests/pertpy/test_distances.py b/tests/pertpy/test_distances.py
+index f679f6421..19dddb432 100644
+--- a/tests/pertpy/test_distances.py
++++ b/tests/pertpy/test_distances.py
+@@ -44,6 +44,25 @@ def test_distance_class_initialization() -> None:
+     assert distance_custom.obsm_key == "X_custom"
+ 
+ 
++def test_unused_categories_dropped() -> None:
++    """A zero-cell (unused) category in groupby is dropped, not kept as a NaN
++    group (shared subsetting on BaseMetric handles this for all metrics)."""
++    rng = np.random.default_rng(0)
++    cpg, nf = 15, 5
++    X = np.vstack(
++        [(rng.normal(size=(cpg, nf)) + i).astype(np.float32) for i in range(3)]
++    )
++    labels = [c for c in ["g0", "g1", "g2"] for _ in range(cpg)]
++    obs = pd.DataFrame(
++        {"group": pd.Categorical(labels, categories=["g0", "g1", "g2", "gZ"])}
++    )
++    adata = AnnData(X.copy(), obs=obs)
++    adata.obsm["X_pca"] = cp.asarray(X, dtype=cp.float32)
++    df = Distance(metric="edistance").pairwise(adata, groupby="group")
++    assert list(df.index) == ["g0", "g1", "g2"]  # unused 'gZ' dropped
++    assert np.all(np.isfinite(df.values))
++
++
+ def test_distance_class_invalid_metric() -> None:
+     """Test Distance class raises error for unsupported metrics."""
+     with pytest.raises(ValueError, match="Unknown metric"):

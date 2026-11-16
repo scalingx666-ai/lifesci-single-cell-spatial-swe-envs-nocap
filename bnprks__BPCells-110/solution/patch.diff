@@ -1,0 +1,593 @@
+diff --git a/.gitignore b/.gitignore
+index 65faa488..99b02342 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,7 +25,7 @@ tools/*.exe
+ vignettes/*.html
+ vignettes/pbmc-3k-data
+ cpp-tests
+-
++*.Rproj
+ 
+ # A few convenience igores for my development cruft
+ failing_test.R
+@@ -33,4 +33,4 @@ mytest*.R
+ .clang-format
+ .dockerignore
+ .lintr
+-bench/
+\ No newline at end of file
++bench/
+diff --git a/r/NAMESPACE b/r/NAMESPACE
+index a56ec6dc..bc1af31f 100644
+--- a/r/NAMESPACE
++++ b/r/NAMESPACE
+@@ -86,6 +86,7 @@ export(read_gencode_genes)
+ export(read_gencode_transcripts)
+ export(read_gtf)
+ export(read_ucsc_chrom_sizes)
++export(regress_out)
+ export(rotate_x_labels)
+ export(rowMaxs)
+ export(rowMaxs.IterableMatrix)
+diff --git a/r/NEWS.md b/r/NEWS.md
+index 8c9aadbc..25f7a978 100644
+--- a/r/NEWS.md
++++ b/r/NEWS.md
+@@ -15,6 +15,8 @@ Contributions welcome :)
+ - Add `rowMaxs()` and `colMaxs()` functions, which return the maximum value in each row or column of a matrix. 
+   If `matrixStats` or `MatrixGenerics` packages are installed, `BPCells::rowMaxs()` will fall back to their implementations for non-BPCells objects.
+   Thanks to @immanuelazn for their first contribution as a new lab hire!
++- `regress_out()` now allows removing unwanted sources of variation via least squares linear regression models.
++  Thanks to @ycli1995 for pull request #110
+ 
+ ## Bug-fixes
+ - Fixed error message when a matrix is too large to be converted to dgCMatrix (Thanks to @RookieA1 for reporting issue #95)
+diff --git a/r/R/RcppExports.R b/r/R/RcppExports.R
+index 182ce0b4..56c7a8b2 100644
+--- a/r/R/RcppExports.R
++++ b/r/R/RcppExports.R
+@@ -525,6 +525,10 @@ iterate_matrix_sctransform_pearson_transpose_simd_cpp <- function(matrix, cell_p
+     .Call(`_BPCells_iterate_matrix_sctransform_pearson_transpose_simd_cpp`, matrix, cell_params, gene_params, global_params)
+ }
+ 
++iterate_matrix_linear_residual_cpp <- function(matrix, row_params, col_params) {
++    .Call(`_BPCells_iterate_matrix_linear_residual_cpp`, matrix, row_params, col_params)
++}
++
+ iterate_matrix_scale_cpp <- function(matrix, row_scale, col_scale) {
+     .Call(`_BPCells_iterate_matrix_scale_cpp`, matrix, row_scale, col_scale)
+ }
+diff --git a/r/R/transforms.R b/r/R/transforms.R
+index ac858675..2a5de994 100644
+--- a/r/R/transforms.R
++++ b/r/R/transforms.R
+@@ -812,3 +812,114 @@ multiply_cols <- function(mat, vec) {
+   assert_true(length(vec) == ncol(mat))
+   t(t(mat) * vec)
+ }
++
++
++
++#################
++# Linear residual
++#################
++
++setClass("TransformLinearResidual",
++  contains = "TransformedMatrix",
++  slots = c(
++    vars_to_regress = "character"
++  ),
++  prototype = list(
++    vars_to_regress = character()
++  )
++)
++setMethod("iterate_matrix", "TransformLinearResidual", function(x) {
++  res <- iterate_matrix(x@matrix)
++  
++  if (any(nrow(x@row_params) == 0, nrow(x@col_params) == 0)) {
++    return(res)
++  }
++  iterate_matrix_linear_residual_cpp(res, x@row_params, x@col_params)
++})
++setMethod("short_description", "TransformLinearResidual", function(x) {
++  # Return multiple lines, one for each transform active
++  res <- short_description(x@matrix)
++  if (any(nrow(x@row_params) == 0, nrow(x@col_params) == 0)) {
++    res <- c(res, sprintf("Regress out 0 variables"))
++    return(res)
++  }
++  res <- c(res, sprintf(
++    "Regress out %d variable(s): %s", length(x@vars_to_regress), 
++    pretty_print_vector(x@vars_to_regress)
++  ))
++  res
++})
++
++#' Regress out unwanted variation
++#'
++#' Regress out the effects of confounding variables using a linear least squares regression model. 
++#'
++#' @details Conceptually, `regress_out` calculates a linear least squares best fit model for each row of the matrix. 
++#' (Or column if `prediction_axis` is `"col"`).
++#' The input data for each regression model are the columns of `latent_data`, and each model tries to 
++#' predict the values in the corresponding row (or column) of `mat`. After fitting each model, `regress_out`
++#' will subtract the model predictions from the input values, aiming to only retain effects that are
++#' not explained by the variables in `latent_data`.
++#'
++#' These models can be fit efficiently since they all share the same input data and so most of the 
++#' calculations for the closed-form best fit solution are shared. A QR factorization of the
++#' model matrix and a dense matrix-vector multiply are sufficient to fully calculate the residual values.
++#'
++#' *Efficiency considerations*: As the output matrix is dense rather than sparse, mean and variance calculations may
++#' run comparatively slowly. However, PCA and matrix/vector multiply operations can be performed at nearly the same
++#' cost as the input matrix due to mathematical simplifications. Memory usage scales with `n_features * ((nrow(mat) + ncol(mat))`.
++#' Generally, `n_features == ncol(latent_data)`, but for categorical variables in `latent_data`, each 
++#' category will be expanded into its own indicator variable. Memory usage will therefore be higher when
++#' using categorical input variables with many (i.e. >100) distinct values.
++#'
++#' @param mat Input IterableMatrix
++#' @param latent_data Data to regress out, as a `data.frame` where each column is a 
++#' variable to regress out.
++#' @param prediction_axis Which axis corresponds to prediction outputs from the linear models 
++#' (e.g. the gene axis in typical single cell analysis). Options include "row" (default) and "col". 
++#'
++#' @return IterableMatrix 
++#' @export
++regress_out <- function(mat, latent_data, prediction_axis = c("row", "col")) {
++  prediction_axis <- match.arg(prediction_axis)
++  assert_is(mat, "IterableMatrix")
++  assert_is(latent_data, "data.frame")
++  assert_true(ncol(latent_data) > 0)
++  if (prediction_axis == "row") {
++    assert_true(nrow(latent_data) == ncol(mat))
++  } else {
++    assert_true(nrow(latent_data) == nrow(mat))
++  }
++  vars_to_regress <- colnames(latent_data)
++  fmla <- as.formula(paste("~", paste(vars_to_regress, collapse="+")))
++  model_mat <- model.matrix(fmla, data = latent_data)
++  Q <- qr.Q(qr(model_mat))
++  
++  if (prediction_axis == "row") {
++    # val = t(t(X) - Q %*% Qty) = X - t(row_params) %*% col_params
++    col_params <- t(Q)
++    row_params <- col_params %*% t(mat)
++  } else {
++    # val = X - Q %*% Qty
++    row_params <- t(Q)
++    col_params <- row_params %*% mat ## col_params = Qty
++  }
++  
++  if (storage_order(mat) == "row") {
++    # The math works basically identically when transposed, so just swap parameters
++    tmp <- row_params
++    row_params <- col_params
++    col_params <- tmp
++  }
++  
++  if (!inherits(row_params, "matrix")) row_params <- as.matrix(row_params)
++  if (!inherits(col_params, "matrix")) col_params <- as.matrix(col_params)
++  wrapMatrix(
++    "TransformLinearResidual", 
++    convert_matrix_type(mat, "double"),
++    row_params = row_params,
++    col_params = col_params,
++    global_params = numeric(),
++    vars_to_regress = vars_to_regress
++  )
++}
+diff --git a/r/man/regress_out.Rd b/r/man/regress_out.Rd
+new file mode 100644
+index 00000000..8d8e7148
+--- /dev/null
++++ b/r/man/regress_out.Rd
+@@ -0,0 +1,42 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/transforms.R
++\name{regress_out}
++\alias{regress_out}
++\title{Regress out unwanted variation}
++\usage{
++regress_out(mat, latent_data, prediction_axis = c("row", "col"))
++}
++\arguments{
++\item{mat}{Input IterableMatrix}
++
++\item{latent_data}{Data to regress out, as a \code{data.frame} where each column is a
++variable to regress out.}
++
++\item{prediction_axis}{Which axis corresponds to prediction outputs from the linear models
++(e.g. the gene axis in typical single cell analysis). Options include "row" (default) and "col".}
++}
++\value{
++IterableMatrix
++}
++\description{
++Regress out the effects of confounding variables using a linear least squares regression model.
++}
++\details{
++Conceptually, \code{regress_out} calculates a linear least squares best fit model for each row of the matrix.
++(Or column if \code{prediction_axis} is \code{"col"}).
++The input data for each regression model are the columns of \code{latent_data}, and each model tries to
++predict the values in the corresponding row (or column) of \code{mat}. After fitting each model, \code{regress_out}
++will subtract the model predictions from the input values, aiming to only retain effects that are
++not explained by the variables in \code{latent_data}.
++
++These models can be fit efficiently since they all share the same input data and so most of the
++calculations for the closed-form best fit solution are shared. A QR factorization of the
++model matrix and a dense matrix-vector multiply are sufficient to fully calculate the residual values.
++
++\emph{Efficiency considerations}: As the output matrix is dense rather than sparse, mean and variance calculations may
++run comparatively slowly. However, PCA and matrix/vector multiply operations can be performed at nearly the same
++cost as the input matrix due to mathematical simplifications. Memory usage scales with \verb{n_features * ((nrow(mat) + ncol(mat))}.
++Generally, \code{n_features == ncol(latent_data)}, but for categorical variables in \code{latent_data}, each
++category will be expanded into its own indicator variable. Memory usage will therefore be higher when
++using categorical input variables with many (i.e. >100) distinct values.
++}
+diff --git a/r/pkgdown/_pkgdown.yml b/r/pkgdown/_pkgdown.yml
+index 666809ac..3ce3735e 100644
+--- a/r/pkgdown/_pkgdown.yml
++++ b/r/pkgdown/_pkgdown.yml
+@@ -116,6 +116,7 @@ reference:
+   - all_matrix_inputs
+   - checksum
+   - apply_by_row
++  - regress_out
+   - IterableMatrix-methods
+ 
+ - title: "Reference Annotations"
+diff --git a/r/src/Makevars.in b/r/src/Makevars.in
+index ea85ecb2..6cfd241c 100644
+--- a/r/src/Makevars.in
++++ b/r/src/Makevars.in
+@@ -42,6 +42,7 @@ bpcells-cpp/matrixIterators/MatrixStats.o \
+ bpcells-cpp/matrixIterators/MatrixMarketImport.o \
+ bpcells-cpp/matrixIterators/SVD.o \
+ bpcells-cpp/matrixTransforms/Binarize.o \
++bpcells-cpp/matrixTransforms/LinearResidual.o \
+ bpcells-cpp/matrixTransforms/Log1p.o \
+ bpcells-cpp/matrixTransforms/Min.o \
+ bpcells-cpp/matrixTransforms/MatrixTransform.o \
+diff --git a/r/src/RcppExports.cpp b/r/src/RcppExports.cpp
+index 0a56518e..0488cc5e 100644
+--- a/r/src/RcppExports.cpp
++++ b/r/src/RcppExports.cpp
+@@ -1795,6 +1795,19 @@ BEGIN_RCPP
+     return rcpp_result_gen;
+ END_RCPP
+ }
++// iterate_matrix_linear_residual_cpp
++SEXP iterate_matrix_linear_residual_cpp(SEXP matrix, Eigen::Map<Eigen::ArrayXXd> row_params, Eigen::Map<Eigen::ArrayXXd> col_params);
++RcppExport SEXP _BPCells_iterate_matrix_linear_residual_cpp(SEXP matrixSEXP, SEXP row_paramsSEXP, SEXP col_paramsSEXP) {
++BEGIN_RCPP
++    Rcpp::RObject rcpp_result_gen;
++    Rcpp::RNGScope rcpp_rngScope_gen;
++    Rcpp::traits::input_parameter< SEXP >::type matrix(matrixSEXP);
++    Rcpp::traits::input_parameter< Eigen::Map<Eigen::ArrayXXd> >::type row_params(row_paramsSEXP);
++    Rcpp::traits::input_parameter< Eigen::Map<Eigen::ArrayXXd> >::type col_params(col_paramsSEXP);
++    rcpp_result_gen = Rcpp::wrap(iterate_matrix_linear_residual_cpp(matrix, row_params, col_params));
++    return rcpp_result_gen;
++END_RCPP
++}
+ // iterate_matrix_scale_cpp
+ SEXP iterate_matrix_scale_cpp(SEXP matrix, Eigen::Map<Eigen::ArrayXXd> row_scale, Eigen::Map<Eigen::ArrayXXd> col_scale);
+ RcppExport SEXP _BPCells_iterate_matrix_scale_cpp(SEXP matrixSEXP, SEXP row_scaleSEXP, SEXP col_scaleSEXP) {
+@@ -2594,6 +2607,7 @@ static const R_CallMethodDef CallEntries[] = {
+     {"_BPCells_iterate_matrix_sctransform_pearson_transpose_cpp", (DL_FUNC) &_BPCells_iterate_matrix_sctransform_pearson_transpose_cpp, 4},
+     {"_BPCells_iterate_matrix_sctransform_pearson_simd_cpp", (DL_FUNC) &_BPCells_iterate_matrix_sctransform_pearson_simd_cpp, 4},
+     {"_BPCells_iterate_matrix_sctransform_pearson_transpose_simd_cpp", (DL_FUNC) &_BPCells_iterate_matrix_sctransform_pearson_transpose_simd_cpp, 4},
++    {"_BPCells_iterate_matrix_linear_residual_cpp", (DL_FUNC) &_BPCells_iterate_matrix_linear_residual_cpp, 3},
+     {"_BPCells_iterate_matrix_scale_cpp", (DL_FUNC) &_BPCells_iterate_matrix_scale_cpp, 3},
+     {"_BPCells_iterate_matrix_row_shift_cpp", (DL_FUNC) &_BPCells_iterate_matrix_row_shift_cpp, 2},
+     {"_BPCells_iterate_matrix_col_shift_cpp", (DL_FUNC) &_BPCells_iterate_matrix_col_shift_cpp, 2},
+diff --git a/r/src/bpcells-cpp/matrixTransforms/LinearResidual.cpp b/r/src/bpcells-cpp/matrixTransforms/LinearResidual.cpp
+new file mode 100644
+index 00000000..44995403
+--- /dev/null
++++ b/r/src/bpcells-cpp/matrixTransforms/LinearResidual.cpp
+@@ -0,0 +1,60 @@
++// Copyright 2024 BPCells contributors
++// 
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++#include "LinearResidual.h"
++#include <atomic>
++
++namespace BPCells {
++
++bool LinearResidual::loadZeroSubtracted(MatrixLoader<double> &loader) {
++    return loader.load();
++}
++
++void LinearResidual::loadZero(
++    double *values, uint32_t count, uint32_t start_row, uint32_t col
++) {
++    Eigen::Map<Eigen::VectorXd> values_vec(values, count);
++    // For prediction_axis == "row" (default)
++    // col_params = t(Q)
++    // row_params = Qty
++    // val = X - t(Qty) %*% t(Q)
++    // val = X - t(row_params) %*% col_params
++    values_vec = -fit.row_params.middleCols(start_row, count).matrix().transpose() * 
++      fit.col_params.col(col).matrix();
++}
++
++Eigen::MatrixXd LinearResidual::denseMultiplyRight(
++    const Eigen::Map<Eigen::MatrixXd> B, std::atomic<bool> *user_interrupt
++) {
++    Eigen::MatrixXd res = loader->denseMultiplyRight(B, user_interrupt);
++    res -= fit.row_params.matrix().transpose() * (fit.col_params.matrix() * B);
++    return res;
++}
++Eigen::MatrixXd LinearResidual::denseMultiplyLeft(
++    const Eigen::Map<Eigen::MatrixXd> B, std::atomic<bool> *user_interrupt
++) {
++    Eigen::MatrixXd res = loader->denseMultiplyLeft(B, user_interrupt);
++    res -= (B * fit.row_params.matrix().transpose()) * fit.col_params.matrix();
++    return res;
++}
++Eigen::VectorXd LinearResidual::vecMultiplyRight(
++    const Eigen::Map<Eigen::VectorXd> v, std::atomic<bool> *user_interrupt
++) {
++    Eigen::VectorXd res = loader->vecMultiplyRight(v, user_interrupt);
++    res -= fit.row_params.matrix().transpose() * (fit.col_params.matrix() * v);
++    return res;
++}
++Eigen::VectorXd LinearResidual::vecMultiplyLeft(
++    const Eigen::Map<Eigen::VectorXd> v, std::atomic<bool> *user_interrupt
++) {
++    Eigen::VectorXd res = loader->vecMultiplyLeft(v, user_interrupt);
++    res -= (v.transpose() * fit.row_params.matrix().transpose()) * fit.col_params.matrix();
++    return res;
++}
++
++} // namespace BPCells
+diff --git a/r/src/bpcells-cpp/matrixTransforms/LinearResidual.h b/r/src/bpcells-cpp/matrixTransforms/LinearResidual.h
+new file mode 100644
+index 00000000..39aa5016
+--- /dev/null
++++ b/r/src/bpcells-cpp/matrixTransforms/LinearResidual.h
+@@ -0,0 +1,38 @@
++// Copyright 2024 BPCells contributors
++// 
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++#pragma once
++
++#include <atomic>
++#include "MatrixTransform.h"
++
++namespace BPCells {
++
++// Get linear residuals using QR decomposition
++class LinearResidual : public MatrixTransformDense {
++public:
++    using MatrixTransformDense::MatrixTransformDense;
++
++    bool loadZeroSubtracted(MatrixLoader<double> &loader) override;
++    void loadZero(double *values, uint32_t count, uint32_t start_row, uint32_t col) override;
++
++    Eigen::MatrixXd denseMultiplyRight(
++        const Eigen::Map<Eigen::MatrixXd> B, std::atomic<bool> *user_interrupt = NULL
++    ) override;
++    Eigen::MatrixXd denseMultiplyLeft(
++        const Eigen::Map<Eigen::MatrixXd> B, std::atomic<bool> *user_interrupt = NULL
++    ) override;
++    Eigen::VectorXd vecMultiplyRight(
++        const Eigen::Map<Eigen::VectorXd> v, std::atomic<bool> *user_interrupt = NULL
++    ) override;
++    Eigen::VectorXd vecMultiplyLeft(
++        const Eigen::Map<Eigen::VectorXd> v, std::atomic<bool> *user_interrupt = NULL
++    ) override;
++};
++
++} // namespace BPCells
+diff --git a/r/src/matrix_transforms.cpp b/r/src/matrix_transforms.cpp
+index 130139e0..e37aa4f4 100644
+--- a/r/src/matrix_transforms.cpp
++++ b/r/src/matrix_transforms.cpp
+@@ -18,6 +18,7 @@
+ #include "bpcells-cpp/matrixTransforms/Pow.h"
+ #include "bpcells-cpp/matrixTransforms/Round.h"
+ #include "bpcells-cpp/matrixTransforms/SCTransform.h"
++#include "bpcells-cpp/matrixTransforms/LinearResidual.h"
+ #include "bpcells-cpp/matrixTransforms/Scale.h"
+ #include "bpcells-cpp/matrixTransforms/Shift.h"
+ 
+@@ -159,6 +160,15 @@ SEXP iterate_matrix_sctransform_pearson_transpose_simd_cpp(
+     );
+ }
+ 
++// [[Rcpp::export]]
++SEXP iterate_matrix_linear_residual_cpp(
++    SEXP matrix, Eigen::Map<Eigen::ArrayXXd> row_params, Eigen::Map<Eigen::ArrayXXd> col_params
++) {
++    return make_unique_xptr<LinearResidual>(
++        take_unique_xptr<MatrixLoader<double>>(matrix), TransformFit{row_params, col_params}
++    );
++}
++
+ // [[Rcpp::export]]
+ SEXP iterate_matrix_scale_cpp(
+     SEXP matrix, Eigen::Map<Eigen::ArrayXXd> row_scale, Eigen::Map<Eigen::ArrayXXd> col_scale
+diff --git a/r/tests/testthat/test-matrix_transforms.R b/r/tests/testthat/test-matrix_transforms.R
+index 28881ab5..385605e0 100644
+--- a/r/tests/testthat/test-matrix_transforms.R
++++ b/r/tests/testthat/test-matrix_transforms.R
+@@ -298,3 +298,51 @@ test_that("sctransform works", {
+         }
+     }
+ })
++
++test_that("linear regression works", {
++    nrow <- 5
++    ncol <- 30
++
++    m0 <- generate_sparse_matrix(nrow, ncol, max_val = 10)
++    m <- as(m0, "IterableMatrix")
++    mt <- t(as(t(m0), "IterableMatrix"))
++    latent_data <- data.frame(
++        nUMI = colSums(m),
++        group = as.factor(sample(1:5, ncol, replace = TRUE)),
++        random = runif(ncol),
++        gene1 = m0[3, ]
++    )
++    # Calculate residuals manually
++    # This is less efficient than calculating the QR once and using qr.resid, but
++    # it's a bit more foolproof for our reference answer
++    ans <- matrix(nrow = nrow, ncol = ncol)
++    for (i in seq_len(nrow)) {
++        regression_data <- cbind(latent_data, m0[i, ])
++        colnames(regression_data) <- c(colnames(latent_data), "y")
++        fmla <- fmla <- as.formula(paste("y ~", paste(colnames(latent_data), collapse="+")))
++        ans[i,] <- lm(fmla, regression_data)$residuals
++    }
++    m1 <- regress_out(m, latent_data = latent_data)
++    m1t <- regress_out(mt, latent_data = latent_data)
++    expect_equal(as(m1, "matrix"), ans)
++    expect_equal(as(m1t, "matrix"), ans)
++    
++    # Also test when the predicted variables are in the columns.
++    latent_data <- data.frame(
++        nUMI = rowSums(m),
++        group = as.factor(sample(1:5, nrow, replace = TRUE)),
++        random = runif(nrow),
++        cell1 = m0[, 4]
++    )
++    ans <- matrix(nrow = nrow, ncol = ncol)
++    for (i in seq_len(ncol)) {
++        regression_data <- cbind(latent_data, m0[, i])
++        colnames(regression_data) <- c(colnames(latent_data), "y")
++        fmla <- fmla <- as.formula(paste("y ~", paste(colnames(latent_data), collapse="+")))
++        ans[, i] <- lm(fmla, regression_data)$residuals
++    }
++    m1 <- regress_out(m, latent_data = latent_data, prediction_axis = "col")
++    m1t <- regress_out(mt, latent_data = latent_data, prediction_axis = "col")
++    expect_equal(as(m1, "matrix"), ans)
++    expect_equal(as(m1t, "matrix"), ans)
++})
+diff --git a/r/tests/testthat/test-matrix_utils.R b/r/tests/testthat/test-matrix_utils.R
+index 3060713f..f3cdb09c 100644
+--- a/r/tests/testthat/test-matrix_utils.R
++++ b/r/tests/testthat/test-matrix_utils.R
+@@ -408,54 +408,54 @@ test_that("Transposing a 0 dimension matrix works", {
+ })
+ 
+ # Test dense multiplication ops given dgCMatrix m1 and equivalent iterable matrix i1
+-test_dense_multiply_ops <- function(m1, i1, inner_dim=12) {
++test_dense_multiply_ops <- function(m1, i1, inner_dim=12, test_func = expect_identical) {
+   withr::local_seed(195123) 
+   m2 <- t(m1)
+   i2 <- t(i1)
+   b1 <- generate_dense_matrix(nrow(m1), inner_dim)
+   b2 <- generate_dense_matrix(ncol(m1), inner_dim)
+ 
+-  expect_identical(to_matrix(t(b1) %*% m1), t(b1) %*% i1)
+-  expect_identical(to_matrix(m2 %*% b1), i2 %*% b1)
++  test_func(to_matrix(t(b1) %*% m1), t(b1) %*% i1)
++  test_func(to_matrix(m2 %*% b1), i2 %*% b1)
+ 
+-  expect_identical(to_matrix(t(m1) %*% b1), t(i1) %*% b1)
+-  expect_identical(to_matrix(t(b1) %*% t(m2)), t(b1) %*% t(i2))
++  test_func(to_matrix(t(m1) %*% b1), t(i1) %*% b1)
++  test_func(to_matrix(t(b1) %*% t(m2)), t(b1) %*% t(i2))
+ 
+-  expect_identical(to_matrix(t(b2) %*% m2), t(b2) %*% i2)
+-  expect_identical(to_matrix(m1 %*% b2), i1 %*% b2)
++  test_func(to_matrix(t(b2) %*% m2), t(b2) %*% i2)
++  test_func(to_matrix(m1 %*% b2), i1 %*% b2)
+ 
+-  expect_identical(to_matrix(t(m2) %*% b2), t(i2) %*% b2)
+-  expect_identical(to_matrix(t(b2) %*% t(m1)), t(b2) %*% t(i1))
++  test_func(to_matrix(t(m2) %*% b2), t(i2) %*% b2)
++  test_func(to_matrix(t(b2) %*% t(m1)), t(b2) %*% t(i1))
+ 
+   y1 <- as.numeric(generate_dense_matrix(nrow(m1), 1))
+   y2 <- as.numeric(generate_dense_matrix(ncol(m1), 1))
+-  expect_identical(y1 %*% as.matrix(m1), y1 %*% i1)
+-  expect_identical(as.matrix(m2) %*% y1, i2 %*% y1)
++  test_func(y1 %*% as.matrix(m1), y1 %*% i1)
++  test_func(as.matrix(m2) %*% y1, i2 %*% y1)
+ 
+-  expect_identical(y2 %*% as.matrix(m2), y2 %*% i2)
+-  expect_identical(as.matrix(m1) %*% y2, i1 %*% y2)
++  test_func(y2 %*% as.matrix(m2), y2 %*% i2)
++  test_func(as.matrix(m1) %*% y2, i1 %*% y2)
+ 
+   # Check that everything works fine with integers
+   i3 <- convert_matrix_type(i1, "uint32_t")
+   i4 <- convert_matrix_type(i2, "uint32_t")
+ 
+-  expect_identical(to_matrix(t(b1) %*% m1), t(b1) %*% i3)
+-  expect_identical(to_matrix(m2 %*% b1), i4 %*% b1)
++  test_func(to_matrix(t(b1) %*% m1), t(b1) %*% i3)
++  test_func(to_matrix(m2 %*% b1), i4 %*% b1)
+ 
+-  expect_identical(to_matrix(t(m1) %*% b1), t(i3) %*% b1)
+-  expect_identical(to_matrix(t(b1) %*% t(m2)), t(b1) %*% t(i4))
++  test_func(to_matrix(t(m1) %*% b1), t(i3) %*% b1)
++  test_func(to_matrix(t(b1) %*% t(m2)), t(b1) %*% t(i4))
+ 
+-  expect_identical(to_matrix(t(b2) %*% m2), t(b2) %*% i4)
+-  expect_identical(to_matrix(m1 %*% b2), i3 %*% b2)
++  test_func(to_matrix(t(b2) %*% m2), t(b2) %*% i4)
++  test_func(to_matrix(m1 %*% b2), i3 %*% b2)
+ 
+-  expect_identical(to_matrix(t(m2) %*% b2), t(i4) %*% b2)
+-  expect_identical(to_matrix(t(b2) %*% t(m1)), t(b2) %*% t(i3))
++  test_func(to_matrix(t(m2) %*% b2), t(i4) %*% b2)
++  test_func(to_matrix(t(b2) %*% t(m1)), t(b2) %*% t(i3))
+ 
+-  expect_identical(y1 %*% as.matrix(m1), y1 %*% i3)
+-  expect_identical(as.matrix(m2) %*% y1, i4 %*% y1)
++  test_func(y1 %*% as.matrix(m1), y1 %*% i3)
++  test_func(as.matrix(m2) %*% y1, i4 %*% y1)
+ 
+-  expect_identical(y2 %*% as.matrix(m2), y2 %*% i4)
+-  expect_identical(as.matrix(m1) %*% y2, i3 %*% y2)
++  test_func(y2 %*% as.matrix(m2), y2 %*% i4)
++  test_func(as.matrix(m1) %*% y2, i3 %*% y2)
+ }
+ 
+ test_that("Dense matrix-vector multiply works", {
+@@ -472,6 +472,31 @@ test_that("Dense matrix-vector multiply works", {
+   }
+ })
+ 
++test_that("LinearResidual matrix-vector multiply works", {
++  nrow <- 5
++  ncol <- 30
++  m0 <- generate_sparse_matrix(nrow, ncol, max_val = 10)
++  m <- as(m0, "IterableMatrix")
++  
++  latent_data <- data.frame(
++    nUMI = colSums(m),
++    group = as.factor(sample(1:5, ncol, replace = TRUE)),
++    random = runif(ncol),
++    gene1 = m0[3, ]
++  )
++  m1 <- matrix(nrow = nrow, ncol = ncol)
++  for (i in seq_len(nrow)) {
++    regression_data <- cbind(latent_data, m0[i, ])
++    colnames(regression_data) <- c(colnames(latent_data), "y")
++    fmla <- fmla <- as.formula(paste("y ~", paste(colnames(latent_data), collapse="+")))
++    m1[i, ] <- lm(fmla, regression_data, tol = 1e-10)$residuals
++  }
++  i1 <- regress_out(m, latent_data = latent_data)
++  
++  test_dense_multiply_ops(m1, i1, test_func = expect_equal)
++  
++})
++
+ # Test rows/col sum/mean given dgCMatrix m1 and equivalent iterable matrix i1
+ test_rowsum_colsum_rowmean_colmean_rowvar_colvar <- function(m1, i1) {
+   expect_s4_class(m1, "dgCMatrix")

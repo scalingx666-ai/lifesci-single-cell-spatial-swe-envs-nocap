@@ -1,0 +1,968 @@
+diff --git a/pantheon/agent.py b/pantheon/agent.py
+index 9f5950bfd..1bf3d2b73 100644
+--- a/pantheon/agent.py
++++ b/pantheon/agent.py
+@@ -128,9 +128,9 @@ class AgentRunContext:
+ 
+     agent: "Agent"
+     memory: "Memory | None"
+-    execution_context_id: str | None
+-    process_step_message: Callable | None
+-    process_chunk: Callable | None
++    execution_context_id: str | None = None
++    process_step_message: Callable | None = None
++    process_chunk: Callable | None = None
+     cache_safe_runtime_params: Any | None = None
+     cache_safe_prompt_messages: list[dict] | None = None
+     cache_safe_tool_definitions: list[dict] | None = None
+@@ -1356,7 +1356,8 @@ async def _run_single_tool_call(call: dict) -> dict:
+                 # Process and truncate tool result in one step
+                 content = process_tool_result(
+                     result,
+-                    max_length=self.max_tool_content_length
++                    max_length=self.max_tool_content_length,
++                    tool_name=func_name,
+                 )
+                 
+                 tool_message.update({
+@@ -1421,7 +1422,7 @@ async def _acompletion(
+         # Step 1: Process messages for the model
+         async with tracker.measure("message_processing"):
+             from pantheon.utils.token_optimization import (
+-                build_llm_view,
++                build_llm_view_async,
+                 inject_cache_control_markers,
+                 is_anthropic_model,
+             )
+@@ -1431,10 +1432,11 @@ async def _acompletion(
+             is_main_thread = (
+                 run_context.execution_context_id is None if run_context else True
+             )
+-            messages = build_llm_view(
++            messages = await build_llm_view_async(
+                 messages,
+                 memory=optimization_memory,
+                 is_main_thread=is_main_thread,
++                autocompact_model=model,
+             )
+             messages = process_messages_for_model(messages, model)
+             # Inject Anthropic prompt-cache markers so the server-side cache
+@@ -1442,7 +1444,16 @@ async def _acompletion(
+             if is_anthropic_model(model):
+                 messages = inject_cache_control_markers(messages)
+             if run_context is not None:
+-                run_context.cache_safe_prompt_messages = copy.deepcopy(messages)
++                # Selective copy: shallow for messages with string content,
++                # deepcopy only for messages with list content (Anthropic blocks
++                # from inject_cache_control_markers) to avoid mutation issues.
++                cached = []
++                for m in messages:
++                    if isinstance(m.get("content"), list):
++                        cached.append(copy.deepcopy(m))
++                    else:
++                        cached.append({**m})
++                run_context.cache_safe_prompt_messages = cached
+ 
+         # Step 2: Detect provider and get configuration
+         provider_config = detect_provider(model, self.force_litellm)
+diff --git a/pantheon/factory/templates/settings.json b/pantheon/factory/templates/settings.json
+index 9b85093b9..f19c84b40 100644
+--- a/pantheon/factory/templates/settings.json
++++ b/pantheon/factory/templates/settings.json
+@@ -25,12 +25,12 @@
+         // - "thread": Execute in separate thread (isolated, for heavy tasks)
+         "local_toolset_execution_mode": "direct",
+         // === Tool Output Limits ===
+-        // Maximum characters for tool output (used for smart truncation)
+-        "max_tool_content_length": 10000,
++        // Maximum characters for tool output (fallback; per-tool thresholds take priority)
++        "max_tool_content_length": 50000,
+         // Maximum lines for file read operations
+         "max_file_read_lines": 1000,
+-        // Maximum characters for file read operations (prevents single-line overflow)
+-        "max_file_read_chars": 100000,
++        // Maximum characters for file read operations (safety valve; per-tool thresholds handle LLM sizing)
++        "max_file_read_chars": 500000,
+         // Maximum results for glob/search operations
+         "max_glob_results": 50,
+         // Enable notebook execution logging (JSONL files in .pantheon/logs/notebook/)
+diff --git a/pantheon/settings.py b/pantheon/settings.py
+index 2194155d4..3e37d67f9 100644
+--- a/pantheon/settings.py
++++ b/pantheon/settings.py
+@@ -661,11 +661,13 @@ def tool_timeout(self) -> int:
+     def max_tool_content_length(self) -> int:
+         """
+         Maximum characters for tool output content.
+-        Used for smart truncation at agent level.
+-        Defaults to 10000 (~5K tokens).
++        Used as fallback for smart truncation at agent level.
++        Per-tool thresholds (from token_optimization.py) take priority
++        when available.
++        Defaults to 50000 (~12.5K tokens).
+         """
+         self._ensure_loaded()
+-        return self._settings.get("endpoint", {}).get("max_tool_content_length", 10000)
++        return self._settings.get("endpoint", {}).get("max_tool_content_length", 50000)
+ 
+     @property
+     def max_file_read_lines(self) -> int:
+@@ -679,17 +681,16 @@ def max_file_read_lines(self) -> int:
+     @property
+     def max_file_read_chars(self) -> int:
+         """
+-        Maximum characters for read_file output.
+-        
+-        Set higher than max_tool_content_length to allow reading larger files
+-        while preventing unbounded output. When exceeded, read_file returns
+-        truncated content with a 'truncated' flag to prevent infinite loops.
+-        
+-        Industry reference: Cursor uses 100K limit.
+-        Defaults to 50000 characters.
++        Maximum characters for read_file output (safety valve).
++
++        Acts as an upper bound to prevent unbounded output from pathological
++        files. Per-tool thresholds (from token_optimization.py) handle the
++        actual LLM-context sizing at Layer 2.
++
++        Defaults to 500000 characters.
+         """
+         self._ensure_loaded()
+-        return self._settings.get("endpoint", {}).get("max_file_read_chars", 50000)
++        return self._settings.get("endpoint", {}).get("max_file_read_chars", 500000)
+ 
+     @property
+     def max_glob_results(self) -> int:
+diff --git a/pantheon/utils/llm.py b/pantheon/utils/llm.py
+index 2d9c72c4f..edd1bba98 100644
+--- a/pantheon/utils/llm.py
++++ b/pantheon/utils/llm.py
+@@ -862,37 +862,49 @@ def remove_hidden_fields(content: dict) -> dict:
+ 
+ 
+ def process_tool_result(
+-    result: Any, 
++    result: Any,
+     max_length: int | None = None,
++    tool_name: str | None = None,
+ ) -> Any:
+     """Process tool result with optional truncation.
+-    
++
+     Args:
+         result: Raw tool result
+-        max_length: Optional max length for truncation
+-        
++        max_length: Global max length for truncation (fallback)
++        tool_name: Tool name for per-tool threshold lookup
++
+     Returns:
+         Processed result
+     """
+     # Remove hidden fields
+     result = remove_hidden_fields(result)
+-    
+-    # Apply smart truncation if max_length specified
+-    # (includes base64 filtering for JSON tools)
++
++    # Determine effective limit: per-tool threshold takes priority over global
++    effective_limit = max_length
+     if max_length is not None:
++        try:
++            from pantheon.utils.token_optimization import (
++                get_per_tool_limit,
++            )
++            effective_limit = int(get_per_tool_limit(tool_name, max_length))
++        except Exception as e:
++            logger.debug(f"get_per_tool_limit failed for {tool_name}: {e}")
++
++    # Apply smart truncation if limit specified
++    if effective_limit is not None:
+         try:
+             from pantheon.utils.truncate import smart_truncate_result
+-            return smart_truncate_result(result, max_length, filter_base64=True)
++            return smart_truncate_result(result, effective_limit, filter_base64=True)
+         except Exception as e:
+             # Fallback to simple string conversion if truncation fails
+             logger.warning(f"Smart truncation failed: {e}, falling back to simple conversion")
+             content = str(result) if not isinstance(result, str) else result
+-            if len(content) > max_length:
++            if len(content) > effective_limit:
+                 # Simple truncation: head + tail
+-                half = max_length // 2
++                half = effective_limit // 2
+                 return f"{content[:half]}\n...[truncated]...\n{content[-half:]}"
+             return content
+-    
++
+     return result
+ 
+ 
+diff --git a/pantheon/utils/token_optimization.py b/pantheon/utils/token_optimization.py
+index 230064abf..3afae7a3c 100644
+--- a/pantheon/utils/token_optimization.py
++++ b/pantheon/utils/token_optimization.py
+@@ -7,12 +7,15 @@
+ from typing import Any
+ 
+ from pantheon.utils.log import logger
++from pantheon.utils.truncate import (
++    PERSISTED_OUTPUT_TAG,
++    PERSISTED_OUTPUT_CLOSING_TAG,
++    PREVIEW_SIZE_BYTES,
++    _format_file_size,
++)
+ 
+-PERSISTED_OUTPUT_TAG = "<persisted-output>"
+-PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
+ TIME_BASED_MC_CLEARED_MESSAGE = "[Old tool result content cleared]"
+ EMPTY_TOOL_RESULT_PLACEHOLDER = "[No output]"
+-PREVIEW_SIZE_BYTES = 2000
+ BYTES_PER_TOKEN = 4
+ MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000
+ # CC default: DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000.  Used as fallback when
+@@ -232,15 +235,7 @@ def save_content_replacement_state(
+     memory.mark_dirty()
+ 
+ 
+-def _format_file_size(num_bytes: int) -> str:
+-    value = float(num_bytes)
+-    for unit in ["B", "KB", "MB", "GB"]:
+-        if value < 1024 or unit == "GB":
+-            if unit == "B":
+-                return f"{int(value)}{unit}"
+-            return f"{value:.1f}{unit}"
+-        value /= 1024
+-    return f"{num_bytes}B"
++# _format_file_size is imported from pantheon.utils.truncate
+ 
+ 
+ def generate_preview(content: str, max_bytes: int) -> tuple[str, bool]:
+@@ -492,7 +487,7 @@ def replace_tool_message_contents(
+     return result
+ 
+ 
+-def _get_per_tool_limit(tool_name: str | None, global_limit: int) -> int | float:
++def get_per_tool_limit(tool_name: str | None, global_limit: int) -> int | float:
+     """Return the effective size limit for a single tool result.
+ 
+     Mirrors Claude Code's ``getPersistenceThreshold()``:
+@@ -536,6 +531,18 @@ def apply_tool_result_budget(
+     skip_tool_names: set[str] | None = None,
+     query_source: str | None = None,
+ ) -> list[dict]:
++    """Safety-net budget enforcement for tool results.
++
++    Per-tool externalization is now handled at tool execution time by
++    ``process_tool_result`` (using per-tool thresholds from
++    ``get_per_tool_limit``).  This function serves as a second pass:
++
++    1. Replays prior externalization decisions (session resume).
++    2. Guards empty tool results.
++    3. Enforces the **per-message aggregate** limit — if a single turn
++       contains many tool results whose combined size exceeds
++       *per_message_limit*, the largest fresh results are externalized.
++    """
+     # Guard empty tool results first (CC emptiness guard)
+     messages = guard_empty_tool_results(messages)
+     state = load_content_replacement_state(memory)
+@@ -570,46 +577,33 @@ def apply_tool_result_budget(
+         eligible = [candidate for candidate in fresh if candidate not in skipped]
+ 
+         # Separate opt-out tools (Infinity limit) — never externalize them
+-        opted_out: list[ToolMessageCandidate] = []
+         checkable: list[ToolMessageCandidate] = []
+         for candidate in eligible:
+             tool_name = tool_name_map.get(candidate.tool_use_id)
+             normalized = normalize_tool_name(tool_name)
+             if normalized in PERSISTENCE_OPT_OUT_TOOLS:
+-                opted_out.append(candidate)
++                state.seen_ids.add(candidate.tool_use_id)
+             else:
+                 checkable.append(candidate)
+-        for candidate in opted_out:
+-            state.seen_ids.add(candidate.tool_use_id)
+ 
+-        # Per-tool threshold check: externalize any single result that already
+-        # exceeds its own tool-specific limit, regardless of the group total.
+-        per_tool_selected: list[ToolMessageCandidate] = []
+-        remaining_eligible: list[ToolMessageCandidate] = []
+-        for candidate in checkable:
+-            tool_name = tool_name_map.get(candidate.tool_use_id)
+-            tool_limit = _get_per_tool_limit(tool_name, per_message_limit)
+-            if candidate.size > tool_limit:
+-                per_tool_selected.append(candidate)
+-            else:
+-                remaining_eligible.append(candidate)
+-
+-        # Per-message aggregate check on what's left
++        # Per-message aggregate check: externalize largest results when the
++        # combined size of all results in this turn exceeds per_message_limit.
++        # Individual per-tool thresholds are already enforced at tool execution
++        # time, so this only catches the aggregate-too-large case.
+         frozen_size = sum(candidate.size for candidate in frozen)
+-        fresh_size = sum(candidate.size for candidate in remaining_eligible)
++        fresh_size = sum(candidate.size for candidate in checkable)
+         aggregate_selected = (
+-            select_fresh_to_replace(remaining_eligible, frozen_size, per_message_limit)
++            select_fresh_to_replace(checkable, frozen_size, per_message_limit)
+             if frozen_size + fresh_size > per_message_limit
+             else []
+         )
+ 
+-        selected = per_tool_selected + aggregate_selected
+-        selected_ids = {candidate.tool_use_id for candidate in selected}
++        selected_ids = {candidate.tool_use_id for candidate in aggregate_selected}
+         for candidate in candidates:
+             if candidate.tool_use_id not in selected_ids:
+                 state.seen_ids.add(candidate.tool_use_id)
+ 
+-        for candidate in selected:
++        for candidate in aggregate_selected:
+             if persist_allowed:
+                 persisted = persist_tool_result(
+                     candidate.content,
+@@ -931,18 +925,30 @@ def _is_collapsible_message(message: dict, tool_name_map: dict[str, str]) -> boo
+     return False
+ 
+ 
+-def _extract_read_path(message: dict) -> str | None:
+-    """Try to extract a file path from a tool call's arguments."""
+-    # Look for path-like argument in the corresponding assistant tool_call
+-    tool_name = message.get("tool_name", "")
+-    content = message.get("content", "")
+-    if not content:
+-        return None
+-    # Heuristic: first line often contains the path for read tools
+-    first_line = content.split("\n", 1)[0].strip()
+-    if "/" in first_line and len(first_line) < 200:
+-        return first_line
+-    return None
++def _extract_read_paths_from_tool_calls(message: dict) -> list[str]:
++    """Extract file paths from an assistant message's tool_call arguments.
++
++    Looks for common path parameter names (path, file_path, filepath, url)
++    in the function arguments of tool_calls that target read/fetch tools.
++    """
++    paths: list[str] = []
++    for tc in message.get("tool_calls") or []:
++        if not isinstance(tc, dict):
++            continue
++        func = tc.get("function", {})
++        name = normalize_tool_name(func.get("name"))
++        if name not in COLLAPSIBLE_READ_TOOLS:
++            continue
++        try:
++            args = json.loads(func.get("arguments", "{}"))
++        except (json.JSONDecodeError, TypeError):
++            continue
++        for key in ("path", "file_path", "filepath", "url"):
++            val = args.get(key)
++            if isinstance(val, str) and val:
++                paths.append(val)
++                break
++    return paths
+ 
+ 
+ def collapse_read_search_groups(
+@@ -982,6 +988,12 @@ def collapse_read_search_groups(
+         while i < n and _is_collapsible_message(messages[i], tool_name_map):
+             msg = messages[i]
+             tokens += _estimate_message_tokens(msg)
++            if msg.get("role") == "assistant":
++                # Extract file paths from tool_call arguments
++                for path in _extract_read_paths_from_tool_calls(msg):
++                    if path not in seen_paths:
++                        seen_paths.add(path)
++                        read_paths.append(path)
+             if msg.get("role") == "tool":
+                 tool_name = normalize_tool_name(
+                     get_tool_name_for_message(msg, tool_name_map)
+@@ -990,10 +1002,6 @@ def collapse_read_search_groups(
+                     search_count += 1
+                 if tool_name in COLLAPSIBLE_READ_TOOLS:
+                     read_count += 1
+-                    path = _extract_read_path(msg)
+-                    if path and path not in seen_paths:
+-                        seen_paths.add(path)
+-                        read_paths.append(path)
+                 if tool_name in COLLAPSIBLE_LIST_TOOLS:
+                     list_count += 1
+                 if tool_name in ("shell", "bash"):
+@@ -1462,18 +1470,13 @@ def project_memory_messages_for_llm(messages: list[dict]) -> list[dict]:
+     return result
+ 
+ 
+-def build_llm_view(
++def _prepare_llm_view_messages(
+     messages: list[dict],
+-    memory: Any | None = None,
+-    base_dir: Path | None = None,
+-    *,
+-    is_main_thread: bool = True,
+-    snip_config: "SnipConfig | None" = None,
+-) -> list[dict]:
+-    """Build the projected prompt view from raw history."""
+-    if not messages:
+-        return []
++) -> tuple[dict | None, list[dict]]:
++    """Shared projection logic for build_llm_view / build_llm_view_async.
+ 
++    Returns (system_message_or_None, projected_non_system_messages).
++    """
+     system_message = next(
+         (message for message in messages if message.get("role") == "system"),
+         None,
+@@ -1482,6 +1485,34 @@ def build_llm_view(
+         message for message in messages if message.get("role") != "system"
+     ]
+     projected = project_memory_messages_for_llm(non_system_messages)
++    projected = [
++        m for m in projected
++        if m.get("role") in ("user", "assistant", "tool")
++    ]
++    return system_message, projected
++
++
++def _wrap_with_system(
++    system_message: dict | None,
++    optimized: list[dict],
++) -> list[dict]:
++    if system_message is not None:
++        return [system_message, *optimized]
++    return optimized
++
++
++def build_llm_view(
++    messages: list[dict],
++    memory: Any | None = None,
++    base_dir: Path | None = None,
++    *,
++    is_main_thread: bool = True,
++    snip_config: "SnipConfig | None" = None,
++) -> list[dict]:
++    """Build the projected prompt view from raw history (sync, no autocompact)."""
++    if not messages:
++        return []
++    system_message, projected = _prepare_llm_view_messages(messages)
+     optimized = apply_token_optimizations(
+         projected,
+         memory=memory,
+@@ -1489,9 +1520,31 @@ def build_llm_view(
+         is_main_thread=is_main_thread,
+         snip_config=snip_config,
+     )
+-    if system_message is not None:
+-        return [system_message, *optimized]
+-    return optimized
++    return _wrap_with_system(system_message, optimized)
++
++
++async def build_llm_view_async(
++    messages: list[dict],
++    memory: Any | None = None,
++    base_dir: Path | None = None,
++    *,
++    is_main_thread: bool = True,
++    snip_config: "SnipConfig | None" = None,
++    autocompact_model: str | None = None,
++) -> list[dict]:
++    """Async variant of build_llm_view that enables LLM-based autocompact."""
++    if not messages:
++        return []
++    system_message, projected = _prepare_llm_view_messages(messages)
++    optimized, _ = await apply_token_optimizations_async(
++        projected,
++        memory=memory,
++        base_dir=base_dir,
++        is_main_thread=is_main_thread,
++        snip_config=snip_config,
++        autocompact_model=autocompact_model,
++    )
++    return _wrap_with_system(system_message, optimized)
+ 
+ 
+ def stabilize_tool_definitions(tools: list[dict]) -> list[dict]:
+@@ -1670,7 +1723,23 @@ def inject_cache_control_markers(
+     preserves cache for the parent conversation prefix.
+ 
+     Returns a *new* list; input messages are not mutated.
++
++    Requires litellm >= 1.34.0 for cache_control pass-through to Anthropic.
+     """
++    # Safety check: litellm must support cache_control field pass-through
++    try:
++        from importlib.metadata import version as pkg_version
++        litellm_version = pkg_version("litellm")
++        major, minor = (int(x) for x in litellm_version.split(".")[:2])
++        if (major, minor) < (1, 34):
++            logger.debug(
++                "litellm {} < 1.34 — skipping cache_control injection",
++                litellm_version,
++            )
++            return messages
++    except Exception:
++        pass  # can't determine version, proceed optimistically
++
+     from copy import deepcopy
+ 
+     result = deepcopy(messages)
+diff --git a/pantheon/utils/truncate.py b/pantheon/utils/truncate.py
+index de1795a4f..f6cf7165e 100644
+--- a/pantheon/utils/truncate.py
++++ b/pantheon/utils/truncate.py
+@@ -30,8 +30,8 @@
+    - Handles edge cases (circular refs, non-serializable objects)
+ 
+ Configuration:
+-  - max_tool_content_length: 10K (LLM context limit)
+-  - max_file_read_chars: 50K (read_file internal limit)
++  - max_tool_content_length: 50K (global fallback; per-tool thresholds take priority)
++  - max_file_read_chars: 50K-100K (read_file internal limit)
+   - Recursion depth: 2 layers (covers 99% cases)
+ """
+ 
+@@ -40,6 +40,24 @@
+ from typing import Any
+ 
+ 
++def _format_file_size(num_bytes: int) -> str:
++    """Format byte count as human-readable size string."""
++    value = float(num_bytes)
++    for unit in ["B", "KB", "MB", "GB"]:
++        if value < 1024 or unit == "GB":
++            if unit == "B":
++                return f"{int(value)}{unit}"
++            return f"{value:.1f}{unit}"
++        value /= 1024
++    return f"{num_bytes}B"
++
++
++# Unified externalization markers — shared with token_optimization.py
++PERSISTED_OUTPUT_TAG = "<persisted-output>"
++PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
++PREVIEW_SIZE_BYTES = 2000
++
++
+ def truncate_string(content: str, max_length: int) -> str:
+     """Truncate string preserving head and tail with info.
+     
+@@ -78,24 +96,21 @@ def _format_truncated_message(
+     filepath: Path,
+     preview_size: int | None = None,
+ ) -> str:
+-    """Format truncated content message.
+-    
+-    Args:
+-        preview: Preview content to show
+-        total_size: Total size of original content
+-        filepath: Path where full content is saved
+-        preview_size: Optional preview size (if None, uses len(preview))
+-        
+-    Returns:
+-        Formatted message with preview
++    """Format truncated content message using unified <persisted-output> format.
++
++    This format is recognized by token_optimization.py's _is_already_externalized()
++    so that the LLM-view pipeline can correctly detect already-externalized content.
+     """
+     if preview_size is None:
+         preview_size = len(preview)
+-    
++
+     return (
+-        f"[truncated {preview_size:,}/{total_size:,} chars]\n"
+-        f"Full content saved to: {filepath}\n\n"
+-        f"{preview}"
++        f"{PERSISTED_OUTPUT_TAG}\n"
++        f"Output too large ({_format_file_size(total_size)}). "
++        f"Full output saved to: {filepath}\n\n"
++        f"Preview (first {_format_file_size(preview_size)}):\n"
++        f"{preview}\n"
++        f"{PERSISTED_OUTPUT_CLOSING_TAG}"
+     )
+ 
+ 
+@@ -188,7 +203,7 @@ def _truncate_non_dict(
+             with open(filepath, 'w', encoding='utf-8') as f:
+                 f.write(content)
+             
+-            preview_size = min(2000, max_length // 2)
++            preview_size = min(PREVIEW_SIZE_BYTES, max_length // 2)
+             preview = content[:preview_size]
+             return _format_truncated_message(
+                 preview=preview,
+@@ -209,14 +224,16 @@ def _truncate_json_path(
+     temp_dir: str,
+ ) -> str:
+     """Handle JSON tools truncation.
+-    
++
+     Special handling for tools with 'truncated' field:
+     - Skip base64 filtering (already processed by tool)
+-    - Skip length limits (trust tool's truncation)
++    - Length limits are ALWAYS applied (per-tool thresholds are the
++      primary control; Layer 1's truncated flag only means the tool
++      did its own pre-processing, not that no further limits apply).
+     """
+     # Check if tool already handled truncation
+     has_truncated_field = 'truncated' in result
+-    
++
+     # Step 1: Base64 filter (skip for tools with truncated field)
+     if filter_base64 and not has_truncated_field:
+         try:
+@@ -228,7 +245,7 @@ def _truncate_json_path(
+         except Exception as e:
+             from pantheon.utils.log import logger
+             logger.warning(f"Skipping base64 filter due to error: {e}")
+-    
++
+     # Step 2: Format to JSON
+     try:
+         formatted = json.dumps(result, ensure_ascii=False)
+@@ -236,11 +253,11 @@ def _truncate_json_path(
+         from pantheon.utils.log import logger
+         logger.warning(f"JSON serialization failed: {e}, using repr")
+         formatted = repr(result)
+-    
+-    # Step 3: Length check (skip for tools with truncated field)
+-    if has_truncated_field or len(formatted) <= max_length:
++
++    # Step 3: Length check — always applied regardless of truncated field
++    if len(formatted) <= max_length:
+         return formatted
+-    
++
+     # Step 4: Save and generate preview
+     return _save_and_preview_json(result, formatted, max_length, temp_dir)
+ 
+diff --git a/tests/test_token_optimization.py b/tests/test_token_optimization.py
+index a62d03eea..210ec776a 100644
+--- a/tests/test_token_optimization.py
++++ b/tests/test_token_optimization.py
+@@ -37,8 +37,10 @@ def _build_tool_message(tool_call_id: str, content: str) -> dict:
+ 
+ 
+ def test_apply_tool_result_budget_persists_large_parallel_tool_messages(tmp_path):
+-    """Per-tool threshold: shell limit is 50K chars. Each 90K result exceeds
+-    its individual limit, so all three are externalized (per-tool path)."""
++    """Aggregate path: 3×90K = 270K exceeds the 200K per-message limit,
++    so the budget externalizes the largest fresh results until under limit.
++    Per-tool thresholds are now enforced at tool execution time (process_tool_result),
++    so apply_tool_result_budget only handles aggregate overflow."""
+     memory = Memory("test-memory")
+     messages = [
+         {
+@@ -62,8 +64,8 @@ def test_apply_tool_result_budget_persists_large_parallel_tool_messages(tmp_path
+         msg for msg in optimized_tool_messages if msg["content"].startswith(PERSISTED_OUTPUT_TAG)
+     ]
+ 
+-    # All three exceed the shell per-tool limit (50K), so all are externalized
+-    assert len(persisted) == 3
++    # 270K > 200K aggregate limit — at least 1 result must be externalized
++    assert len(persisted) >= 1
+     assert all("Full output saved to:" in m["content"] for m in persisted)
+     assert "token_optimization" in memory.extra_data
+ 
+@@ -785,27 +787,19 @@ def test_apply_token_optimizations_runs_snip_before_microcompact(tmp_path):
+ # ---------------------------------------------------------------------------
+ 
+ def test_per_tool_threshold_externalizes_oversized_single_result(tmp_path):
+-    """A single read_file result > 40K chars should be externalized even if
+-    the group total is below the 200K global limit."""
++    """Per-tool threshold is now enforced at process_tool_result() time.
++    Here we verify that process_tool_result uses get_per_tool_limit to
++    apply the correct per-tool threshold (read_file = 40K)."""
+     from pantheon.utils.token_optimization import PER_TOOL_RESULT_SIZE_CHARS
++    from pantheon.utils.llm import process_tool_result
+ 
+     read_file_limit = PER_TOOL_RESULT_SIZE_CHARS["read_file"]
+     big_content = "x" * (read_file_limit + 1000)
+ 
+-    messages = [
+-        {
+-            "role": "assistant",
+-            "content": "reading file",
+-            "tool_calls": [{"id": "rf-1", "function": {"name": "read_file", "arguments": "{}"}}],
+-        },
+-        {"role": "tool", "tool_call_id": "rf-1", "tool_name": "read_file", "content": big_content},
+-    ]
+-
+-    mem = Memory("per-tool-test")
+-    result = apply_tool_result_budget(messages, memory=mem, base_dir=tmp_path)
+-
+-    tool_msg = next(m for m in result if m.get("role") == "tool")
+-    assert PERSISTED_OUTPUT_TAG in tool_msg["content"]
++    # process_tool_result with tool_name="read_file" should apply 40K limit
++    result = process_tool_result(big_content, max_length=50_000, tool_name="read_file")
++    # Result should be truncated since content exceeds read_file's 40K limit
++    assert len(result) < len(big_content)
+ 
+ 
+ def test_per_tool_threshold_keeps_small_result_intact(tmp_path):
+@@ -939,24 +933,20 @@ def test_empty_result_guard_runs_inside_apply_tool_result_budget(tmp_path):
+ # ---------------------------------------------------------------------------
+ 
+ def test_default_per_tool_limit_is_50k_for_unknown_tools(tmp_path):
+-    """Unknown tools use DEFAULT_MAX_RESULT_SIZE_CHARS (50K), not the 200K global."""
+-    from pantheon.utils.token_optimization import DEFAULT_MAX_RESULT_SIZE_CHARS
+-    from pantheon.internal.memory import Memory
+-    memory = Memory("default-50k-test")
+-    # Content is 60K — above 50K default but below 200K global
++    """Unknown tools use DEFAULT_MAX_RESULT_SIZE_CHARS (50K) as their
++    per-tool limit, enforced at process_tool_result() time."""
++    from pantheon.utils.token_optimization import get_per_tool_limit, DEFAULT_MAX_RESULT_SIZE_CHARS
++    from pantheon.utils.llm import process_tool_result
++
++    # Verify the limit value
++    limit = get_per_tool_limit("unknown_tool", 200_000)
++    assert limit == DEFAULT_MAX_RESULT_SIZE_CHARS
++
++    # Verify process_tool_result applies it
+     content = "x" * 60_000
+-    messages = [
+-        {
+-            "role": "assistant",
+-            "tool_calls": [{"id": "u1", "function": {"name": "unknown_tool"}}],
+-        },
+-        {"role": "tool", "tool_call_id": "u1", "tool_name": "unknown_tool", "content": content},
+-    ]
+-    result = apply_tool_result_budget(messages, memory=memory, base_dir=tmp_path)
+-    tool_msg = next(m for m in result if m.get("role") == "tool")
+-    assert PERSISTED_OUTPUT_TAG in tool_msg["content"], (
+-        f"60K content should be externalized (default limit is {DEFAULT_MAX_RESULT_SIZE_CHARS})"
+-    )
++    result = process_tool_result(content, max_length=200_000, tool_name="unknown_tool")
++    # 60K > 50K default limit, so should be truncated
++    assert len(result) < len(content)
+ 
+ 
+ def test_persistence_opt_out_prevents_externalization(tmp_path):
+@@ -1178,21 +1168,30 @@ def test_query_source_agent_summary_does_not_persist(tmp_path):
+ 
+ 
+ def test_query_source_main_thread_persists(tmp_path):
+-    """Main thread query source SHOULD persist to disk."""
++    """Main thread query source SHOULD persist to disk when aggregate limit
++    is exceeded. Per-tool threshold enforcement is now at process_tool_result()."""
+     from pantheon.internal.memory import Memory
+     memory = Memory("qs-main-test")
++    # Use 3 × 80K = 240K to exceed aggregate 200K limit
+     messages = [
+         {
+             "role": "assistant",
+-            "tool_calls": [{"id": "qs2", "function": {"name": "shell"}}],
++            "tool_calls": [
++                {"id": "qs2", "function": {"name": "shell"}},
++                {"id": "qs3", "function": {"name": "shell"}},
++                {"id": "qs4", "function": {"name": "shell"}},
++            ],
+         },
+-        {"role": "tool", "tool_call_id": "qs2", "tool_name": "shell", "content": "x" * 100_000},
++        {"role": "tool", "tool_call_id": "qs2", "tool_name": "shell", "content": "x" * 80_000},
++        {"role": "tool", "tool_call_id": "qs3", "tool_name": "shell", "content": "y" * 80_000},
++        {"role": "tool", "tool_call_id": "qs4", "tool_name": "shell", "content": "z" * 80_000},
+     ]
+     result = apply_tool_result_budget(
+         messages, memory=memory, base_dir=tmp_path, query_source="repl_main_thread"
+     )
+-    tool_msg = next(m for m in result if m.get("role") == "tool")
+-    assert PERSISTED_OUTPUT_TAG in tool_msg["content"]
++    tool_msgs = [m for m in result if m.get("role") == "tool"]
++    persisted = [m for m in tool_msgs if PERSISTED_OUTPUT_TAG in m["content"]]
++    assert len(persisted) >= 1
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1372,3 +1371,128 @@ def test_apply_token_optimizations_async_runs_full_pipeline(tmp_path):
+     )
+     after = estimate_total_tokens_from_chars(result)
+     assert after < before
++
++
++# ---------------------------------------------------------------------------
++# Adaptation tests: Layer 2 ↔ Layer 3 integration
++# ---------------------------------------------------------------------------
++
++
++def test_process_tool_result_uses_per_tool_limit_for_grep():
++    """process_tool_result should apply grep's 20K limit, not the 50K global."""
++    from pantheon.utils.llm import process_tool_result
++
++    content = "x" * 30_000  # > 20K (grep limit) but < 50K (global)
++    result = process_tool_result(content, max_length=50_000, tool_name="grep")
++    assert len(result) < 30_000, "grep output above 20K should be truncated"
++
++
++def test_process_tool_result_uses_global_for_unknown_tool():
++    """Unknown tools fall back to min(DEFAULT_MAX_RESULT_SIZE_CHARS, global_limit)."""
++    from pantheon.utils.llm import process_tool_result
++
++    content = "x" * 40_000  # < 50K
++    result = process_tool_result(content, max_length=50_000, tool_name="my_custom_tool")
++    assert len(result) == 40_000, "40K < 50K fallback, should pass through"
++
++
++def test_process_tool_result_truncated_field_skips_base64_but_not_length():
++    """Tools with 'truncated' field skip base64 filtering but per-tool
++    length limits are ALWAYS applied (P0 fix: no more bypass)."""
++    from pantheon.utils.llm import process_tool_result
++
++    # read_file limit is 40K; content is 45K with 'truncated' flag.
++    # Old behavior: trusted → pass through. New behavior: still externalized.
++    result = {"content": "x" * 45_000, "truncated": True}
++    output = process_tool_result(result, max_length=50_000, tool_name="read_file")
++    # 45K > read_file's 40K limit → should be externalized
++    assert len(output) < 45_000, "truncated field should NOT bypass per-tool limits"
++
++
++def test_unified_format_recognized_by_is_already_externalized():
++    """Content produced by smart_truncate_result (Layer 2) should be
++    recognized by _is_already_externalized (Layer 3) to avoid double processing."""
++    from pantheon.utils.token_optimization import _is_already_externalized
++    from pantheon.utils.truncate import PERSISTED_OUTPUT_TAG, PERSISTED_OUTPUT_CLOSING_TAG
++
++    # Simulate Layer 2 output
++    layer2_output = (
++        f"{PERSISTED_OUTPUT_TAG}\n"
++        f"Output too large (100.0KB). Full output saved to: /tmp/test.json\n\n"
++        f"Preview (first 2.0KB):\nsome preview content\n"
++        f"{PERSISTED_OUTPUT_CLOSING_TAG}"
++    )
++    assert _is_already_externalized(layer2_output), (
++        "Layer 2's <persisted-output> format must be recognized by Layer 3"
++    )
++
++
++def test_stage1_skips_already_externalized_by_layer2(tmp_path):
++    """If Layer 2 already externalized content, Stage 1 should not re-process it."""
++    from pantheon.utils.truncate import PERSISTED_OUTPUT_TAG, PERSISTED_OUTPUT_CLOSING_TAG
++
++    externalized_content = (
++        f"{PERSISTED_OUTPUT_TAG}\n"
++        f"Output too large (100.0KB). Full output saved to: /tmp/test.json\n\n"
++        f"Preview (first 2.0KB):\npreview\n"
++        f"{PERSISTED_OUTPUT_CLOSING_TAG}"
++    )
++    messages = [
++        {
++            "role": "assistant",
++            "tool_calls": [{"id": "t1", "function": {"name": "shell"}}],
++        },
++        {"role": "tool", "tool_call_id": "t1", "tool_name": "shell",
++         "content": externalized_content},
++    ]
++    mem = Memory("skip-test")
++    result = apply_tool_result_budget(messages, memory=mem, base_dir=tmp_path)
++    tool_msg = next(m for m in result if m.get("role") == "tool")
++    # Content should be unchanged — already externalized
++    assert tool_msg["content"] == externalized_content
++
++
++def test_per_tool_limit_values():
++    """Verify per-tool limits match the expected CC-aligned values."""
++    from pantheon.utils.token_optimization import get_per_tool_limit
++
++    assert get_per_tool_limit("grep", 200_000) == 20_000
++    assert get_per_tool_limit("read_file", 200_000) == 40_000
++    assert get_per_tool_limit("shell", 200_000) == 50_000
++    assert get_per_tool_limit("bash", 200_000) == 50_000
++    assert get_per_tool_limit("glob", 200_000) == 10_000
++    assert get_per_tool_limit("web_fetch", 200_000) == 30_000
++    # Unknown tool: min(DEFAULT_MAX_RESULT_SIZE_CHARS=50K, global_limit)
++    assert get_per_tool_limit("unknown", 200_000) == 50_000
++    assert get_per_tool_limit("unknown", 30_000) == 30_000
++    # MCP-prefixed tool name normalization
++    assert get_per_tool_limit("mcp__server__grep", 200_000) == 20_000
++
++
++def test_full_pipeline_layer2_then_layer3(tmp_path):
++    """End-to-end: Layer 2 externalizes large content, Layer 3 preserves it."""
++    from pantheon.utils.llm import process_tool_result
++
++    # Simulate Layer 2: large grep output gets externalized
++    big_output = "x" * 25_000  # > grep's 20K limit
++    layer2_result = process_tool_result(big_output, max_length=50_000, tool_name="grep")
++
++    # Build message as agent.py would
++    messages = [
++        {"role": "system", "content": "You are an assistant."},
++        {"role": "user", "content": "search for pattern"},
++        {
++            "role": "assistant",
++            "tool_calls": [{"id": "g1", "function": {"name": "grep"}}],
++        },
++        {"role": "tool", "tool_call_id": "g1", "tool_name": "grep",
++         "content": layer2_result},
++    ]
++
++    # Layer 3: build_llm_view should preserve the externalized content
++    mem = Memory("e2e-test")
++    view = build_llm_view(messages, memory=mem, base_dir=tmp_path)
++
++    tool_msg = next(m for m in view if m.get("role") == "tool")
++    # Should still be externalized (not re-expanded)
++    assert len(tool_msg["content"]) < 25_000
+diff --git a/tests/test_truncate.py b/tests/test_truncate.py
+index 88cfb22f5..b1f6ead8f 100644
+--- a/tests/test_truncate.py
++++ b/tests/test_truncate.py
+@@ -132,23 +132,24 @@ def test_format_consistency():
+ 
+ 
+ def test_smart_truncate_with_truncated_field():
+-    """Test tools with 'truncated' field skip base64 filter and length limits."""
+-    # Simulate read_file/shell output
++    """Test tools with 'truncated' field: skip base64 filter, but
++    length limits are still applied (per-tool thresholds are always enforced)."""
++    # Simulate read_file/shell output (small enough to be under limit)
+     result = {
+         "content": "file content here",
+         "truncated": False,
+         "path": "/some/path",
+     }
+-    
++
+     output = smart_truncate_result(result, max_length=100)
+-    
++
+     # Should be JSON formatted (unified format)
+     parsed = json.loads(output)
+     assert parsed["content"] == "file content here"
+     assert parsed["truncated"] == False
+     assert parsed["path"] == "/some/path"
+-    
+-    # Should NOT apply length limits (trust tool's truncation)
++
++    # Small content under limit → passes through as-is
+     assert isinstance(output, str)
+     print("✓ test_smart_truncate_with_truncated_field passed")
+ 
+@@ -184,9 +185,9 @@ def test_smart_truncate_path2_oversized():
+             temp_dir=tmpdir
+         )
+         
+-        # Should indicate truncation
+-        assert "[truncated" in output
+-        assert "Full content saved to:" in output
++        # Should indicate truncation (unified <persisted-output> format)
++        assert "Full output saved to:" in output
++        assert "<persisted-output>" in output
+         
+         # Should contain preview
+         assert "small_field" in output
+@@ -209,10 +210,10 @@ def test_smart_truncate_non_dict():
+     result1 = smart_truncate_result("simple string", max_length=100)
+     assert result1 == "simple string"
+     
+-    # Large string - allow more tolerance
++    # Large string - when saved to file, uses <persisted-output> format
+     result2 = smart_truncate_result("x" * 1000, max_length=100)
+-    assert len(result2) <= 200  # More tolerance for suffix
+-    assert "[truncated" in result2
++    # May be truncated inline or saved to file with persisted-output wrapper
++    assert "[truncated" in result2 or "<persisted-output>" in result2
+     
+     print("✓ test_smart_truncate_non_dict passed")
+ 

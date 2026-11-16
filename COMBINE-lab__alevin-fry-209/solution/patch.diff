@@ -1,0 +1,693 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 53aab1d..e1aac70 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -40,8 +40,10 @@ Changelog for alevin-fry
+     equivalence classes whose ids do not index the `quants_mat_cols.txt` beside
+     them, as with this output, rather than label a probe matrix with gene names.
+   * Cost depends on the library. On the Flex library above, across the five
+-    strategies, `quant-probe` took 18-34% longer than `quant` (1.5-2.1 s to
+-    1.8-2.7 s at 16 threads), and 37-52% longer with `--probe-mtx`.
++    strategies, `quant-probe` took 3-6% longer than `quant` (1.43-1.80 s to
++    1.50-1.87 s at 16 threads), and 25-27% longer with `--probe-mtx`
++    (`cr-like` and `cr-like-em`). Without the per-cell sparse resolution below,
++    it took 18-34% longer.
+ 
+ * `quant --dump-molecules` writes `alevin/molecules.parquet`: one row per
+   molecule produced by UMI resolution, before molecules are summed into the
+@@ -57,6 +59,20 @@ Changelog for alevin-fry
+   USA mode) and about 1 GB of peak memory; the files were 457 MB and 832 MB.
+   Without the flag, quant output and speed are unchanged.
+ 
++### Performance
++
++* `quant` resolves each cell over the features its equivalence classes name,
++  rather than over the whole feature axis (genes, or probes under
++  `quant-probe`). This applies to every resolution strategy except the
++  USA-mode and long-read EMs. Output is unchanged. On the 384-plex Flex library
++  (262k cells, 53,519 probes over 18,132 genes) at 16 threads, `quant-probe`
++  ran 16-36% faster (`cr-like-em` 2.53 to 1.62 s) and `quant` 5-18% faster.
++  Data where nearly every cell takes the tiny-cell fast path, such as standard
++  10x 3' libraries, is unaffected.
++* Library API: `pugutils::get_num_molecules_trivial_discard_all_ambig` now
++  writes the cell's counts into a reusable `em::SparseCellCounts` and returns
++  only the fraction of UMIs discarded as multi-gene.
++
+ ### Fixed
+ 
+ * `quant -r` now accepts any case. A strategy not in lower case (`-r CR-LIKE`)
+diff --git a/src/em.rs b/src/em.rs
+index 74d4dcb..151344f 100644
+--- a/src/em.rs
++++ b/src/em.rs
+@@ -581,6 +581,187 @@ pub fn em_optimize<P: EqClassPayload>(
+     alphas_in
+ }
+ 
++/// One cell's counts on a feature axis (genes, or probes at probe level),
++/// held by a worker and reused for every cell it resolves.
++///
++/// `em_optimize` allocates, initializes and scans vectors over the whole axis
++/// for every cell, and the caller then scans the result again to find the
++/// nonzero entries, although a cell only touches the features its own
++/// equivalence classes name. Here `values` (and, once the EM has run, `scratch`)
++/// span the axis once per worker, and every per-cell pass walks only `support`:
++/// the features this cell's classes name. Between cells, both vectors are zero
++/// outside `support`. Every method that starts a cell (`reset`, `unique_counts`,
++/// `em`, and the resolvers that fill a `SparseCellCounts`) forgets the previous
++/// one first.
++#[derive(Default)]
++pub struct SparseCellCounts {
++    values: Vec<f32>,
++    scratch: Vec<f32>,
++    in_support: Vec<bool>,
++    support: Vec<u32>,
++}
++
++impl SparseCellCounts {
++    /// Forgets the previous cell and sizes the axis to `num_features`.
++    pub fn reset(&mut self, num_features: usize) {
++        for &index in &self.support {
++            let index = index as usize;
++            self.values[index] = 0.0;
++            self.in_support[index] = false;
++        }
++        self.support.clear();
++        self.values.resize(num_features, 0.0);
++        self.in_support.resize(num_features, false);
++    }
++
++    #[inline]
++    fn mark(&mut self, index: usize) {
++        if !self.in_support[index] {
++            self.in_support[index] = true;
++            self.support
++                .push(u32::try_from(index).expect("feature index does not fit in u32"));
++        }
++    }
++
++    /// Adds `count` to feature `index`.
++    #[inline]
++    pub fn add(&mut self, index: usize, count: f32) {
++        self.mark(index);
++        self.values[index] += count;
++    }
++
++    /// Forgets the previous cell and counts the classes that name a single
++    /// feature, over an axis of `num_features`, as
++    /// `em_optimize(.., only_unique = true)` does.
++    pub fn unique_counts<P: EqClassPayload>(
++        &mut self,
++        eqclasses: &HashMap<Vec<u32>, P, ahash::RandomState>,
++        num_features: usize,
++    ) {
++        self.reset(num_features);
++        for (labels, payload) in eqclasses {
++            if let [index] = labels[..] {
++                self.add(index as usize, payload.count() as f32);
++            }
++        }
++    }
++
++    /// Forgets the previous cell and runs `em_optimize(.., only_unique = false)`
++    /// over this cell's support, on an axis of `num_alphas` features.
++    ///
++    /// A feature outside the support appears in no class: `em_update` never
++    /// reads or writes it, so the dense version zeroes it in the first
++    /// iteration (there are always at least `MIN_ITER`) whatever its initial
++    /// value. Within the support, every step is the dense version's, in the
++    /// same order, so for the uniform and informative initializations the
++    /// result is bit-identical. A random initialization draws one value per
++    /// supported feature instead of one per feature.
++    pub fn em<P: EqClassPayload>(
++        &mut self,
++        eqclasses: &HashMap<Vec<u32>, P, ahash::RandomState>,
++        init_type: EmInitType,
++        num_alphas: usize,
++    ) {
++        self.reset(num_alphas);
++        // Only the EM needs the second vector; it stays zero between cells.
++        self.scratch.resize(num_alphas, 0.0);
++        for (labels, payload) in eqclasses {
++            if let [index] = labels[..] {
++                self.add(index as usize, payload.count() as f32);
++            } else {
++                for &index in labels {
++                    self.mark(index as usize);
++                }
++            }
++        }
++
++        let Self {
++            values: alphas_in,
++            scratch: alphas_out,
++            support,
++            ..
++        } = self;
++
++        let mut rng = rand::rng();
++        let uni_prior = 1.0 / (num_alphas as f32);
++        for &index in support.iter() {
++            let item = &mut alphas_in[index as usize];
++            match init_type {
++                EmInitType::Uniform => {
++                    *item = uni_prior;
++                }
++                EmInitType::Informative => {
++                    *item = (*item + 0.5) * 1e-3;
++                }
++                EmInitType::Random => {
++                    *item = rng.random::<f32>() + 1e-5;
++                }
++            }
++        }
++
++        let mut it_num: u32 = 0;
++        let mut converged: bool = true;
++        while it_num < MIN_ITER || (it_num < MAX_ITER && !converged) {
++            em_update(alphas_in, alphas_out, eqclasses);
++
++            converged = true;
++            for &index in support.iter() {
++                let index = index as usize;
++                if alphas_out[index] > ALPHA_CHECK_CUTOFF {
++                    let rel_diff = (alphas_in[index] - alphas_out[index]).abs();
++                    if rel_diff > REL_DIFF_TOLERANCE {
++                        converged = false;
++                    }
++                }
++                alphas_in[index] = alphas_out[index];
++                alphas_out[index] = 0.0_f32;
++            }
++
++            it_num += 1;
++        }
++
++        for &index in support.iter() {
++            let alpha = &mut alphas_in[index as usize];
++            if *alpha < MIN_OUTPUT_ALPHA {
++                *alpha = 0.0_f32;
++            }
++        }
++    }
++
++    /// Writes this cell's nonzero counts to `ind`/`vals` in increasing
++    /// feature order, and returns their maximum and sum. These are exactly
++    /// the entries, order and floating-point sum of a scan over the dense
++    /// vector: the entries skipped here are all zero.
++    pub fn write_nonzero(&mut self, ind: &mut Vec<usize>, vals: &mut Vec<f32>) -> (f32, f32) {
++        self.support.sort_unstable();
++        ind.clear();
++        vals.clear();
++        let mut max = 0.0f32;
++        let mut sum = 0.0f32;
++        for &index in &self.support {
++            let c = self.values[index as usize];
++            if c > max {
++                max = c;
++            }
++            sum += c;
++            if c > 0.0 {
++                ind.push(index as usize);
++                vals.push(c);
++            }
++        }
++        (max, sum)
++    }
++
++    /// The counts as a dense vector over the axis `reset` last sized.
++    pub fn to_dense(&self) -> Vec<f32> {
++        let mut dense = vec![0.0f32; self.values.len()];
++        for &index in &self.support {
++            dense[index as usize] = self.values[index as usize];
++        }
++        dense
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn run_bootstrap_subset_with_scratch(
+     eqclasses: &IndexedEqList,
+@@ -1280,4 +1461,184 @@ mod tests {
+         assert!(!scratch.support_membership[2]);
+         assert_eq!(scratch.support_membership.capacity(), membership_capacity);
+     }
++
++    fn cell_eqc(
++        classes: &[(&[u32], u32)],
++    ) -> HashMap<Vec<u32>, crate::utils::BasicEqClassPayload, ahash::RandomState> {
++        let mut eqc = HashMap::with_hasher(ahash::RandomState::with_seeds(2, 7, 1, 8));
++        for &(labels, ct) in classes {
++            eqc.insert(labels.to_vec(), crate::utils::BasicEqClassPayload { ct });
++        }
++        eqc
++    }
++
++    fn bits(v: &[f32]) -> Vec<u32> {
++        v.iter().map(|x| x.to_bits()).collect()
++    }
++
++    /// The dense path this replaces: `em_optimize`, then a scan of its output.
++    fn dense_cell(
++        eqc: &HashMap<Vec<u32>, crate::utils::BasicEqClassPayload, ahash::RandomState>,
++        init_type: EmInitType,
++        num_alphas: usize,
++        only_unique: bool,
++    ) -> (Vec<f32>, Vec<usize>, Vec<f32>, f32, f32) {
++        let mut unique_evidence = vec![false; num_alphas];
++        let mut no_ambiguity = vec![false; num_alphas];
++        let counts = em_optimize(
++            eqc,
++            &mut unique_evidence,
++            &mut no_ambiguity,
++            init_type,
++            num_alphas,
++            only_unique,
++            &slog::Logger::root(slog::Discard, slog::o!()),
++        );
++        let (mut ind, mut vals, mut max, mut sum) = (Vec::new(), Vec::new(), 0.0f32, 0.0f32);
++        for (i, &c) in counts.iter().enumerate() {
++            max = if c > max { c } else { max };
++            sum += c;
++            if c > 0.0 {
++                ind.push(i);
++                vals.push(c);
++            }
++        }
++        (counts, ind, vals, max, sum)
++    }
++
++    fn assert_cell_counts_match_dense(
++        sparse: &mut SparseCellCounts,
++        classes: &[(&[u32], u32)],
++        init_type: EmInitType,
++        num_alphas: usize,
++        only_unique: bool,
++    ) {
++        let eqc = cell_eqc(classes);
++        let (dense, d_ind, d_vals, d_max, d_sum) =
++            dense_cell(&eqc, init_type, num_alphas, only_unique);
++        if only_unique {
++            sparse.unique_counts(&eqc, num_alphas);
++        } else {
++            sparse.em(&eqc, init_type, num_alphas);
++        }
++        assert_eq!(bits(&sparse.to_dense()), bits(&dense), "{classes:?}");
++        let (mut ind, mut vals) = (vec![usize::MAX], vec![-1.0]);
++        let (max, sum) = sparse.write_nonzero(&mut ind, &mut vals);
++        assert_eq!(ind, d_ind, "{classes:?}");
++        assert_eq!(bits(&vals), bits(&d_vals), "{classes:?}");
++        assert_eq!(max.to_bits(), d_max.to_bits(), "{classes:?}");
++        assert_eq!(sum.to_bits(), d_sum.to_bits(), "{classes:?}");
++    }
++
++    #[test]
++    fn cell_counts_match_em_optimize_and_the_dense_scan() {
++        let cells: &[&[(&[u32], u32)]] = &[
++            &[],
++            &[(&[3], 5)],
++            &[
++                (&[0], 20),
++                (&[1], 4),
++                (&[0, 1], 8),
++                (&[1, 2], 1),
++                (&[2, 3, 4], 2),
++            ],
++            // only ambiguous classes: every feature starts from its prior
++            &[(&[5, 9], 3), (&[9, 11], 7)],
++            // a feature whose EM share falls under MIN_OUTPUT_ALPHA
++            &[(&[2], 1000), (&[2, 7], 1)],
++            // slow convergence: a long chain of overlapping classes
++            &[
++                (&[0, 1], 9),
++                (&[1, 2], 9),
++                (&[2, 3], 9),
++                (&[3, 4], 9),
++                (&[4], 1),
++                (&[0], 30),
++            ],
++        ];
++        let mut sparse = SparseCellCounts::default();
++        for &init_type in &[EmInitType::Uniform, EmInitType::Informative] {
++            for only_unique in [true, false] {
++                for cell in cells {
++                    assert_cell_counts_match_dense(&mut sparse, cell, init_type, 12, only_unique);
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn cell_counts_match_dense_on_generated_cells_with_one_reused_scratch() {
++        // A worker reuses one scratch for every cell: each result must not
++        // depend on what the previous cells touched.
++        let mut state = 0x2545_f491_4f6c_dd1du64;
++        let mut next = move |n: u64| {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state % n
++        };
++        let num_alphas = 200;
++        let mut sparse = SparseCellCounts::default();
++        for cell_num in 0..500 {
++            let num_classes = next(40) as usize;
++            let mut owned: Vec<(Vec<u32>, u32)> = Vec::new();
++            for _ in 0..num_classes {
++                let len = 1 + next(4) as usize;
++                let mut labels: Vec<u32> =
++                    (0..len).map(|_| next(num_alphas as u64) as u32).collect();
++                labels.sort_unstable();
++                labels.dedup();
++                owned.push((labels, 1 + next(50) as u32));
++            }
++            let classes: Vec<(&[u32], u32)> = owned.iter().map(|(l, c)| (&l[..], *c)).collect();
++            let init_type = if cell_num % 2 == 0 {
++                EmInitType::Uniform
++            } else {
++                EmInitType::Informative
++            };
++            assert_cell_counts_match_dense(
++                &mut sparse,
++                &classes,
++                init_type,
++                num_alphas,
++                cell_num % 3 == 0,
++            );
++        }
++    }
++
++    #[test]
++    fn usa_unique_counts_match_extract_counts_with_one_reused_scratch() {
++        // USA labels are `gene << 1 | unspliced`; the axis is genes x {S, U, A}.
++        let mut state = 0x9e37_79b9_7f4a_7c15u64;
++        let mut next = move |n: u64| {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state % n
++        };
++        let num_genes = 60u64;
++        let num_counts = 3 * num_genes as usize;
++        let mut sparse = SparseCellCounts::default();
++        for _ in 0..500 {
++            let mut owned: Vec<(Vec<u32>, u32)> = Vec::new();
++            for _ in 0..next(30) {
++                let len = 1 + next(4) as usize;
++                let mut labels: Vec<u32> = (0..len)
++                    .map(|_| {
++                        let g = next(num_genes) as u32;
++                        // often both statuses of one gene, the A column's case
++                        (g << 1) | next(2) as u32
++                    })
++                    .collect();
++                labels.sort_unstable();
++                labels.dedup();
++                owned.push((labels, 1 + next(50) as u32));
++            }
++            let classes: Vec<(&[u32], u32)> = owned.iter().map(|(l, c)| (&l[..], *c)).collect();
++            let eqc = cell_eqc(&classes);
++            let dense = crate::utils::extract_counts(&eqc, num_counts);
++            crate::utils::extract_counts_sparse(&eqc, num_counts, &mut sparse);
++            assert_eq!(bits(&sparse.to_dense()), bits(&dense), "{classes:?}");
++        }
++    }
+ }
+diff --git a/src/pugutils.rs b/src/pugutils.rs
+index 5457741..053785f 100644
+--- a/src/pugutils.rs
++++ b/src/pugutils.rs
+@@ -28,6 +28,7 @@ use libradicl::record::{
+ 
+ use slog::{crit, info, warn};
+ 
++use crate::em::SparseCellCounts;
+ use crate::eq_class::{EqMap, EqMapType};
+ use crate::molecules::CellMolecules;
+ use crate::quant::SplicedAmbiguityModel;
+@@ -1344,6 +1345,10 @@ pub fn get_num_molecules_cell_ranger_like<P: EqClassPayload>(
+     }
+ }
+ 
++/// Writes the cell's gene-unique counts to `counts` (reset to `num_genes`
++/// features first) and returns the fraction of UMIs that were discarded as
++/// multi-gene.
++///
+ /// With `mols`, each distinct (UMI, gene) of a gene-unique equivalence class is
+ /// recorded as a molecule with the reads summed over classes, and each UMI of a
+ /// gene-ambiguous class as a multi-gene molecule with that class's reads.
+@@ -1351,10 +1356,11 @@ pub fn get_num_molecules_trivial_discard_all_ambig(
+     eq_map: &EqMap,
+     tid_to_gid: &[u32],
+     num_genes: usize,
++    counts: &mut SparseCellCounts,
+     mut mols: Option<&mut CellMolecules>,
+     _log: &slog::Logger,
+-) -> (Vec<f32>, f64) {
+-    let mut counts = vec![0.0f32; num_genes];
++) -> f64 {
++    counts.reset(num_genes);
+     let s = ahash::RandomState::with_seeds(2u64, 7u64, 1u64, 8u64);
+     let mut gene_map: std::collections::HashMap<u32, Vec<(u64, u32)>, ahash::RandomState> =
+         HashMap::with_hasher(s);
+@@ -1418,7 +1424,7 @@ pub fn get_num_molecules_trivial_discard_all_ambig(
+             same
+         });
+         // the count is the number of distinct UMIs.
+-        counts[*k as usize] += v.len() as f32;
++        counts.add(*k as usize, v.len() as f32);
+         if let Some(m) = mols.as_deref_mut() {
+             for &(umi, reads) in v.iter() {
+                 m.push(umi, &[*k], reads, 1);
+@@ -1426,8 +1432,7 @@ pub fn get_num_molecules_trivial_discard_all_ambig(
+         }
+     }
+ 
+-    // return the counts
+-    (counts, multi_gene_umis as f64 / total_umis as f64)
++    multi_gene_umis as f64 / total_umis as f64
+ }
+ 
+ /// given the connected component (subgraph) of `g` defined by the
+diff --git a/src/quant.rs b/src/quant.rs
+index dc9e299..ba2d2a3 100644
+--- a/src/quant.rs
++++ b/src/quant.rs
+@@ -45,7 +45,7 @@ use flate2::Compression;
+ use flate2::write::GzEncoder;
+ 
+ use crate::em::{
+-    EmInitType, EmSubsetScratch, em_optimize, em_optimize_long_read,
++    EmInitType, EmSubsetScratch, SparseCellCounts, em_optimize_long_read,
+     em_optimize_subset_with_scratch, run_bootstrap_with_scratch,
+ };
+ use crate::eq_class::{EqMap, EqMapType, IndexedEqList};
+@@ -927,6 +927,9 @@ where
+     // Reusable working buffers for the cr-like resolvers, carried across cells
+     // to avoid a fresh allocation per cell / per equivalence class.
+     let mut crlike_scratch = pugutils::CrLikeScratch::default();
++    // This cell's counts when its resolver works over the cell's own features
++    // (every path but the USA-mode and long-read EMs); see `SparseCellCounts`.
++    let mut cell_counts = SparseCellCounts::default();
+ 
+     let mut local_nrec = 0usize;
+     // Drain MetaChunks until the producer is done and the queue is empty.
+@@ -983,7 +986,11 @@ where
+ 
+             // The structures we'll need to hold our output for this
+             // cell.
+-            let mut counts: Vec<f32>;
++            // Dense counts, from the resolvers that still produce them (the
++            // USA-mode EM and the long-read EM). Otherwise the cell is resolved
++            // into `cell_counts`, and `counts` is only built for bootstrapping.
++            let mut counts: Vec<f32> = Vec::new();
++            let mut sparse_counts = false;
+             let mut alt_resolution = false;
+             let mut max_umi = 0.0f32;
+             let mut sum_umi = 0.0f32;
+@@ -1060,8 +1067,6 @@ where
+                 max_umi = max_umi_local;
+                 sum_umi = sum_umi_local;
+                 num_expr = expressed_vec.len() as u32;
+-                // counts is only needed for EDS output; build lazily below
+-                counts = Vec::new();
+             } else
+             // Original path for larger cells
+             {
+@@ -1116,8 +1121,12 @@ where
+                             match (config.usa_mode, only_unique) {
+                                 (true, true) => {
+                                     // USA mode, only gene-unqique reads
+-                                    counts =
+-                                        afutils::extract_counts(&gene_eqc, config.feature_rows);
++                                    afutils::extract_counts_sparse(
++                                        &gene_eqc,
++                                        config.feature_rows,
++                                        &mut cell_counts,
++                                    );
++                                    sparse_counts = true;
+                                 }
+                                 (true, false) => {
+                                     // USA mode, use EM
+@@ -1142,28 +1151,30 @@ where
+                                 }
+                                 (false, _) => {
+                                     // not USA-mode
+-                                    counts = em_optimize(
+-                                        &gene_eqc,
+-                                        &mut unique_evidence,
+-                                        &mut no_ambiguity,
+-                                        config.em_init_type,
+-                                        config.num_features,
+-                                        only_unique,
+-                                        &log,
+-                                    );
++                                    if only_unique {
++                                        cell_counts.unique_counts(&gene_eqc, config.num_features);
++                                    } else {
++                                        cell_counts.em(
++                                            &gene_eqc,
++                                            config.em_init_type,
++                                            config.num_features,
++                                        );
++                                    }
++                                    sparse_counts = true;
+                                 }
+                             }
+                         }
+                         ResolutionStrategy::Trivial => {
+                             eq_map.init_from_chunk(&mut c);
+-                            let ct = pugutils::get_num_molecules_trivial_discard_all_ambig(
++                            pugutils::get_num_molecules_trivial_discard_all_ambig(
+                                 &eq_map,
+                                 &shared.tid_to_gid,
+                                 config.num_features,
++                                &mut cell_counts,
+                                 dump_molecules.then_some(&mut cell_mols),
+                                 &log,
+                             );
+-                            counts = ct.0;
++                            sparse_counts = true;
+                             eq_map.clear();
+                         }
+                         ResolutionStrategy::Parsimony
+@@ -1205,8 +1216,12 @@ where
+                             match (config.usa_mode, only_unique, P::HAS_PROBS) {
+                                 (true, true, _) => {
+                                     // USA mode, only gene-unqique reads
+-                                    counts =
+-                                        afutils::extract_counts(&gene_eqc, config.feature_rows);
++                                    afutils::extract_counts_sparse(
++                                        &gene_eqc,
++                                        config.feature_rows,
++                                        &mut cell_counts,
++                                    );
++                                    sparse_counts = true;
+                                 }
+                                 (true, false, _) => {
+                                     // USA mode, use EM
+@@ -1231,15 +1246,16 @@ where
+                                 }
+                                 (false, _, false) => {
+                                     // not USA-mode
+-                                    counts = em_optimize(
+-                                        &gene_eqc,
+-                                        &mut unique_evidence,
+-                                        &mut no_ambiguity,
+-                                        config.em_init_type,
+-                                        config.num_features,
+-                                        only_unique,
+-                                        &log,
+-                                    );
++                                    if only_unique {
++                                        cell_counts.unique_counts(&gene_eqc, config.num_features);
++                                    } else {
++                                        cell_counts.em(
++                                            &gene_eqc,
++                                            config.em_init_type,
++                                            config.num_features,
++                                        );
++                                    }
++                                    sparse_counts = true;
+                                 }
+                                 (false, _, true) => {
+                                     // not USA-mode
+@@ -1258,6 +1274,9 @@ where
+                     }
+ 
+                     if config.num_bootstraps > 0 {
++                        if sparse_counts {
++                            counts = cell_counts.to_dense();
++                        }
+                         bootstraps = run_bootstrap_with_scratch(
+                             &gene_eqc,
+                             config.num_bootstraps,
+@@ -1272,9 +1291,12 @@ where
+                     // clear our local variables
+                     // eq_map.clear();
+ 
+-                    // fill requires >= 1.50.0
+-                    unique_evidence.fill(false);
+-                    no_ambiguity.fill(false);
++                    // Only the dense resolvers set these. Nothing in quant
++                    // reads them, but they are cleared for the next cell.
++                    if !sparse_counts {
++                        unique_evidence.fill(false);
++                        no_ambiguity.fill(false);
++                    }
+ 
+                     // done clearing
+                 } else {
+@@ -1384,9 +1406,13 @@ where
+             //   << "\t" << numMappedReads
+             //
+             // For fast-path cells, max_umi/sum_umi/num_expr/expressed_*
+-            // are already computed sparsely above. For non-fast-path
+-            // cells, extract them from the dense counts vector.
+-            if !used_fast_path {
++            // are already computed sparsely above. Otherwise, extract them
++            // from `cell_counts` or, after a dense resolver, from `counts`.
++            if sparse_counts {
++                (max_umi, sum_umi) =
++                    cell_counts.write_nonzero(&mut expressed_ind, &mut expressed_vec);
++                num_expr = expressed_vec.len() as u32;
++            } else if !used_fast_path {
+                 let mut max_umi_local = 0.0f32;
+                 let mut sum_umi_local = 0.0f32;
+                 expressed_vec.clear();
+diff --git a/src/utils.rs b/src/utils.rs
+index d1c3dee..2eebc2b 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -7,6 +7,7 @@
+  * License: 3-clause BSD, see https://opensource.org/licenses/BSD-3-Clause
+  */
+ use crate::constants as afconst;
++use crate::em::SparseCellCounts;
+ use crate::eq_class::IndexedEqList;
+ use anyhow::{Context, anyhow};
+ use bstr::io::BufReadExt;
+@@ -854,6 +855,23 @@ pub fn extract_counts<P: EqClassPayload>(
+     counts
+ }
+ 
++/// [`extract_counts`] into a worker's reusable [`SparseCellCounts`]: the same
++/// columns and sums, touching only the columns this cell's labels map to.
++pub fn extract_counts_sparse<P: EqClassPayload>(
++    gene_eqc: &HashMap<Vec<u32>, P, ahash::RandomState>,
++    num_counts: usize,
++    counts: &mut SparseCellCounts,
++) {
++    let unspliced_offset = num_counts / 3;
++    let ambig_offset = 2 * unspliced_offset;
++    counts.reset(num_counts);
++    for (labels, payload) in gene_eqc {
++        if let Some(idx) = usa_label_column(labels, unspliced_offset, ambig_offset) {
++            counts.add(idx, payload.count() as f32);
++        }
++    }
++}
++
+ /// Extracts UMI counts from the `gene_eqc` HashMap.
+ /// This function is to be used when we are counting UMIs in
+ /// USA mode.  Multimappers will be uniformly allocated to the

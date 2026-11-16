@@ -1,0 +1,132 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 72b5005..762c002 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,15 @@
+   `--polyA` did. Raised by @marenmsk in
+   [#504](https://github.com/FelixKrueger/TrimGalore/issues/504).
+ 
++
++- **The `--cores N` gzip teardown no longer leaks its compressor to avoid a panic**
++  ([#434](https://github.com/FelixKrueger/TrimGalore/issues/434)). Reporting a failed teardown on the
++  parallel path relied on a local `std::mem::forget`, which disarmed a double-teardown panic in
++  `gzp` at the cost of leaking a `Sender` pair and a `JoinHandle` and parking the compressor threads.
++  [gzp 2.0.3](https://github.com/sstadick/gzp/issues/68) fixes that upstream, so the workaround is
++  gone and the error propagates normally; the minimum `gzp` is now 2.0.3, because on 2.0.2 the
++  regression test panics rather than fails.
++
+ - **`--clumpify` keeps peak memory inside the budget it prints on short reads too**
+   ([#457](https://github.com/FelixKrueger/TrimGalore/issues/457)). Part of the per-record cost is the
+   allocator's, so the bin-pool coefficients now bound it at 25 bp rather than modelling it: bins are
+diff --git a/Cargo.lock b/Cargo.lock
+index 4b3607c..22e6b47 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -693,9 +693,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "gzp"
+-version = "2.0.2"
++version = "2.0.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7abe9930717197e0ea50d8c8a1106a38b5bee0536ed4cbf4b93ba1a953f97d04"
++checksum = "d4db1c9484dd0efe5915d057891b2d3800271cd1e466dcdea80022038b86e510"
+ dependencies = [
+  "byteorder",
+  "bytes",
+diff --git a/Cargo.toml b/Cargo.toml
+index 360e418..d5a3161 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -28,7 +28,7 @@ path = "src/main.rs"
+ [dependencies]
+ clap = { version = "4", features = ["derive"] }
+ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+-gzp = { version = "2", default-features = false, features = ["deflate_rust"] }
++gzp = { version = "2.0.3", default-features = false, features = ["deflate_rust"] }
+ anyhow = "1"
+ memchr = "2"
+ log = "0.4"
+diff --git a/src/fastq.rs b/src/fastq.rs
+index 494a989..cbd0f94 100644
+--- a/src/fastq.rs
++++ b/src/fastq.rs
+@@ -647,51 +647,17 @@ impl Sink {
+                 encoder.try_finish()?;
+             }
+             Sink::ParGz(mut w) => {
+-                // Every fallible step is inside the closure so that ONE error
+-                // path covers all of them. `?` straight out of this arm would
+-                // drop `w` on the way, and dropping a `ParCompress` that has
+-                // not been finished is the panic described below — which the
+-                // flushes can reach just as easily as `finish` can.
+-                let outcome = (|| -> Result<()> {
+-                    // Same markers as the serial arm, same reason — see
+-                    // `PRE_434_GZ_SYNC_FLUSHES`. `ParCompress::flush` is
+-                    // `flush_last(false)`.
+-                    for _ in 0..PRE_434_GZ_SYNC_FLUSHES {
+-                        w.flush()?;
+-                    }
+-                    w.finish()?;
+-                    Ok(())
+-                })();
+-                match outcome {
+-                    Ok(()) => {}
+-                    Err(e) => {
+-                        // `ParCompress::finish` propagates a failed
+-                        // `flush_last` with `?` BEFORE it takes its channels
+-                        // and join handle, so all three are still `Some` here.
+-                        // `ParCompress::drop` reads that as "never finished",
+-                        // calls `finish()` again and `unwrap()`s the same
+-                        // error (`gzp-2.0.2/src/par/compress.rs:398`) — turning
+-                        // a reportable I/O failure into a panic on the way out
+-                        // of this function. #434 is specifically about a failed
+-                        // teardown being *reported* rather than swallowed, so
+-                        // leaving that in place would half-undo it for
+-                        // `--cores N`.
+-                        //
+-                        // Disarming means not running that `Drop`. What leaks
+-                        // is a `Sender` pair and a `JoinHandle`; the compressor
+-                        // threads then park on a channel that is never closed.
+-                        // That is bounded by the process, which is on its way
+-                        // to exiting with this error — every
+-                        // `FastqWriter::finish` caller propagates it with `?`.
+-                        // A panic in place of an error message is the worse
+-                        // trade.
+-                        //
+-                        // The real fix belongs upstream in `gzp`: take the
+-                        // fields before the `?`. Remove this when that lands.
+-                        std::mem::forget(w);
+-                        return Err(e);
+-                    }
++                // A `ParCompress` dropped after a failed teardown does not
++                // retry it: gzp >= 2.0.3 takes the channels and the join
++                // handle in `recover_send_error` before joining.
++                //
++                // Same markers as the serial arm, same reason — see
++                // `PRE_434_GZ_SYNC_FLUSHES`. `ParCompress::flush` is
++                // `flush_last(false)`.
++                for _ in 0..PRE_434_GZ_SYNC_FLUSHES {
++                    w.flush()?;
+                 }
++                w.finish()?;
+             }
+         }
+         Ok(())
+@@ -905,14 +871,9 @@ mod tests {
+         // THE `--cores N` ARM, WHICH HAD NO TEST OF ITS OWN AND IS THE ONE THE
+         // REVIEW OF #436 CAUGHT TWICE.
+         //
+-        // `ParCompress::finish` propagates a failed `flush_last` with `?`
+-        // before taking its channels and join handle, so `ParCompress::drop`
+-        // sees them still `Some`, calls `finish()` a second time and
+-        // `unwrap()`s the same error at `gzp-2.0.2/src/par/compress.rs:398`.
+-        // Without the `mem::forget` in `Sink::finish` this test does not fail
+-        // — it PANICS, which is exactly the outcome #434 set out to remove.
+         // Running to completion is the real assertion here; `is_err()` is the
+-        // weaker half.
++        // weaker half. A `Drop` that retried a failed teardown would panic
++        // instead, which is why Cargo.toml floors gzp at 2.0.3.
+         //
+         // THE WINDOW IS NARROW AND THE OBVIOUS TEST MISSES IT. `ParCompress::
+         // write`, on a send failure, takes the join handle itself so it can

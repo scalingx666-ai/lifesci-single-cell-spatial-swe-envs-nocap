@@ -1,0 +1,202 @@
+diff --git a/benchmarks/benchmarks/tools.py b/benchmarks/benchmarks/tools.py
+index ef5d18e62f..159abd2d51 100644
+--- a/benchmarks/benchmarks/tools.py
++++ b/benchmarks/benchmarks/tools.py
+@@ -9,7 +9,7 @@
+ 
+ import scanpy as sc
+ 
+-from ._utils import pbmc68k_reduced
++from ._utils import pbmc3k, pbmc68k_reduced, to_off_axis
+ 
+ 
+ class ToolsSuite:  # noqa: D101
+@@ -50,3 +50,34 @@ def time_combat(self) -> None:
+ 
+     def peakmem_combat(self) -> None:
+         sc.pp.combat(self.adata, key="bulk_labels")
++
++
++class ScoreGenesSuite:
++    """End-to-end benchmark for `sc.tl.score_genes` on sparse data.
++
++    `score_genes` reduces the control- and target-gene blocks with
++    `_sparse_nanmean` when `.X` is sparse, so this covers the public path that
++    consumes the kernel for both the CSR and the off-axis (CSC) layout.
++    """
++
++    params: tuple[str, ...] = ("pbmc3k", "pbmc3k-off-axis")
++    param_names = ("layout",)
++
++    def setup_cache(self) -> None:
++        adata = pbmc3k()
++        adata.write_h5ad("pbmc3k.h5ad")
++        adata.X = to_off_axis(adata.X)
++        adata.write_h5ad("pbmc3k-off-axis.h5ad")
++
++    def setup(self, layout: str) -> None:
++        self.adata = ad.read_h5ad(f"{layout}.h5ad")
++        self.gene_list = self.adata.var_names[:100].tolist()
++        # warm up the numba JIT (score_genes -> _sparse_nanmean) so compilation
++        # is excluded from the timing
++        sc.tl.score_genes(self.adata, self.gene_list, rng=0)
++
++    def time_score_genes(self, *_) -> None:
++        sc.tl.score_genes(self.adata, self.gene_list, rng=0)
++
++    def peakmem_score_genes(self, *_) -> None:
++        sc.tl.score_genes(self.adata, self.gene_list, rng=0)
+diff --git a/docs/release-notes/4141.perf.md b/docs/release-notes/4141.perf.md
+new file mode 100644
+index 0000000000..7838e7541b
+--- /dev/null
++++ b/docs/release-notes/4141.perf.md
+@@ -0,0 +1 @@
++Speed up {func}`~scanpy.tl.score_genes` by computing the sparse `nanmean` in a single pass instead of copying the matrix twice {smaller}`L Darrow`
+diff --git a/src/scanpy/tools/_score_genes.py b/src/scanpy/tools/_score_genes.py
+index 8044d73350..bc9f977e5e 100644
+--- a/src/scanpy/tools/_score_genes.py
++++ b/src/scanpy/tools/_score_genes.py
+@@ -4,8 +4,10 @@
+ 
+ from typing import TYPE_CHECKING
+ 
++import numba
+ import numpy as np
+ import pandas as pd
++from fast_array_utils.numba import njit
+ 
+ from .. import logging as logg
+ from .._compat import CSBase, old_positionals
+@@ -25,28 +27,65 @@
+ type _GetSubset = Callable[[_StrIdx], np.ndarray | CSBase]
+ 
+ 
++@njit
++def _sparse_nanmean_within_slot(
++    data: NDArray, indptr: NDArray, n_out: int, divisor: int
++) -> NDArray[np.float64]:
++    """Reduce within each compressed slot (e.g. per row for CSR), ignoring NaNs."""
++    out = np.empty(n_out, dtype=np.float64)
++    for i in numba.prange(n_out):
++        total = np.float64(0)
++        n_nan = 0
++        for k in range(indptr[i], indptr[i + 1]):
++            v = data[k]
++            if np.isnan(v):
++                n_nan += 1
++            else:
++                total += v
++        out[i] = total / (divisor - n_nan)
++    return out
++
++
++@njit
++def _sparse_nanmean_across_slots(
++    data: NDArray, indices: NDArray, n_out: int, divisor: int
++) -> NDArray[np.float64]:
++    """Reduce across compressed slots (e.g. per column for CSR), ignoring NaNs."""
++    total = np.zeros(n_out, dtype=np.float64)
++    n_nan = np.zeros(n_out, dtype=np.int64)
++    for k in range(data.shape[0]):
++        v = data[k]
++        j = indices[k]
++        if np.isnan(v):
++            n_nan[j] += 1
++        else:
++            total[j] += v
++    out = np.empty(n_out, dtype=np.float64)
++    for j in numba.prange(n_out):
++        out[j] = total[j] / (divisor - n_nan[j])
++    return out
++
++
+ def _sparse_nanmean(x: CSBase, /, axis: Literal[0, 1]) -> NDArray[np.float64]:
+-    """np.nanmean equivalent for sparse matrices."""
++    """np.nanmean equivalent for sparse matrices.
++
++    Computed in a single pass over the stored values, avoiding the two matrix
++    copies and the sparse set-index/``eliminate_zeros`` the previous
++    implementation needed. Implicit (structural) zeros count as observed
++    values; only stored ``NaN`` entries are excluded, matching ``np.nanmean``
++    on the densified array.
++    """
+     if not isinstance(x, CSBase):
+         msg = "X must be a compressed sparse matrix"
+         raise TypeError(msg)
+ 
+-    # count the number of nan elements per row/column (dep. on axis)
+-    z = x.copy()
+-    z.data = np.isnan(z.data)
+-    z.eliminate_zeros()
+-    n_elements = z.shape[axis] - z.sum(axis)
+-
+-    # set the nans to 0, so that a normal .sum() works
+-    y = x.copy()
+-    y.data[np.isnan(y.data)] = 0
+-    y.eliminate_zeros()
+-
+-    # the average
+-    s = y.sum(axis, dtype="float64")  # float64 for score_genes function compatibility)
+-    m = s / n_elements
+-
+-    return m
++    n_out = x.shape[1 - axis]  # one result per row (axis=1) or per column (axis=0)
++    divisor = x.shape[axis]  # observable positions along the reduced axis
++    # the compressed (major) axis stores rows for CSR and columns for CSC
++    reduce_within_slot = (x.format == "csr") == (axis == 1)
++    if reduce_within_slot:
++        return _sparse_nanmean_within_slot(x.data, x.indptr, n_out, divisor)
++    return _sparse_nanmean_across_slots(x.data, x.indices, n_out, divisor)
+ 
+ 
+ @old_positionals(
+diff --git a/tests/test_score_genes.py b/tests/test_score_genes.py
+index 89272015cb..65d48a73d0 100644
+--- a/tests/test_score_genes.py
++++ b/tests/test_score_genes.py
+@@ -15,7 +15,6 @@
+ from scipy import sparse
+ 
+ import scanpy as sc
+-from scanpy._compat import CSBase
+ from scanpy._utils.random import random_str
+ from testing.scanpy._helpers.data import paul15
+ 
+@@ -23,7 +22,7 @@
+     from collections.abc import Callable
+     from typing import Literal
+ 
+-    from scanpy._compat import CSRBase
++    from scanpy._compat import CSBase, CSRBase
+ 
+ 
+ HERE = Path(__file__).parent
+@@ -93,6 +92,7 @@ def test_add_score():
+     assert adata.obs["Test"].dtype == "float64"
+ 
+ 
++@pytest.mark.parametrize("fmt", ["csr", "csc"])
+ @pytest.mark.parametrize("axis", [0, 1])
+ @pytest.mark.parametrize(
+     "mk_arr",
+@@ -118,14 +118,14 @@ def test_add_score():
+     ],
+ )
+ def test_sparse_nanmean(
+-    mk_arr: Callable[[], CSBase | np.ndarray], axis: Literal[0, 1]
++    mk_arr: Callable[[], CSBase | np.ndarray], axis: Literal[0, 1], fmt: str
+ ) -> None:
+-    """Check that _sparse_nanmean() is equivalent to np.nanmean()."""
++    """Check that _sparse_nanmean() is equivalent to np.nanmean() for CSR and CSC."""
+     from scanpy.tools._score_genes import _sparse_nanmean
+ 
+-    arr_or_mat = mk_arr()
+-    arr = conv.to_dense(arr_or_mat)
+-    mat = sparse.csr_matrix(arr) if not isinstance(arr, CSBase) else arr  # noqa: TID251
++    arr = conv.to_dense(mk_arr())
++    make = sparse.csr_matrix if fmt == "csr" else sparse.csc_matrix  # noqa: TID251
++    mat = make(arr)
+     np.testing.assert_allclose(
+         np.nanmean(arr, axis), np.array(_sparse_nanmean(mat, axis)).flatten()
+     )

@@ -1,0 +1,397 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fdd5119..fb3ca35 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,14 @@
+ All notable changes to rctd-py are documented here.
+ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [0.4.4] — 2026-11-06
++
++rctd-py 0.4.4 fixes GPU out-of-memory errors in doublet and multi mode with the Python API's default `batch_size="auto"`, found while answering [#49](https://github.com/p-gueguen/rctd-py/issues/49) ([#50](https://github.com/p-gueguen/rctd-py/pull/50)). `rctd run` is unchanged.
++
++### Fixed
++- **Doublet and multi mode could run out of GPU memory with the default `batch_size="auto"`** (Python API; `rctd run` defaults to `--batch-size 10000` and was not affected). The automatic batch size was computed from full mode's memory per pixel, but in doublet mode a batch row is a (pixel, type, type) triple and in multi mode a candidate type set, each with its own design matrix, and it ignored the count matrix these modes keep on the GPU. On a 44 GB L40S, doublet and multi mode on 39k Visium HD segmented cells (4,747 genes, 40 types, float64) got batches of 200,000 rows and failed. The batch size is now computed per mode from peak memory measured up to 25,000 genes and 150 cell types, after subtracting the memory that does not grow with the batch: the resident count matrix (not in full mode with `stream_gpu=True`) and the genes x types² table of the full-mode fit. It now reads the free memory of the GPU the run uses (`config.device`) and returns the default on CPU. An unknown `mode` now raises, and a warning says when the count matrix or the minimum batch of 1,024 rows does not fit.
++- Because `"auto"` now picks different batch sizes in every mode, weights from `batch_size="auto"` can differ from 0.4.3 in the last digits, as with any change of batch size. On the Visium HD run above, the spot classes and cell types were identical.
++
+ ## [0.4.3] — 2026-11-02
+ 
+ rctd-py 0.4.3 adds a scverse-style interface: `rctd.pp.reference` and `rctd.tl.deconvolve`, with `layer` and `key_added`. Results are unchanged: `rctd run` writes the same output as 0.4.2, and `rctd.deconvolve` with its 0.4.2 arguments writes the same keys and values.
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 006c26c..9f278d5 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -62,7 +62,7 @@ Two optimization layers accelerate the hot path beyond basic `torch.compile`:
+    - `_solve_box_qp_2`: Cramer's rule + clamping (avoids 50-sweep Gauss-Seidel)
+    - Dispatched automatically by `_psd_batch` and `_solve_box_qp_batch` when K==2
+ 
+-2. **Auto batch sizing** (`_types.py:auto_batch_size`): Calculates optimal GPU batch size from available VRAM using per-pixel memory footprint estimation. Used by `run_rctd(batch_size="auto")` (default).
++2. **Auto batch sizing** (`_types.py:auto_batch_size`): Calculates the GPU batch size from free VRAM, minus the dense (N, G) counts each mode keeps on the GPU, divided by a per-mode peak per batch row (`_row_values`; a row is a pixel in full mode, a (pixel, type, type) triple in doublet mode, a candidate set in multi mode). The constants are measured; `tests/test_auto_batch_size.py::test_measured_peak_per_row_within_estimate` (GPU, `slow`) fails if solver changes push the real peak above them. Used by `run_rctd(batch_size="auto")` (default).
+ 
+ ### GPU memory (0.4.1)
+ 
+diff --git a/benchmarks/bench_visiumhd.py b/benchmarks/bench_visiumhd.py
+index 347c7e1..3024287 100644
+--- a/benchmarks/bench_visiumhd.py
++++ b/benchmarks/bench_visiumhd.py
+@@ -10,6 +10,7 @@
+         --ref-dir data/mouse_brain \
+         --out-dir data/visiumhd_mouse_brain
+ """
++
+ import argparse
+ import json
+ import resource
+@@ -100,9 +101,17 @@ def main():
+     else:
+         try:
+             from rctd._types import auto_batch_size
++
+             G = rctd_obj.counts.shape[1]
+             K = reference.n_types
+-            batch_size = auto_batch_size(G, K)
++            # resident full mode: the whole N x G count matrix sits on the GPU
++            batch_size = auto_batch_size(
++                G,
++                K,
++                dtype_bytes=rctd_obj.counts.dtype.itemsize,
++                mode="full",
++                n_resident=rctd_obj.counts.shape[0],
++            )
+         except ImportError:
+             batch_size = 10000
+     print(f"  Batch size: {batch_size}")
+diff --git a/src/rctd/_rctd.py b/src/rctd/_rctd.py
+index 89147d5..b8616ae 100644
+--- a/src/rctd/_rctd.py
++++ b/src/rctd/_rctd.py
+@@ -353,7 +353,17 @@ def run_rctd(
+     dtype_bytes = 8 if rctd.config.dtype == "float64" else 4
+ 
+     if batch_size == "auto":
+-        batch_size = auto_batch_size(G, K, dtype_bytes=dtype_bytes)
++        # Every mode keeps the dense (N, G) counts on the GPU, except full mode with stream_gpu.
++        n_resident = 0 if (mode == "full" and stream_gpu) else rctd.counts.shape[0]
++        batch_size = auto_batch_size(
++            G,
++            K,
++            dtype_bytes=dtype_bytes,
++            mode=mode,
++            n_resident=n_resident,
++            max_multi_types=rctd.config.MAX_MULTI_TYPES,
++            device=rctd.config.device,
++        )
+         print(f"Auto batch size: {batch_size}")
+ 
+     print(f"Running in {mode} mode...")
+diff --git a/src/rctd/_types.py b/src/rctd/_types.py
+index 413cd49..f68962a 100644
+--- a/src/rctd/_types.py
++++ b/src/rctd/_types.py
+@@ -1,5 +1,6 @@
+ """Result types for RCTD."""
+ 
++import warnings
+ from typing import NamedTuple
+ 
+ import numpy as np
+@@ -79,38 +80,80 @@ def resolve_device(device: str = "auto") -> torch.device:
+     return torch.device(device)
+ 
+ 
++# Peak GPU memory of one batch row, in values. A batch row is a pixel in full mode, but a
++# (pixel, type, type) triple in doublet mode and a candidate type set in multi mode, each carrying
++# its own (G, k) design matrix, so those modes need far more per row. Measured with
++# torch.cuda.max_memory_allocated on an L40S (G 1,500-25,000, K 10-150, float32 and float64):
++# full 7.5-14 x G, doublet 20-21.5 x G, multi (MAX_MULTI_TYPES=4) up to 18.4 x G at G >= 18,000.
++# The constants below sit above every measurement (measured / estimate 0.44-0.76);
++# budget_fraction adds the remaining margin. Batch-independent memory (the resident counts and
++# the G x K^2 P_outer of the full-mode fit) is subtracted from free memory instead.
++_MIN_BATCH = 1024
++_MAX_BATCH = 200_000
++
++
++def _row_values(mode: str, G: int, K: int, max_multi_types: int) -> int:
++    """Peak values per batch row. Doublet and multi mode start with a full-mode fit at the same
++    batch size, so their cost is the larger of the two stages."""
++    full = 16 * G + 5 * K + 2 * K * K  # + per-pixel K x K Hessian and QP terms
++    if mode == "full":
++        return full
++    if mode == "doublet":
++        return max(full, 24 * G)
++    if mode == "multi":
++        return max(full, 6 * max_multi_types * G + 80_000)
++    raise ValueError(f"Unknown mode: {mode!r} (expected 'full', 'doublet' or 'multi')")
++
++
+ def auto_batch_size(
+     G: int,
+     K: int,
+     dtype_bytes: int = 4,
+     budget_fraction: float = 0.7,
+     default: int = 10000,
++    mode: str = "full",
++    n_resident: int = 0,
++    max_multi_types: int = 4,
++    device: str | torch.device = "auto",
+ ) -> int:
+-    """Calculate optimal batch size based on available GPU VRAM.
++    """Calculate a batch size that fits in the free memory of the GPU the run uses.
+ 
+-    Estimates per-pixel memory footprint from all IRWLS intermediates
+-    and scales batch size to use ``budget_fraction`` of free VRAM.
+-    Falls back to ``default`` on CPU or if CUDA info is unavailable.
++    Estimates the peak memory of one batch row in ``mode`` and scales the batch to use
++    ``budget_fraction`` of the VRAM left free once the ``n_resident`` x ``G`` count matrix the
++    mode keeps on the GPU, and the G x K^2 ``P_outer`` table of the full-mode fit every mode runs,
++    are in place. Returns ``default`` when ``device`` is not a CUDA device, CUDA info is
++    unavailable, or ``G`` or ``K`` is not positive.
+     """
+-    if not torch.cuda.is_available():
++    if G <= 0 or K <= 0:
++        return default
++    bytes_per_row = _row_values(mode, G, K, max_multi_types) * dtype_bytes
++    dev = resolve_device(device) if isinstance(device, str) else device
++    if dev.type != "cuda" or not torch.cuda.is_available():
+         return default
+     try:
+-        free_mem, _ = torch.cuda.mem_get_info()
++        free_mem, _ = torch.cuda.mem_get_info(dev)
+     except Exception:
+         return default
+ 
+-    budget = int(free_mem * budget_fraction)
+-
+-    # Per-pixel intermediates in solve_irwls_batch_shared:
+-    #   Y_batch(G) + prediction(G) + d1/d2(G) + solution(K) + grad(K)
+-    #   + hess(K*K) + D(K*K) + d_vec(K) + delta_w(K) + w_new(K)
+-    bytes_per_pixel = (3 * G + 5 * K + 2 * K * K) * dtype_bytes
+-
+-    if bytes_per_pixel <= 0:
+-        return default
+-
+-    computed = budget // bytes_per_pixel
+-    return max(1024, min(computed, 200000))
++    resident = (n_resident * G + G * K * K) * dtype_bytes  # counts + P_outer
++    if resident >= free_mem:
++        warnings.warn(
++            f"The count matrix and reference tables ({resident / 2**30:.1f} GiB) do not fit in "
++            f"the free GPU memory "
++            f"({free_mem / 2**30:.1f} GiB) in {mode} mode, whatever the batch size. Use "
++            "dtype='float32', fewer pixels per run, or stream_gpu=True in full mode.",
++            stacklevel=2,
++        )
++        return _MIN_BATCH
++    computed = int((free_mem - resident) * budget_fraction) // bytes_per_row
++    if computed < _MIN_BATCH:
++        warnings.warn(
++            f"Only about {computed} rows fit in the free GPU memory ({free_mem / 2**30:.1f} GiB) "
++            f"in {mode} mode; using batch_size={_MIN_BATCH}, which may run out of memory. Pass a "
++            "smaller batch_size, use dtype='float32', or free the GPU.",
++            stacklevel=2,
++        )
++    return max(_MIN_BATCH, min(computed, _MAX_BATCH))
+ 
+ 
+ class FullResult(NamedTuple):
+diff --git a/tests/test_auto_batch_size.py b/tests/test_auto_batch_size.py
+new file mode 100644
+index 0000000..572ee15
+--- /dev/null
++++ b/tests/test_auto_batch_size.py
+@@ -0,0 +1,153 @@
++"""auto_batch_size must size batches per mode: doublet and multi batch rows carry their own (G, k)
++design matrix, and every mode but streamed full mode keeps the dense (N, G) counts on the GPU.
++Before the fix, doublet and multi mode on a 44 GB L40S (39k Visium HD cells, G=4,747, K=40,
++float64) got 200,000 rows per batch and ran out of memory.
++"""
++
++import numpy as np
++import pytest
++import torch
++
++from rctd._types import _row_values, auto_batch_size
++
++GIB = 2**30
++
++
++def _fake_gpu(monkeypatch, free_bytes):
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_: (free_bytes, free_bytes))
++
++
++def test_issue49_doublet_no_longer_hits_cap(monkeypatch):
++    _fake_gpu(monkeypatch, 44 * GIB)
++    bs = auto_batch_size(4747, 40, dtype_bytes=8, mode="doublet", n_resident=38990)
++    # measured cost on an L40S: ~21.5 x G values per row
++    assert bs * 21.5 * 4747 * 8 + 38990 * 4747 * 8 < 44 * GIB
++    assert bs < 50_000
++
++
++def test_resident_counts_shrink_the_budget(monkeypatch):
++    _fake_gpu(monkeypatch, 44 * GIB)
++    G = 4638
++    without = auto_batch_size(G, 40, dtype_bytes=8, mode="doublet")
++    with_res = auto_batch_size(G, 40, dtype_bytes=8, mode="doublet", n_resident=557_300)
++    resident = 557_300 * G * 8  # ~19 GiB of counts
++    assert with_res < without
++    assert with_res * _row_values("doublet", G, 40, 4) * 8 + resident < 44 * GIB
++
++
++def test_multi_cost_scales_with_max_types(monkeypatch):
++    _fake_gpu(monkeypatch, 44 * GIB)
++    four = auto_batch_size(18000, 40, dtype_bytes=8, mode="multi", max_multi_types=4)
++    eight = auto_batch_size(18000, 40, dtype_bytes=8, mode="multi", max_multi_types=8)
++    assert eight < four
++
++
++def test_unknown_mode_raises():
++    with pytest.raises(ValueError, match="Unknown mode"):
++        auto_batch_size(4747, 40, mode="doublets")
++
++
++def test_warns_when_minimum_batch_does_not_fit(monkeypatch):
++    _fake_gpu(monkeypatch, 2 * GIB)
++    with pytest.warns(UserWarning, match="may run out of memory"):
++        bs = auto_batch_size(18000, 40, dtype_bytes=8, mode="doublet")
++    assert bs == 1024
++
++
++def test_nonpositive_shape_returns_default(monkeypatch):
++    _fake_gpu(monkeypatch, 44 * GIB)
++    assert auto_batch_size(0, 0, mode="doublet") == 10000
++
++
++def test_p_outer_shrinks_the_budget(monkeypatch):
++    # P_outer (G x K^2) of the full-mode fit is batch-independent: ~0.9 GiB at G=5,000, K=150
++    _fake_gpu(monkeypatch, 4 * GIB)
++    G, K = 5000, 150
++    bs = auto_batch_size(G, K, dtype_bytes=8, mode="doublet", n_resident=6000)
++    fixed = (6000 * G + G * K * K) * 8
++    assert bs * _row_values("doublet", G, K, 4) * 8 + fixed <= 4 * GIB
++
++
++def test_cpu_falls_back_to_default(monkeypatch):
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
++    assert auto_batch_size(4747, 40, mode="doublet") == 10000
++
++
++def test_cpu_device_ignores_gpu_memory(monkeypatch):
++    _fake_gpu(monkeypatch, 1 * GIB)  # a busy GPU must not matter for a CPU run
++    assert auto_batch_size(4747, 40, mode="doublet", n_resident=10**6, device="cpu") == 10000
++
++
++def test_warns_when_counts_alone_do_not_fit(monkeypatch):
++    _fake_gpu(monkeypatch, 10 * GIB)
++    with pytest.warns(UserWarning, match="count matrix .* do not fit"):
++        auto_batch_size(12000, 40, dtype_bytes=8, mode="doublet", n_resident=557_300)
++
++
++@pytest.mark.parametrize("mode", ["doublet", "multi"])
++@pytest.mark.parametrize("G,K", [(1500, 100), (40_000, 20), (4747, 40)])
++def test_first_full_fit_is_covered(mode, G, K):
++    # doublet and multi mode start with a full-mode fit at the same batch size
++    assert _row_values(mode, G, K, 4) >= _row_values("full", G, K, 4)
++
++
++@pytest.mark.slow
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("mode", ["full", "doublet", "multi"])
++# K > 32: unchunked eigh; G=18,000: multi's 4-type stage, where the old multi constant fell short
++@pytest.mark.parametrize(
++    "G,K,dtype", [(3000, 20, "float32"), (3000, 40, "float64"), (18000, 20, "float32")]
++)
++def test_measured_peak_per_row_within_estimate(mode, G, K, dtype):
++    """Run each mode at two batch sizes on synthetic data and check the measured peak GPU memory
++    per batch row (the slope) stays below the estimate auto_batch_size uses."""
++    from rctd._doublet import run_doublet_mode
++    from rctd._full import run_full_mode
++    from rctd._likelihood import compute_spline_coefficients, load_cached_q_matrices
++    from rctd._multi import run_multi_mode
++    from rctd._types import RCTDConfig
++
++    N = 4000
++    npdt = np.float32 if dtype == "float32" else np.float64
++    rng = np.random.default_rng(0)
++    prof = rng.gamma(0.3, 1.0, size=(G, K))
++    prof /= prof.sum(0, keepdims=True)
++    W = np.zeros((N, K))
++    for i in range(N):  # 4-type mixtures: multi mode reaches its 4-type stage with many rows
++        W[i, rng.choice(K, 4, replace=False)] = rng.dirichlet([1, 1, 1, 1])
++    counts = rng.poisson(2000 * W @ prof.T).astype(npdt)
++    cache = load_cached_q_matrices()
++    x_vals = cache.pop("X_vals")
++    q = cache["Q_100"]
++    sq = compute_spline_coefficients(q, x_vals)
++    args = dict(
++        spatial_counts=counts,
++        spatial_numi=counts.sum(1),
++        norm_profiles=prof.astype(npdt),
++        cell_type_names=[f"t{i}" for i in range(K)],
++        q_mat=q.astype(npdt),
++        sq_mat=sq.astype(npdt),
++        x_vals=x_vals.astype(npdt),
++        device="cuda",
++    )
++    cfg = RCTDConfig(device="cuda", dtype=dtype)
++
++    def peak(bs):
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats()
++        base = torch.cuda.memory_allocated()
++        if mode == "full":
++            run_full_mode(**args, batch_size=bs)
++        elif mode == "doublet":
++            run_doublet_mode(**args, config=cfg, batch_size=bs)
++        else:
++            run_multi_mode(**args, config=cfg, batch_size=bs)
++        torch.cuda.synchronize()
++        return torch.cuda.max_memory_allocated() - base
++
++    per_row = (peak(3000) - peak(1000)) / 2000
++    estimate = _row_values(mode, G, K, cfg.MAX_MULTI_TYPES) * np.dtype(npdt).itemsize
++    assert per_row > 0
++    assert per_row <= estimate, f"{mode}: measured {per_row:.0f} B/row > estimate {estimate} B/row"
+diff --git a/tests/test_full_gpu_streaming.py b/tests/test_full_gpu_streaming.py
+index a2292c3..53aaf85 100644
+--- a/tests/test_full_gpu_streaming.py
++++ b/tests/test_full_gpu_streaming.py
+@@ -131,12 +131,14 @@ def eager_solver(**kwargs):
+ 
+ 
+ @pytest.mark.parametrize("stream_gpu", [False, True])
+-def test_run_rctd_forwards_streaming_without_changing_auto_batch(monkeypatch, stream_gpu):
++def test_run_rctd_forwards_streaming_and_resident_rows_to_auto_batch(monkeypatch, stream_gpu):
+     captured = {}
+ 
+     class FakeRCTD:
+         def __init__(self, *_):
+-            self.config = type("Config", (), {"dtype": "float64", "device": "cpu"})()
++            self.config = type(
++                "Config", (), {"dtype": "float64", "device": "cpu", "MAX_MULTI_TYPES": 4}
++            )()
+             self.reference = type("Reference", (), {"cell_type_names": ["A", "B"]})()
+             self.counts = np.ones((5, 3))
+             self.nUMI = np.ones(5)
+@@ -149,8 +151,8 @@ def __init__(self, *_):
+         def fit_platform_effects(self, sigma_override=None):
+             return None
+ 
+-    def fake_auto_batch_size(G, K, dtype_bytes):
+-        captured["auto_args"] = (G, K, dtype_bytes)
++    def fake_auto_batch_size(G, K, dtype_bytes, mode, n_resident, max_multi_types, device):
++        captured["auto_args"] = (G, K, dtype_bytes, mode, n_resident, max_multi_types, device)
+         return 77
+ 
+     def fake_full(**kwargs):
+@@ -162,7 +164,8 @@ def fake_full(**kwargs):
+     monkeypatch.setattr(_rctd, "run_full_mode", fake_full)
+     result = _rctd.run_rctd(None, None, mode="full", batch_size="auto", stream_gpu=stream_gpu)
+     assert result == "result"
+-    assert captured["auto_args"] == (3, 2, 8)
++    # streamed counts stay on the host, so none of the 5 rows count against the GPU budget
++    assert captured["auto_args"] == (3, 2, 8, "full", 0 if stream_gpu else 5, 4, "cpu")
+     assert captured["batch_size"] == 77
+     assert captured["stream_gpu"] is stream_gpu
+ 

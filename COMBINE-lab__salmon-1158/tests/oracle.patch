@@ -1,0 +1,741 @@
+diff --git a/crates/salmon-align/src/bam_rad.rs b/crates/salmon-align/src/bam_rad.rs
+index 3b7eb10c7..db9119781 100644
+--- a/crates/salmon-align/src/bam_rad.rs
++++ b/crates/salmon-align/src/bam_rad.rs
+@@ -116,12 +116,22 @@ pub fn write_alignment_rad(
+     // Paired unless the library type is explicitly single-end (matches the
+     // alignment-mode `paired_lib` derivation in `quantify_alignments`).
+     let is_paired = !matches!(opts.lib_type.as_str(), "U" | "SF" | "SR" | "S");
++    // Only meaningful for a paired library: with single-end reads every
++    // placement is an "orphan" and the flag would discard the entire run. Same
++    // guard the online path applies (`discard_orphans && paired_lib`).
++    let discard_orphans = opts.discard_orphans && is_paired;
+     // The user-fixed expected format (`None` for auto / unstranded), resolved
+     // against the FLD-detected format at end of pass.
+     let expected_format = match opts.lib_type.as_str() {
+         "A" | "IU" | "U" => None,
+         s => LibraryFormat::parse(s).ok(),
+     };
++    // The `-l A` caveat belongs to alignment *input*, not to the estimator
++    // reading it: this path detects via the FLD pass, so it owes the same
++    // warning the online path gives (#1140, audit C12).
++    if LibraryFormat::is_auto(&opts.lib_type) {
++        crate::warn_auto_detect_from_alignments();
++    }
+ 
+     // Reference sequences for the error model: supplied index sequences take
+     // precedence, else load the `-t` FASTA (mirrors `quantify_rad`). Absent ⇒ no
+@@ -179,7 +189,7 @@ pub fn write_alignment_rad(
+         // written yet; scores aren't final). Per-worker counting models are
+         // merged by integer add, so the total is partition-independent.
+         let models = stream_grouped(&opts.bam, nthreads, || {
+-            TrainWorker::new(error_bins, &fld, naive.as_ref(), ref_bytes)
++            TrainWorker::new(error_bins, &fld, naive.as_ref(), ref_bytes, discard_orphans)
+         })?;
+         let mut counting = CountingAlignmentModel::new(error_bins);
+         for m in &models {
+@@ -188,14 +198,14 @@ pub fn write_alignment_rad(
+         let fixed = counting.finalize(ERROR_MODEL_ALPHA);
+         // Pass B — score each placement against the fixed model and write records.
+         let sums = stream_grouped(&opts.bam, nthreads, || {
+-            ScoreWriteWorker::new(&writer, ref_bytes, &fixed)
++            ScoreWriteWorker::new(&writer, ref_bytes, &fixed, discard_orphans)
+         })?;
+         writer.set_score_kind(salmon_rad::SCORE_KIND_LOGWEIGHT);
+         reduce_summary(sums)
+     } else {
+         // One pass — write records carrying the BAM `AS` score + FLD + naive-eq.
+         let sums = stream_grouped(&opts.bam, nthreads, || {
+-            WriteWorker::new(&writer, &fld, naive.as_ref())
++            WriteWorker::new(&writer, &fld, naive.as_ref(), discard_orphans)
+         })?;
+         // The scores these records carry are only as good as the tags they came
+         // from, and a BAM without them fails silently: say so before the numbers
+@@ -395,6 +405,7 @@ fn analyze_group<R: sam::alignment::Record>(
+     group: &[R],
+     header: &Header,
+     need_seq: bool,
++    discard_orphans: bool,
+     scratch: &mut Vec<FragRecord>,
+ ) -> Option<GroupData> {
+     scratch.clear();
+@@ -407,7 +418,16 @@ fn analyze_group<R: sam::alignment::Record>(
+         return None;
+     }
+     let frags = std::mem::take(scratch);
+-    let placements = pair_records(&frags);
++    let mut placements = pair_records(&frags);
++    // `--discardOrphans`: drop half-mapped fragments before they reach the RAD,
++    // by the same rule the online path applies at weighting time (a placement
++    // backed by fewer than two records is an orphan). Applied here rather than
++    // at requant so both alignment paths answer the flag identically and the
++    // FLD / naive-eq tallies see exactly the placements that get written
++    // (#1140, audit C10 — the flag was silently inert on the 2.6.0 default).
++    if discard_orphans {
++        placements.retain(|pl| pl.idxs.len() >= 2);
++    }
+     if placements.is_empty() {
+         *scratch = frags;
+         return None;
+@@ -531,6 +551,8 @@ struct WriteWorker<'a> {
+     scratch: Vec<FragRecord>,
+     processed: u64,
+     mapped: u64,
++    /// `--discardOrphans`: drop half-mapped fragments (see `analyze_group`)
++    discard_orphans: bool,
+     /// what this worker saw of the `AS` tags it is scoring by
+     tags: ScoreTagTally,
+ }
+@@ -540,6 +562,7 @@ impl<'a> WriteWorker<'a> {
+         writer: &'a RadOutputWriter,
+         fld: &'a DiscreteFld,
+         naive: Option<&'a NaiveEqBuilder>,
++        discard_orphans: bool,
+     ) -> Self {
+         Self {
+             buf: FragmentChunkBuf::with_capacity_codec(CHUNK_FLUSH_BYTES, writer.codec()),
+@@ -549,6 +572,7 @@ impl<'a> WriteWorker<'a> {
+             scratch: Vec::new(),
+             processed: 0,
+             mapped: 0,
++            discard_orphans,
+             tags: ScoreTagTally::new(),
+         }
+     }
+@@ -558,7 +582,13 @@ impl GroupWorker for WriteWorker<'_> {
+     type Output = (u64, u64, ScoreTagTally);
+     fn handle<R: sam::alignment::Record>(&mut self, header: &Header, group: &[R]) -> Result<()> {
+         self.processed += 1;
+-        let Some(data) = analyze_group(group, header, false, &mut self.scratch) else {
++        let Some(data) = analyze_group(
++            group,
++            header,
++            false,
++            self.discard_orphans,
++            &mut self.scratch,
++        ) else {
+             return Ok(());
+         };
+         // Fragment alignment score = sum of the mates' AS tags.
+@@ -596,6 +626,9 @@ struct TrainWorker<'a> {
+     naive: Option<&'a NaiveEqBuilder>,
+     ref_bytes: &'a salmon_core::RefSeqs,
+     scratch: Vec<FragRecord>,
++    /// `--discardOrphans`: must match the write pass, or the model would train
++    /// on placements the RAD never receives.
++    discard_orphans: bool,
+ }
+ 
+ impl<'a> TrainWorker<'a> {
+@@ -604,6 +637,7 @@ impl<'a> TrainWorker<'a> {
+         fld: &'a DiscreteFld,
+         naive: Option<&'a NaiveEqBuilder>,
+         ref_bytes: &'a salmon_core::RefSeqs,
++        discard_orphans: bool,
+     ) -> Self {
+         Self {
+             model: CountingAlignmentModel::new(error_bins),
+@@ -611,6 +645,7 @@ impl<'a> TrainWorker<'a> {
+             naive,
+             ref_bytes,
+             scratch: Vec::new(),
++            discard_orphans,
+         }
+     }
+ }
+@@ -618,7 +653,9 @@ impl<'a> TrainWorker<'a> {
+ impl GroupWorker for TrainWorker<'_> {
+     type Output = CountingAlignmentModel;
+     fn handle<R: sam::alignment::Record>(&mut self, header: &Header, group: &[R]) -> Result<()> {
+-        let Some(data) = analyze_group(group, header, true, &mut self.scratch) else {
++        let Some(data) =
++            analyze_group(group, header, true, self.discard_orphans, &mut self.scratch)
++        else {
+             return Ok(());
+         };
+         // Uniform per-placement training: one count per placement-mate. Integer
+@@ -652,6 +689,8 @@ struct ScoreWriteWorker<'a> {
+     scratch: Vec<FragRecord>,
+     processed: u64,
+     mapped: u64,
++    /// `--discardOrphans`: drop half-mapped fragments (see `analyze_group`)
++    discard_orphans: bool,
+ }
+ 
+ impl<'a> ScoreWriteWorker<'a> {
+@@ -659,6 +698,7 @@ impl<'a> ScoreWriteWorker<'a> {
+         writer: &'a RadOutputWriter,
+         ref_bytes: &'a salmon_core::RefSeqs,
+         model: &'a AlignmentModel,
++        discard_orphans: bool,
+     ) -> Self {
+         Self {
+             buf: FragmentChunkBuf::with_capacity_codec(CHUNK_FLUSH_BYTES, writer.codec()),
+@@ -668,6 +708,7 @@ impl<'a> ScoreWriteWorker<'a> {
+             scratch: Vec::new(),
+             processed: 0,
+             mapped: 0,
++            discard_orphans,
+         }
+     }
+ }
+@@ -676,7 +717,9 @@ impl GroupWorker for ScoreWriteWorker<'_> {
+     type Output = (u64, u64);
+     fn handle<R: sam::alignment::Record>(&mut self, header: &Header, group: &[R]) -> Result<()> {
+         self.processed += 1;
+-        let Some(data) = analyze_group(group, header, true, &mut self.scratch) else {
++        let Some(data) =
++            analyze_group(group, header, true, self.discard_orphans, &mut self.scratch)
++        else {
+             return Ok(());
+         };
+         // Per placement: Σ(fg−bg) over its mate(s) under the fixed model (0 when
+diff --git a/crates/salmon-align/src/genome_project.rs b/crates/salmon-align/src/genome_project.rs
+index 4a38a9010..b74cd72d7 100644
+--- a/crates/salmon-align/src/genome_project.rs
++++ b/crates/salmon-align/src/genome_project.rs
+@@ -201,6 +201,12 @@ pub fn project_genome_bam_to_rad(
+         "A" | "IU" | "U" => None,
+         s => LibraryFormat::parse(s).ok(),
+     };
++    // The `-l A` caveat belongs to alignment *input*, not to the estimator
++    // reading it: this path detects via the FLD pass, so it owes the same
++    // warning the online path gives (#1140, audit C12).
++    if LibraryFormat::is_auto(&opts.lib_type) {
++        crate::warn_auto_detect_from_alignments();
++    }
+     // Tag bake: detected wins, matching the reads-mode writer, so an explicit
+     // `-l` can still fire `library_type_mismatch` downstream; the filter below
+     // keeps expected-wins (see the same split in `bam_rad.rs`, #1140).
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index b0b1dd0b0..2d000568e 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -225,6 +225,13 @@ pub struct AlignQuantOptions {
+     /// `--noFragLengthDist`: drop the fragment-length term from a placement's
+     /// weight, leaving score and compatibility to decide it.
+     pub no_frag_length_dist: bool,
++    /// `--noSingleFragProb` (inverted): model an orphan's fragment length with
++    /// the bounded-CMF ambiguous weight. When false, orphans in a paired
++    /// library take a flat `LOG_EPSILON` penalty instead, matching the reads
++    /// path. The deprecated online alignment path always behaves as though
++    /// this were false (see the FLD note in `weigh_fragment`), so this reaches
++    /// only the RAD quantifier — which is every default path (#1140, D14).
++    pub model_single_frag_prob: bool,
+     /// diagnostics born in an earlier phase the driver ran (e.g. the
+     /// deterministic alignment pass's unusable-`AS` verdict), appended to this
+     /// pass's own in `meta_info.json` — so a pipeline that only keeps the
+@@ -309,6 +316,7 @@ impl AlignQuantOptions {
+             dump_eq_weights: false,
+             no_length_correction: false,
+             no_frag_length_dist: false,
++            model_single_frag_prob: true,
+             extra_diagnostics: Vec::new(),
+             dump_bias_models: false,
+             sig_digits: 3,
+@@ -2094,6 +2102,32 @@ fn apply_bias_correction(
+ }
+ 
+ /// Run alignment-based quantification end-to-end.
++/// Warn that `-l A` over alignment input can only sample what the aligner
++/// chose to report.
++///
++/// Detection can only see the reported alignments. In reads mode salmon maps
++/// everything itself, so the sampled orientations are the library's; here they
++/// are whatever survived the aligner's own settings, and an upstream
++/// orientation/strand filter skews the sample in a way detection cannot
++/// recover from.
++///
++/// Every alignment-input producer that detects a library type calls this — the
++/// online path, the deterministic RAD writer, and genome projection — because
++/// the caveat is a property of the input, not of which estimator reads it. It
++/// used to live only on the online path, so the 2.6.0 default detected and said
++/// nothing (COMBINE-lab/salmon#1140, audit C12).
++pub(crate) fn warn_auto_detect_from_alignments() {
++    tracing::warn!(
++        "`-l A` with alignment input infers the library type from the alignments \
++         the aligner reported, treating them as an unfiltered sample. If the \
++         aligner was configured to report only one orientation or strand, \
++         detection will mirror that filter rather than the library — e.g. it \
++         cannot conclude `IU` when wrong-strand alignments were already excluded \
++         upstream. If the input BAM/SAM is filtered this way, pass the library \
++         type explicitly instead."
++    );
++}
++
+ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult> {
+     let start_time = opts.external_start_time.clone().unwrap_or_else(asctime_now);
+     let run_timer = std::time::Instant::now();
+@@ -2213,20 +2247,7 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+         None
+     };
+     let detector = auto_detect.then(|| {
+-        // Detection can only see what the aligner chose to report. In reads
+-        // mode salmon maps everything itself, so the sampled orientations are
+-        // the library's; here they are whatever survived the aligner's own
+-        // settings, and an upstream orientation/strand filter skews the sample
+-        // in a way detection cannot recover from.
+-        tracing::warn!(
+-            "`-l A` with alignment input infers the library type from the alignments \
+-             the aligner reported, treating them as an unfiltered sample. If the \
+-             aligner was configured to report only one orientation or strand, \
+-             detection will mirror that filter rather than the library — e.g. it \
+-             cannot conclude `IU` when wrong-strand alignments were already excluded \
+-             upstream. If the input BAM/SAM is filtered this way, pass the library \
+-             type explicitly instead."
+-        );
++        warn_auto_detect_from_alignments();
+         salmon_model::LibraryTypeDetector::new(if peeked_paired.unwrap_or(true) {
+             salmon_core::ReadType::PairedEnd
+         } else {
+@@ -2519,7 +2540,13 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+     let bootstraps: Vec<Vec<f64>> = if opts.skip_quant {
+         Vec::new()
+     } else if opts.num_bootstraps > 0 {
+-        salmon_infer::bootstrap(&packed, &opts.em, opts.num_bootstraps, 0x5A13_0000)
++        salmon_infer::bootstrap(
++            &packed,
++            &opts.em,
++            Some(&eff_lengths),
++            opts.num_bootstraps,
++            0x5A13_0000,
++        )
+     } else if opts.num_gibbs_samples > 0 {
+         let prior = if opts.em.use_vbem {
+             opts.em.vb_prior.max(1.0)
+@@ -2530,7 +2557,10 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+             num_samples: opts.num_gibbs_samples,
+             thinning: opts.thinning_factor,
+             prior,
+-            per_transcript_prior: true,
++            // Honour --perNucleotidePrior here as the EM does; hardcoding a
++            // per-transcript prior made the flag a no-op for Gibbs on every
++            // path (#1140, audit D13).
++            per_transcript_prior: !opts.em.per_nucleotide_prior,
+         };
+         salmon_infer::gibbs_sample(&packed, &eff_lengths, &counts, &gopts, 0x6217_0000)
+     } else {
+diff --git a/crates/salmon-align/src/rad.rs b/crates/salmon-align/src/rad.rs
+index c974b5dd5..70d643cda 100644
+--- a/crates/salmon-align/src/rad.rs
++++ b/crates/salmon-align/src/rad.rs
+@@ -453,10 +453,20 @@ struct FragCfg<'a> {
+     paired_lib: bool,
+     /// `--noFragLengthDist`: leave the fragment-length term out of the weight.
+     no_frag_length_dist: bool,
++    /// `--noSingleFragProb` (inverted): model an orphan's fragment length.
++    model_single_frag_prob: bool,
+     range_factorization_bins: u32,
+     eq_builder: &'a EquivalenceClassBuilder,
+ }
+ 
++/// salmon's `LOG_EPSILON` = `log(0.375e-10)`: the flat penalty an orphan takes
++/// under `--noSingleFragProb`, when its fragment length is deliberately not
++/// modelled. Deliberately NOT `salmon_core::math::LOG_EPSILON`, which is
++/// `-1e10` — a log-zero sentinel that would annihilate the placement rather
++/// than merely disfavour it. Same value the reads path uses
++/// (`salmon_quant::processor::LOG_EPSILON`).
++const ORPHAN_LOG_EPSILON: f64 = -23.998_158_637_57;
++
+ /// The eq-class log-weight basis for one hit, given the file's score
+ /// interpretation. Uniform (`0`) when the profile is unscored; for a raw AS
+ /// score, the salmon soft-weight `−scoreExp·(best−score)` (best hit → `0`, worse
+@@ -536,6 +546,21 @@ fn process_rad_fragment(
+             // support. Matches the direct/reads path the round-trip is compared to.
+             let flen = (p.frag_len as i32).min(rl.max(1));
+             at(cfg.pmf, flen as usize) - at(cfg.cmf, rl.max(1) as usize)
++        } else if cfg.paired_lib && !cfg.model_single_frag_prob {
++            // `--noSingleFragProb`: do not model an orphan's fragment length —
++            // a flat penalty for an unexpected orphan, nothing for a
++            // single-end read, exactly as `processor::frag_log_prob` does on
++            // the reads path. The flag used to stop at the mapping pass, so it
++            // was inert on every RAD path including the 2.6.0 default (#1140,
++            // audit D14).
++            if matches!(
++                p.status,
++                MateStatus::PairedEndLeft | MateStatus::PairedEndRight
++            ) {
++                ORPHAN_LOG_EPSILON
++            } else {
++                0.0
++            }
+         } else if cfg.paired_lib {
+             // Orphan / single-end in a paired library: bounded-CMF ambiguous
+             // fragment-length probability (salmon's `getAmbigFragLengthProb`), the
+@@ -1287,6 +1312,9 @@ struct BiasCfg<'a> {
+     /// `--noFragLengthDist`: leave the fragment-length term out of the posterior
+     /// this bias pass weights its observations by, as the eq-class pass does.
+     no_frag_length_dist: bool,
++    /// `--noSingleFragProb` (inverted): as the eq-class pass, so the bias
++    /// posterior weights orphans the same way the weights it explains do.
++    model_single_frag_prob: bool,
+     /// fixed per-reference abundances (baked or first-EM) for the posterior.
+     abundances: &'a [f64],
+     ref_bytes: &'a salmon_core::RefSeqs,
+@@ -1332,6 +1360,16 @@ fn collect_bias_fragment(
+             0.0
+         } else if proper {
+             at(cfg.pmf, flen as usize) - at(cfg.cmf, rl.max(1) as usize)
++        } else if cfg.paired_lib && !cfg.model_single_frag_prob {
++            // `--noSingleFragProb`, as in the eq-class pass above.
++            if matches!(
++                p.status,
++                MateStatus::PairedEndLeft | MateStatus::PairedEndRight
++            ) {
++                ORPHAN_LOG_EPSILON
++            } else {
++                0.0
++            }
+         } else if cfg.paired_lib {
+             let read_len = if p.frag_len != salmon_rad::FRAG_LEN_UNPAIRED {
+                 p.frag_len as i32
+@@ -1923,6 +1961,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+             incompat_prior: opts.incompat_prior,
+             paired_lib,
+             no_frag_length_dist: opts.no_frag_length_dist,
++            model_single_frag_prob: opts.model_single_frag_prob,
+             range_factorization_bins: opts.range_factorization_bins,
+             eq_builder: &eq_builder,
+         };
+@@ -1940,6 +1979,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+                 incompat_prior: opts.incompat_prior,
+                 paired_lib,
+                 no_frag_length_dist: opts.no_frag_length_dist,
++                model_single_frag_prob: opts.model_single_frag_prob,
+                 abundances: abund,
+                 ref_bytes: &ref_bytes,
+                 gc_store: &gc_store,
+@@ -2106,6 +2146,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+                 incompat_prior: opts.incompat_prior,
+                 paired_lib,
+                 no_frag_length_dist: opts.no_frag_length_dist,
++                model_single_frag_prob: opts.model_single_frag_prob,
+                 abundances: &bias_abund,
+                 ref_bytes: &ref_bytes,
+                 gc_store: &gc_store,
+@@ -2198,7 +2239,13 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+     let bootstraps: Vec<Vec<f64>> = if opts.skip_quant {
+         Vec::new()
+     } else if opts.num_bootstraps > 0 {
+-        salmon_infer::bootstrap(&packed, &opts.em, opts.num_bootstraps, 0x5A13_0000)
++        salmon_infer::bootstrap(
++            &packed,
++            &opts.em,
++            Some(&eff_lengths),
++            opts.num_bootstraps,
++            0x5A13_0000,
++        )
+     } else if opts.num_gibbs_samples > 0 {
+         let prior = if opts.em.use_vbem {
+             opts.em.vb_prior.max(1.0)
+@@ -2209,7 +2256,10 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+             num_samples: opts.num_gibbs_samples,
+             thinning: opts.thinning_factor,
+             prior,
+-            per_transcript_prior: true,
++            // Honour --perNucleotidePrior here as the EM does; hardcoding a
++            // per-transcript prior made the flag a no-op for Gibbs on every
++            // path (#1140, audit D13).
++            per_transcript_prior: !opts.em.per_nucleotide_prior,
+         };
+         salmon_infer::gibbs_sample(&packed, &eff_lengths, &counts, &gopts, 0x6217_0000)
+     } else {
+diff --git a/crates/salmon-align/tests/deterministic_bam.rs b/crates/salmon-align/tests/deterministic_bam.rs
+index 68379164a..2a73a0ba9 100644
+--- a/crates/salmon-align/tests/deterministic_bam.rs
++++ b/crates/salmon-align/tests/deterministic_bam.rs
+@@ -429,3 +429,149 @@ fn driver_diagnostics_reach_meta_on_the_alignment_path() {
+         "driver-supplied diagnostics must reach meta_info.json on the online -a path: {meta}"
+     );
+ }
++
++// ---- flags that were inert on this path (#1140, audit batches C and D) -----
++
++/// A SAM with proper pairs on txA plus half-mapped fragments on txB, so
++/// `--discardOrphans` has something to discard and something to keep.
++fn write_sam_with_orphans(dir: &Path) -> PathBuf {
++    let path = dir.join("orphans.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:queryname").unwrap();
++    writeln!(f, "@SQ\tSN:txA\tLN:5000").unwrap();
++    writeln!(f, "@SQ\tSN:txB\tLN:5000").unwrap();
++    let mut pos = 1usize;
++    for i in 0..40 {
++        let (l, r) = (pos + 1, pos + 201);
++        writeln!(f, "p{i}\t99\ttxA\t{l}\t60\t100M\t=\t{r}\t300\t*\t*").unwrap();
++        writeln!(f, "p{i}\t147\ttxA\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*").unwrap();
++        pos += 400;
++    }
++    // Half-mapped: only read 1 is placed (0x1 paired, 0x8 mate unmapped).
++    let mut opos = 1usize;
++    for i in 0..25 {
++        let l = opos + 1;
++        writeln!(f, "o{i}\t73\ttxB\t{l}\t60\t100M\t*\t0\t0\t*\t*").unwrap();
++        opos += 400;
++    }
++    path
++}
++
++#[test]
++/// `--discardOrphans` was read only by the online path, so on the 2.6.0
++/// default (`-a` deterministic) it was accepted and silently did nothing
++/// (#1140, audit C10). Dropping the half-mapped fragments before they reach
++/// the RAD makes both alignment paths answer the flag the same way.
++fn discard_orphans_is_honoured_on_the_deterministic_path() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = write_sam_with_orphans(dir.path());
++
++    let run = |tag: &str, discard: bool| -> (u64, Vec<(String, f64)>) {
++        let out = dir.path().join(tag);
++        std::fs::create_dir_all(&out).unwrap();
++        let mut opts = opts_for(&sam, &out);
++        opts.discard_orphans = discard;
++        let rad = dir.path().join(format!("{tag}.rad"));
++        let summary = write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
++        quantify_rad(&opts, &rad).unwrap();
++        let mut counts = quant_counts(&out);
++        counts.sort_by(|a, b| a.0.cmp(&b.0));
++        (summary.num_mapped, counts)
++    };
++
++    let (kept_mapped, kept) = run("keep", false);
++    let (dropped_mapped, dropped) = run("drop", true);
++
++    assert_eq!(kept_mapped, 65, "40 proper pairs + 25 orphans");
++    assert_eq!(
++        dropped_mapped, 40,
++        "--discardOrphans must leave only the proper pairs"
++    );
++
++    let txb_kept = kept.iter().find(|(n, _)| n == "txB").unwrap().1;
++    let txb_dropped = dropped.iter().find(|(n, _)| n == "txB").unwrap().1;
++    assert!(
++        txb_kept > 1.0,
++        "the orphan-only transcript must carry mass when orphans are kept: {txb_kept}"
++    );
++    assert!(
++        txb_dropped < 1e-6,
++        "and none when they are discarded: {txb_dropped}"
++    );
++}
++
++/// Proper pairs on txC (which train the FLD) plus orphan-only fragments
++/// contested between a long transcript and the 3' end of a short one.
++///
++/// The contest has to be built this way. The RAD carries one map type per
++/// *fragment*, so a fragment cannot be a proper pair on one transcript and an
++/// orphan on another; and an orphan's modelled weight only differs between
++/// transcripts when the length it bounds falls inside the FLD's support — at
++/// position 1050 of a 1200-base transcript only ~150 bases remain, which
++/// cannot host a ~300-base fragment, while the long transcript is unbounded.
++fn write_sam_contested_orphans(dir: &Path) -> PathBuf {
++    let path = dir.join("contested.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:queryname").unwrap();
++    writeln!(f, "@SQ\tSN:txA\tLN:5000").unwrap();
++    writeln!(f, "@SQ\tSN:txB\tLN:1200").unwrap();
++    writeln!(f, "@SQ\tSN:txC\tLN:5000").unwrap();
++    let mut pos = 1usize;
++    for i in 0..60 {
++        let (l, r) = (pos + 1, pos + 201);
++        writeln!(f, "p{i}\t99\ttxC\t{l}\t60\t100M\t=\t{r}\t300\t*\t*").unwrap();
++        writeln!(f, "p{i}\t147\ttxC\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*").unwrap();
++        pos += 400;
++    }
++    for i in 0..60 {
++        // flag 73 / 329: paired, mate unmapped, first segment (329 adds
++        // secondary) — a genuine orphan placement on each transcript.
++        let a = (i * 13) % 500 + 1;
++        let b = 1050 + (i % 40);
++        writeln!(f, "o{i}\t73\ttxA\t{a}\t60\t100M\t*\t0\t0\t*\t*").unwrap();
++        writeln!(f, "o{i}\t329\ttxB\t{b}\t60\t100M\t*\t0\t0\t*\t*").unwrap();
++    }
++    path
++}
++
++#[test]
++/// `--noSingleFragProb` stopped at the mapping pass, so it was inert on every
++/// RAD path — including the 2.6.0 default (#1140, audit D14).
++///
++/// Modelled, an orphan's bounded-CMF weight knows that txB's remaining ~150
++/// bases cannot hold this library's ~300-base fragments, so the contested mass
++/// goes to txA. With the flag, both placements take the same flat penalty and
++/// the split falls back to effective length, which favours the shorter txB.
++/// The flag flipping the answer this completely is the point: it was silently
++/// doing nothing.
++fn no_single_frag_prob_changes_orphan_weighting_on_the_rad_path() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = write_sam_contested_orphans(dir.path());
++    let rad = dir.path().join("shared.rad");
++    let base = opts_for(&sam, &dir.path().join("unused"));
++    write_alignment_rad(&base, &rad, ChunkCodec::None).unwrap();
++
++    let quant = |tag: &str, model: bool| -> Vec<(String, f64)> {
++        let out = dir.path().join(tag);
++        std::fs::create_dir_all(&out).unwrap();
++        let mut opts = opts_for(&sam, &out);
++        opts.model_single_frag_prob = model;
++        quantify_rad(&opts, &rad).unwrap();
++        let mut c = quant_counts(&out);
++        c.sort_by(|a, b| a.0.cmp(&b.0));
++        c
++    };
++    let get = |v: &[(String, f64)], name: &str| v.iter().find(|(n, _)| n == name).unwrap().1;
++
++    let modelled = quant("modelled", true);
++    let flat = quant("flat", false);
++
++    assert!(
++        get(&modelled, "txA") > 59.0 && get(&modelled, "txB") < 1.0,
++        "modelled: the bounded-CMF weight must reject the 3'-end placement: {modelled:?}"
++    );
++    assert!(
++        get(&flat, "txB") > 59.0 && get(&flat, "txA") < 1.0,
++        "flat: equal orphan weights leave effective length to decide: {flat:?}"
++    );
++}
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index e0af3ad77..f5d1e022e 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -1197,6 +1197,10 @@ fn requant_options(
+     // the driver clears the flags for phase 1.
+     q.dump_eq = map_opts.dump_eq;
+     q.dump_eq_weights = map_opts.dump_eq_weights;
++    // Honoured by the RAD quantifier's orphan weighting, so the flag survives
++    // the phase-1/phase-2 split instead of dying with the mapping pass
++    // (#1140, audit D14).
++    q.model_single_frag_prob = map_opts.model_single_frag_prob;
+     // Same shape as the eq dumps: phase 2 owns the run's final bias models
+     // (phase 1's dump site is gated off by skip_quant), so `--dumpBiasModels`
+     // is honoured by the requant's shared writer (#1140: the flag silently
+@@ -1948,7 +1952,13 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         opts.fld_sd = args.fld_sd.unwrap_or(DEFAULT_FLD_SD);
+         opts.fld_max = args.fld_max.unwrap_or(DEFAULT_FLD_MAX);
+         opts.forgetting_factor = args.forgetting_factor.unwrap_or(0.65);
+-        opts.init_uniform = args.init_uniform;
++        // `--meta` promises a uniform start, and this is the one path where
++        // that is a real choice: the online alignment optimizer warm-starts
++        // from its online estimates unless told otherwise. Every other path
++        // starts uniform by construction, which is why the preset's own log
++        // line was true everywhere except here (#1140, audit D15).
++        opts.init_uniform = args.init_uniform || args.meta;
++        opts.model_single_frag_prob = !args.no_single_frag_prob;
+         opts.dump_eq = args.dump_eq;
+         opts.dump_eq_weights = args.dump_eq_weights;
+         opts.dump_bias_models = args.dump_bias_models;
+@@ -1966,8 +1976,12 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         opts.num_bootstraps = args.num_bootstraps;
+         opts.num_gibbs_samples = args.num_gibbs_samples;
+         opts.thinning_factor = args.thinning_factor;
+-        // --scoreExp is selective-alignment-mode only (it scales the
+-        // best-minus-score soft weight); alignment mode has no such term.
++        // --scoreExp scales the best-minus-score soft weight, and the RAD
++        // quantifier applies it to AS-scored placements exactly as it does to
++        // selective-alignment ones — so the deterministic `-a` path honours it.
++        // A previous comment here claimed alignment mode "has no such term",
++        // which was true only of the online path (#1140, audit C11).
++        opts.score_exp = args.score_exp;
+ 
+         // Genome-alignment mode: `-a <genome.bam> --annotation <gtf>` projects the
+         // spliced genome alignments into transcriptome coordinates (bramble) and
+@@ -2202,6 +2216,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             max: args.fld_max.is_some(),
+         };
+         opts.skip_quant = args.skip_quant;
++        opts.model_single_frag_prob = !args.no_single_frag_prob;
+         opts.dump_eq = args.dump_eq;
+         opts.dump_eq_weights = args.dump_eq_weights;
+         opts.dump_bias_models = args.dump_bias_models;
+@@ -2818,6 +2833,7 @@ mod tests {
+         map_opts.dump_eq = true;
+         map_opts.dump_eq_weights = true;
+         map_opts.dump_bias_models = true;
++        map_opts.model_single_frag_prob = false;
+         map_opts.no_length_correction = true;
+         map_opts.no_frag_length_dist = true;
+ 
+@@ -2854,6 +2870,7 @@ mod tests {
+         assert!(q.dump_eq);
+         assert!(q.dump_eq_weights);
+         assert!(q.dump_bias_models);
++        assert!(!q.model_single_frag_prob);
+         assert!(q.no_length_correction);
+         assert!(q.no_frag_length_dist);
+     }
+diff --git a/crates/salmon-infer/src/uncertainty.rs b/crates/salmon-infer/src/uncertainty.rs
+index 8439a9163..91a38eb61 100644
+--- a/crates/salmon-infer/src/uncertainty.rs
++++ b/crates/salmon-infer/src/uncertainty.rs
+@@ -108,6 +108,7 @@ fn multinomial(total: u64, weights: &[f64], rng: &mut impl Rng) -> Vec<u64> {
+ pub fn bootstrap(
+     p: &PackedEqClasses,
+     opts: &EmOptions,
++    eff_lens: Option<&[f64]>,
+     num_bootstraps: u32,
+     seed: u64,
+ ) -> Vec<Vec<f64>> {
+@@ -122,7 +123,11 @@ pub fn bootstrap(
+             let mut rng =
+                 Pcg64Mcg::seed_from_u64(seed ^ (bs as u64).wrapping_mul(0x9E3779B97F4A7C15));
+             let resampled = multinomial(total, &sample_weights, &mut rng);
+-            let (alphas, _, _) = run_em_counts(p, &resampled, opts, false, 50, None, None);
++            // Effective lengths reach the replicate EM so `--perNucleotidePrior`
++            // shapes the prior here exactly as it does the point estimate;
++            // passing `None` silently fell back to the flat prior, which made
++            // the flag a no-op inside every replicate (#1140, audit D13).
++            let (alphas, _, _) = run_em_counts(p, &resampled, opts, false, 50, eff_lens, None);
+             // Finalize like the point estimate: truncate the negligible
+             // abundances, then redistribute that mass to eq-class co-members via a
+             // masked final M-step over the *resampled* counts (no rescale-up). The
+@@ -455,7 +460,7 @@ mod tests {
+     fn bootstrap_mean_near_point_estimate() {
+         // unique evidence -> every bootstrap recovers ~the same counts
+         let p = packed(&[(vec![0], 300), (vec![1], 700)], 2);
+-        let bs = bootstrap(&p, &EmOptions::default(), 50, 12345);
++        let bs = bootstrap(&p, &EmOptions::default(), None, 50, 12345);
+         assert_eq!(bs.len(), 50);
+         let m0: f64 = bs.iter().map(|b| b[0]).sum::<f64>() / 50.0;
+         let m1: f64 = bs.iter().map(|b| b[1]).sum::<f64>() / 50.0;
+@@ -472,7 +477,7 @@ mod tests {
+     fn bootstrap_variance_grows_with_ambiguity() {
+         // a fully shared class has higher per-transcript bootstrap variance
+         let p = packed(&[(vec![0], 10), (vec![1], 10), (vec![0, 1], 980)], 2);
+-        let bs = bootstrap(&p, &EmOptions::default(), 100, 7);
++        let bs = bootstrap(&p, &EmOptions::default(), None, 100, 7);
+         let m0: f64 = bs.iter().map(|b| b[0]).sum::<f64>() / 100.0;
+         let var0: f64 = bs.iter().map(|b| (b[0] - m0).powi(2)).sum::<f64>() / 100.0;
+         assert!(
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index f7aa8c573..e529ddc73 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -1278,9 +1278,13 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     // it needs Gibbs after the weights it reads were skipped.
+     let bootstraps: Vec<Vec<f64>> = match posterior {
+         salmon_infer::PosteriorMethod::None => Vec::new(),
+-        salmon_infer::PosteriorMethod::Bootstrap { replicates } => {
+-            salmon_infer::bootstrap(&packed, &opts.em, replicates, 0x5A13_0000)
+-        }
++        salmon_infer::PosteriorMethod::Bootstrap { replicates } => salmon_infer::bootstrap(
++            &packed,
++            &opts.em,
++            Some(&eff_lengths),
++            replicates,
++            0x5A13_0000,
++        ),
+         salmon_infer::PosteriorMethod::Gibbs { samples } => {
+             // Gibbs prior follows the main optimizer (salmon): with VBEM and a
+             // per-transcript prior it is `max(1.0, vbPrior)`; with plain EM it is
+@@ -1294,7 +1298,10 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+                 num_samples: samples,
+                 thinning: opts.thinning_factor,
+                 prior,
+-                per_transcript_prior: true,
++                // Honour --perNucleotidePrior here as the EM does; hardcoding a
++                // per-transcript prior made the flag a no-op for Gibbs on every
++                // path (#1140, audit D13).
++                per_transcript_prior: !opts.em.per_nucleotide_prior,
+             };
+             salmon_infer::gibbs_sample(&packed, &eff_lengths, &counts, &gopts, 0x6217_0000)
+         }

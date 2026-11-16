@@ -1,0 +1,730 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 8b5492c40..4d465cb47 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -194,8 +194,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
+     libxcb1 \
+     libxext6 \
+     libxshmfence1 \
+-    # Fonts for better rendering (removed emoji fonts to save ~20MB)
++    # Fonts for better rendering (removed emoji fonts to save ~20MB).
++    # noto-cjk: the desktop Browser app streams real Chromium pages to the
++    # user — without CJK coverage every Chinese/Japanese/Korean page is tofu.
+     fonts-liberation \
++    fonts-noto-cjk \
+     # Interactive shell tools. The sandbox now serves a real terminal (the pty
+     # toolset), and a terminal without an editor or a pager is not one: `vim`
+     # was "command not found", so was `less`, and installing them by hand does
+diff --git a/pantheon/factory/templates/skills/desktop/SKILL.md b/pantheon/factory/templates/skills/desktop/SKILL.md
+index 635a52cda..d5725378c 100644
+--- a/pantheon/factory/templates/skills/desktop/SKILL.md
++++ b/pantheon/factory/templates/skills/desktop/SKILL.md
+@@ -50,6 +50,18 @@ app_call(app_id, method, args={})                # an app's backend method,
+ Windows the **user** opened are first-class: find them with
+ `desktop_windows()`, then read/update/call exactly as if you opened them.
+ 
++## The Browser (a shared, real Chromium)
++
++`browser_open(url)` starts a real Chromium page in the sandbox and shows it
++to the user as a Browser window. The page is SHARED: the user sees it live
++and can click, type, and log in; you drive the same page with
++`browser_goto` / `browser_click` / `browser_type` / `browser_read` /
++`browser_screenshot`. When a site needs credentials, open it, ask the user
++to sign in in the Browser window, then continue on the now-authenticated
++page. The profile (cookies, sessions) persists in the sandbox. Use
++`browser_read` (text) or `browser_screenshot` + observe_image (pixels) as
++your eyes; prefer leaving pages open for the user over closing them.
++
+ ## Fix the window you have
+ 
+ Windows are long-lived and they are the USER's. When a view is wrong —
+diff --git a/pantheon/toolsets/live_view/browser.py b/pantheon/toolsets/live_view/browser.py
+new file mode 100644
+index 000000000..0876ecbc5
+--- /dev/null
++++ b/pantheon/toolsets/live_view/browser.py
+@@ -0,0 +1,435 @@
++"""A real Chromium, shared by the agent and the user's desktop.
++
++One headless Chromium (Playwright, persistent profile) runs in the sandbox.
++Every page in it is visible to BOTH sides at once:
++
++  * the **user**, through the Atrium Browser app — frames stream out of CDP
++    ``Page.startScreencast`` and are served by the LiveView data server's
++    ``browser-frame`` endpoint (long-poll: a request parks until the page
++    repaints, so idle pages cost nothing and busy pages feel live); pointer
++    and keyboard events come back through ``browser-input``.
++  * the **agent**, through the ``browser_*`` tools on the live_view toolset
++    (navigate / read / click / type / screenshot).
++
++That sharing is the point: the agent can open a page for the user, the user
++can carry it past a login wall, and the agent can continue on the same,
++now-authenticated page.
++
++Threading: Playwright objects are loop-bound, but our callers are not — tool
++calls run on ephemeral per-call loops (ThreadJob isolation) and endpoint
++handlers run on the data server's daemon loop. So the engine owns a daemon
++thread with its own loop, everything Playwright happens THERE, and both kinds
++of caller marshal in via ``run_coroutine_threadsafe``.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import base64
++import re
++import threading
++import time
++import uuid
++from pathlib import Path
++from typing import Any
++from urllib.parse import quote
++
++from aiohttp import web
++
++from pantheon.utils.log import logger
++
++# Schemes that carry their payload without "//": leave them untouched.
++_SCHEME_NO_SLASH = re.compile(r"^(data|about|blob|view-source|file):", re.I)
++
++
++def normalize_url(url: str) -> str:
++    """What the address bar means: a bare host gets https, real schemes pass.
++
++    ``"://" in url`` alone mis-handles ``data:`` / ``about:`` (no slashes), so
++    it prepended https and produced ``https://data:…`` — an invalid URL.
++    """
++    if not url:
++        return url
++    if "://" in url or _SCHEME_NO_SLASH.match(url):
++        return url
++    return f"https://{url}"
++
++VIEW_W, VIEW_H = 1280, 800
++JPEG_QUALITY = 70
++LONG_POLL_S = 20.0
++READ_LIMIT = 8000
++
++_BUTTONS = {0: "left", 1: "middle", 2: "right"}
++
++
++class PageSession:
++    """One Chromium page: its screencast state and navigation status."""
++
++    def __init__(self, page_id: str, page: Any) -> None:
++        self.id = page_id
++        self.page = page
++        self.cdp: Any = None
++        self.frame: bytes = b""
++        self.seq = 0
++        self.width = VIEW_W
++        self.height = VIEW_H
++        self.loading = False
++        self.can_back = False
++        self.can_forward = False
++        self.new_frame = asyncio.Condition()
++        self.input_lock = asyncio.Lock()
++        self.created_at = time.time()
++
++    @property
++    def url(self) -> str:
++        try:
++            return self.page.url
++        except Exception:
++            return ""
++
++    async def title(self) -> str:
++        try:
++            return await self.page.title()
++        except Exception:
++            return ""
++
++
++class BrowserEngine:
++    """The process-wide Chromium, on its own daemon loop."""
++
++    _instance: "BrowserEngine | None" = None
++    _instance_lock = threading.Lock()
++
++    @classmethod
++    def instance(cls) -> "BrowserEngine":
++        with cls._instance_lock:
++            if cls._instance is None:
++                cls._instance = BrowserEngine()
++            return cls._instance
++
++    def __init__(self) -> None:
++        self._loop: asyncio.AbstractEventLoop | None = None
++        self._thread: threading.Thread | None = None
++        self._start_lock = threading.Lock()
++        self._pw = None
++        self._context = None
++        self._launch_error: str | None = None
++        self.pages: dict[str, PageSession] = {}
++
++    # ── the daemon loop ──────────────────────────────────────────────────
++
++    def _ensure_thread(self) -> None:
++        with self._start_lock:
++            if self._loop is not None:
++                return
++            ready = threading.Event()
++
++            def _run() -> None:
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
++                self._loop = loop
++                ready.set()
++                loop.run_forever()
++
++            self._thread = threading.Thread(
++                target=_run, name="browser-engine", daemon=True,
++            )
++            self._thread.start()
++            ready.wait(10)
++
++    async def call(self, coro) -> Any:
++        """Run `coro` on the engine loop, awaited from ANY loop (or thread)."""
++        self._ensure_thread()
++        assert self._loop is not None
++        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
++        return await asyncio.wrap_future(fut)
++
++    # ── Chromium lifecycle (engine loop only) ────────────────────────────
++
++    async def _ensure_browser(self) -> None:
++        if self._context is not None:
++            return
++        if self._launch_error:
++            raise RuntimeError(self._launch_error)
++        try:
++            from playwright.async_api import async_playwright
++
++            self._pw = await async_playwright().start()
++            profile = Path.home() / ".pantheon" / "browser-profile"
++            profile.mkdir(parents=True, exist_ok=True)
++            self._context = await self._pw.chromium.launch_persistent_context(
++                user_data_dir=str(profile),
++                headless=True,
++                viewport={"width": VIEW_W, "height": VIEW_H},
++                args=[
++                    "--no-sandbox",
++                    "--disable-dev-shm-usage",
++                    "--disable-gpu",
++                ],
++            )
++            # The persistent context opens with a blank page; close it so the
++            # page registry is the single source of what exists.
++            for p in list(self._context.pages):
++                try:
++                    await p.close()
++                except Exception:
++                    pass
++            logger.info("browser: chromium up (profile {})", profile)
++        except Exception as e:
++            self._launch_error = f"chromium unavailable: {e}"
++            logger.error("browser: launch failed: {}", e)
++            raise RuntimeError(self._launch_error) from e
++
++    async def _attach(self, session: PageSession) -> None:
++        """Wire screencast + navigation events for a page."""
++        page = session.page
++        cdp = await self._context.new_cdp_session(page)  # type: ignore[union-attr]
++        session.cdp = cdp
++
++        def on_frame(params: dict) -> None:
++            data = params.get("data")
++            sid = params.get("sessionId")
++
++            async def _handle() -> None:
++                try:
++                    if data:
++                        session.frame = base64.b64decode(data)
++                        session.seq += 1
++                        async with session.new_frame:
++                            session.new_frame.notify_all()
++                    if sid is not None:
++                        await cdp.send("Page.screencastFrameAck", {"sessionId": sid})
++                except Exception:
++                    pass  # page is closing
++
++            asyncio.ensure_future(_handle())
++
++        cdp.on("Page.screencastFrame", on_frame)
++        await cdp.send("Page.startScreencast", {
++            "format": "jpeg",
++            "quality": JPEG_QUALITY,
++            "maxWidth": session.width,
++            "maxHeight": session.height,
++            "everyNthFrame": 1,
++        })
++
++        async def refresh_history() -> None:
++            try:
++                hist = await cdp.send("Page.getNavigationHistory")
++                idx = hist.get("currentIndex", 0)
++                session.can_back = idx > 0
++                session.can_forward = idx < len(hist.get("entries", [])) - 1
++            except Exception:
++                pass
++
++        def on_nav(frame: Any) -> None:
++            if frame == page.main_frame:
++                session.loading = True
++                asyncio.ensure_future(refresh_history())
++
++        def on_load(_: Any = None) -> None:
++            session.loading = False
++            asyncio.ensure_future(refresh_history())
++
++        page.on("framenavigated", on_nav)
++        page.on("load", on_load)
++        page.on("domcontentloaded", on_load)
++
++        # Popups fold back into the SAME page: the streamed window is the one
++        # surface the user has, so a hidden second page would just be lost.
++        def on_popup(popup: Any) -> None:
++            async def _adopt() -> None:
++                try:
++                    for _ in range(30):
++                        if popup.url and popup.url != "about:blank":
++                            break
++                        await asyncio.sleep(0.1)
++                    url = popup.url
++                    await popup.close()
++                    if url and url != "about:blank":
++                        await page.goto(url)
++                except Exception:
++                    pass
++
++            asyncio.ensure_future(_adopt())
++
++        page.on("popup", on_popup)
++
++    # ── public surface (call through .call from any loop) ────────────────
++
++    async def open_page(self, url: str = "") -> PageSession:
++        await self._ensure_browser()
++        page = await self._context.new_page()  # type: ignore[union-attr]
++        session = PageSession(uuid.uuid4().hex[:12], page)
++        self.pages[session.id] = session
++        await self._attach(session)
++        if url:
++            try:
++                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
++            except Exception as e:
++                logger.warning("browser: initial goto {} failed: {}", url, e)
++        return session
++
++    def get(self, page_id: str) -> PageSession:
++        session = self.pages.get(page_id)
++        if session is None:
++            raise KeyError(f"no such page: {page_id}")
++        return session
++
++    def latest(self, page_id: str = "") -> PageSession:
++        """The addressed page, or the most recently opened one."""
++        if page_id:
++            return self.get(page_id)
++        if not self.pages:
++            raise KeyError("no browser pages are open")
++        return max(self.pages.values(), key=lambda s: s.created_at)
++
++    async def close_page(self, page_id: str) -> None:
++        session = self.pages.pop(page_id, None)
++        if session is None:
++            return
++        try:
++            await session.page.close()
++        except Exception:
++            pass
++
++    async def navigate(self, page_id: str, op: str, url: str = "") -> None:
++        session = self.get(page_id)
++        page = session.page
++        if op == "goto":
++            await page.goto(normalize_url(url), wait_until="domcontentloaded", timeout=30_000)
++        elif op == "back":
++            await page.go_back(wait_until="domcontentloaded", timeout=30_000)
++        elif op == "forward":
++            await page.go_forward(wait_until="domcontentloaded", timeout=30_000)
++        elif op == "reload":
++            await page.reload(wait_until="domcontentloaded", timeout=30_000)
++        elif op == "stop":
++            await page.evaluate("() => window.stop()")
++        else:
++            raise ValueError(f"unknown op: {op}")
++
++    async def dispatch(self, page_id: str, events: list[dict]) -> None:
++        """Replay UI input events on the page, in order."""
++        session = self.get(page_id)
++        page = session.page
++        async with session.input_lock:
++            for ev in events:
++                t = ev.get("t")
++                try:
++                    if t == "move":
++                        await page.mouse.move(ev["x"], ev["y"])
++                    elif t == "down":
++                        await page.mouse.move(ev["x"], ev["y"])
++                        await page.mouse.down(
++                            button=_BUTTONS.get(ev.get("button", 0), "left"),
++                            click_count=ev.get("clicks", 1),
++                        )
++                    elif t == "up":
++                        await page.mouse.up(
++                            button=_BUTTONS.get(ev.get("button", 0), "left"),
++                            click_count=ev.get("clicks", 1),
++                        )
++                    elif t == "wheel":
++                        await page.mouse.move(ev["x"], ev["y"])
++                        await page.mouse.wheel(ev.get("dx", 0), ev.get("dy", 0))
++                    elif t == "keydown":
++                        await page.keyboard.down(ev["key"])
++                    elif t == "keyup":
++                        await page.keyboard.up(ev["key"])
++                    elif t == "text":
++                        await page.keyboard.insert_text(ev["text"])
++                    elif t == "resize":
++                        w = max(320, min(2560, int(ev["w"])))
++                        h = max(240, min(1600, int(ev["h"])))
++                        if (w, h) != (session.width, session.height):
++                            session.width, session.height = w, h
++                            await page.set_viewport_size({"width": w, "height": h})
++                            if session.cdp is not None:
++                                try:
++                                    await session.cdp.send("Page.stopScreencast")
++                                except Exception:
++                                    pass
++                                await session.cdp.send("Page.startScreencast", {
++                                    "format": "jpeg",
++                                    "quality": JPEG_QUALITY,
++                                    "maxWidth": w,
++                                    "maxHeight": h,
++                                    "everyNthFrame": 1,
++                                })
++                except Exception as e:
++                    logger.debug("browser: input {} failed: {}", t, e)
++
++    async def status_headers(self, session: PageSession) -> dict[str, str]:
++        """Navigation state as latin-1-safe response headers."""
++        return {
++            "X-Seq": str(session.seq),
++            "X-Url": quote(session.url, safe=""),
++            "X-Title": quote(await session.title(), safe=""),
++            "X-Loading": "1" if session.loading else "0",
++            "X-Back": "1" if session.can_back else "0",
++            "X-Fwd": "1" if session.can_forward else "0",
++            "X-W": str(session.width),
++            "X-H": str(session.height),
++        }
++
++    async def wait_frame(self, session: PageSession, since: int) -> bool:
++        """Park until the page paints past `since` (or the poll times out)."""
++        if session.seq > since:
++            return True
++        deadline = time.monotonic() + LONG_POLL_S
++        while session.seq <= since:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                return False
++            async with session.new_frame:
++                try:
++                    await asyncio.wait_for(
++                        session.new_frame.wait(), timeout=min(remaining, 5.0),
++                    )
++                except asyncio.TimeoutError:
++                    continue
++        return True
++
++
++# ── data-server endpoint handlers ────────────────────────────────────────────
++# These run on the DATA SERVER's loop; every engine touch marshals over.
++
++
++def make_frame_handler(engine: BrowserEngine):
++    async def handler(request: web.Request) -> web.StreamResponse:
++        page_id = request.query.get("page", "")
++        since = int(request.query.get("since", "0") or 0)
++        session = engine.pages.get(page_id)
++        if session is None:
++            return web.Response(status=404, text="no such page")
++        fresh = await engine.call(engine.wait_frame(session, since))
++        headers = await engine.call(engine.status_headers(session))
++        if not fresh or not session.frame:
++            return web.Response(status=204, headers=headers)
++        return web.Response(
++            body=session.frame,
++            content_type="image/jpeg",
++            headers=headers,
++        )
++
++    return handler
++
++
++def make_input_handler(engine: BrowserEngine):
++    async def handler(request: web.Request) -> web.StreamResponse:
++        if request.method != "POST":
++            return web.Response(status=405)
++        try:
++            payload = await request.json()
++        except Exception:
++            return web.Response(status=400, text="bad json")
++        page_id = payload.get("page", "")
++        events = payload.get("events", [])
++        if page_id not in engine.pages:
++            return web.Response(status=404, text="no such page")
++        if events:
++            await engine.call(engine.dispatch(page_id, events))
++        return web.Response(status=204)
++
++    return handler
+diff --git a/pantheon/toolsets/live_view/toolset.py b/pantheon/toolsets/live_view/toolset.py
+index 9c61748c2..e7230ee95 100644
+--- a/pantheon/toolsets/live_view/toolset.py
++++ b/pantheon/toolsets/live_view/toolset.py
+@@ -121,6 +121,7 @@ def __init__(self, name: str = "live_view", **kwargs):
+         self._desktop_ready: set[str] = set()
+         self._nats = None  # lazy NATSStreamAdapter
+         self._data_server = None  # lazy LiveViewDataServer
++        self._browser_endpoints = False  # browser-frame/-input registered
+ 
+     # ── internals ─────────────────────────────────────────────────────────
+ 
+@@ -1285,3 +1286,236 @@ async def list_views_for_ui(self, chat_id: str | None = None) -> dict:
+             if s.chat_id == cid and s.status != "closed"
+         ]
+         return {"success": True, "views": views}
++
++    # ══ Browser — a real Chromium, shared by the agent and the user ═══════════
++    #
++    # One headless Chromium runs in this sandbox (see browser.py). Pages are
++    # visible to both sides at once: the user's Atrium Browser window streams
++    # frames from the browser-frame endpoint and sends input back through
++    # browser-input; the agent drives the SAME pages with the tools below.
++
++    def _browser_engine(self):
++        from .browser import BrowserEngine
++
++        return BrowserEngine.instance()
++
++    async def _browser_urls(self) -> tuple[str, str]:
++        """Register the stream endpoints (once) and return their URLs."""
++        server = await self._ensure_data_server()
++        from .browser import make_frame_handler, make_input_handler
++
++        engine = self._browser_engine()
++        if not self._browser_endpoints:
++            await server.register_endpoint("browser-frame", make_frame_handler(engine))
++            await server.register_endpoint("browser-input", make_input_handler(engine))
++            self._browser_endpoints = True
++        frame = server.url_for_endpoint("browser-frame")
++        inp = server.url_for_endpoint("browser-input")
++        if not frame or not inp:
++            raise RuntimeError(
++                "the data server has no browser-reachable URL yet (tunnel not set)")
++        return frame, inp
++
++    async def _browser_page_info(self, session) -> dict:
++        engine = self._browser_engine()
++        return {
++            "page_id": session.id,
++            "url": session.url,
++            "title": await engine.call(session.title()),
++        }
++
++    @tool
++    async def browser_open(self, url: str = "", show: bool = True) -> dict:
++        """Open a real browser page (Chromium in this sandbox) and, by default,
++        show it to the user as a Browser window on their desktop.
++
++        THE PAGE IS SHARED. The user sees it live and can click, type and log
++        in; you drive the SAME page with browser_goto / browser_click /
++        browser_type / browser_read. When a site needs a login, open it, ask
++        the user to sign in, then continue — the profile (cookies, sessions)
++        persists in the sandbox.
++
++        Args:
++            url: address to load (https:// is assumed when the scheme is
++                missing). Empty opens a blank page.
++            show: also open the desktop Browser window (needs an Atrium
++                desktop on this chat). Pass False to browse headlessly.
++
++        Returns `page_id` for the other browser_* tools, plus url/title, and
++        `window_id` when a desktop window was opened.
++        """
++        try:
++            from .browser import normalize_url
++
++            engine = self._browser_engine()
++            session = await engine.call(engine.open_page(normalize_url(url)))
++            info = await self._browser_page_info(session)
++            result: dict = {"success": True, **info}
++            if show:
++                shown = await self._desktop_request("desktop.open", {
++                    "app": "browser", "path": "",
++                    "state": {"page_id": session.id}, "window_id": "",
++                }, timeout=60.0)
++                if shown.get("success"):
++                    result["window_id"] = (shown.get("result") or {}).get("window_id")
++                else:
++                    result["shown"] = False
++                    result["show_error"] = shown.get("error")
++            return result
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_goto(self, url: str, page_id: str = "") -> dict:
++        """Navigate a browser page (the newest one unless `page_id` says
++        otherwise). The user watching the window sees the navigation live."""
++        try:
++            engine = self._browser_engine()
++            session = engine.latest(page_id)
++            await engine.call(engine.navigate(session.id, "goto", url))
++            return {"success": True, **await self._browser_page_info(session)}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_read(self, page_id: str = "") -> dict:
++        """Read the visible text of a browser page (title, url, body text
++        truncated to ~8k chars). Your eyes on the shared page — use it after
++        navigating, or after asking the user to do something there."""
++        try:
++            from .browser import READ_LIMIT
++
++            engine = self._browser_engine()
++            session = engine.latest(page_id)
++            text = await engine.call(session.page.evaluate(
++                "() => document.body ? document.body.innerText : ''"))
++            if len(text) > READ_LIMIT:
++                text = text[:READ_LIMIT] + "\n… (truncated)"
++            return {"success": True, **await self._browser_page_info(session),
++                    "text": text}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_click(self, selector: str, page_id: str = "") -> dict:
++        """Click an element on a browser page by CSS selector (or text=...,
++        role=... — any Playwright selector). 5s timeout when nothing matches."""
++        try:
++            engine = self._browser_engine()
++            session = engine.latest(page_id)
++            await engine.call(session.page.click(selector, timeout=5000))
++            return {"success": True, **await self._browser_page_info(session)}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_type(
++        self, selector: str, text: str, submit: bool = False, page_id: str = "",
++    ) -> dict:
++        """Fill a field on a browser page (replaces its value). `submit`
++        presses Enter afterwards."""
++        try:
++            engine = self._browser_engine()
++            session = engine.latest(page_id)
++            await engine.call(session.page.fill(selector, text, timeout=5000))
++            if submit:
++                await engine.call(session.page.press(selector, "Enter"))
++            return {"success": True, **await self._browser_page_info(session)}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_screenshot(self, page_id: str = "", path: str = "") -> dict:
++        """Screenshot a browser page to a workspace file (JPEG) and return its
++        path — observe_image it to see the page as pixels."""
++        try:
++            import time as _time
++            from pathlib import Path as _Path
++
++            engine = self._browser_engine()
++            session = engine.latest(page_id)
++            rel = path or f"browser-shot-{int(_time.time())}.jpg"
++            out = _Path(rel)
++            if not out.is_absolute():
++                out = _Path.cwd() / out
++            out.parent.mkdir(parents=True, exist_ok=True)
++            data = await engine.call(session.page.screenshot(type="jpeg", quality=80))
++            out.write_bytes(data)
++            return {"success": True, "path": str(out),
++                    **await self._browser_page_info(session)}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_pages(self) -> dict:
++        """List open browser pages (newest last) with their ids and urls."""
++        try:
++            engine = self._browser_engine()
++            pages = []
++            for s in sorted(engine.pages.values(), key=lambda x: x.created_at):
++                pages.append(await self._browser_page_info(s))
++            return {"success": True, "pages": pages}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool
++    async def browser_close(self, page_id: str) -> dict:
++        """Close a browser page. The user's window for it (if any) goes blank
++        — prefer leaving pages open for the user unless they are truly done."""
++        try:
++            engine = self._browser_engine()
++            await engine.call(engine.close_page(page_id))
++            return {"success": True}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    # ── UI plumbing (excluded from the agent) ─────────────────────────────
++
++    @tool(exclude=True)
++    async def browser_ui_page(self, url: str = "", page_id: str = "") -> dict:
++        """UI → backend: create (or attach to) a page and get stream URLs.
++
++        The Atrium Browser window calls this on mount: with `page_id` when the
++        agent already opened the page (desktop.open state), without to start a
++        fresh page. Returns frame/input endpoint URLs plus the page's state.
++        """
++        try:
++            engine = self._browser_engine()
++            if page_id:
++                session = engine.get(page_id)
++            else:
++                from .browser import normalize_url
++
++                session = await engine.call(engine.open_page(normalize_url(url)))
++            frame_url, input_url = await self._browser_urls()
++            return {
++                "success": True,
++                **await self._browser_page_info(session),
++                "frame_url": frame_url,
++                "input_url": input_url,
++                "width": session.width,
++                "height": session.height,
++            }
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool(exclude=True)
++    async def browser_ui_nav(self, page_id: str, op: str, url: str = "") -> dict:
++        """UI → backend: toolbar navigation (goto/back/forward/reload/stop)."""
++        try:
++            engine = self._browser_engine()
++            await engine.call(engine.navigate(page_id, op, url))
++            return {"success": True,
++                    **await self._browser_page_info(engine.get(page_id))}
++        except Exception as e:
++            return {"success": False, "error": str(e)}
++
++    @tool(exclude=True)
++    async def browser_ui_close(self, page_id: str) -> dict:
++        """UI → backend: the Browser window closed; drop its page."""
++        try:
++            engine = self._browser_engine()
++            await engine.call(engine.close_page(page_id))
++            return {"success": True}
++        except Exception as e:
++            return {"success": False, "error": str(e)}

@@ -1,0 +1,670 @@
+diff --git a/omicverse/io/single/_read.py b/omicverse/io/single/_read.py
+index fd52b4ff2..bf21d223b 100644
+--- a/omicverse/io/single/_read.py
++++ b/omicverse/io/single/_read.py
+@@ -100,6 +100,35 @@ def _read_h5ad_rust(path, **kwargs):
+     return adata
+ 
+ 
++def _read_h5ad_threaded(path):
++    """``anndata.read_h5ad`` with a CSR ``X`` read by anndataoom-fast on all
++    threads (int32 indices).  None when it does not apply (backend='python',
++    anndataoom-fast without ``read_csr``, non-CSR ``X`` or a ``raw`` section)."""
++    from ..._backend import resolve_backend
++    if resolve_backend(None) != 'cpp':
++        return None
++    try:
++        import h5py
++        from anndataoom_fast.memory import read_csr
++    except ImportError:
++        return None
++    try:
++        from anndata.io import read_elem
++    except ImportError:  # anndata < 0.11
++        from anndata.experimental import read_elem
++    import anndata
++    with h5py.File(path, 'r') as f:
++        if 'X' not in f or 'raw' in f or not isinstance(f['X'], h5py.Group):
++            return None
++        enc = f['X'].attrs.get('encoding-type', b'')
++        enc = enc.decode() if isinstance(enc, bytes) else str(enc)
++        if enc != 'csr_matrix':
++            return None
++        parts = {k: read_elem(f[k]) for k in
++                 ('obs', 'var', 'uns', 'obsm', 'varm', 'obsp', 'varp', 'layers') if k in f}
++    return anndata.AnnData(X=read_csr(path), **parts)
++
++
+ @register_function(
+     aliases=["读取数据", "read", "load_data", "数据读取", "file_reader"],
+     category="utils",
+@@ -190,7 +219,8 @@ def read(path, storage='memory', *, backend=None, **kwargs):
+                 return _anndata_read_h5ad(path, **kwargs)
+             return _read_h5ad_rust(path, **kwargs)
+         if storage == 'memory':
+-            return _anndata_read_h5ad(path, **kwargs)
++            fast = None if kwargs else _read_h5ad_threaded(path)
++            return fast if fast is not None else _anndata_read_h5ad(path, **kwargs)
+         if storage == 'disk':
+             from ..._settings import settings
+             if settings.mode == 'gpu':
+diff --git a/omicverse/pp/_highly_variable_genes.py b/omicverse/pp/_highly_variable_genes.py
+index 31fb25151..d3c0f3b59 100644
+--- a/omicverse/pp/_highly_variable_genes.py
++++ b/omicverse/pp/_highly_variable_genes.py
+@@ -24,6 +24,17 @@
+ def check_nonnegative_integers(X) -> bool:
+     """Check if X contains only non-negative integers."""
+     if sparse.issparse(X):
++        d = X.data
++        if d.size >= 1 << 24:
++            try:  # threaded C++ scan with early exit (anndataoom-fast)
++                from anndataoom_fast.memory import nonnegative_integers
++                return nonnegative_integers(d)
++            except ImportError:
++                pass
++            from ._qc import threaded_chunks
++            return all(threaded_chunks(
++                lambda a, b: bool(np.all(d[a:b] >= 0) and np.all(d[a:b] == np.floor(d[a:b]))),
++                d.size))
+         return (
+             np.all(X.data >= 0)
+             and np.all(X.data == np.floor(X.data))
+diff --git a/omicverse/pp/_normalization.py b/omicverse/pp/_normalization.py
+index 74b26a3c4..a76f9c1ee 100644
+--- a/omicverse/pp/_normalization.py
++++ b/omicverse/pp/_normalization.py
+@@ -450,14 +450,33 @@ def log1p_sparse(x: CSBase, *, base: Number | None = None, copy: bool = False):
+     x = check_array(
+         x, accept_sparse=("csr", "csc"), dtype=(np.float64, np.float32), copy=copy
+     )
++    d = x.data
++    if d.size >= 1 << 24 and d.flags.c_contiguous:
++        # large matrices: in place on all threads (the result replaces x.data
++        # anyway, so nothing else sees the intermediate)
++        from ._qc import threaded_chunks
++        scale = None if base is None else 1.0 / np.log(base)
++        def _part(a, b):
++            np.log1p(d[a:b], out=d[a:b])
++            if scale is not None:
++                np.multiply(d[a:b], scale, out=d[a:b])
++        threaded_chunks(_part, d.size)
++        return x
+     x.data = _log1p(x.data, copy=False, base=base)
+     return x
+ 
+ 
+ 
++from scipy.sparse import issparse as _sp_issparse
++
++
+ def log1p_array(x: np.ndarray, *, base: Number | None = None, copy: bool = False):
+     # Can force arrays to be np.ndarrays, but would be useful to not
+     # X = check_array(X, dtype=(np.float64, np.float32), ensure_2d=False, copy=copy)
++    if _sp_issparse(x) and getattr(x, "format", None) in ("csr", "csc") and x.data.size >= 1 << 24:
++        # large sparse matrices: in place on all threads instead of np.log1p's
++        # deduplicate + copy of the whole matrix
++        return log1p_sparse(x, base=base, copy=copy)
+     
+     if copy:
+         x = x.astype(float) if not np.issubdtype(x.dtype, np.floating) else x.copy()
+diff --git a/omicverse/pp/_preprocess.py b/omicverse/pp/_preprocess.py
+index 845c9d24b..07629a8b1 100644
+--- a/omicverse/pp/_preprocess.py
++++ b/omicverse/pp/_preprocess.py
+@@ -97,8 +97,14 @@ def identify_robust_genes(data: anndata.AnnData, percent_cells: float = 0.05) ->
+     # OOM goes through chunked_identify_robust_genes in preprocess(); this
+     # function only runs for regular AnnData.
+     if issparse(data.X):
+-        data.var["n_cells"] = data.X.getnnz(axis=0)
+-        data._inplace_subset_var(data.var["n_cells"] > 0)
++        from ._qc import _fast_cut
++        if _fast_cut(data, None) is not None:
++            from .._backend import cpp_memory
++            data.var["n_cells"] = cpp_memory().stored_counts(data.X)  # threaded getnnz(axis=0)
++        else:
++            data.var["n_cells"] = data.X.getnnz(axis=0)
++        from ._qc import subset_inplace
++        subset_inplace(data, var=(data.var["n_cells"] > 0).values)
+         data.var["percent_cells"] = (data.var["n_cells"] / data.shape[0]) * 100
+         data.var["robust"] = data.var["percent_cells"] >= percent_cells
+     else:
+@@ -738,7 +744,13 @@ def preprocess(
+         # Dask transforms below build new blocks instead of editing these)
+         adata.layers['counts'] = adata.X
+     else:
+-        adata.layers['counts'] = adata.X.copy()
++        # In-memory CSR with backend='cpp': the counts layer is a threaded
++        # copy made after the robust-gene cut below (one copy instead of
++        # copying and then cutting X and counts separately).
++        from ._qc import _fast_cut
++        _defer_counts = _fast_cut(adata, backend) is not None
++        if not _defer_counts:
++            adata.layers['counts'] = adata.X.copy()
+     
+     
+     print(f"{EMOJI['start']} [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Running preprocessing in '{settings.mode}' mode...")
+@@ -757,8 +769,13 @@ def preprocess(
+         elif dask_X:
+             _dask.subset_var(adata, adata.var['robust'].values)
+         else:
+-            adata = adata[:, adata.var['robust']]
++            # in place rather than a view: every access to a view's X re-slices
++            # the whole matrix
++            from ._qc import subset_inplace
++            subset_inplace(adata, var=adata.var['robust'].values, backend=backend)
+         print(f"{EMOJI['done']} Robust gene identification completed successfully.")
++    if not (is_oom or dask_X) and _defer_counts:
++        adata.layers['counts'] = _fast_cut(adata, backend)(adata.X)
+     method_list = mode.split('|')
+     print(f"{Colors.CYAN}Begin size normalization: {method_list[0]} and HVGs selection {method_list[1]}{Colors.ENDC}")
+     if exclude_highly_expressed is None:
+@@ -1130,6 +1147,67 @@ def highly_variable_genes(
+          viz=[{"function": "ov.pl.highly_variable_genes_scatter", "kwargs": {}}])
+     return result
+ 
++def _dense_limit_gb():
++    import os
++    return float(os.environ.get("OV_SCALE_DENSE_LIMIT_GB", "32"))
++
++
++def _lazy_scale_applies(adata, backend, layers_add, kwargs):
++    """In-memory CSR X in a CPU mode with backend='cpp' (and anndataoom-fast
++    with ``scale(cols=)``): the scaled layer can stay implicit."""
++    from .._backend import resolve_backend
++    from ._qc import _is_oom
++    if (layers_add != 'scaled' or not kwargs.get('zero_center', True) or set(kwargs) - {'zero_center'}
++            or settings.mode not in ('cpu', 'cpu-gpu-mixed') or _is_oom(adata)
++            or resolve_backend(backend) != 'cpp'
++            or not (issparse(adata.X) and adata.X.format == 'csr')):
++        return False
++    from .._backend import cpp_memory
++    return hasattr(cpp_memory(), 'scale_stats')
++
++
++def _scale_lazy(adata, max_value):
++    """Keep the z-score statistics instead of the dense scaled matrix;
++    ``ov.pp.pca`` rebuilds the columns it needs (identical values)."""
++    from .._backend import cpp_memory
++    mean, std = cpp_memory().scale_stats(adata.X)
++    adata.var['mean'] = mean
++    adata.var['std'] = std
++    if 'scaled' in adata.layers:
++        del adata.layers['scaled']
++    adata.uns.pop('_scaled_implicit', None)
++    adata.uns.setdefault('status', {})['scaled'] = True
++    adata.uns.setdefault('status_args', {})['scaled'] = {
++        'implicit': 'X', 'max_value': max_value,
++        'shape': [int(adata.n_obs), int(adata.n_vars)], 'nnz': int(adata.X.nnz)}
++    gb = adata.n_obs * adata.n_vars * 8 / 1e9
++    print(f"{Colors.BLUE}    Scaled layer kept implicit (dense would be {gb:.0f} GB): "
++          f"adata.var['mean'/'std'] hold the statistics and ov.pp.pca builds the "
++          f"HVG columns from adata.X. Pass use_implicit_centering=False for a "
++          f"dense adata.layers['scaled'].{Colors.ENDC}")
++    add_reference(adata, 'scanpy', 'scaling with scanpy')
++    note(backend=f"omicverse({settings.mode}) · implicit")
++
++
++def _lazy_scaled_hvg(adata, layer):
++    """Dense HVG columns of the implicit scaled layer, or None."""
++    sa = adata.uns.get('status_args', {}).get('scaled', {})
++    if layer != 'scaled' or layer in adata.layers or not isinstance(sa, dict) \
++            or sa.get('implicit') != 'X':
++        return None, None
++    if list(sa.get('shape', [])) != [adata.n_obs, adata.n_vars] or \
++            int(sa.get('nnz', -1)) != int(adata.X.nnz):
++        raise ValueError("adata.X changed since ov.pp.scale (implicit scaled layer); "
++                         "run ov.pp.scale again.")
++    from .._backend import cpp_memory
++    hv = adata.var['highly_variable'] if 'highly_variable' in adata.var.columns else None
++    mask = np.asarray(hv, dtype=bool) if hv is not None else np.ones(adata.n_vars, dtype=bool)
++    Z = cpp_memory().scale(adata.X, max_value=sa.get('max_value'),
++                           mean=adata.var['mean'].values, std=adata.var['std'].values,
++                           cols=mask)[0]
++    return Z, mask
++
++
+ @monitor
+ @register_function(
+     aliases=["标准化", "scale", "scaling", "标准化处理"],
+@@ -1148,7 +1226,7 @@ def highly_variable_genes(
+ )
+ @tracked("scale", "ov.pp.scale")
+ def scale(adata, max_value=10, layers_add='scaled', to_sparse=False,
+-          use_implicit_centering=False, backend=None, **kwargs):
++          use_implicit_centering=None, backend=None, **kwargs):
+     """
+     Scale the input AnnData object.
+ 
+@@ -1170,7 +1248,11 @@ def scale(adata, max_value=10, layers_add='scaled', to_sparse=False,
+             60606 genes that is ~240 GB, the difference between OOM-killed and
+             completing under a typical 256 GB per-process RSS cap. ``ov.pp.pca``
+             densifies only the HVG-subset slice the SVD actually needs.
+-            Default: False (preserves existing behavior). Ignored on the OOM
++            With ``backend='cpp'`` (default) the lazy form keeps only the
++            per-gene ``mean``/``std`` in ``adata.var`` (h5ad-writable) and
++            ``ov.pp.pca`` rebuilds exactly the HVG columns of the dense
++            result. Default ``None``: lazy when the dense matrix would exceed
++            32 GB (``OV_SCALE_DENSE_LIMIT_GB``), dense otherwise. Ignored on the OOM
+             backend (which already uses a lazy ``ScaledBackedArray``) and on
+             GPU mode.
+         **kwargs: Additional arguments passed to scaling functions.
+@@ -1213,6 +1295,13 @@ def scale(adata, max_value=10, layers_add='scaled', to_sparse=False,
+     # (c) adata.X is sparse (the densification this avoids is exactly the
+     # sparse zero-centering step). zero_center defaults True in kwargs.
+     _zero_center = kwargs.get('zero_center', True)
++    from .._backend import resolve_backend
++    _lazy_cpp = _lazy_scale_applies(adata, backend, layers_add, kwargs)
++    if _lazy_cpp and (use_implicit_centering or (
++            use_implicit_centering is None
++            and adata.n_obs * adata.n_vars * 8 / 1e9 > _dense_limit_gb())):
++        _scale_lazy(adata, max_value)
++        return
+     if (use_implicit_centering
+             and (settings.mode == 'cpu' or settings.mode == 'cpu-gpu-mixed')
+             and _zero_center
+@@ -1534,6 +1623,32 @@ def pca(adata, n_pcs=50, layer='scaled',inplace=True,random_state=SEED_DEFAULT,b
+     _has_implicit_scaled = (
+         layer == 'scaled' and '_scaled_implicit' in adata.uns
+     )
++    _Z, _zmask = _lazy_scaled_hvg(adata, layer)
++    if _Z is not None and settings.mode in ('cpu', 'cpu-gpu-mixed'):
++        # ov.pp.scale kept the scaled layer implicit: PCA on exactly the HVG
++        # columns of the dense scaled matrix, built from adata.X.
++        from ._pca import pca as _pca
++        key = f'{layer}|original'
++        tmp = anndata.AnnData(X=_Z)
++        if settings.mode == 'cpu-gpu-mixed' and kwargs.get("svd_solver", "auto") in (None, "auto"):
++            kwargs["svd_solver"] = "covariance_eigh"
++        _pca(tmp, layer=None, n_comps=n_pcs, use_gpu=settings.mode == 'cpu-gpu-mixed',
++             **({} if settings.mode == 'cpu-gpu-mixed' else {'backend': backend}), **kwargs)
++        del _Z
++        pcs = np.zeros((adata.n_vars, tmp.varm['PCs'].shape[1]), dtype=tmp.varm['PCs'].dtype)
++        pcs[_zmask] = tmp.varm['PCs']
++        adata.obsm['X_pca'] = tmp.obsm['X_pca']
++        adata.varm['PCs'] = pcs
++        adata.uns['pca'] = tmp.uns['pca']
++        adata.obsm[key + '|X_pca'] = adata.obsm['X_pca']
++        adata.varm[key + '|pca_loadings'] = adata.varm['PCs']
++        adata.uns[key + '|pca_var_ratios'] = adata.uns['pca']['variance_ratio']
++        adata.uns[key + '|cum_sum_eigenvalues'] = adata.uns['pca']['variance']
++        adata.uns.setdefault('status', {})['pca'] = True
++        adata.uns.setdefault('status_args', {})['pca'] = {'layer': layer, 'n_pcs': n_pcs}
++        add_reference(adata, 'scanpy', 'PCA with scanpy')
++        note(backend=f"omicverse({settings.mode}) · implicit scaled")
++        return None if inplace else adata
+     if layer in adata.layers:
+         X = adata.layers[layer]
+         key = f'{layer}|original'
+diff --git a/omicverse/pp/_qc.py b/omicverse/pp/_qc.py
+index 5c4efe62d..e72c63fce 100644
+--- a/omicverse/pp/_qc.py
++++ b/omicverse/pp/_qc.py
+@@ -52,6 +52,112 @@ def _oom_axis_stats(X, axis):
+     return s, nnz
+ 
+ 
++def _n_threads():
++    import os
++    try:
++        n = len(os.sched_getaffinity(0))
++    except AttributeError:
++        n = os.cpu_count() or 1
++    env = os.environ.get("OMP_NUM_THREADS")
++    return max(1, min(n, int(env))) if env and env.isdigit() else n
++
++
++def threaded_chunks(fn, n, min_chunk=1 << 22):
++    """Run ``fn(start, stop)`` over ``range(n)`` split into contiguous chunks
++    on a thread pool (numpy ufuncs release the GIL); returns the results."""
++    k = max(1, min(_n_threads(), n // min_chunk))
++    if k == 1:
++        return [fn(0, n)]
++    from concurrent.futures import ThreadPoolExecutor
++    b = np.linspace(0, n, k + 1, dtype=np.int64)
++    with ThreadPoolExecutor(k) as ex:
++        return list(ex.map(lambda i: fn(int(b[i]), int(b[i + 1])), range(k)))
++
++
++def _fast_cut(adata, backend):
++    """anndataoom-fast's threaded CSR subset applies: in-memory CSR ``X``
++    (not a view, not AnnDataOOM) and the cpp backend."""
++    from .._backend import resolve_backend
++    if resolve_backend(backend) != 'cpp' or adata.is_view or _is_oom(adata):
++        return None
++    if not (sparse.issparse(adata.X) and adata.X.format == 'csr'):
++        return None
++    try:
++        from anndataoom_fast.memory import subset_csr
++    except ImportError:
++        return None
++    return subset_csr
++
++
++def _detach_csr(adata):
++    """Take ``X`` and the CSR layers out of ``adata`` (returned as a dict)."""
++    parts = {None: adata.X}
++    for k in list(adata.layers.keys()):
++        v = adata.layers[k]
++        if sparse.issparse(v) and v.format == 'csr':
++            parts[k] = v
++            del adata.layers[k]
++    adata.X = None
++    return parts
++
++
++def _attach_csr(adata, parts):
++    for k, v in parts.items():
++        if k is None:
++            adata.X = v
++        else:
++            adata.layers[k] = v
++
++
++def subset_inplace(adata, obs=None, var=None, backend=None):
++    """``adata._inplace_subset_obs/var`` that cuts an in-memory CSR ``X`` and
++    its CSR layers on all threads (anndata copies them single-threaded, and
++    twice).  No-op for all-true masks."""
++    obs = None if obs is None else np.asarray(obs)
++    var = None if var is None else np.asarray(var)
++    if obs is not None and obs.dtype == bool and obs.all():
++        obs = None
++    if var is not None and var.dtype == bool and var.all():
++        var = None
++    if obs is None and var is None:
++        return
++    cut = _fast_cut(adata, backend)
++    if cut is None:
++        if obs is not None:
++            adata._inplace_subset_obs(obs)
++        if var is not None:
++            adata._inplace_subset_var(var)
++        return
++    parts = _detach_csr(adata)
++    try:
++        if obs is not None:
++            adata._inplace_subset_obs(obs)
++        if var is not None:
++            adata._inplace_subset_var(var)
++    except BaseException:
++        _attach_csr(adata, parts)
++        raise
++    _attach_csr(adata, {k: cut(v, obs, var) for k, v in parts.items()})
++
++
++def subset_copy(adata, obs=None, var=None, backend=None):
++    """``adata[obs, var].copy()`` with in-memory CSR matrices cut on all
++    threads; ``adata`` itself is left unchanged."""
++    cut = _fast_cut(adata, backend)
++    if cut is None:
++        sel = (slice(None) if obs is None else obs, slice(None) if var is None else var)
++        return adata[sel].copy()
++    parts = _detach_csr(adata)
++    try:
++        sel = (slice(None) if obs is None else np.asarray(obs),
++               slice(None) if var is None else np.asarray(var))
++        new = adata[sel].copy()
++    finally:
++        _attach_csr(adata, parts)
++    _attach_csr(new, {k: cut(v, obs, var) for k, v in parts.items()})
++    return new
++
++
+ def _filter_cells_impl(
+     adata,
+     min_counts=None,
+@@ -89,7 +195,7 @@ def _filter_cells_impl(
+         cell_subset &= n_genes <= max_genes
+ 
+     if inplace:
+-        adata._inplace_subset_obs(cell_subset)
++        subset_inplace(adata, obs=cell_subset, backend=backend)
+         return None
+     else:
+         return cell_subset, n_counts
+@@ -131,7 +237,7 @@ def _filter_genes_impl(
+         gene_subset &= n_cells <= max_cells
+ 
+     if inplace:
+-        adata._inplace_subset_var(gene_subset)
++        subset_inplace(adata, var=gene_subset, backend=backend)
+         return None
+     else:
+         return gene_subset, n_counts
+@@ -1427,10 +1533,14 @@ def qc_cpu(
+         removed = QC_test.loc[lambda x : x == False]
+         removed_cells.extend(list(removed.index.values))
+         total_qc_failed = n1-np.sum(QC_test)
+-        adata = adata[QC_test, :]
+-    
+-    
+-    n2 = adata.shape[0]
++    # In-memory CSR with backend='cpp': the QC filter and the min_genes /
++    # min_cells filters below become one threaded cut (same result as the
++    # step-by-step subsets, which each copied the whole matrix).
++    _fused = (not is_oom) and _fast_cut(adata, backend) is not None
++    if not is_oom and not _fused:
++        adata = subset_copy(adata, obs=QC_test.values, backend=backend)
++
++    n2 = int(np.sum(QC_test)) if _fused else adata.shape[0]
+     
+     print(f"   {Colors.GREEN}✓ Combined QC filters: {Colors.BOLD}{total_qc_failed:,}{Colors.ENDC}{Colors.GREEN} cells removed ({total_qc_failed/n1*100:.1f}%){Colors.ENDC}")
+ 
+@@ -1439,10 +1549,22 @@ def qc_cpu(
+     print(f"   {Colors.CYAN}Parameters: min_genes={min_genes}, min_cells={min_cells}{Colors.ENDC}")
+     print(f"   {Colors.CYAN}Ratios: max_genes_ratio={max_genes_ratio}, max_cells_ratio={max_cells_ratio}{Colors.ENDC}")
+     
+-    cells_before_final = adata.shape[0]
++    cells_before_final = n2
+     genes_before_final = adata.shape[1]
+ 
+-    if is_oom:
++    if _fused:
++        from .._backend import cpp_memory
++        _mem = cpp_memory()
++        _rows = np.asarray(QC_test.values, dtype=bool).copy()
++        if min_genes is not None:
++            _rows &= _mem.qc_metrics(adata.X)['n_positive'] >= min_genes
++        _genes = np.ones(adata.n_vars, dtype=bool)
++        if min_cells is not None:
++            _genes = _mem.positive_counts(adata.X, rows=_rows) >= min_cells
++        adata = subset_copy(adata, obs=_rows, var=_genes, backend=backend)
++        _filter_cells_impl(adata, max_genes=int(max_genes_ratio*adata.shape[1]), backend=backend)
++        _filter_genes_impl(adata, max_cells=int(max_cells_ratio*adata.shape[0]), backend=backend)
++    elif is_oom:
+         # OOM path: use _inplace_subset and chunked column counts
+         selected_cells = np.ones(adata.n_obs, dtype=bool)
+         if min_genes:
+diff --git a/omicverse/pp/_scale.py b/omicverse/pp/_scale.py
+index d44ed7d3f..70099c9e6 100644
+--- a/omicverse/pp/_scale.py
++++ b/omicverse/pp/_scale.py
+@@ -229,6 +229,29 @@ def new_data_op(x):
+     if x.format == "csr":
+         indices = x.indices
+         indptr = x.indptr
++        if out is not None and row_scale and x.data.size >= 1 << 24:
++            # large CSR, per-row factor: fill the result row block by row block
++            # on all threads (same values and dtype as new_data_op)
++            d, ip, f = x.data, indptr, np.asarray(scaling_array)
++            try:  # one threaded C++ pass (anndataoom-fast), bit-identical
++                from anndataoom_fast.memory import scale_rows as _scale_rows
++            except ImportError:
++                _scale_rows = None
++            if _scale_rows is not None and d.dtype in (np.float32, np.float64) \
++                    and f.dtype in (np.float32, np.float64):
++                x.data = _scale_rows(x, f, divide=op is truediv)
++                return x
++            from ._qc import threaded_chunks
++            res = np.empty(d.size, dtype=np.result_type(d.dtype, f.dtype))
++            ufunc = np.true_divide if op is truediv else np.multiply
++
++            def _rows(r0, r1):
++                a, b = int(ip[r0]), int(ip[r1])
++                ufunc(d[a:b], np.repeat(f[r0:r1], np.diff(ip[r0:r1 + 1])), out=res[a:b])
++
++            threaded_chunks(_rows, x.shape[0], min_chunk=1 << 12)
++            x.data = res
++            return x
+         if out is not None:
+             x.data = new_data_op(x)
+             return x
+diff --git a/omicverse/pp/experimental/_highly_variable_genes.py b/omicverse/pp/experimental/_highly_variable_genes.py
+index d6e45b372..0ddc89229 100644
+--- a/omicverse/pp/experimental/_highly_variable_genes.py
++++ b/omicverse/pp/experimental/_highly_variable_genes.py
+@@ -172,21 +172,37 @@ def _highly_variable_pearson_residuals(
+ 
+     # Get pearson residuals for each batch separately
+     residual_gene_vars = []
++    # In-memory CSR with backend='cpp': cut the batch / non-zero genes on all
++    # threads (and only when something is dropped) instead of slicing views.
++    _cut = None
++    if _cpp and not is_rust:
++        from .._qc import _fast_cut
++        _cut = _fast_cut(adata, backend)
++        _X_all = _get_obs_rep(adata, layer=layer) if _cut is not None else None
++        if _cut is not None and not (sp_sparse.issparse(_X_all) and _X_all.format == 'csr'):
++            _cut = None
+     for batch in np.unique(batch_info):
+-        if is_rust:
+-            adata_subset_prefilter = adata.subset(obs_indices=np.where(batch_info == batch)[0],inplace=False)
++        if _cut is not None:
++            from ..._backend import cpp_memory
++            _rows = batch_info == batch
++            X_batch_prefilter = _X_all if _rows.all() else _cut(_X_all, _rows, None)
++            nonzero_genes = cpp_memory().gene_sums(X_batch_prefilter)[0] != 0
++            X_batch = X_batch_prefilter if nonzero_genes.all() else \
++                _cut(X_batch_prefilter, None, nonzero_genes)
+         else:
+-            adata_subset_prefilter = adata[batch_info == batch]
+-        #  adata_subset_prefilter = adata[batch_info == batch]
+-        X_batch_prefilter = _get_obs_rep(adata_subset_prefilter, layer=layer)
+-        if is_rust:
+-            X_batch_prefilter = X_batch_prefilter[:]
+-        # Filter out zero genes
+-        nonzero_genes = np.ravel(X_batch_prefilter.sum(axis=0)) != 0
+-        adata_subset = adata_subset_prefilter[:, nonzero_genes]
+-        X_batch = _get_obs_rep(adata_subset, layer=layer)
+-        if is_rust:
+-            X_batch = X_batch[:]
++            if is_rust:
++                adata_subset_prefilter = adata.subset(obs_indices=np.where(batch_info == batch)[0],inplace=False)
++            else:
++                adata_subset_prefilter = adata[batch_info == batch]
++            X_batch_prefilter = _get_obs_rep(adata_subset_prefilter, layer=layer)
++            if is_rust:
++                X_batch_prefilter = X_batch_prefilter[:]
++            # Filter out zero genes
++            nonzero_genes = np.ravel(X_batch_prefilter.sum(axis=0)) != 0
++            adata_subset = adata_subset_prefilter[:, nonzero_genes]
++            X_batch = _get_obs_rep(adata_subset, layer=layer)
++            if is_rust:
++                X_batch = X_batch[:]
+         # Prepare clipping
+         if clip is None:
+             n = X_batch.shape[0]
+diff --git a/tests/pp/test_inmemory_cpp.py b/tests/pp/test_inmemory_cpp.py
+new file mode 100644
+index 000000000..e0e00f6f2
+--- /dev/null
++++ b/tests/pp/test_inmemory_cpp.py
+@@ -0,0 +1,98 @@
++"""storage='memory' with backend='cpp': threaded load / cuts / implicit scale
++give the same AnnData as the plain anndata + scanpy-style path."""
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++aof_memory = pytest.importorskip("anndataoom_fast.memory")
++if not hasattr(aof_memory, "subset_csr"):
++    pytest.skip("anndataoom-fast without subset_csr", allow_module_level=True)
++
++
++def _counts(n=1500, g=400, seed=0):
++    import anndata as ad
++    rng = np.random.default_rng(seed)
++    lam = rng.gamma(0.4, 2.0, size=g) * rng.lognormal(0, 0.6, size=(n, 1))
++    lam[:, 0] *= 40  # one highly expressed gene
++    X = sp.csr_matrix(rng.poisson(lam).astype(np.float32))
++    X[:, 5] = 0  # a gene detected nowhere
++    X.eliminate_zeros()
++    a = ad.AnnData(X)
++    a.obs_names = [f"c{i}" for i in range(n)]
++    names = [f"G{j}" for j in range(g)]
++    names[10:15] = [f"MT-{j}" for j in range(5)]
++    a.var_names = names
++    a.layers["raw"] = X.copy()
++    return a
++
++
++@pytest.fixture
++def h5ad(tmp_path):
++    p = tmp_path / "c.h5ad"
++    a = _counts()
++    del a.layers["raw"]
++    a.write_h5ad(p)
++    return p
++
++
++def test_threaded_read_equals_anndata(h5ad):
++    import anndata as ad
++    import omicverse as ov
++    from omicverse.io.single._read import _read_h5ad_threaded
++    ov.settings.backend = "cpp"
++    a, b = _read_h5ad_threaded(h5ad), ad.read_h5ad(h5ad)
++    assert a is not None
++    assert (a.X != b.X).nnz == 0 and a.X.dtype == b.X.dtype
++    assert a.obs.equals(b.obs) and a.var.equals(b.var)
++
++
++def test_subset_helpers_match_anndata():
++    from omicverse.pp._qc import subset_copy, subset_inplace
++    a = _counts()
++    rng = np.random.default_rng(1)
++    rows, cols = rng.random(a.n_obs) < 0.7, rng.random(a.n_vars) < 0.6
++    ref = a[rows, cols].copy()
++    got = subset_copy(a, obs=rows, var=cols, backend="cpp")
++    assert a.shape == (1500, 400)  # input untouched
++    assert list(got.obs_names) == list(ref.obs_names) and list(got.var_names) == list(ref.var_names)
++    for k in (None, "raw"):
++        x, y = (got.X, ref.X) if k is None else (got.layers[k], ref.layers[k])
++        np.testing.assert_array_equal(x.toarray(), y.toarray())
++    b = a.copy()
++    subset_inplace(b, obs=rows, var=cols, backend="cpp")
++    assert list(b.obs_names) == list(ref.obs_names)
++    np.testing.assert_array_equal(b.layers["raw"].toarray(), ref.layers["raw"].toarray())
++
++
++def test_cpp_qc_same_cells_and_genes_and_input_untouched():
++    import omicverse as ov
++    a = _counts()
++    kw = dict(doublets=False, tresh={"mito_perc": 0.5, "nUMIs": 100, "detected_genes": 30},
++              min_cells=20, min_genes=30)
++    ov.settings.cpu_init()
++    c = ov.pp.qc(a.copy(), backend="python", **kw)
++    before = a.shape
++    f = ov.pp.qc(a, backend="cpp", **kw)
++    assert a.shape == before  # the user's object is not filtered in place
++    assert list(f.obs_names) == list(c.obs_names)
++    assert list(f.var_names) == list(c.var_names)
++    np.testing.assert_array_equal(f.X.toarray(), c.X.toarray())
++
++
++def test_implicit_scale_pca_equals_dense(tmp_path):
++    import omicverse as ov
++    ov.settings.cpu_init()
++
++    def run(lazy):
++        a = ov.pp.qc(_counts(), backend="cpp", doublets=False,
++                     tresh={"mito_perc": 0.5, "nUMIs": 100, "detected_genes": 30})
++        ov.pp.preprocess(a, mode="shiftlog|pearson", n_HVGs=100, backend="cpp")
++        ov.pp.scale(a, max_value=10, use_implicit_centering=lazy, backend="cpp")
++        ov.pp.pca(a, n_pcs=10, layer="scaled", backend="cpp")
++        return a
++
++    d, l = run(False), run(True)
++    assert "scaled" in d.layers and "scaled" not in l.layers
++    np.testing.assert_array_equal(d.obsm["X_pca"], l.obsm["X_pca"])
++    np.testing.assert_array_equal(d.varm["PCs"], l.varm["PCs"])
++    l.write_h5ad(tmp_path / "lazy.h5ad")  # only plain arrays are stored

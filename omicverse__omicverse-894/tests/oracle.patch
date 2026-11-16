@@ -1,0 +1,3768 @@
+diff --git a/omicverse/external/camex/LICENSE b/omicverse/external/camex/LICENSE
+new file mode 100644
+index 000000000..f1e8daa8d
+--- /dev/null
++++ b/omicverse/external/camex/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2024 Smilenone
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/omicverse/external/camex/__init__.py b/omicverse/external/camex/__init__.py
+new file mode 100644
+index 000000000..7ea61b394
+--- /dev/null
++++ b/omicverse/external/camex/__init__.py
+@@ -0,0 +1,63 @@
++"""Vendored copy of CAMEX (Cross-species cell-type Annotation and integration
++via Multi-species EXpression graphs).
++
++CAMEX is a graph-neural-network method for cross-species single-cell
++integration and annotation. Given one AnnData per species (raw counts, gene
++symbols) plus many-to-many gene-homology tables linking the species, it builds
++a DGL heterograph of cells and genes, connects homologous genes across species,
++and trains a relational GNN autoencoder that embeds every species into a shared
++latent space (integration) and, optionally, transfers cell-type labels from
++annotated reference species to unannotated query species (annotation).
++
++Reference
++---------
++Guo, Z.-H., et al. "CAMEX: cross-species cell-type annotation and integration
++via multi-species expression graphs."
++Upstream: https://github.com/zhanglabtools/CAMEX (branch ``main``, MIT license)
++
++Why vendored
++------------
++CAMEX is not published on PyPI and its ``setup.py`` pins a conflicting set of
++dependencies (``numpy>=1.22.4,<=1.24.4``, ``scanpy<=1.9.3``, ``pandas==1.5.3``,
++``numba==0.56.4``, ``harmonypy==0.0.9``) that are incompatible with the
++omicverse environment (numpy 2.x, newer scanpy). Rather than pip-installing it
++(which would break the environment), the ``CAMEX/`` package source is copied
++here and patched to run under the current environment:
++
++* intra-package ``from CAMEX.xxx import ...`` imports rewritten as relative
++  imports (``from .xxx import ...``);
++* ``dgl.dataloading.NodeDataLoader`` (removed in DGL >=1.0) resolved via a
++  compatibility shim to ``dgl.dataloading.DataLoader``;
++* the heavy optional ``scib`` / ``scanpy.external`` imports in
++  :mod:`integration_metrics` made lazy so ``import omicverse.external.camex``
++  stays light.
++
++The vendored modules (``base``, ``model``, ``layer``, ``loss``, ``trainer``,
++``params``, ``preprocess_untils``, ``train_untils``, ``integration_metrics``)
++are imported lazily so that merely importing this package does not require
++``torch``/``dgl`` to be present.
++
++Programmatic entry point
++------------------------
++Use :func:`omicverse.external.camex._run.run_camex` to run the CAMEX
++integration pipeline from Python and get back a combined AnnData with the CAMEX
++integration embedding in ``.obsm['X_CAMEX_Integration']`` and ``species`` /
++``batch`` in ``.obs``.
++"""
++
++__all__ = ["run_camex", "Dataset", "Trainer"]
++
++
++def __getattr__(name):
++    # Lazy re-exports so ``import omicverse.external.camex`` does not eagerly
++    # import torch/dgl-heavy submodules.
++    if name == "run_camex":
++        from ._run import run_camex
++        return run_camex
++    if name == "Dataset":
++        from .base import Dataset
++        return Dataset
++    if name == "Trainer":
++        from .trainer import Trainer
++        return Trainer
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/omicverse/external/camex/_run.py b/omicverse/external/camex/_run.py
+new file mode 100644
+index 000000000..8ccdc3780
+--- /dev/null
++++ b/omicverse/external/camex/_run.py
+@@ -0,0 +1,278 @@
++"""Programmatic entry point for the vendored CAMEX pipeline.
++
++This reproduces the glue found in the upstream CAMEX analysis notebooks
++(``analysis/1liver/Integrate_liver_across_4_species.ipynb`` and
++``analysis/4cortex_annotation/integration_annotation_in_relatives_distant_species.ipynb``)::
++
++    from CAMEX.base import Dataset
++    from CAMEX.trainer import Trainer
++    from params import PARAMS
++
++    for k, v in PARAMS.items():
++        v['time_start'] = time_start
++        v['log_path'] = log_path
++
++    dataset = Dataset(**PARAMS['preprocess'])
++    adata_CAMEX = dataset.adata_whole
++    dgl_data = dataset.dgl_data
++    trainer = Trainer(adata_CAMEX, dgl_data, **PARAMS['train'])
++    trainer.integration()          # writes adata_CAMEX.obsm['X_CAMEX_Integration']
++    trainer.annotation()           # optional; writes adata_CAMEX.obsm['X_CAMEX_Annotation']
++    adata_CAMEX.write_h5ad(log_path + 'adata_CAMEX.h5ad')
++
++``run_camex`` wires this together from in-memory AnnData objects: it writes the
++per-species ``.h5ad`` files and the pairwise many-to-many homology CSVs that
++CAMEX expects on disk, builds the merged ``PARAMS`` dict, runs
++``Dataset -> Trainer.integration()`` (and optionally ``.annotation()``), and
++returns the combined AnnData.
++"""
++
++from __future__ import annotations
++
++import os
++import time
++from typing import Dict, List, Optional, Sequence, Tuple
++
++import numpy as np
++import pandas as pd
++
++
++def _default_params():
++    """The full CAMEX ``PARAMS`` skeleton (from ``params_template.py``).
++
++    ``dataset_file`` / ``path`` are filled in by :func:`run_camex`.
++    """
++    return {
++        "preprocess": {
++            "path": "./dataset/",
++            "dataset_file": None,  # filled by run_camex
++            "graph_mode": "undirected",
++            "feature_gene": "HIG",
++            "sample_ratio": 1,
++            "get_balance": "False",
++        },
++        "train": {
++            "device": "cuda:0",
++            "train_mode": "mini_batch",
++            "epoch_integration": 10,
++            "epoch_annotation": 10,
++            "batch_size": 1024,
++            "dim_hidden": 128,
++            "gnn_layer_num": 2,
++            "encoder": "GCN",
++            "classifier": "GAT",
++            "res": True,
++            "share": True,
++            "cluster": False,
++            "epoch_cluster": 10,
++            "cluster_num": 5,
++            "domain": False,
++            "reconstruct": True,
++        },
++        "postprocess": {},
++    }
++
++
++def _prepare_adata(adata, label_col: str):
++    """Return a copy with raw counts in ``.X`` and ``cell_ontology_class`` set.
++
++    CAMEX's ``Dataset`` requires ``obs['cell_ontology_class']`` for *every*
++    dataset (reference and query) and expects raw counts in ``.X``.
++    """
++    import scanpy as sc  # noqa: F401  (kept for parity / lazy heavy import)
++
++    ad = adata.copy()
++    if label_col is not None and label_col in ad.obs.columns:
++        ad.obs["cell_ontology_class"] = ad.obs[label_col].astype(str).values
++    elif "cell_ontology_class" not in ad.obs.columns:
++        # No labels available -> assign a single placeholder cell type so that
++        # graph construction / DEG clustering still works (integration only).
++        ad.obs["cell_ontology_class"] = "unknown"
++    ad.obs["cell_ontology_class"] = ad.obs["cell_ontology_class"].astype(str)
++    # ensure gene symbols are unique strings
++    ad.var_names = [str(g) for g in ad.var_names]
++    ad.var_names_make_unique()
++    return ad
++
++
++def run_camex(
++    adatas: List,
++    species: List[str],
++    *,
++    homology: Optional[Dict[Tuple[str, str], "pd.DataFrame"]] = None,
++    ref_index: int = 0,
++    label_col: str = "cell_type",
++    device: str = "cuda",
++    epoch_integration: int = 10,
++    epoch_annotation: int = 10,
++    batch_size: int = 1024,
++    work_dir: str = "./camex_work",
++    annotate: bool = False,
++    **params,
++):
++    """Run the vendored CAMEX cross-species integration pipeline.
++
++    Parameters
++    ----------
++    adatas
++        List of per-species :class:`anndata.AnnData` objects holding **raw
++        counts** in ``.X`` and gene symbols in ``.var_names``.
++    species
++        List of species names (parallel to ``adatas``). Used as the on-disk
++        ``.h5ad`` file stems and the ``species`` / ``batch`` obs column.
++    homology
++        Optional dict ``{(src_species, dst_species): DataFrame}`` where each
++        DataFrame's first two columns are ``[src_gene_symbol, dst_gene_symbol]``
++        (a many-to-many homology table). If ``None``, every non-reference
++        species is star-linked to the reference species and the caller must
++        instead supply homology via this argument -- with ``None`` and no
++        homology CAMEX cannot connect the species, so a value is required unless
++        a single species is passed.
++    ref_index
++        Index (into ``adatas`` / ``species``) of the reference/annotated
++        species. Its labels are marked available (``source label=True``).
++    label_col
++        ``obs`` column holding cell-type labels; copied to
++        ``cell_ontology_class`` which CAMEX requires. Missing -> ``'unknown'``.
++    device
++        ``'cuda'`` / ``'cuda:0'`` / ``'cpu'``.
++    epoch_integration, epoch_annotation, batch_size
++        Training hyper-parameters.
++    work_dir
++        Directory used to stage the ``dataset/`` h5ads, homology CSVs and CAMEX
++        output logs.
++    annotate
++        If True (and reference labels are present) also run
++        ``Trainer.annotation()`` after integration, writing
++        ``obsm['X_CAMEX_Annotation']``.
++    **params
++        Extra keys merged into the CAMEX ``PARAMS['train']`` dict
++        (e.g. ``dim_hidden``, ``encoder``, ``classifier``, ``gnn_layer_num``).
++
++    Returns
++    -------
++    anndata.AnnData
++        The combined ``adata_whole`` with the integration embedding in
++        ``.obsm['X_CAMEX_Integration']`` and ``species`` / ``batch`` in
++        ``.obs``.
++    """
++    # Lazy heavy imports so ``import omicverse.external.camex`` stays light.
++    from .base import Dataset
++    from .trainer import Trainer
++
++    if len(adatas) != len(species):
++        raise ValueError("`adatas` and `species` must have the same length.")
++    if len(adatas) < 2:
++        raise ValueError("CAMEX needs at least two species to integrate.")
++    if homology is None:
++        raise ValueError(
++            "`homology` is required: pass a dict {(src_species, dst_species): "
++            "DataFrame[[src_gene, dst_gene]]} linking the species. With None "
++            "CAMEX cannot build the cross-species gene graph."
++        )
++
++    species = [str(s) for s in species]
++    ref_species = species[ref_index]
++
++    # ---- work dirs ------------------------------------------------------
++    work_dir = os.path.abspath(work_dir)
++    dataset_dir = os.path.join(work_dir, "dataset") + os.sep
++    time_start = time.strftime("%Y-%m-%d-%H-%M-%S")
++    log_path = os.path.join(work_dir, "log", time_start) + os.sep
++    os.makedirs(dataset_dir, exist_ok=True)
++    os.makedirs(log_path, exist_ok=True)
++
++    # ---- write per-species h5ad ----------------------------------------
++    fname = {sp: f"{sp}.h5ad" for sp in species}
++    has_label = {}
++    for sp, ad in zip(species, adatas):
++        prepared = _prepare_adata(ad, label_col)
++        # a species is "labelled" (reference-eligible) if real labels exist
++        if label_col is not None and label_col in ad.obs.columns:
++            has_label[sp] = True
++        else:
++            has_label[sp] = False
++        prepared.write_h5ad(dataset_dir + fname[sp], compression="gzip")
++
++    # ref is always marked as labelled reference (its labels drive annotation)
++    has_label[ref_species] = has_label.get(ref_species, False) or (
++        label_col is not None and label_col in adatas[ref_index].obs.columns
++    )
++
++    # ---- build homology CSVs + dataset_file ----------------------------
++    # CAMEX's `_check_dataset_exist` asserts the homology CSV's two column
++    # headers are exactly the source and destination *.h5ad filenames.
++    rows = []
++    for (src_sp, dst_sp), df in homology.items():
++        src_sp, dst_sp = str(src_sp), str(dst_sp)
++        if src_sp not in fname or dst_sp not in fname:
++            raise ValueError(
++                f"homology key ({src_sp!r}, {dst_sp!r}) references unknown "
++                f"species; known: {species}"
++            )
++        pair = df.iloc[:, :2].copy()
++        pair.columns = [fname[src_sp], fname[dst_sp]]
++        csv_name = f"gene_matches_{src_sp}2{dst_sp}.csv"
++        pair.to_csv(dataset_dir + csv_name, index=False)
++        rows.append(
++            [
++                fname[src_sp],
++                bool(has_label[src_sp]),
++                csv_name,
++                fname[dst_sp],
++                bool(has_label[dst_sp]),
++            ]
++        )
++
++    dataset_file = pd.DataFrame(
++        data=rows,
++        columns=["source", "source label", "relationship", "destination", "destination label"],
++    )
++
++    # ---- merged PARAMS --------------------------------------------------
++    PARAMS = _default_params()
++    PARAMS["preprocess"]["path"] = dataset_dir
++    PARAMS["preprocess"]["dataset_file"] = dataset_file
++
++    train = PARAMS["train"]
++    train["device"] = device
++    train["epoch_integration"] = int(epoch_integration)
++    train["epoch_annotation"] = int(epoch_annotation)
++    train["batch_size"] = int(batch_size)
++    # merge user overrides (dim_hidden, encoder, classifier, gnn_layer_num, ...)
++    for k, v in params.items():
++        if k in PARAMS["preprocess"]:
++            PARAMS["preprocess"][k] = v
++        else:
++            train[k] = v
++
++    # CAMEX expects every sub-dict to carry time_start / log_path.
++    for v in PARAMS.values():
++        if isinstance(v, dict):
++            v["time_start"] = time_start
++            v["log_path"] = log_path
++
++    # ---- run pipeline (faithful to the tutorial glue) ------------------
++    dataset = Dataset(**PARAMS["preprocess"])
++    adata_camex = dataset.adata_whole
++    dgl_data = dataset.dgl_data
++
++    trainer = Trainer(adata_camex, dgl_data, **PARAMS["train"])
++    trainer.integration()
++
++    if annotate and int(epoch_annotation) > 0 and bool(has_label[ref_species]):
++        trainer.annotation()
++
++    # ---- tidy obs -------------------------------------------------------
++    # ``batch`` is set by CAMEX to the per-species data order; mirror it into
++    # a ``species`` column for convenience.
++    if "batch" in adata_camex.obs.columns:
++        adata_camex.obs["species"] = adata_camex.obs["batch"].astype(str).values
++
++    if "X_CAMEX_Integration" not in adata_camex.obsm:
++        raise RuntimeError(
++            "CAMEX integration finished but no 'X_CAMEX_Integration' embedding "
++            "was written to adata.obsm -- check the training logs."
++        )
++
++    return adata_camex
+diff --git a/omicverse/external/camex/base.py b/omicverse/external/camex/base.py
+new file mode 100644
+index 000000000..0afd1652f
+--- /dev/null
++++ b/omicverse/external/camex/base.py
+@@ -0,0 +1,809 @@
++# !/usr/bin/env python
++# coding: utf-8
++# @Time    : 2022/7/17 14:26
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : base2.py
++# @IDE     : PyCharm
++
++import torch
++import dgl
++import copy
++import scanpy as sc
++import numpy as np
++import pandas as pd
++import networkx as nx
++
++from scipy import sparse
++from scipy.sparse import csr_matrix
++
++from .train_untils import z_score, integrate_feature_gene, subset_matches
++from .preprocess_untils import quick_preprocess
++
++np.random.seed(42)
++pd.set_option('display.max_columns', None)
++pd.set_option('display.width', 10000)
++
++
++class Dataset(object):
++    """
++    1，load data
++    2，qc
++    3，preprocess
++    4，generate dgl data
++    """
++
++    def __init__(self, **kwargs):
++        # params
++        self.params = kwargs
++
++        # preprocess
++        # load data
++        self.data_dict, self.data_dict_whole = self.load_data()  # {dataset_name: dataset_adata}
++        # get many-to-many homologous  relationship
++        self.relationship_multiple = self.load_relationship()  # {relationship_name: [src, rel, dst]}
++        self.relationship_single = self.load_relationship_1v1()  # pd.DataFrame
++
++        # generate feature and graph
++        # generate feature gene
++        self.feature_gene, self.feature_gene_raw_1v1 = self.generate_feature_gene()
++        # generate node gene
++        self.generate_node_gene()
++        # generate node feature
++        self.generate_feature()
++        # generate index to find gene or cell node from DGL
++        self.generate_index()
++        # generate cell label
++        self.cl_cell_type = self.generate_cl_cell_type()
++        self.generate_cell_label()
++        # cluster label
++        self.generate_cluster_label()
++        # graph in data[dataset].uns[graph]
++        self.generate_graph()
++        # generate dgl with graph and feature
++        self.dgl_data = self.generate_dgl_data()
++
++        # use feature gene to generate adata_whole
++        self.adata_whole = self.generate_adata_whole()  #
++        print()
++
++    def load_data(self):
++        """
++        load_data
++        :return:
++        """
++        # Check whether the data sets are existed and connected to each other
++        self._check_dataset()
++        # get_dataset_name
++        dataset_name = self._get_dataset_name()
++        # load_dataset
++        dataset_dict = self._load_dataset(dataset_name)
++        # preprocess including dowmsample and get balanced dataset
++        dataset_dict = self._preprocess(dataset_dict, dataset_name)
++        # qc
++        dataset_dict = {k: self._qc_dataset(v) for k, v in dataset_dict.items()}
++        # combat
++        # dataset_dict = self._combat(dataset_dict)   # TODO
++        # get_describe
++        self._get_describe(dataset_dict)
++
++        # raw
++        dataset_dict_raw = {k: copy.deepcopy(v.uns['whole']) for k, v in dataset_dict.items()}  # raw
++        # del
++        for name, data in dataset_dict.items():
++            del data.uns['whole']
++        return dataset_dict, dataset_dict_raw
++
++    def _get_describe(self, dataset_dict):
++        # get_describe
++        ref_desc = [data.uns['dataset_description'] for data in dataset_dict.values() if
++                    data.uns['dataset_type'] == 'reference']
++        query_desc = [data.uns['dataset_description'] for data in dataset_dict.values() if
++                      data.uns['dataset_type'] == 'query']
++        ref_desc.extend(query_desc)
++        dataset_descriptions_list = ref_desc
++        dataset_descriptions = pd.concat(dataset_descriptions_list, axis=1)
++        self.data_description = dataset_descriptions
++        print(dataset_descriptions)
++
++    def _check_dataset(self):
++        self._check_dataset_exist()
++        self._check_dataset_graph()
++
++    def _check_dataset_exist(self):
++        import os
++        dataset_file = self.params['dataset_file']
++        dataset = dataset_file.loc[:, ['source', 'relationship', 'destination']].to_numpy()
++        path = self.params['path']
++        for item in dataset:
++            os.path.exists(path + item[0])  # data1
++            os.path.exists(path + item[1])  # gene
++            os.path.exists(path + item[2])  # data2
++            temp = pd.read_csv(path + item[1], index_col=None, header=0, nrows=10)
++            assert temp.columns[0] == item[0]
++            assert temp.columns[1] == item[2]
++
++    def _check_dataset_graph(self):
++        """
++        Check whether the data set is connected
++        We need to link all datasets together using many-to-many homology relationships
++
++        :return:
++        """
++        dataset_file = self.params['dataset_file']
++        edges = dataset_file.loc[:, ['source', 'destination']].to_numpy()
++        dataset_graph = nx.Graph()
++        dataset_graph.add_edges_from(edges)
++        for item in list(dataset_graph.degree()):
++            if item[1] == 0:
++                print('dataset_graph is not connected!')
++                raise TypeError
++        return
++
++    def _get_dataset_name(self):
++        """
++        get_dataset_name
++        :param
++        :return:
++        """
++        dataset_file = self.params['dataset_file']
++        # get_dataset_name
++        dataset_all = {}
++        for item in dataset_file.to_numpy():
++            if item[1] is True:
++                dataset_all.setdefault(item[0], 'reference')
++            else:
++                dataset_all.setdefault(item[0], 'query')
++            if item[4] is True:
++                dataset_all.setdefault(item[3], 'reference')
++            else:
++                dataset_all.setdefault(item[3], 'query')
++        return dataset_all
++
++    def _load_dataset(self, dataset_name):
++        # load dataset
++        path = self.params['path']
++        dataset_dict = {k[: -5]: sc.read_h5ad(path + k) for k, v in dataset_name.items()}  # {name: adata}，no ".h5ad"
++        # dataset_type: ref or query
++        for name, data in dataset_dict.items():
++            data.uns['dataset_type'] = dataset_name[f'{name}.h5ad']
++            data.uns['dataset_name'] = name
++        return dataset_dict
++
++    def _preprocess(self, dataset_dict, dataset_name):
++        # 1，balance dataset
++        if self.params['get_balance'] == 'True':
++            ref_names = [name for name, dataset_type in dataset_name.items() if dataset_type == 'reference']
++            if len(ref_names) > 0:
++                ref_cell_type = np.unique(
++                    np.concatenate([dataset_dict[name[:-5]].obs.loc[:, 'cell_ontology_class'].unique()
++                                    for name in ref_names]))
++                #
++                dataset_dict = {name: data[data.obs.loc[:, 'cell_ontology_class'].isin(ref_cell_type), :]
++                                for name, data in dataset_dict.items()}
++        # 2，downsample counts，
++        if 0 < self.params['sample_ratio'] < 1:
++            [sc.pp.downsample_counts(data, total_counts=int(self.params['sample_ratio'] * data.X.toarray().sum()),
++                                     replace=True) for data in dataset_dict.values()]
++        elif 0 < self.params['sample_ratio'] == 1:
++            pass
++        else:
++            print('there must be sth. wrong in sample_ratio and we set sample_ratio to 1')
++            pass
++        return dataset_dict
++
++    @staticmethod
++    def _qc_dataset(dataset):
++        #
++        if isinstance(dataset.X, csr_matrix):
++            pass
++        else:
++            dataset.X = csr_matrix(dataset.X)
++
++        # unique barcode and gene
++        dataset = dataset[:, ~dataset.var.index.duplicated(keep='first')]
++        # dataset = dataset[~dataset.obs.index.duplicated(keep='first'), :]
++
++        # # filter 1
++        # sc.pp.filter_cells(dataset, min_genes=200)
++        # sc.pp.filter_genes(dataset, min_cells=3)
++
++        # filter 2，
++        dataset_description = dataset.obs.loc[:, 'cell_ontology_class'].value_counts()
++        # #
++        # major_classes = dataset_description[dataset_description > 5].index.tolist()  # get the minority classes
++        # dataset = dataset[dataset.obs.loc[:, 'cell_ontology_class'].isin(major_classes)]
++        #
++        dataset_description = pd.DataFrame(dataset_description).astype(int)
++        dataset_description.columns = [f'{dataset.uns["dataset_name"]}: {dataset.uns["dataset_type"]}']
++        dataset.uns['dataset_description'] = dataset_description
++
++        # whole
++        dataset.uns['whole'] = dataset.copy()
++
++        # normalization
++        sc.pp.normalize_total(dataset, target_sum=None)
++        sc.pp.log1p(dataset)
++
++        # hvg
++        sc.pp.highly_variable_genes(dataset, n_top_genes=2000)
++        # raw
++        dataset.raw = dataset
++
++        # subset
++        dataset = dataset[:, dataset.var['highly_variable']]
++
++        # z-score
++        sc.pp.scale(dataset, zero_center=True)
++
++        # n_comps = 30
++        n_comps = min(30, len(dataset) - 1)
++        n_neighbors = min(15, n_comps)
++        sc.tl.pca(dataset, n_comps=n_comps)
++
++        if dataset.uns['dataset_type'] == 'reference':
++            # #
++            # dataset.obs['clust_lbs'] = dataset.obs['cell_ontology_class']
++            # cell_type = np.unique(dataset.obs['clust_lbs'].to_numpy())
++            # cell_type_dict = {cell_type[i]: str(i) for i in range(len(cell_type))}  #
++            # dataset.obs['clust_lbs'] = dataset.obs['clust_lbs'].apply(lambda x: cell_type_dict[x])
++            # sc.pp.neighbors(dataset, n_pcs=n_comps, n_neighbors=n_neighbors, use_rep='X_pca', key_added='clust', random_state=0)
++            #
++            sc.pp.neighbors(dataset, use_rep='X_pca', n_pcs=n_comps, n_neighbors=n_neighbors, key_added='clust', random_state=0, metric='cosine') # TODO
++            sc.tl.leiden(dataset, resolution=0.5, neighbors_key='clust', key_added='clust_lbs', random_state=0)
++        else:
++            #
++            sc.pp.neighbors(dataset, use_rep='X_pca', n_pcs=n_comps, n_neighbors=n_neighbors, key_added='clust', random_state=0, metric='cosine')
++            sc.tl.leiden(dataset, resolution=0.5, neighbors_key='clust', key_added='clust_lbs')  #
++
++        # DEG
++        sc.tl.rank_genes_groups(dataset, groupby='clust_lbs', method='t-test', key_added='rank_genes_groups', pts=True)
++        deg_all = pd.DataFrame(dataset.uns['rank_genes_groups']['names'])
++        deg_selected = pd.unique(deg_all.iloc[0: 50, :].values.T.flatten())
++
++        # save
++        dataset.uns['deg'] = deg_selected
++        dataset.uns['hvg'] = dataset.var_names
++        hvg_deg = np.unique(np.concatenate((dataset.var_names.to_numpy(), deg_selected)))
++        dataset.uns['hvg_deg'] = hvg_deg
++        dataset.uns['gene_raw'] = dataset.raw.var_names
++        return dataset
++
++    def load_relationship(self):
++        # path
++        path = self.params['path']
++        # get relationship
++        relationship_name = self._get_relationship_name()
++        # dict
++        # relationship_dict = {item[1][: -4]: {'src': item[0][: -5], 'mul_to_mul': pd.read_csv(path + item[1]),
++        #                                      'dst': item[2][: -5]} for item in relationship_name}
++        # to avoid name error, we change the src and dst name as the 1 and 2 column name
++        relationship_dict = {}
++        for item in relationship_name:
++            rel_temp = pd.read_csv(path + item[1])  # load relationship
++            rel_temp.columns = [item[0], item[2]]  # change columns of relationship
++            relationship_dict[item[1][: -4]] = {'src': item[0][: -5], 'mul_to_mul': rel_temp, 'dst': item[2][: -5]}
++        return relationship_dict
++
++    def _get_relationship_name(self):
++        dataset_file = self.params['dataset_file']
++        relationship_name = dataset_file.loc[:, ['source', 'relationship', 'destination']].to_numpy().tolist()
++        return relationship_name
++
++    def load_relationship_1v1(self):
++        """
++
++        :return:
++        """
++        # path
++        path = self.params['path']
++        # dataset_file
++        dataset_file = self.params['dataset_file']
++        # dataset_graph
++        edges = dataset_file.loc[:, ['source', 'destination']].to_numpy()
++        dataset_graph = nx.Graph()
++        dataset_graph.add_edges_from(edges)
++        # dfs or bfs on dataset_graph, the result is oriented [(s, d), (s, d)], and merge in that order
++        result = list(nx.traversal.bfs_edges(dataset_graph, list(dataset_graph.nodes)[0]))  # (graph, root)
++        gene_map_1v1_list = []
++        for item in result:
++            # Because dfs or bfs results are oriented, (s, d) or (d, s) are in the original data
++            # If (s, d) is in the original data
++            condition1 = (dataset_file.iloc[:, 0] == item[0]) & (dataset_file.iloc[:, 3] == item[1])
++            # If (d, s) is in the original data
++            condition2 = (dataset_file.iloc[:, 0] == item[1]) & (dataset_file.iloc[:, 3] == item[0])
++            if len(dataset_file[condition1]) == 1:
++                # gene_map_1v1_list.extend(dataset_file[condition1].iloc[:, -1].to_numpy().tolist())    # 1v1
++                gene_map_1v1_list.extend(dataset_file[condition1].loc[:, 'relationship'].to_numpy().tolist())
++            elif len(dataset_file[condition2]) == 1:
++                # gene_map_1v1_list.extend(dataset_file[condition2].iloc[:, -1].to_numpy().tolist())    # 1v1
++                gene_map_1v1_list.extend(dataset_file[condition2].loc[:, 'relationship'].to_numpy().tolist())
++            else:
++                print('there must be sth. wrong')
++                # raise TypeError
++                continue
++
++        # load the first
++        gene_map_1v1_all = self.read_csv_drop(path + gene_map_1v1_list[0])
++        # merge the rest
++        for i in range(1, len(gene_map_1v1_list)):
++            gene_map_1v1_all = gene_map_1v1_all.merge(self.read_csv_drop(path + gene_map_1v1_list[i]))
++        return gene_map_1v1_all
++
++    def read_csv_drop(self, name):
++        # method 1 drop_duplicates，
++        df = pd.read_csv(name)
++        df = df.drop_duplicates(subset=[df.columns[0]], keep=False).drop_duplicates(subset=[df.columns[1]], keep=False)
++        df = df.reset_index(drop=True)
++
++        # # TODO method 2 select one2one
++        # df = pd.read_csv(name)
++        # df = df.loc[df.iloc[:, 2] == 'ortholog_one2one', :].reset_index(drop=True)
++        return df
++
++    def generate_feature_gene(self):
++        # feature gene is common to all datasets and is used to generate features of cells and genes
++        raw_gene_list = []
++        deg_list = []
++        for item in self.relationship_single.columns:
++            raw_gene_list.append(self.data_dict[item[: -5]].uns['gene_raw'])  #
++            deg_list.append(self.data_dict[item[: -5]].uns['deg'])  #
++        feature_gene_raw_1v1 = integrate_feature_gene(self.relationship_single, raw_gene_list, union=False)
++        feature_gene = integrate_feature_gene(feature_gene_raw_1v1, deg_list, union=True)
++        return feature_gene, feature_gene_raw_1v1
++
++    @staticmethod
++    def integrate_feature_gene(gene_map, deg_list, union: bool = False):
++        """
++        Enter 1v1 homologous gene and deg of each dataset
++        :param gene_map:
++        :param deg_list:
++        :param union:
++        :return:
++        """
++        # TODO
++        # Enter in a certain order, or determine the name of the dataset and the name of the columns
++        # Or combine all 1v1 homologous genes into a single table
++        temp = None
++        cols = gene_map.columns
++        for i in range(len(deg_list)):
++            if i == 0:  # i == 0
++                temp = gene_map[cols[i]].isin(deg_list[i]).to_frame(cols[i])
++            else:  #
++                temp[cols[i]] = gene_map[cols[i]].isin(deg_list[i])
++
++        keep = temp.max(1) if union else temp.min(1)  #
++        return gene_map[keep]
++
++    def generate_node_gene(self):
++        # node gene
++        # select
++        self._select_node_gene()
++        # integrate
++        self._integrate_node_gene()
++
++    def _integrate_node_gene(self, mod='union'):
++        assert mod in {'intersect', 'union'}
++        for name, dataset in self.data_dict.items():
++            node_gene_temp = pd.Series()
++            for k, v in dataset.uns.items():
++                if k[0: 9] == 'node_gene':
++                    if len(node_gene_temp) == 0:
++                        node_gene_temp = pd.Series(v)
++                    elif mod == 'union':
++                        node_gene_temp = pd.concat([pd.Series(node_gene_temp), pd.Series(v)]).unique()
++                    else:
++                        raise NotImplementedError
++            node_gene_list = node_gene_temp.tolist()
++            dataset.uns['node_gene'] = node_gene_list
++            dataset.uns['node_gene_dict'] = {node_gene_list[i]: i for i in range(len(node_gene_list))}  # num: str
++
++    def _select_node_gene(self):
++        for rel, rel_details in self.relationship_multiple.items():
++            gene_raw_src = self.data_dict[rel_details['src']].uns['gene_raw']  # all expressed gene
++            gene_raw_dst = self.data_dict[rel_details['dst']].uns['gene_raw']
++            hvg_deg_src = self.data_dict[rel_details['src']].uns['hvg_deg']  # hvg union deg
++            hvg_deg_dst = self.data_dict[rel_details['dst']].uns['hvg_deg']
++
++            # The intersection of genes in raw and homologous genes, i.e. homologous genes expressed in the data set
++            sub_map = subset_matches(rel_details['mul_to_mul'], gene_raw_src, gene_raw_dst, union=False)
++            # The combination of expressed homologous genes and HVG+DEG in the dataset
++            sub_map = subset_matches(sub_map, hvg_deg_src, hvg_deg_dst, union=True)
++            # self.node_gene_pair = sub_map
++            rel_details['sub_map'] = sub_map
++            # The above results were combined with HVG+DEG, that is, some homologous genes of opposite species were mapped on the basis of DEG+HVG
++            # Submaps are obtained from many-to-many-homologous genes, and there may be duplicates in each column, namely nodes1 and nodes2, so the effect is better if they are not taken
++            node_gene_src = pd.concat([sub_map.iloc[:, 0], pd.Series(hvg_deg_src)]).unique().tolist()
++            node_gene_dst = pd.concat([sub_map.iloc[:, 1], pd.Series(hvg_deg_dst)]).unique().tolist()
++            # node_gene_src = list(set(sub_map.iloc[:, 0]))
++            # node_gene_dst = list(set(sub_map.iloc[:, 1]))
++            self.data_dict[rel_details['src']].uns['node_gene' + '_' + rel] = node_gene_src  # candidate
++            self.data_dict[rel_details['dst']].uns['node_gene' + '_' + rel] = node_gene_dst  # candidate
++
++    def generate_feature(self):
++
++        # combat
++        adata_dict = {}
++        for item in self.feature_gene.columns:
++            gene = self.feature_gene.loc[:, item].to_numpy()
++            cell_feature = self.data_dict[item[: -5]].raw[:, gene].X.toarray()
++            adata_dict[item] = sc.AnnData(X=cell_feature)
++        adata_all = sc.concat([v for v in adata_dict.values()], label='batch', keys=list(adata_dict.keys()))
++        sc.pp.combat(adata_all, key='batch')
++        feature_dict = {name: adata_all[adata_all.obs.loc[:, 'batch'] == name, :].X.astype(np.float32)
++                        for name, data in adata_dict.items()}
++
++        for item in self.feature_gene.columns:  # columns are each data set
++            if self.params['feature_gene'] == 'HIG':
++                # use HIG genes (DEG+HVG)
++                # feature_gene
++                gene = self.feature_gene.loc[:, item].to_numpy()
++                self.data_dict[item[: -5]].uns['feature_gene'] = gene
++
++                # cell_feature
++                try:
++                    # cell_feature = self.data_dict[item[: -5]].raw[:, gene].X.toarray()
++                    cell_feature = feature_dict[item]     # TODO combat
++                except:
++                    cell_feature = z_score(self.data_dict[item[: -5]].raw[:, gene].X.toarray())
++                # # TODO
++                # from sklearn.decomposition import PCA
++                # self.n_pcs = 30
++                # pca = PCA(n_components=self.n_pcs, svd_solver="arpack", random_state=0)
++                # cell_feature = pca.fit_transform(cell_feature)
++                # # TODO
++                self.data_dict[item[: -5]].uns[item[: -5] + 'cell'] = cell_feature  # z_score(cell_feature)
++                # self.data_dict[item[: -5]].uns[item[: -5] + 'cell'] = z_score(cell_feature)  # z_score(cell_feature)
++
++                # gene_feature
++                num_gene = len(self.data_dict[item[: -5]].uns['node_gene'])
++                num_dim = len(cell_feature[0])
++                gene_feature = np.zeros((num_gene, num_dim), dtype=np.float32)
++                self.data_dict[item[: -5]].uns[item[: -5] + 'gene'] = gene_feature
++            elif self.params['feature_gene'] == 'all':
++                # use all genes
++                # feature_gene
++                gene = self.feature_gene_raw_1v1.loc[:, item].to_numpy()
++                self.data_dict[item[: -5]].uns['feature_gene'] = gene
++
++                # cell_feature
++                cell_feature = self.data_dict[item[: -5]].raw[:, gene].X.toarray()
++                self.data_dict[item[: -5]].uns[item[: -5] + 'cell'] = z_score(cell_feature)
++
++                # gene_feature
++                num_gene = len(self.data_dict[item[: -5]].uns['node_gene'])
++                num_dim = len(self.feature_gene_raw_1v1)
++                gene_feature = np.zeros((num_gene, num_dim), dtype=np.float32)
++                self.data_dict[item[: -5]].uns[item[: -5] + 'gene'] = gene_feature
++            else:
++                raise NotImplementedError
++
++    def generate_index(self):
++        # generate node index
++        # cell_index and gene_index
++        for name, data in self.data_dict.items():
++            # The cell feature is generated based on data.obs_names
++            cell_index = data.obs_names
++            data.uns[name + 'cell_index'] = {i: cell_index[i] for i in range(len(cell_index))}
++            # gene_feature
++            data.uns[name + 'gene_index'] = {i: data.uns['node_gene'][i] for i in range(len(data.uns['node_gene']))}
++
++    def generate_cl_cell_type(self):
++        # generate separately
++        cl_cell_type_dict = {'reference': {}, 'query': {}}
++        cl_cell_type_reference = []
++        cl_cell_type_query = []
++        for name, data in self.data_dict.items():
++            if data.uns['dataset_type'] == 'reference':
++                temp = data.obs['cell_ontology_class'].to_numpy().tolist()
++                cl_cell_type_dict['reference'][name] = temp
++                cl_cell_type_reference.extend(temp)
++            else:
++                temp = data.obs['cell_ontology_class'].to_numpy().tolist()
++                cl_cell_type_dict['query'][name] = temp
++                cl_cell_type_query.extend(temp)
++
++        cl_cell_type_reference = np.unique(np.array(cl_cell_type_reference))
++        cl_cell_type_query = np.unique(np.array(cl_cell_type_query))
++
++        # If the cell_type of query exists in reference, use reference; otherwise, set it to unknown
++        # reference comes before, query comes after. self.data_description.index is the order
++        describe_dict = {item: i for i, item in enumerate(self.data_description.index)}
++        cell_type_dict_reference = {item: describe_dict[item] for item in cl_cell_type_reference}
++        # unknown
++        cell_type_dict_reference.setdefault('unknown', len(cell_type_dict_reference))
++        # save
++        cl_cell_type_dict['cell_type_dict_reference'] = copy.deepcopy(cell_type_dict_reference)
++        # query
++        cell_type_dict_query = {cl_cell_type_query[i]: i for i in range(len(cl_cell_type_query))}
++        # save
++        cl_cell_type_dict['cell_type_dict_query'] = copy.deepcopy(cell_type_dict_query)  # query
++
++        counter = len(cell_type_dict_reference)
++        cell_type_dict_all = copy.deepcopy(cell_type_dict_reference)
++        for cell_type in cell_type_dict_query.keys():
++            if cell_type not in cell_type_dict_all.keys():
++                cell_type_dict_all.setdefault(cell_type, counter)
++                counter += 1
++
++        cl_cell_type_dict['cell_type_dict_all'] = copy.deepcopy(cell_type_dict_all)  # ref + query
++
++        return cl_cell_type_dict
++
++    def generate_cell_label(self):
++        # Convert the cell body type to numeric type
++        # stored in data.obs['cell_ontology_class_num']
++        cl_cell_type_dict_all = self.cl_cell_type['cell_type_dict_all']
++        for name, data in self.data_dict.items():
++            data.uns['cell_label_cl'] = [cl_cell_type_dict_all[cell_type] for cell_type in
++                                         data.obs['cell_ontology_class'].to_numpy()]
++            data.obs.loc[:, ['cell_class']] = [item if item in self.cl_cell_type['cell_type_dict_reference'].keys()
++                                               else 'unknown' for item in
++                                               data.obs.loc[:, 'cell_ontology_class'].to_numpy()]
++            data.obs.loc[:, ['cell_class_num']] = data.obs.loc[:, 'cell_class'].map(
++                self.cl_cell_type['cell_type_dict_reference']).astype(int)
++            data.uns['cell_label_class'] = data.obs.loc[:, 'cell_class_num'].to_numpy()
++
++    def generate_cluster_label(self):
++        for name, data in self.data_dict.items():
++            data.uns['cluster_label'] = [int(cluster_label) for cluster_label in data.obs['clust_lbs'].to_numpy()]
++
++    def generate_graph(self):
++        """
++        After merging different types of graph_gene_candidate to obtain the complete graph_gene, a diagram of the cell-gene is generated
++        """
++        self._generate_dataset_graph()
++        self._generate_relationship_graph()
++
++    def _generate_dataset_graph(self):
++        for name, dataset in self.data_dict.items():
++            dataset.uns['graph'] = {}  # graph for each dataset
++            # 1 cell_knn_cell
++            # sc.pp.neighbors(dataset, n_neighbors=30)
++            sc.pp.neighbors(dataset, n_pcs=30, n_neighbors=20)   # TODO
++            dataset.uns['graph'][tuple(f'{name}cell_knn_{name}cell'.split('_'))] = dataset.obsp['connectivities']
++
++            # 2 cell_selfloop_cell
++            node_cell = dataset.obs_names.to_numpy()
++            data = np.ones(len(node_cell), dtype=int)
++            nodes = np.arange(len(data))
++            cell_selfloop_cell = sparse.csr_matrix((data, (nodes, nodes)))
++            dataset.uns['graph'][tuple(f'{name}cell_selfloop_{name}cell'.split('_'))] = cell_selfloop_cell
++
++            # 3 gene_selfloop_gene
++            node_gene = dataset.uns['node_gene']
++            data = np.ones(len(node_gene), dtype=int)
++            nodes = np.arange(len(data))
++            gene_selfloop_gene = sparse.csr_matrix((data, (nodes, nodes)))
++            dataset.uns['graph'][tuple(f'{name}gene_homo_{name}gene'.split('_'))] = gene_selfloop_gene
++
++            # 4 cell_express_gene
++            node_gene = dataset.uns['node_gene']
++            cell_express_gene = dataset.raw[:, node_gene].X
++            dataset.uns['graph'][tuple(f'{name}cell_express_{name}gene'.split('_'))] = cell_express_gene
++
++            # 5 gene_expressedby_cell
++            gene_expressedby_cell = cell_express_gene.T
++            dataset.uns['graph'][tuple(f'{name}gene_expressedby_{name}cell'.split('_'))] = gene_expressedby_cell
++
++    def _generate_relationship_graph(self):
++        for rel, rel_details in self.relationship_multiple.items():
++            # graph_gene_homo_gene
++            sub_map = rel_details['sub_map']
++            src_name = sub_map.iloc[:, 0].to_numpy()
++            dst_name = sub_map.iloc[:, 1].to_numpy()
++
++            # gene_homo_gene
++            #
++            # src to dst
++            dict_source = self.data_dict[rel_details['src']].uns['node_gene_dict']
++            dict_target = self.data_dict[rel_details['dst']].uns['node_gene_dict']
++
++            src = [dict_source[src_name[i]] for i in range(len(src_name))]
++            dst = [dict_target[dst_name[i]] for i in range(len(dst_name))]
++            # TODO directed or undirected
++            data = np.ones(sub_map.shape[0], dtype=int)
++            gene_homo_gene = sparse.csr_matrix((data, (src, dst)))
++            # dataset_namegene homo dataset_namegene
++            rel_details['graph'] = {}
++            rel_details['graph'][
++                tuple(f'{rel_details["src"]}gene_homo_{rel_details["dst"]}gene'.split('_'))] = gene_homo_gene
++            if self.params['graph_mode'] == 'undirected':
++                temp = sparse.csr_matrix((data, (dst, src)))  # reverse graph
++                rel_details['graph'][tuple(f'{rel_details["dst"]}gene_homo_{rel_details["src"]}gene'.split('_'))] = temp
++            else:
++                pass
++
++    def generate_dgl_data(self):
++        dgl_graph = self.generate_dgl_graph()  # {relationship: graph}
++        data_mode = self.generate_data_mode()  #
++        class_num = self.generate_class_num(data_mode)
++        data_type = {name: data.uns['dataset_type'] for name, data in self.data_dict.items()}
++        cell_type = self.cl_cell_type['reference']
++        dgl_data_dict = {'graph': dgl_graph, 'data_mode': data_mode, 'data_type': data_type, 'class_num': class_num,
++                         'cell_type': cell_type,
++                         'node_gene': {name: data.uns['node_gene'] for name, data in self.data_dict.items()}}
++
++        if self.params['feature_gene'] == 'HIG':
++            dgl_data_dict['feature_dim'] = len(self.feature_gene)
++            # dgl_data_dict['feature_dim'] = self.n_pcs
++            dgl_data_dict['feature_gene'] = {name: data.uns['feature_gene'] for name, data in self.data_dict.items()}
++        elif self.params['feature_gene'] == 'all':
++            dgl_data_dict['feature_dim'] = len(self.feature_gene_raw_1v1)
++            dgl_data_dict['feature_gene'] = {name: data.uns['feature_gene'] for name, data in self.data_dict.items()}
++
++        dgl_data = DGLData(**dgl_data_dict)
++        return dgl_data
++
++    def generate_class_num(self, data_mode):
++        # annotation
++        if data_mode == 'all query':
++            cluster_len_list = []
++            for name, data in self.data_dict.items():
++                cluster_len = len(set(data.obs['clust_lbs'].tolist()))
++                cluster_len_list.append(cluster_len)
++            class_num = max(cluster_len_list)
++        else:
++            class_num = len(self.cl_cell_type['cell_type_dict_reference'])
++        return class_num
++
++    def generate_data_mode(self):
++        # Count the number of reference and query datasets
++        mode = None
++        reference = 0
++        query = 0
++        for name, data in self.data_dict.items():
++            if data.uns['dataset_type'] == 'reference':
++                reference += 1
++            elif data.uns['dataset_type'] == 'query':
++                query += 1
++            else:
++                pass
++
++        if reference > 0 and query > 0:
++            mode = 'reference and query'
++        elif reference > 0 and query == 0:
++            mode = 'all reference'
++        elif reference == 0 and query > 0:
++            mode = 'all query'
++        else:
++            pass
++        return mode
++
++    def generate_dgl_graph(self):
++        # edge
++        dgl_graph = self._generate_dgl_edge()
++        # feature and label
++        dgl_graph = self._generate_dgl_feature_and_label(dgl_graph)
++        return dgl_graph
++
++    def _generate_dgl_feature_and_label(self, dgl_graph):
++        dgl_graph = dgl_graph
++        # Assign features and labels to dgl_graph
++        for name, data in self.data_dict.items():
++            cell = name + 'cell'
++            gene = name + 'gene'
++            assert cell in dgl_graph.ntypes
++            assert gene in dgl_graph.ntypes
++
++            # cell
++            # feature
++            dgl_graph.nodes[name + 'cell'].data['feature'] = torch.tensor(data.uns[name + 'cell'])
++            # index
++            dgl_graph.nodes[name + 'cell'].data['index'] = torch.tensor(list(data.uns[name + 'cell_index'].keys()))
++            # cell_label_cl
++            dgl_graph.nodes[name + 'cell'].data['cell_label_cl'] = torch.tensor(data.uns['cell_label_cl'])
++            # cell_label_class
++            dgl_graph.nodes[name + 'cell'].data['cell_label_class'] = torch.tensor(data.uns['cell_label_class'])
++            # cluster_label
++            dgl_graph.nodes[name + 'cell'].data['cluster_label'] = torch.tensor(data.uns['cluster_label'])
++
++            # gene
++            # feature
++            dgl_graph.nodes[name + 'gene'].data['feature'] = torch.tensor(data.uns[name + 'gene'])
++            # index
++            dgl_graph.nodes[name + 'gene'].data['index'] = torch.tensor(list(data.uns[name + 'gene_index'].keys()))
++
++        return dgl_graph
++
++    def _generate_dgl_edge(self):
++        # Aggregates the edges in the data set and the edges in the relationship together
++        graph = {}
++        # data graph
++        for data_name, data in self.data_dict.items():
++            graph.update(data.uns['graph'])
++
++        # relationship graph
++        for data_name, data in self.relationship_multiple.items():
++            graph.update(data['graph'])
++
++        # After converting the csr sparse matrix in the graph to coo matrix, row col is turned into a tuple
++        for k, v in graph.items():
++            # coo
++            v = v.tocoo()
++            # tuple
++            row = torch.from_numpy(v.row).to(torch.long)
++            col = torch.from_numpy(v.col).to(torch.long)
++            # update
++            graph[k] = tuple([row, col])
++
++        # dgl
++        dgl_graph = dgl.heterograph(graph)
++        return dgl_graph
++
++    def generate_adata_whole(self):
++
++        # 1, raw data
++        data_dict_raw = copy.deepcopy(self.data_dict_whole)
++
++        # 2, convert gene dict
++        gene_convert_dict = {name: {item[0]: item[1]
++                                    for item in self.relationship_single.loc[:,
++                                                [name, self.relationship_single.columns[0]]].to_numpy()}
++                             for name in self.relationship_single.columns}
++
++        # 3 preprocess
++        data_dict_preprocess = {}
++        for name, data in data_dict_raw.items():
++            adata = data.copy()
++            # Take only the genes that have been expressed
++            condition_gene = adata.var_names.map(gene_convert_dict[name + '.h5ad']).notnull()
++            adata = adata[:, condition_gene]
++            # map
++            adata.var.index = adata.var.index.map(gene_convert_dict[name + '.h5ad'])
++            # get hvg and raw
++            raw = adata.copy()
++            # adata = quick_preprocess(adata)   # TODO
++            adata.raw = raw
++            # add key
++            data_dict_preprocess[name] = adata
++
++        # 4, concat
++        data_whole = sc.concat([data for data in data_dict_preprocess.values()], label='batch')   # TODO
++        data_whole = quick_preprocess(data_whole, n_top_genes=2000)
++        data_order = list(data_dict_preprocess.keys())
++        data_whole.obs.loc[:, 'batch'] = data_whole.obs.loc[:, 'batch'].apply(lambda x: data_order[int(x)])  # name
++        data_whole.uns['data_order'] = data_order
++
++        # 5，add cell label
++        # mapping
++        #
++        data_whole.obs.loc[:, ['cell_ontology_class_num']] = data_whole.obs.loc[:, 'cell_ontology_class']. \
++            map(self.cl_cell_type['cell_type_dict_all']).astype(int)
++        # 计算细胞类型
++        cell_class = [item if item in self.cl_cell_type['cell_type_dict_reference'].keys() else 'unknown'
++                      for item in data_whole.obs.loc[:, 'cell_ontology_class'].to_numpy()]
++        data_whole.obs.loc[:, ['cell_class']] = cell_class
++        data_whole.obs.loc[:, ['cell_class_num']] = data_whole.obs.loc[:, 'cell_class']. \
++            map(self.cl_cell_type['cell_type_dict_reference']).astype(int)
++
++        # 5, postprocess
++        sc.pp.regress_out(data_whole, ['total_counts'])
++        sc.pp.scale(data_whole, max_value=10)
++        sc.tl.pca(data_whole, svd_solver='arpack')
++        sc.pp.neighbors(data_whole, n_neighbors=10)
++        # sc.pp.neighbors(data_whole, n_neighbors=10, n_pcs=40)
++
++        # 6, uns
++        data_whole.uns['dataset_type'] = {name: data.uns['dataset_type'] for name, data in self.data_dict.items()}
++        data_whole.uns['dataset_description'] = self.data_description
++        data_whole.uns['cell_type'] = self.cl_cell_type['cell_type_dict_all']
++        data_whole.uns['hvg'] = data_whole.var.index.tolist()
++
++        return data_whole
++
++
++class DGLData(object):
++    def __init__(self, **kwargs):
++        self.graph = kwargs['graph']
++
++        self.data_mode = kwargs['data_mode']
++        self.data_type = kwargs['data_type']
++        self.feature_dim = kwargs['feature_dim']
++        self.class_num = kwargs['class_num']
++        self.node_gene = kwargs['node_gene']
++        self.feature_gene = kwargs['feature_gene']
++
++    def to_device(self, device):
++        self.graph = self.graph.to(device)
+diff --git a/omicverse/external/camex/integration_metrics.py b/omicverse/external/camex/integration_metrics.py
+new file mode 100644
+index 000000000..62bb00773
+--- /dev/null
++++ b/omicverse/external/camex/integration_metrics.py
+@@ -0,0 +1,80 @@
++# !/usr/bin/env python
++# coding: utf-8
++# @Time    : 2022/10/28 20:45
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : integration_metircs.py
++# @IDE     : PyCharm
++import scanpy as sc
++import pandas as pd
++import os
++
++# NOTE: ``scib`` and ``scanpy.external`` are optional, heavy dependencies only
++# needed for benchmark evaluation (``evaluate``). Import them lazily inside the
++# function so ``import omicverse.external.camex`` stays light and does not fail
++# when these packages are absent.
++
++
++def evaluate(adata_raw, adata_int, method_name, batch_key='batch', label_key='cell_ontology_class', cluster_nmi=None,
++             verbose=False,
++             ari_=True,  # biological
++             nmi_=True,  # biological
++             silhouette_=True,  # asw batch: batch, asw label: biological
++             pcr_=True,  # batch
++             isolated_labels_f1_=True,  # biological
++             isolated_labels_asw_=True,  # biological
++             graph_conn_=True,  # batch
++             kBET_=True,  # batch，win下爆内存
++
++             ):
++    """
++    ref: https://github.com/theislab/scib-pipeline/blob/main/scripts/metrics/metrics.py
++
++    """
++    import scib  # lazy heavy import
++
++    if method_name in ['scanorama', 'harmony', 'pyliger', 'scvi', 'scanvi', 'scalex',
++                       'cell_train_class', 'cell_train_hidden', 'cell_pretrain_hidden']:
++        type_ = 'embed'
++        embed = 'X_emb'
++    elif method_name in ['bbknn']:
++        type_ = 'knn'
++        embed = 'X_pca'
++    elif method_name in ['seurat']:
++        type_ = 'full'
++        embed = 'X_pca'
++    else:
++        raise NotImplementedError
++    result = scib.me.metrics(
++        adata_raw,  #
++        adata_int,  #
++        batch_key=batch_key,  #
++        label_key=label_key,  #
++        type_=type_,  # , either knn, full or embed
++        embed=embed,  #
++        # cluster_key='leiden',  #
++        cluster_nmi=cluster_nmi,  #
++        verbose=verbose,  #
++
++        #
++        ari_=ari_,  # biological
++        nmi_=nmi_,  # biological
++        silhouette_=silhouette_,  # asw batch: batch, asw label: biological
++        pcr_=pcr_,  # batch
++        isolated_labels_f1_=isolated_labels_f1_,  # biological
++        isolated_labels_asw_=isolated_labels_asw_,  # biological
++        graph_conn_=graph_conn_,  # batch
++        kBET_=kBET_,  # batch，
++        clisi_=False,  # biological，
++        ilisi_=False,  # batch，
++
++        trajectory_=False,
++        cell_cycle_=False,
++        hvg_score_=False,
++    )
++    return result  # df
++
++
++if __name__ == '__main__':
++    print('hello world')
+diff --git a/omicverse/external/camex/layer.py b/omicverse/external/camex/layer.py
+new file mode 100644
+index 000000000..b2e650175
+--- /dev/null
++++ b/omicverse/external/camex/layer.py
+@@ -0,0 +1,52 @@
++from torch import nn
++import torch
++
++class EmbLayer(nn.Module):
++    def __init__(self,
++                 hidden_dim=None,
++                 aggregate='sum',
++                 bias=True,
++                 activation=None,
++                 ntypes=None,
++                 dropout=0.0,
++                 conv_dict=None,
++                 ):
++        super(EmbLayer, self).__init__()
++        from dgl.nn.pytorch import HeteroGraphConv
++
++        self.conv = HeteroGraphConv(conv_dict, aggregate=aggregate)
++        if ntypes is not None:
++            self.use_layernorm = True
++            self.norm_layers = nn.ModuleDict({
++                ntype: nn.LayerNorm(hidden_dim, elementwise_affine=True)
++                for ntype in ntypes
++            })
++        else:
++            self.use_layernorm = False
++
++        self.bias = bias
++        if bias:
++            self.h_bias = nn.ParameterDict()
++            for ntype in ntypes:
++                self.h_bias[ntype] = nn.Parameter(torch.Tensor(hidden_dim))
++                nn.init.zeros_(self.h_bias[ntype])
++
++        self.activation = activation
++
++        self.dropout = nn.Dropout(dropout)
++
++    def forward(self, g, inputs: dict,
++                norm=True, bias=True, activate=True):
++
++        hs = self.conv(g, inputs)
++
++        def _apply(ntype, h):
++            if self.use_layernorm and norm:
++                h = self.norm_layers[ntype[-4:]](h)
++            if self.bias and bias:
++                h = h + self.h_bias[ntype[-4:]]
++            if self.activation and activate:
++                h = self.activation(h)
++            return self.dropout(h)
++
++        return {ntype: _apply(ntype, h) for ntype, h in hs.items()}
+diff --git a/omicverse/external/camex/loss.py b/omicverse/external/camex/loss.py
+new file mode 100644
+index 000000000..d69da3109
+--- /dev/null
++++ b/omicverse/external/camex/loss.py
+@@ -0,0 +1,96 @@
++#!/usr/bin/python3.8+
++# -*- coding: utf-8 -*-
++# @Time    : 2022/3/4 10:16
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : loss.py
++# @IDE: PyCharm
++
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch.autograd import Variable
++
++
++class FocalLoss(nn.Module):
++    r"""
++        This criterion is a implemenation of Focal Loss, which is proposed in
++        Focal Loss for Dense Object Detection.
++
++            Loss(x, class) = - \alpha (1-softmax(x)[class])^gamma \log(softmax(x)[class])
++
++        The losses are averaged across observations for each minibatch.
++
++        Args:
++            alpha(1D Tensor, Variable) : the scalar factor for this criterion
++            gamma(float, double) : gamma > 0; reduces the relative loss for well-classiﬁed examples (p > .5),
++                                   putting more focus on hard, misclassiﬁed examples
++            size_average(bool): By default, the losses are averaged over observations for each minibatch.
++                                However, if the field size_average is set to False, the losses are
++                                instead summed for each minibatch.
++
++
++    """
++    def __init__(self, class_num, alpha=None, gamma=0.5, size_average=True):
++        super(FocalLoss, self).__init__()
++        if alpha is None:
++            self.alpha = Variable(torch.ones(class_num, 1))
++        else:
++            if isinstance(alpha, Variable):
++                self.alpha = alpha
++            else:
++                self.alpha = Variable(alpha)
++        self.gamma = gamma
++        self.class_num = class_num
++        self.size_average = size_average
++
++    def forward(self, inputs, targets):
++        N = inputs.size(0)
++        C = inputs.size(1)
++        P = F.softmax(inputs, dim=1)
++
++        class_mask = inputs.data_dict.new(N, C).fill_(0)
++        class_mask = Variable(class_mask)
++        ids = targets.view(-1, 1)
++        class_mask.scatter_(1, ids.data_dict, 1.)
++
++        if inputs.is_cuda and not self.alpha.is_cuda:
++            self.alpha = self.alpha.cuda()
++        alpha = self.alpha[ids.data_dict.view(-1)]
++
++        probs = (P*class_mask).sum(1).view(-1, 1)
++
++        log_p = probs.log()
++
++        batch_loss = -alpha*(torch.pow((1-probs), self.gamma))*log_p
++
++        if self.size_average:
++            loss = batch_loss.mean()
++        else:
++            loss = batch_loss.sum()
++        return loss
++
++
++def linear_combination(x, y, epsilon):
++    return epsilon*x + (1-epsilon)*y
++
++
++def reduce_loss(loss, reduction='mean'):
++    return loss.mean() if reduction == 'mean' else loss.sum() if reduction == 'sum' else loss
++
++
++class LabelSmoothingCrossEntropy(nn.Module):
++    def __init__(self, epsilon: float = 0.1, reduction='mean'):
++        super().__init__()
++        self.epsilon = epsilon
++        self.reduction = reduction
++
++    def forward(self, preds, target):
++        n = preds.size()[-1]
++        log_preds = F.log_softmax(preds, dim=-1)
++        loss = reduce_loss(-log_preds.sum(dim=-1), self.reduction)
++        nll = F.nll_loss(log_preds, target, reduction=self.reduction)
++        return linear_combination(loss / n, nll, self.epsilon)
++
+diff --git a/omicverse/external/camex/model.py b/omicverse/external/camex/model.py
+new file mode 100644
+index 000000000..bfc564d43
+--- /dev/null
++++ b/omicverse/external/camex/model.py
+@@ -0,0 +1,701 @@
++import torch
++import dgl
++import torch.nn as nn
++import dgl.function as fn
++import numpy as np
++
++from dgl.nn.pytorch import HeteroGraphConv
++from dgl.nn.pytorch import GraphConv, GATConv
++from torch.autograd import Function
++from torch.distributions import Normal
++
++
++class GAE(nn.Module):
++    def __init__(self, encoder, decoder, classifier, domain_classifier, cluster_classifier=None, mlp=None):
++        super(GAE, self).__init__()
++        self.encoder = encoder
++        self.decoder = decoder
++        self.classifier = classifier
++        self.domain_classifier = domain_classifier
++        self.cluster_classifier = cluster_classifier
++        self.mlp = mlp
++
++    def forward(self, graph, feature):
++        """
++        just for feature importance selection
++        :param graph:
++        :param feature:
++        :return:
++        """
++        h_hidden = self.encoder(graph, feature)
++        h_class = self.classifier(graph, h_hidden)
++        return h_class
++
++    def reset_parameters(self):
++        for name, submodule in self.named_modules():
++            # if type(submodule) in [nn.Linear, GraphConv, GATConv]:
++            if isinstance(submodule, (nn.Linear, GraphConv, GATConv)):
++                submodule.reset_parameters()
++
++
++# class RGNNEncoder(nn.Module):
++#     def __init__(self, relation, dim_in, dim_hidden, layer_num, res=True, share=True, graph=None):
++#         super().__init__()
++#
++#         self.relation = set(relation)
++#         self.dim_in = dim_in
++#         self.dim_hidden = dim_hidden
++#         self.layer_num = layer_num
++#         self.head_num = 8
++#
++#         self.relation_selfloop = []
++#         self.relation_emb = []
++#         for item in relation:
++#             src, rel, dst = item
++#             if rel in {'selfloop'}:
++#                 self.relation_selfloop.append(item)
++#             if rel in {'express', 'selfloop'}:
++#                 self.relation_emb.append(item)
++#
++#         # emb_layer
++#         self.emb_layer = {item[1]: GraphConv(dim_in, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02)) for item in self.relation_emb}
++#         # self.emb_layer = {item[1]: GraphConv(dim_in, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02), norm='right') for item in self.relation_emb}
++#         self.emb = HeteroGraphConv({rel: self.emb_layer[rel] for src, rel, dst in self.relation_emb}, aggregate='mean')
++#
++#         self.emb_norm = nn.ModuleDict({'cell': nn.LayerNorm(dim_in), 'gene': nn.LayerNorm(dim_in)})
++#         self.emb_bias = nn.ParameterDict({'cell': nn.Parameter(torch.Tensor(dim_hidden)), 'gene': nn.Parameter(torch.Tensor(dim_hidden))})
++#         self.emb_ac = nn.LeakyReLU()
++#         self.emb_dp = nn.Dropout(0.3)
++#         # self._build_embed_layer()
++#
++#         # share
++#         self.conv_layer = {item[1]: GraphConv(dim_hidden, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02)) for item in self.relation}
++#         self.conv = HeteroGraphConv({rel: self.conv_layer[rel] for src, rel, dst in self.relation}, aggregate='mean')
++#
++#         self.convs_layer = [{item[1]: GraphConv(dim_hidden, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02)) for item in self.relation}
++#                             for i in range(layer_num + 1)]
++#         self.convs = nn.ModuleList([HeteroGraphConv({rel: self.convs_layer[i][rel] for
++#                                                     src, rel, dst in relation}, aggregate='mean') for i in range(layer_num + 1)])
++#
++#         self.conv_norm = nn.ModuleDict({'cell': nn.LayerNorm(dim_hidden), 'gene': nn.LayerNorm(dim_hidden)})
++#         self.conv_dp = nn.Dropout(0.3)
++#
++#         assert res in [True, False]
++#         self.res = res
++#         assert share in [True, False]
++#         self.share = share
++#
++#     def forward(self, graph, feature):
++#
++#         h = {k: self.emb_norm[k[-4:]](v) for k, v in feature.items()}
++#         sub_graph_emb = dgl.edge_type_subgraph(graph, self.relation_emb)
++#         emb = self.emb(sub_graph_emb, h)
++#
++#         # h = {k: self.emb_bias[k[-4:]] + v for k, v in h.items()}
++#         # h = {k: self.emb_ac(v) for k, v in h.items()}
++#         # emb = {k: self.emb_dp(v) for k, v in h.items()}
++#
++#         # conv
++#         for i in range(1, self.layer_num + 1):
++#             h = {k: self.conv_norm[k[-4:]](v) for k, v in emb.items()}  # TODO cell gene
++#             if self.share:
++#                 h = self.conv(graph, h)
++#             else:
++#                 h = self.convs[i](graph, h)
++#             h = {k: self.conv_dp(v.float()) for k, v in h.items()}
++#             if self.res:
++#                 h = {k: v + emb[k] for k, v in h.items()}  # TODO identity
++#
++#         h_gnn = nn.Identity()(h)
++#         return h_gnn
++#
++#     def _build_embed_layer(self, **kwds):
++#         embed_params = dict(
++#             hidden_dim=self.dim_hidden,
++#             aggregate='sum',
++#             bias=True,  #
++#             activation=nn.LeakyReLU(),  # None #nn.LeakyReLU(0.2)
++#             ntypes=['cell', 'gene'],  # None, #
++#             dropout=0.2,
++#             conv_dict=self.emb_layer
++#         )
++#         if len(kwds) > 0:
++#             embed_params.update(**kwds)
++#         self.emb = EmbLayer(**embed_params)
++
++
++class EmbLayer(nn.Module):
++    def __init__(self,
++                 hidden_dim=None,
++                 aggregate='sum',
++                 bias=True,
++                 activation=None,
++                 ntypes=None,
++                 dropout=0.0,
++                 conv_dict=None,
++                 ):
++        super(EmbLayer, self).__init__()
++        from dgl.nn.pytorch import HeteroGraphConv
++
++        self.conv = HeteroGraphConv(conv_dict, aggregate=aggregate)
++        if ntypes is not None:
++            self.use_layernorm = True
++            self.norm_layers = nn.ModuleDict({
++                ntype: nn.LayerNorm(hidden_dim, elementwise_affine=True)
++                for ntype in ntypes
++            })
++        else:
++            self.use_layernorm = False
++
++        self.bias = bias
++        if bias:
++            self.h_bias = nn.ParameterDict()
++            for ntype in ntypes:
++                self.h_bias[ntype] = nn.Parameter(torch.Tensor(hidden_dim))
++                nn.init.zeros_(self.h_bias[ntype])
++
++        self.activation = activation
++
++        self.dropout = nn.Dropout(dropout)
++
++    def forward(self, g, inputs: dict,
++                norm=True, bias=True, activate=True):
++
++        hs = self.conv(g, inputs)
++
++        def _apply(ntype, h):
++            if self.use_layernorm and norm:
++                h = self.norm_layers[ntype[-4:]](h)
++            if self.bias and bias:
++                h = h + self.h_bias[ntype[-4:]]
++            if self.activation and activate:
++                h = self.activation(h)
++            return self.dropout(h)
++
++        return {ntype: _apply(ntype, h) for ntype, h in hs.items()}
++
++
++class RGNNEncoder(nn.Module):
++    def __init__(self, relation, dim_in, dim_hidden, layer_num, res=True, share=True):
++        super().__init__()
++
++        self.relation = set(relation)
++        self.dim_in = dim_in
++        self.dim_hidden = dim_hidden
++        self.layer_num = layer_num
++        self.head_num = 8
++
++        self.relation_selfloop = []
++        self.relation_emb = []
++        for item in relation:
++            src, rel, dst = item
++            if rel in {'selfloop'}:
++                self.relation_selfloop.append(item)
++            if rel in {'express', 'selfloop'}:
++                self.relation_emb.append(item)
++
++        # emb_layer
++        # self.emb_layer = GraphConv(dim_in, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02))
++        # self.emb = HeteroGraphConv({rel: self.emb_layer for src, rel, dst in self.relation_emb}, aggregate='mean')
++        self.emb_layer = {item[1]: GraphConv(dim_in, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02)) for item in self.relation_emb}
++        self.emb = HeteroGraphConv({rel: self.emb_layer[rel] for src, rel, dst in self.relation_emb}, aggregate='mean')
++
++        self.emb_dp = nn.Dropout(0.3)
++        self.emb_norm = nn.LayerNorm(dim_in)
++        # self._build_embed_layer()
++
++        # share
++        # self.conv_layer = GraphConv(dim_hidden, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02))
++        # self.conv = HeteroGraphConv({rel: self.conv_layer for src, rel, dst in self.relation}, aggregate='mean')
++        self.conv_layer = {item[1]: GraphConv(dim_hidden, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02)) for item in self.relation}
++        self.conv = HeteroGraphConv({rel: self.conv_layer[rel] for src, rel, dst in self.relation}, aggregate='mean')
++
++        self.convs_layer = [{item[1]: GraphConv(dim_hidden, dim_hidden, weight=True, bias=True, activation=nn.LeakyReLU(0.02)) for item in self.relation}
++                            for i in range(layer_num + 1)]
++        self.convs = nn.ModuleList([HeteroGraphConv({rel: self.convs_layer[i][rel] for
++                                                    src, rel, dst in relation}, aggregate='mean') for i in range(layer_num + 1)])
++
++        # self.conv_norm = nn.ModuleDict({'cell': nn.LayerNorm(dim_hidden), 'gene': nn.LayerNorm(dim_hidden)})
++        self.conv_norm = nn.LayerNorm(dim_hidden)
++        self.conv_dp = nn.Dropout(0.3)
++
++        assert res in [True, False]
++        self.res = res
++        assert share in [True, False]
++        self.share = share
++
++    def forward(self, graph, feature):
++
++        feature = {k: self.emb_norm(v) for k, v in feature.items()}
++        sub_graph_emb = dgl.edge_type_subgraph(graph, self.relation_emb)
++        emb = self.emb(sub_graph_emb, feature)
++        h = {k: self.emb_dp(v) for k, v in emb.items()}
++
++        # conv
++        for i in range(1, self.layer_num + 1):
++            # h = {k: self.conv_norm[k[-4:]](v) for k, v in emb.items()}  # TODO cell gene
++            h = {k: self.conv_norm(v) for k, v in h.items()}  # TODO cell gene
++            if self.share:
++                h = self.conv(graph, h)
++            else:
++                h = self.convs[i](graph, h)
++            h = {k: self.conv_dp(v.float()) for k, v in h.items()}
++            if self.res:
++                h = {k: v + emb[k] for k, v in h.items()}
++
++        h_gnn = nn.Identity()(h)
++        return h_gnn
++
++    def _build_embed_layer(self, activation=None, **kwds):
++        embed_params = dict(
++            in_dim_dict=self.in_dim_dict,
++            out_dim_dict=self.h_dims[0],
++            canonical_etypes=[('cell', 'express', 'gene'),
++                              ('cell', 'self_loop_cell', 'cell')],
++            norm='right',
++            use_weight=True,
++            bias=True,  #
++            activation=activation,  # None #nn.LeakyReLU(0.2)
++            batchnorm_ntypes=self.batchnorm_ntypes,
++            layernorm_ntypes=self.layernorm_ntypes,  # None, #
++            dropout_feat=0.0,
++            dropout=0.2,
++            aggregate='sum',
++        )
++        if len(kwds) > 0:
++            embed_params.update(**kwds)
++        self.emb = EmbLayer(**embed_params)
++
++
++class RGATEncoder(nn.Module):
++    def __init__(self, relation, dim_in, dim_hidden, layer_num, res=True, share=True):
++        super().__init__()
++        #
++        #
++        self.relation = set(relation)  #
++        self.head_num = 4
++        self.layer_num = layer_num
++
++        self.emb = HeteroGraphConv(
++            {rel: GATConv(dim_in, int(dim_hidden / self.head_num), self.head_num, activation=nn.LeakyReLU(0.1),
++                          feat_drop=0.1)
++             for src, rel, dst in relation}, aggregate='mean')  # 128 / 8 attn_drop
++
++        self.bn0 = nn.LayerNorm(dim_in)
++        self.dp0 = nn.Dropout(0.2)
++        self.conv = HeteroGraphConv(
++            {rel: GATConv(dim_hidden, int(dim_hidden / self.head_num), self.head_num, activation=nn.LeakyReLU(0.1),
++                          feat_drop=0.1) for src, rel, dst in relation}, aggregate='mean')  # 128 / 8 attn_drop
++        self.convs = nn.ModuleList([HeteroGraphConv(
++            {rel: GATConv(dim_hidden, int(dim_hidden / self.head_num), self.head_num, activation=nn.LeakyReLU(0.1),
++                          feat_drop=0.1) for src, rel, dst in relation}, aggregate='mean') for i in range(layer_num + 1)])      # TODO
++
++        self.bn1 = nn.LayerNorm(dim_hidden)
++        self.dp1 = nn.Dropout(0.2)
++
++        self.head = 8
++        self.gat = HeteroGraphConv({rel: GATConv(dim_hidden, 16, self.head) for src, rel, dst in relation},
++                                   aggregate='mean')
++
++        assert res in [True, False]
++        self.res = res
++        assert share in [True, False]
++        self.share = share
++
++    def forward(self, graph, feature):
++        # emb + 1~2gnn +gat
++        # emb
++        emb = {k: self.bn0(v) for k, v in feature.items()}
++        emb = self.emb(graph, emb)  # TODO identity
++        emb = {k: v.view(v.size(0), -1) for k, v in emb.items()}  # reshape
++        h = {k: self.dp0(v) for k, v in emb.items()}
++        temp = [emb]
++        # gnn，+1。
++        for i in range(1, self.layer_num + 1):
++            h = {k: self.bn1(v) for k, v in h.items()}
++
++            if self.share:
++                h = self.conv(graph, h)
++            else:
++                h = self.convs[i](graph, h)
++            h = {k: v.view(v.size(0), -1) for k, v in h.items()}  # reshape
++            if self.res:
++                h = {k: v + emb[k] for k, v in h.items()}  # TODO identity
++            h = {k: self.dp0(v.float()) for k, v in h.items()}
++
++        h_hidden = nn.Identity()(h)  # TODO identity
++        # h_gat = self.gat(graph, h_hidden)
++        # # h_gat = {k: torch.sum(v, dim=-2).squeeze() / v.size(-1) for k, v in h_gat.items()}
++        # h_gat = {k: v.view(v.size(0), -1) for k, v in h_gat.items()}    # batch, hidden
++
++        return h_hidden
++
++
++class DotDecoder(nn.Module):
++    def __init__(self):
++        super(DotDecoder, self).__init__()
++        self.device = None
++
++    def construct_negative_edge(self, edges, node_num, k):
++        # node_num: dst node num
++        src, dst = edges  # src->dst
++        neg_src = src.repeat_interleave(k)
++        neg_dst = torch.randint(0, node_num, (len(src) * k,))
++        return neg_src.to(self.device), neg_dst.to(self.device)  # TODO device
++
++    def construct_negative_graph(self, graph, k=1):
++        #
++        edge_type_list = list(graph.canonical_etypes)
++        data_dict = {
++            edge_type: self.construct_negative_edge(graph.edges(etype=edge_type), graph.num_nodes(edge_type[-1]), k=k)
++            for edge_type in edge_type_list}
++        num_nodes_dict = {node_type: graph.num_nodes(node_type) for node_type in graph.ntypes}
++        return dgl.heterograph(data_dict=data_dict, num_nodes_dict=num_nodes_dict)
++
++    def dot_product(self, graph, feature):
++        out_dict = {}
++        with graph.local_scope():
++            for stype, etype, dtype in graph.canonical_etypes:
++                rel_graph = graph[stype, etype, dtype]  # TODO check
++                rel_graph.nodes[stype].data['hs'] = feature[stype]
++                rel_graph.nodes[dtype].data['hd'] = feature[dtype]
++                rel_graph.apply_edges(fn.u_dot_v('hs', 'hd', 'score'))
++                out_dict[(stype, etype, dtype)] = rel_graph.edata['score'].squeeze()
++
++        return out_dict
++
++    def forward(self, graph, feature):
++        graph_positive = graph
++        graph_negative = self.construct_negative_graph(graph)
++
++        out_positive = self.dot_product(graph_positive, feature)
++        out_negative = self.dot_product(graph_negative, feature)
++        return out_positive, out_negative  # (dict, dict)
++
++
++class GATClassifier(nn.Module):
++    def __init__(self, relation, dim_hidden, dim_out):
++        super(GATClassifier, self).__init__()
++        self.head_num = 8
++        self.relation = set(relation)
++        self.dim_hidden = dim_hidden
++
++        self.relation_class = []
++        for item in relation:
++            src, rel, dst = item
++            if rel in {'homo', 'expressedby', 'selfloop'}:
++                self.relation_class.append(item)
++
++        # self.classifier_layer = {item[1]: GATConv(dim_hidden, dim_out, self.head_num, activation=nn.LeakyReLU(0.1), feat_drop=0.1) for item in self.relation_class}
++        # self.classifier = HeteroGraphConv({rel: self.classifier_layer[rel] for src, rel, dst in self.relation_class}, aggregate='mean')
++        self.classifier_layer = {item[1]: GATConv(dim_hidden, dim_out, self.head_num, activation=nn.LeakyReLU(0.1), feat_drop=0.1) for item in self.relation}
++        self.classifier = HeteroGraphConv({rel: self.classifier_layer[rel] for src, rel, dst in self.relation}, aggregate='mean')
++
++    def forward(self, graph, feature):
++        # graph = dgl.edge_type_subgraph(graph, self.relation_class)
++        prediction = self.classifier(graph, feature)
++        prediction = {k: torch.sum(v, dim=-2).squeeze() / v.size(-1) for k, v in prediction.items()}
++        return prediction
++
++from dgl.utils import expand_as_pair
++from dgl.nn.pytorch.softmax import edge_softmax
++class GraphAttentionLayer(nn.Module):
++    """
++    Modified version of `dgl.nn.GATConv`
++    * message passing with attentions.
++    * directed and asymmetric message passing, allowing different dimensions
++        of source and destination node-features.
++    """
++
++    def __init__(self,
++                 in_dim,
++                 out_dim,
++                 n_heads=8,
++                 feat_drop=0.,
++                 attn_drop=0.,
++                 negative_slope=0.2,
++                 residual=False,
++                 activation=None,
++                 attn_type='mul',  # or 'add' as the original paper
++                 heads_fuse=None,  # 'flat' or 'mean'
++                 ):
++        super(GraphAttentionLayer, self).__init__()
++        self._n_heads = n_heads
++        self._in_src_dim, self._in_dst_dim = expand_as_pair(in_dim)
++        self._out_dim = out_dim
++
++        ### weights for linear feature transform
++        if isinstance(in_dim, tuple):
++            ### asymmetric case
++            self.fc_src = nn.Linear(
++                self._in_src_dim, out_dim * n_heads, bias=False)
++            self.fc_dst = nn.Linear(
++                self._in_dst_dim, out_dim * n_heads, bias=False)
++        else:
++            self.fc = nn.Linear(
++                self._in_src_dim, out_dim * n_heads, bias=False)
++        ### weights for attention computation
++        self.attn_l = nn.Parameter(torch.FloatTensor(size=(1, n_heads, out_dim)))
++        self.attn_r = nn.Parameter(torch.FloatTensor(size=(1, n_heads, out_dim)))
++        if residual:
++            if self._in_dst_dim != out_dim:
++                self.res_fc = nn.Linear(
++                    self._in_dst_dim, n_heads * out_dim, bias=False)
++            else:
++                self.res_fc = nn.Identity()
++        else:
++            self.register_buffer('res_fc', None)
++
++        self.leaky_relu = nn.LeakyReLU(negative_slope)  # for thresholding attentions
++        self.feat_drop = nn.Dropout(feat_drop)
++        self.attn_drop = nn.Dropout(attn_drop)
++        self.reset_parameters()
++
++        self.activation = activation  # output
++        self.attn_type = attn_type
++        self._set_attn_fn()
++        self.heads_fuse = heads_fuse
++        self._set_fuse_fn()
++
++    def reset_parameters(self):
++        """Reinitialize learnable parameters."""
++        gain = nn.init.calculate_gain('relu')
++        if hasattr(self, 'fc'):
++            nn.init.xavier_normal_(self.fc.weight, gain=gain)
++        else:  # bipartite graph neural networks
++            nn.init.xavier_normal_(self.fc_src.weight, gain=gain)
++            nn.init.xavier_normal_(self.fc_dst.weight, gain=gain)
++        nn.init.xavier_normal_(self.attn_l, gain=gain)
++        nn.init.xavier_normal_(self.attn_r, gain=gain)
++        if isinstance(self.res_fc, nn.Linear):
++            nn.init.xavier_normal_(self.res_fc.weight, gain=gain)
++
++    def forward(self, g, feat, return_attn=False):
++        r"""Compute graph attention network layer.
++
++        Parameters
++        ----------
++        g : DGLGraph
++            The graph.
++        feat : torch.Tensor or a pair of torch.Tensor
++            If a torch.Tensor is given, the input feature of shape :math:`(N, D_{in})` where
++            :math:`D_{in}` is size of input feature, :math:`N` is the number of nodes.
++            If a pair of torch.Tensor is given, the pair must contain two tensors of shape
++            :math:`(N_{in}, D_{in_{src}})` and :math:`(N_{out}, D_{in_{dst}})`.
++
++        Returns
++        -------
++        torch.Tensor
++            The output feature of shape :math:`(N, H, D_{out})` where :math:`H`
++            is the number of heads, and :math:`D_{out}` is size of output feature.
++        """
++        g = g.local_var()
++        ### feature linear transform
++        if isinstance(feat, tuple):
++            h_src = self.feat_drop(feat[0])
++            h_dst = self.feat_drop(feat[1])
++            feat_src = self.fc_src(h_src).view(-1, self._n_heads, self._out_dim)
++            feat_dst = self.fc_dst(h_dst).view(-1, self._n_heads, self._out_dim)
++        else:
++            h_src = h_dst = self.feat_drop(feat)
++            feat_src = feat_dst = self.fc(h_src).view(
++                -1, self._n_heads, self._out_dim)
++        # NOTE: GAT paper uses "first concatenation then linear projection"
++        # to compute attention scores, while ours is "first projection then
++        # addition", the two approaches are mathematically equivalent:
++        # We decompose the weight vector a mentioned in the paper into
++        # [a_l || a_r], then
++        # a^T [Wh_i || Wh_j] = a_l Wh_i + a_r Wh_j
++        # Our implementation is much efficient because we do not need to
++        # save [Wh_i || Wh_j] on edges, which is not memory-efficient. Plus,
++        # addition could be optimized with DGL's built-in function u_add_v,
++        # which further speeds up computation and saves memory footprint.
++        el = (feat_src * self.attn_l).sum(dim=-1).unsqueeze(-1)
++        er = (feat_dst * self.attn_r).sum(dim=-1).unsqueeze(-1)
++        if self.heads_fuse == 'mul':
++            er /= np.sqrt(self._out_dim)
++        g.srcdata.update({'ft': feat_src, 'el': el})
++        g.dstdata.update({'er': er})
++        # compute edge attention, el and er are a_l Wh_i and a_r Wh_j respectively.
++        g.apply_edges(self.attn_fn)
++
++        e = self.leaky_relu(g.edata.pop('e'))
++        # compute softmax (normalized weights)
++        g.edata['a'] = self.attn_drop(edge_softmax(g, e))
++        # message passing
++        g.update_all(fn.u_mul_e('ft', 'a', 'm'), fn.sum('m', 'ft'))
++        rst = g.dstdata['ft']
++        # residual
++        if self.res_fc is not None:
++            resval = self.res_fc(h_dst).view(h_dst.shape[0], -1, self._out_dim)
++            rst = rst + resval
++        # activation
++        if self.activation:
++            rst = self.activation(rst)
++
++        # handling multi-heads
++        rst = self.fuse_heads(rst)
++        if return_attn:
++            return rst, g.edata['a']
++        return rst
++
++    def _set_attn_fn(self, ):
++        if self.attn_type == 'mul':
++            self.attn_fn = fn.u_mul_v('el', 'er', 'e')
++        elif self.attn_type == 'add':
++            # use the same attention as the GAT paper
++            self.attn_fn = fn.u_add_v('el', 'er', 'e')
++        else:
++            raise ValueError('`attn_type` shoul be either "add" (paper) or "mul"')
++
++    def _set_fuse_fn(self, ):
++        # function handling multi-heads
++        if self.heads_fuse is None:
++            self.fuse_heads = lambda x: x
++        elif self.heads_fuse == 'flat':
++            self.fuse_heads = lambda x: x.flatten(1)  # then the dim_out is of H * D_out
++        elif self.heads_fuse == 'mean':
++            self.fuse_heads = lambda x: x.mean(1)  # then the dim_out is of D_out
++        elif self.heads_fuse == 'max':
++            self.fuse_heads = lambda x: torch.max(x, 1)[0]  # then the dim_out is of D_out
++
++
++class ReverseLayerF(Function):
++
++    @staticmethod
++    def forward(ctx, x, alpha):
++        ctx.alpha = alpha
++
++        return x.view_as(x)
++
++    @staticmethod
++    def backward(ctx, grad_output):
++        output = grad_output.neg() * ctx.alpha
++
++        return output, None
++
++
++class MLPClassifier(nn.Module):
++    """
++
++    """
++
++    def __init__(self, dim_hidden, dim_out):
++        super(MLPClassifier, self).__init__()
++        #
++
++        self.fc0 = nn.Linear(dim_hidden, dim_hidden)
++        self.ac0 = nn.LeakyReLU()
++        self.dp0 = nn.Dropout()
++        self.fc1 = nn.Linear(dim_hidden, dim_hidden)
++        self.ac1 = nn.ReLU()
++        self.dp1 = nn.Dropout()
++        self.out = nn.Linear(dim_hidden, dim_out)
++        self.sf = nn.Softmax(dim=-1)
++
++    # def forward(self, _, feature, alpha):
++    #     # alpha
++    #     alpha = alpha
++    #     # reverse
++    #     h = {name: ReverseLayerF.apply(data, alpha) for name, data in feature.items()}
++    #     # class
++    #     h = {name: self.fc0(feature) for name, feature in h.items()}
++    #     h = {name: self.ac_func(feature) for name, feature in h.items()}  #
++    #     h = {name: self.bn0(feature) for name, feature in h.items()}  #
++    #     h = {name: self.fc1(feature) for name, feature in h.items()}
++    #     # softmax
++    #     prediction = {name: self.sf(data) for name, data in h.items()}
++    #     return prediction
++
++    def forward(self, feature, alpha):
++        # alpha
++        h = {name: self.fc0(data) for name, data in feature.items()}
++        h = {name: self.ac0(data) for name, data in h.items()}
++        h = {name: self.dp0(data) for name, data in h.items()}
++        h = {name: self.fc1(data) for name, data in h.items()}
++        h = {name: self.ac1(data) for name, data in h.items()}
++        h = {name: self.dp1(data) for name, data in h.items()}
++        h = {name: self.out(data) for name, data in h.items()}
++        # softmax
++        prediction = {name: self.sf(data) for name, data in h.items()}
++        return prediction
++
++
++class ClusterClassifier(nn.Module):
++    """
++
++    """
++    def __init__(self, dim_hidden, dim_out):
++        super(ClusterClassifier, self).__init__()
++        self.fc0 = nn.Linear(dim_hidden, dim_hidden)
++        self.ac0 = nn.LeakyReLU()
++        self.dp0 = nn.Dropout()
++        self.fc1 = nn.Linear(dim_hidden, dim_hidden)
++        self.ac1 = nn.ReLU()
++        self.dp1 = nn.Dropout()
++        self.out = nn.Linear(dim_hidden, dim_out)
++        self.sf = nn.Softmax(dim=-1)
++
++    def forward(self, feature, alpha):
++        h = self.fc0(feature)
++        h = self.ac0(h)
++        h = self.dp0(h)
++        h = self.fc1(h)
++        h = self.ac1(h)
++        h = self.dp1(h)
++        h = self.out(h)
++        # softmax
++        prediction = self.sf(h)
++        return prediction
++
++def target_distribution(q):
++    # Pij
++    weight = q ** 2 / q.sum(0)
++    return (weight.t() / weight.sum(1)).t()
++
++
++# class ClusterClassifier(nn.Module):
++#     """
++#
++#     """
++#     def __init__(self, dim_hidden, cluster_num_dict):
++#         super(ClusterClassifier, self).__init__()
++#         #
++#         from torch.nn.parameter import Parameter
++#         self.params_dict = nn.ParameterDict({name: Parameter(torch.Tensor(n_cluster, dim_hidden)) for name, n_cluster in cluster_num_dict.items()})
++#         # self.bn_dict = nn.ModuleDict({name: nn.BatchNorm1d(dim_hidden) for name, n_cluster in cluster_num_dict.items()})
++#
++#     def forward(self, feature):
++#         # q = {name: self.bn_dict[name](data) for name, data in feature.items() if name.endswith('cell')}
++#         q = feature
++#         q = {name: 1. / (1. + torch.sum(torch.pow(data.unsqueeze(1) - self.params_dict[name], 2), 2) / 1)
++#              for name, data in q.items() if name.endswith('cell')}
++#         q = {name: data.pow((1. + 1.) / 2.) for name, data in q.items()}
++#         q = {name: (data.t() / torch.sum(data, 1)).t() for name, data in q.items()}
++#         p = {name: target_distribution(data) for name, data in q.items()}
++#         return q, p
++
++
++class MLPDecoder(nn.Module):
++    """
++
++    """
++    def __init__(self, dim_hidden, dim_out):
++        super(MLPDecoder, self).__init__()
++        self.fc0 = nn.Linear(dim_hidden, dim_hidden)
++        self.ac0 = nn.LeakyReLU()
++        self.dp0 = nn.Dropout()
++        self.fc1 = nn.Linear(dim_hidden, dim_hidden)
++        self.ac1 = nn.LeakyReLU()
++        self.dp1 = nn.Dropout()
++        self.out = nn.Linear(dim_hidden, dim_out)
++
++    def forward(self, feature):
++        h = self.fc0(feature)
++        h = self.ac0(h)
++        h = self.dp0(h)
++        h = self.fc1(h)
++        h = self.ac1(h)
++        h = self.dp1(h)
++        h = self.out(h)
++        return h
+diff --git a/omicverse/external/camex/params.py b/omicverse/external/camex/params.py
+new file mode 100644
+index 000000000..1b2d334f6
+--- /dev/null
++++ b/omicverse/external/camex/params.py
+@@ -0,0 +1,135 @@
++# !/usr/bin/env python
++# coding: utf-8
++# @Time    : 2022/7/17 13:54
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : params.py
++# @IDE     : PyCharm
++
++
++import pandas as pd
++
++# TODO dict? yaml?
++
++
++# all query
++PARAMS = \
++    {'preprocess':
++        {
++            'path': './dataset/kidney/',
++            'dataset_file': pd.DataFrame(
++                data=[['raw-kidney-human-Wu.h5ad', True, 'gene_matches_human2mouse.csv',
++                       'raw-kidney-mouse-Adam.h5ad', False],
++                      # ['raw-kidney-human-Wu.h5ad', True, 'gene_matches_human2zebrafish.csv',  #
++                      #  'raw-kidney-zebrafish-Alemany.h5ad', False],
++                      ],
++                columns=['source', 'source label', 'relationship', 'destination', 'destination label']),
++            'graph_mode': 'undirected',
++            # 'feature_gene': 'all',  # can impute all_1v1_gene
++            'feature_gene': 'HIG',  # can impute HIG
++        },
++
++        'train': {
++            'train_mode': 'mini_batch',
++            # 'train_mode': 'full_batch',
++            'dim_hidden': 64,
++            'batch_size': 1024,
++            'gnn_layer_num': 2,
++            'epoch_pretrain': 20,
++            'epoch_train': 20,
++            # 'encoder': 'GCN',
++            'encoder': 'GAT',
++            'decoder': 'Dot',
++            # 'decoder': 'GAT',
++            # 'decoder': 'Dot_GAT',
++           'classifier': 'GAT',
++            'use_domain': 'False',
++
++        },
++
++        'postprocess': {}
++    }
++
++
++# # all reference
++# PARAMS = \
++#     {'preprocess':
++#         {
++#             'path': './dataset/brain/',
++#             'dataset_file': pd.DataFrame(
++#                 data=[['raw-brain-human-Lake.h5ad', True, 'gene_matches_human2lizard.csv',
++#                        'raw-brain-lizard-Tosches.h5ad', True],
++#                       ['raw-brain-human-Lake.h5ad', True, 'gene_matches_human2turtle.csv',
++#                        'raw-brain-turtle-Tosches.h5ad', True],
++#                       ],
++#                 columns=['source', 'source label', 'relationship', 'destination', 'destination label']),
++#             'graph_mode': 'undirected',
++#             # 'feature_gene': 'all',  # can impute all_1v1_gene
++#             'feature_gene': 'HIG',  # can impute HIG
++#         },
++#
++#         'train': {
++#             'train_mode': 'mini_batch',
++#             # 'train_mode': 'full_batch',
++#             'dim_hidden': 64,
++#             'batch_size': 1024,
++#             'gnn_layer_num': 2,
++#             'epoch_pretrain': 2,
++#             'epoch_train': 2,
++#             # 'encoder': 'GCN',
++#             'encoder': 'GAT',
++#             'decoder': 'Dot',
++#             # 'decoder': 'GAT',
++#             # 'decoder': 'Dot_GAT',
++#             'classifier': 'GAT',
++#             'use_domain': 'False',
++#
++#         },
++#
++#         'postprocess': {}
++#     }
++
++
++
++# # all query
++# PARAMS = \
++#     {'preprocess':
++#         {
++#             'path': './dataset/brain/',
++#             'dataset_file': pd.DataFrame(
++#                 data=[['raw-brain-human-Lake.h5ad', False, 'gene_matches_human2lizard.csv',
++#                        'raw-brain-lizard-Tosches.h5ad', False, 'gene_matches_1v1_human2lizard.csv'],
++#                       ['raw-brain-human-Lake.h5ad', False, 'gene_matches_human2turtle.csv',
++#                        'raw-brain-turtle-Tosches.h5ad', False, 'gene_matches_1v1_human2turtle.csv'],
++#                       ['raw-brain-mouse-Chen.h5ad', False, 'gene_matches_mouse2lizard.csv',
++#                        'raw-brain-lizard-Tosches.h5ad', False, 'gene_matches_1v1_mouse2lizard.csv'],
++#                       ['raw-brain-mouse-Chen.h5ad', False, 'gene_matches_mouse2turtle.csv',
++#                        'raw-brain-turtle-Tosches.h5ad', False, 'gene_matches_1v1_mouse2turtle.csv'],
++#                       ],
++#                 columns=['source', 'source label', 'relationship', 'destination', 'destination label', '1v1test']),
++#             'graph_mode': 'undirected',
++#             # 'feature_gene': 'all',  # can impute all_1v1_gene
++#             'feature_gene': 'HIG',  # can impute HIG
++#         },
++#
++#         'train': {
++#             'train_mode': 'mini_batch',
++#             # 'train_mode': 'full_batch',
++#             'dim_hidden': 64,
++#             'batch_size': 1024,
++#             'gnn_layer_num': 2,
++#             'epoch_pretrain': 20,
++#             'epoch_train': 20,
++#             # 'encoder': 'GCN',
++#             'encoder': 'GAT',
++#             'decoder': 'Dot',
++#             # 'decoder': 'GAT',
++#             # 'decoder': 'Dot_GAT',
++#             'classifier': 'GAT',
++#             'use_domain': 'False',
++#
++#         },
++#
++#         'postprocess': {}
++#     }
+\ No newline at end of file
+diff --git a/omicverse/external/camex/preprocess_untils.py b/omicverse/external/camex/preprocess_untils.py
+new file mode 100644
+index 000000000..8824ed25b
+--- /dev/null
++++ b/omicverse/external/camex/preprocess_untils.py
+@@ -0,0 +1,341 @@
++# !/usr/bin/env python
++# coding: utf-8
++# @Time    : 2022/9/23 13:25
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : preprocess_untils.py
++# @IDE     : PyCharm
++
++import numpy as np
++import pandas as pd
++import scanpy as sc
++import os
++import logging
++from typing import Sequence, Optional, Callable
++
++
++def get_file_name(path='./', file_type='.h5ad'):
++    """
++    Checking the .h5ad file from the path
++    :param path:
++    :param file_type:
++    :return:
++    """
++    #
++    # read path
++    all_file_name = os.listdir(path)
++    file_name = []
++    for name in all_file_name:
++        if name.endswith(file_type):
++            file_name.append(name)
++    return file_name
++
++
++def get_balanced_dataset(data_name_list, ref_name=None):
++    """
++    Remove cell types that are not in the reference dataset
++    :param data_name_list:
++    :param ref_name:
++    :return:
++    """
++    if ref_name is None:
++        ref_name = data_name_list[0]
++        data_name_list = data_name_list[1:]
++    else:
++        data_name_list.remove(ref_name)
++    ref_data = sc.read_h5ad(ref_name)
++    ref_cell_name = ref_data.obs.loc[:, 'cell_ontology_class'].unique()
++    query_data = [sc.read_h5ad(name) for name in data_name_list]
++    query_data_balanced = [data[data.obs.loc[:, 'cell_ontology_class'].isin(ref_cell_name), :] for data in query_data]
++    return data_name_list, query_data, query_data_balanced
++
++
++def downsample_dataset(data_name_list, ration=0.2):
++    # load
++    adata_list = [sc.read_h5ad(name) for name in data_name_list]
++    [sc.pp.calculate_qc_metrics(adata, percent_top=None, log1p=False, inplace=True) for adata in adata_list]
++    # down sample
++    adata_list_down = [
++        sc.pp.downsample_counts(adata, total_counts=int(ration * adata.obs.loc[:, 'total_counts'].sum()), copy=True) for
++        adata in adata_list]
++    [sc.pp.calculate_qc_metrics(adata, percent_top=None, log1p=False, inplace=True) for adata in adata_list_down]
++    return data_name_list, adata_list, adata_list_down
++
++
++def preprocess(data):
++    sc.pp.calculate_qc_metrics(data, percent_top=None, log1p=False, inplace=True)
++    sc.pp.filter_cells(data, min_genes=200)
++    sc.pp.filter_cells(data, max_genes=20000)
++    sc.pp.filter_genes(data, min_cells=3)
++    data = data[data.obs.n_genes_by_counts < 2500, :]
++    return data
++
++
++def get_counts_from_dataset(dataset, dataset_name):
++    """
++    Get statistics of the dataset
++    :param dataset:
++    :param dataset_name:
++    :return:
++    """
++    dataset = preprocess(dataset)
++    pd_statistics = dataset.obs.loc[:, ['cell_ontology_class', 'total_counts', 'n_genes_by_counts']]
++    pd_statistics['dataset_name'] = dataset_name
++    return pd_statistics
++
++
++def quick_preprocess(adata, n_top_genes=2000):
++    adata = adata.copy()
++    adata.layers['counts'] = adata.X
++    sc.pp.calculate_qc_metrics(adata, percent_top=None, log1p=False, inplace=True)
++    sc.pp.normalize_total(adata)
++    sc.pp.log1p(adata)
++    sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, batch_key='batch')
++    # adata.raw = adata
++    adata = adata[:, adata.var.highly_variable]
++    return adata
++
++
++def get_marker_info_table(
++        adata, groups=None, key='rank_genes_groups',
++        cut_padj: Optional[float] = 0.05,
++        cut_logfc: Optional[float] = 0.25,
++        cut_pts: Optional[float] = None,
++):
++    result = adata.uns[key]
++    if groups is None:
++        groups = result['names'].dtype.names
++
++    dfs = []
++    cols = ['names', 'logfoldchanges', 'pvals', 'pvals_adj', 'scores', ]
++    # cols = [c for c in cols if c in result.keys()]
++    flag_pts = 'pts' in result.keys()
++
++    for group in groups:
++        _df = pd.DataFrame({
++            key: result[key][group] for key in cols
++        })
++        _df['group'] = group
++
++        if flag_pts:
++            # expression proportions, avoid row mismatching
++            _df['pts'] = _df['names'].map(result['pts'][group])
++            _df['pts_rest'] = _df['names'].map(result['pts_rest'][group])
++            if cut_pts is not None:
++                _df = _df[_df['pts'] >= cut_pts]
++        if cut_padj is not None:
++            _df = _df[_df['pvals_adj'] <= cut_padj]
++        if cut_logfc is not None:
++            _df = _df[_df['logfoldchanges'] >= cut_logfc]
++        dfs.append(_df.copy())  # [['group'] + cols])
++    df = pd.concat(dfs, axis=0, keys=groups)
++    if flag_pts:
++        cols += ['pts', 'pts_rest']
++    return df[['group'] + cols]
++
++
++def top_markers_from_info(
++        df_info, n=5, groups=None, unique=True,
++        col_group='group',
++        col_name='names') -> list:
++    """
++    df_info: DEG-info table that can be take from `top_markers_from_adata`
++    """
++    # if groups is not None:
++    #     df_info = df_info[df_info[col_group].isin(groups)]
++    subdf = df_info.groupby(col_group).apply(lambda x: x.head(n))
++    if groups is not None:
++        subdf = subdf.loc[groups]  # filter, or keep the group orders
++    names = subdf[col_name]
++    return names.unique().tolist() if unique else names.tolist()
++
++
++def top_markers_from_adata(adata: sc.AnnData,
++                           n: Optional[int] = 5,
++                           groups: Optional[Sequence] = None,
++                           unique=True,
++                           cut_padj=0.05,
++                           cut_logfc=0.25,
++                           cut_pts=0.1,
++                           key='rank_genes_groups'):
++    df_info = get_marker_info_table(
++        adata, groups, key=key,
++        cut_padj=cut_padj, cut_logfc=cut_logfc, cut_pts=cut_pts)
++
++    if n is None:
++        if unique:
++            return df_info['names'].unique().tolist()
++        return df_info['names'].tolist()
++    else:
++        # df = get_marker_name_table(adata, key=key)
++        # return top_markers_from_df(df, n=n, groups=groups, unique=unique)
++        if groups is None:
++            _groupby = adata.uns[key]['params']['groupby']
++            try:
++                # to keep the group order
++                groups = adata.obs[_groupby].cat.categories
++            except:
++                pass
++        return top_markers_from_info(df_info, n=n, groups=groups, unique=unique)
++
++
++def normalize_default(adata: sc.AnnData,
++                      target_sum=None,
++                      copy: bool = False,
++                      log_only: bool = False,
++                      force_return: bool = False, ):
++    """ Normalizing datasets with default settings (total-counts normalization
++    followed by log(x+1) transform).
++
++    Parameters
++    ----------
++    adata
++        ``AnnData`` object
++    target_sum
++        scale factor of total-count normalization
++    copy
++        whether to copy the dataset
++    log_only
++        whether to skip the "total-counts normalization" and only perform
++        log(x+1) transform
++    force_return
++        whether to return the data, even if changes are made for the
++        original object
++
++    Returns
++    -------
++    ``AnnData`` or None
++
++    """
++    if copy:
++        adata = adata.copy()
++        logging.info('A copy of AnnData made!')
++    else:
++        logging.info('No copy was made, the input AnnData will be changed!')
++    logging.info('normalizing datasets with default settings.')
++    if not log_only:
++        logging.info(
++            f'performing total-sum normalization, target_sum={target_sum}...')
++        sc.pp.normalize_total(adata, target_sum=target_sum)
++    else:
++        logging.info('skipping total-sum normalization')
++    sc.pp.log1p(adata)
++    return adata if copy or force_return else None
++
++
++def change_names(names: Sequence,
++                 foo_change: Callable,
++                 **kwargs):
++    """
++    Parameters
++    ----------
++    names
++        a list of names to be modified
++    foo_change: function to map a name-string to a new one
++    **kwargs: other kwargs for foo_change
++    """
++    return list(map(foo_change, names, **kwargs))
++
++
++def take_group_labels(labels: Sequence, group_names: Sequence,
++                      indicate=False, remove=False):
++    """
++    Parameters
++    ----------
++    labels: list-like
++    group_names:
++        names of groups that you want to take out
++    indicate: bool
++        if True, return a Series of bool indicators of the groups
++        else, return the labels.
++    remove: bool
++        False by default, set as True if you want to keep groups that
++        NOT in the `given group_names`
++    """
++    if isinstance(group_names, (str, int)):
++        group_names = [group_names]
++    if remove:
++        indicators = change_names(labels, lambda x: x not in group_names)
++    else:
++        indicators = change_names(labels, lambda x: x in group_names)
++    if indicate:
++        return np.array(indicators)
++    else:
++        return np.array(labels)[indicators]
++
++
++def remove_small_groups(labels, min_samples=10,
++                        indicate=False, ):
++    """ return labels with small groups removed
++    """
++    vcnts = pd.value_counts(labels)
++    #    print(vcnts)
++    groups_rmv = list(vcnts[vcnts <= min_samples].index)
++    logging.info('groups to be removed:\n\t%s', groups_rmv)
++    return take_group_labels(labels, group_names=groups_rmv,
++                             indicate=indicate, remove=True)
++
++
++def remove_adata_small_groups(adata: sc.AnnData,
++                              key: str,
++                              min_samples=10):
++    """ return adata with small groups removed, grouped by `key`
++    """
++    indicators = remove_small_groups(adata.obs[key],
++                                     min_samples=min_samples,
++                                     indicate=True, )
++    return adata[indicators, :].copy()
++
++
++def compute_and_get_DEGs(adata: sc.AnnData,
++                         groupby: str,
++                         n=50,
++                         groups=None,
++                         unique=True,
++                         force_redo=False,
++                         key_added='rank_genes_groups',
++                         inplace=True,
++                         do_normalize=False,
++                         method='t-test',
++                         return_info=False,
++                         cuts={},
++                         **kwds):
++    """ Compute and get DEGs from ``sc.AnnData`` object
++
++    By default, assume that the counts in adata has been normalized.
++    If `force_redo`: re-compute DEGs and the original DEGs in adata will be ignored
++
++    cuts: dict with keys 'cut_padj', 'cut_pts', and 'cut_logfc'
++
++    """
++    if not inplace:
++        logging.info('making a copy')
++        adata = adata.copy()
++    adata.obs[groupby] = adata.obs[groupby].astype('category')
++    if force_redo or key_added not in adata.uns.keys():
++        logging.info(f'computing differentially expressed genes using {method}')
++        if do_normalize:
++            # todo: ``target_sum`` used to be 1e4
++            normalize_default(adata, target_sum=None, )
++        else:
++            logging.info(
++                'computing differential expression genes using default settings'
++                '(assume that the expression values are already normalized)')
++        if True:  # TODO: singletons will raise error
++            adata = remove_adata_small_groups(adata, key=groupby, min_samples=1)
++        sc.tl.rank_genes_groups(adata, groupby=groupby,
++                                key_added=key_added,
++                                pts=True,
++                                method=method,
++                                **kwds)
++    if return_info:
++        return get_marker_info_table(adata, key=key_added, **cuts)
++    return top_markers_from_adata(adata, n=n,
++                                  groups=groups,
++                                  unique=unique,
++                                  key=key_added, **cuts)
++
++
++if __name__ == '__main__':
++    print('hello world')
+diff --git a/omicverse/external/camex/train_untils.py b/omicverse/external/camex/train_untils.py
+new file mode 100644
+index 000000000..9fc3d8f8a
+--- /dev/null
++++ b/omicverse/external/camex/train_untils.py
+@@ -0,0 +1,263 @@
++#!/usr/bin/python3.8+
++# -*- coding: utf-8 -*-
++# @Time    : 2022/2/26 21:53
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : script.py
++# @IDE: PyCharm
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from sklearn.preprocessing import StandardScaler, label_binarize
++from sklearn import metrics
++import numpy as np
++from sklearn.metrics import balanced_accuracy_score
++
++np.random.seed(42)
++
++
++def subset_matches(df_match, left, right, union: bool = False):
++    """ Take a subset of token matches (e.g., gene homologies)
++
++    Parameters
++    ----------
++    df_match: pd.DataFrame
++        a dataframe with at least 2 columns
++    left:
++        list-like, for extracting elements in the first column.
++    right:
++        list-like, for extracting elements in the second column.
++    union:
++        whether to take union of both sides of genes
++    """
++
++    # TODO
++    cols = df_match.columns[: 2]
++
++    c1, c2 = cols
++    tmp = df_match[c1].isin(left).to_frame(c1)
++    tmp[c2] = df_match[c2].isin(right)
++
++    keep = tmp.max(1) if union else tmp.min(1)
++
++    return df_match[keep]
++
++
++def integrate_feature_gene(gene_map, deg_list, union: bool = False):
++    """
++    # Enter 1v1 homologous gene and deg of each dataset
++    :param gene_map: 同源基因
++    :param args: hvg, deg or hvg+deg
++    :param union: True or False
++    :return:
++    """
++
++    # TODO
++    # Enter in a certain order or determine the name of the dataset and the name of the columns
++    # Or combine all 1v1 homologous genes into one table
++    temp = None
++    cols = gene_map.columns
++    for i in range(len(deg_list)):
++        if i == 0:  #
++            temp = gene_map[cols[i]].isin(deg_list[i]).to_frame(cols[i])
++        else:  #
++            temp[cols[i]] = gene_map[cols[i]].isin(deg_list[i])
++
++    keep = temp.max(1) if union else temp.min(1)  # 取交或并
++    return gene_map[keep]
++
++
++def get_embedding(dataset_dict, hidden):
++    for name, feature in hidden.items():
++        if name[-4:] == 'cell':
++            dataset_dict[name[0: -4]].embedding['cell'] = feature.detach().to('cpu').numpy()  #
++        elif name[-4:] == 'gene':
++            dataset_dict[name[0: -4]].embedding['gene'] = feature.detach().to('cpu').numpy()  #
++        else:
++            print('there must be sth. wrong!')
++    return
++
++
++class LabelSmoothingCrossEntropy(torch.nn.Module):
++    def __init__(self, eps=0.1, reduction='mean'):
++        super(LabelSmoothingCrossEntropy, self).__init__()
++        self.eps = eps
++        if reduction not in {'sum', 'mean'}:
++            raise ValueError('`reduction` should be either "sum" or "mean",'
++                             f'got {reduction}')
++        self.reduction = reduction
++
++    def forward(self, output, target, weight=None):
++        c = output.size()[-1]
++        # F.cross_entropy() combines `log_softmax` and `nll_loss` in a single function.
++        log_preds = F.log_softmax(output, dim=-1)
++        if self.reduction == 'sum':
++            loss = - log_preds.sum()
++        else:
++            loss = - log_preds.sum(dim=-1)
++            loss = loss.mean()
++        return loss * self.eps / c + (1 - self.eps) * F.nll_loss(
++            log_preds, target, reduction=self.reduction, weight=weight)
++
++
++def cross_entropy_loss(
++        logits, labels, weight=None,
++        smooth_eps=0.1,
++        reduction='mean',
++):
++    # take out representations of nodes that have labels
++    # F.cross_entropy() combines `log_softmax` and `nll_loss` in a single function
++    if smooth_eps > 0.:
++        loss = LabelSmoothingCrossEntropy(eps=smooth_eps, reduction=reduction)(
++            logits, labels, weight=weight
++        )
++    else:
++        loss = F.cross_entropy(logits, labels, weight=weight, reduction=reduction)
++    return loss
++
++
++def multilabel_binary_cross_entropy(
++        logits: torch.Tensor,
++        labels: torch.Tensor,
++        weight=None,
++        reduction: str = 'mean',
++):
++    """ multi-label binary cross-entropy
++
++    Parameters
++    ----------
++    logits
++        model output logits, without softmax
++    labels
++        two-dimensional one-hot labels
++    weight
++        class weights
++    reduction
++        'mean' or 'sum'
++
++    Returns
++    -------
++    loss
++    """
++    # probas = F.sigmoid(logits)
++    # loss = F.binary_cross_entropy(probas, labels, weight=weight)
++    loss = F.binary_cross_entropy_with_logits(
++        logits, labels.float(), weight=weight, reduction=reduction)
++    return loss
++
++
++def loss_classification(predict_prob, labels, labels_1hot=None, weight=None, smooth_eps=0.1, reduction='mean', beta=1.):
++    loss = cross_entropy_loss(
++        predict_prob,
++        labels,
++        weight=weight,
++        smooth_eps=smooth_eps,
++        reduction=reduction,
++    )
++
++    if labels_1hot is not None and beta > 0.:
++        loss += multilabel_binary_cross_entropy(
++            predict_prob,
++            labels_1hot,
++            weight=weight,
++            reduction=reduction,
++        ) * beta
++    return loss
++
++
++def z_score(data, with_mean=True, scale=True):
++    """ For each column of X, do centering (z-scoring)
++    """
++    # code borrowed from `scanpy.pp._simple`
++    scaler = StandardScaler(with_mean=with_mean, copy=True).partial_fit(data)
++    if scale:
++        # user R convention (unbiased estimator)
++        e_adjust = np.sqrt(data.shape[0] / (data.shape[0] - 1))
++        scaler.scale_ *= e_adjust
++    else:
++        scaler.scale_ = np.array([1] * data.shape[1])
++    data_new = scaler.transform(data)
++    return data_new
++
++
++def tensor_to_numpy(dict_in: dict):
++    dict_out = {k: v.detach().clone().cpu().numpy() for k, v in dict_in.items()}
++    return dict_out
++
++
++def cal_pred_with_unknown(y_prob: torch.tensor, unknown_num: int, threshold=0.5):
++    """
++    Reject the prediction probability less than threshold and set it to unknown, accept all when threshold=0
++    When unknown is 0, the following can be used instead
++    y_predict_train = tensor_to_numpy({dataset_name: torch.max(label, -1)[1] * (torch.max(label, -1)[0] > 0.5) for
++                                           dataset_name, label in y_predict_prob_train.items()})
++    y_predict_test = tensor_to_numpy({dataset_name: torch.max(label, -1)[1] * (torch.max(label, -1)[0] > 0.5) for
++                                          dataset_name, label in y_predict_prob_test.items()})
++    :param y_prob:
++    :param unknown_num:
++    :return:
++    """
++    y_pred = tensor_to_numpy({dataset_name: torch.max(prob, -1)[1] for dataset_name, prob in y_prob.items()})
++    y_prob_condition = tensor_to_numpy({dataset_name: torch.max(prob, -1)[0] > threshold
++                                        for dataset_name, prob in y_prob.items()})
++    y_predict = {dataset_name: [item if y_prob_condition[dataset_name][num] else unknown_num for
++                                num, item in enumerate(y_pred[dataset_name])] for dataset_name, prob in y_prob.items()}
++
++    return y_predict
++
++
++def get_acc(y_true: dict, y_predict: dict, r=4) -> dict:
++    """
++
++    :param y_true:
++    :param y_predict:
++    :param r:
++    :return:
++    """
++    acc_dict = {}
++    for dataset_name, true_label in y_predict.items():
++        # method 1 acc
++        correct = np.sum(y_true[dataset_name] == y_predict[dataset_name])
++        acc = correct / len(y_true[dataset_name])
++
++        # # method 2 balanced_accuracy
++        # acc = round(balanced_accuracy_score(y_true[dataset_name], y_predict[dataset_name]), r)
++
++        # acc_dict
++        acc_dict[dataset_name + '_acc'] = round(acc, r)  #
++    return acc_dict
++
++
++def get_f1(y_true, y_predict, average='micro', r=4):
++    """
++    :param y_true:
++    :param y_predict:
++    :param average: micro: microF1, macro: macroF1, weighted: weightedF1
++                    ref: https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html
++    :param r:
++    :return:
++    """
++    f1_dict = {}
++    for dataset_name, true_label in y_predict.items():
++        f1 = metrics.f1_score(y_true[dataset_name], y_predict[dataset_name], average=average)
++        f1_dict[dataset_name + f'_{average}F1'] = round(f1, r)  # 保留有效数字
++    return f1_dict
++
++
++# —————— data integration and batch correlation metric
++def get_ami(y_true, y_predict, suffix='_ami', r=4):
++    """
++    :param y_true: cluster label, not cell label
++    :param y_predict:
++    :param r:
++    :return:
++    """
++    ami_dict = {}
++    for dataset_name, true_label in y_predict.items():
++        ami = metrics.adjusted_mutual_info_score(y_true[dataset_name], y_predict[dataset_name])
++        ami_dict[dataset_name + suffix] = round(ami, r)  #
++    return ami_dict
++
++# more metric ref: Learning interpretable cellular and gene signature embeddings from single-cell transcript data
+diff --git a/omicverse/external/camex/trainer.py b/omicverse/external/camex/trainer.py
+new file mode 100644
+index 000000000..82654aa65
+--- /dev/null
++++ b/omicverse/external/camex/trainer.py
+@@ -0,0 +1,722 @@
++# !/usr/bin/env python
++# coding: utf-8
++# @Time    : 2022/7/24 19:52
++# @Author  : Z.-H. G.
++# @Email_0 : guozhenhao17@mails.ucas.ac.cn
++# @Email_1 : guozhenhao@tongji.edu.cn
++# @File    : trainer.py
++# @IDE     : PyCharm
++
++import pandas as pd
++import copy
++
++import torch
++import scanpy as sc
++
++from .train_untils import *
++from .model import *
++
++
++def _dgl_node_dataloader(*args, **kwargs):
++    """Compatibility shim: DGL >=1.0 renamed ``NodeDataLoader`` to ``DataLoader``.
++
++    The vendored CAMEX source was written against DGL <1.0 (``NodeDataLoader``).
++    This resolves whichever name the installed DGL exposes.
++    """
++    import dgl as _dgl
++    loader_cls = getattr(_dgl.dataloading, "NodeDataLoader", None)
++    if loader_cls is None:
++        loader_cls = _dgl.dataloading.DataLoader
++    return loader_cls(*args, **kwargs)
++
++
++class Trainer(object):
++    def __init__(self, adata_whole, dgl_data, **kwargs):
++        # params
++        self.params = kwargs
++        assert self.params['train_mode'] in {'full_batch', 'mini_batch'}
++        self.train_mode = self.params['train_mode']
++        self.use_domain = self.params['domain']
++
++        # whole_adata
++        self.adata_whole = adata_whole
++        # dgl
++        self.dgl_data = dgl_data
++        self.cluster_centers = {}
++        self.cluster_num = self.params['cluster_num']
++        self.cluster_epoch = self.params['epoch_cluster']
++
++        # model
++        self.encoder = None
++        self.decoder_dot = None
++        self.classifier = None
++        self.domain = None
++        self.model = None
++        self._generate_model()
++
++        # optimizer
++        self.optimizer_dot = None
++        self.optimizer_gat = None
++        self.optimizer_class = None
++        self.optimizer_domain = None
++        self.scheduler = None
++        self._generate_optimizer()
++
++        # loss_func
++        self.loss_reconstruct_graph = None
++        self.loss_reconstruct_feature = None
++        self.loss_classification = None
++        self.loss_domain = None
++        self._generate_loss_func()
++
++        # log
++        self.epoch_current_integration = 0
++        self.log_integration = {'best_epoch': 0,  'best_hidden': {},  'evaluation': pd.DataFrame(),
++                             'best_model_params': []}
++        self.epoch_current_train = 0
++        self.log_train = {'best_train_acc': 0, 'best_test_acc': 0, 'best_epoch': 0,  'best_class': {},
++                          'best_hidden': {}, 'evaluation': pd.DataFrame(), 'best_model_params': [], 'best_test_AMI': 0}
++
++    def _generate_model(self):
++        # encoder
++        if self.params['encoder'] == 'GCN':
++            self.encoder = RGNNEncoder(self.dgl_data.graph.canonical_etypes,
++                                       dim_in=self.dgl_data.feature_dim,
++                                       dim_hidden=self.params['dim_hidden'],
++                                       layer_num=self.params['gnn_layer_num'],
++                                       res=self.params['res'],
++                                       # graph=self.dgl_data.graph
++                                       )
++        elif self.params['encoder'] == 'GAT':
++            self.encoder = RGATEncoder(self.dgl_data.graph.canonical_etypes,
++                                       dim_in=self.dgl_data.feature_dim,
++                                       dim_hidden=self.params['dim_hidden'],
++                                       layer_num=self.params['gnn_layer_num'],
++                                       )
++        else:
++            print('not implementedError yet')
++            raise NotImplementedError
++
++        # decoder
++        self.decoder_dot = DotDecoder()
++
++        # classifier
++        if self.params['classifier'] == 'GAT':
++            self.classifier = GATClassifier(self.dgl_data.graph.canonical_etypes,
++                                            dim_hidden=self.params['dim_hidden'],
++                                            dim_out=self.dgl_data.class_num,
++                                            )
++        else:
++            print('not implementedError yet')
++            raise NotImplementedError
++
++        self.domain = MLPClassifier(dim_hidden=self.params['dim_hidden'], dim_out=len(self.dgl_data.data_type))
++        self.cluster_num_dict = {name: self.cluster_num for name, data in self.dgl_data.graph.ndata['cluster_label'].items()}
++        self.cluster_classifier = nn.ModuleDict({name: ClusterClassifier(dim_hidden=self.params['dim_hidden'], dim_out=data)
++                                     for name, data in self.cluster_num_dict.items()})
++        self.mlp = nn.ModuleDict({name: MLPDecoder(dim_hidden=self.params['dim_hidden'], dim_out=self.dgl_data.feature_dim)
++                                  for name, data in self.dgl_data.graph.ndata['feature'].items()})
++        # model
++        self.model = GAE(self.encoder, self.decoder_dot, self.classifier, self.domain, self.cluster_classifier, self.mlp)
++        self.model.reset_parameters()
++
++    def _generate_optimizer(self):
++        # optimizer for each module
++        self.optimizer_model = torch.optim.Adam(self.model.parameters(), weight_decay=0.001)
++        self.optimizer_domain = torch.optim.Adam(self.domain.parameters(), weight_decay=0.001)
++        self.optimizer_generator = torch.optim.Adam([{'params': self.encoder.parameters(), 'lr': 1e-3},
++                                                     {'params': self.decoder_dot.parameters(), 'lr': 1e-3},
++                                                     {'params': self.mlp.parameters(), 'lr': 1e-3}], weight_decay=0.001)
++        self.optimizer_classifier = torch.optim.Adam([{'params': self.encoder.parameters(), 'lr': 1e-3},
++                                                      {'params': self.classifier.parameters(), 'lr': 1e-3}], weight_decay=0.001)
++        self.optimizer_cluster = torch.optim.Adam([{'params': self.encoder.parameters(), 'lr': 1e-3},
++                                                   {'params': self.cluster_classifier.parameters(), 'lr': 1e-3}], weight_decay=0.001)
++
++        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer_model, step_size=5, gamma=0.5)
++
++    def _generate_loss_func(self):
++        self.loss_reconstruct_graph = torch.nn.BCEWithLogitsLoss()
++        self.loss_reconstruct_feature = sce_loss
++        self.loss_classification = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
++        self.loss_domain = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
++        self.loss_cluster = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
++        self.loss_mlp = torch.nn.MSELoss()
++
++    def _batch_integration(self, graph, device, step='d'):
++        # mini batch for integration
++        # to device
++        self.model.to(device)
++        # self.model.to_device(device)
++        graph = graph.to(device)
++
++        loss_total = 0
++
++        if self.params['domain']:
++            # encode
++            h_hidden = self.encoder(graph, graph.ndata['feature'])
++            # domain
++            prediction = self.domain(h_hidden, 1)
++            # domain label TODO
++            domain_label = {}
++            counter = 0
++            for name, data in prediction.items():
++                if name.endswith('cell'):
++                    label = torch.tensor([counter] * len(data)).long().to(device)
++                    domain_label[name] = label
++                    counter += 1
++            # loss
++            loss_domain = [self.loss_domain(data, domain_label[name]) for name, data in prediction.items() if
++                           name.endswith('cell')]
++            loss_domain = sum(loss_domain) * 0.1
++
++            if step == 'd':
++                self.optimizer_domain.zero_grad()
++                # backward
++                loss_domain.backward()
++                torch.nn.utils.clip_grad_value_(self.domain.parameters(), clip_value=1)    # TODO
++                torch.nn.utils.clip_grad_norm_(self.domain.parameters(), max_norm=20, norm_type=2)
++                self.optimizer_domain.step()
++                return loss_domain
++        else:
++            loss_domain = 0
++
++        # forward
++        # to device
++        self.decoder_dot.device = device
++        # encode
++        h_hidden = self.encoder(graph, graph.ndata['feature'])
++        # decode
++        out_positive, out_negative = self.decoder_dot(graph, h_hidden)
++
++        # reconstruct loss
++        label_p = {name: torch.ones(len(data)).to(device) for name, data in out_positive.items() if data.size()}
++        label_n = {name: torch.zeros(len(data)).to(device) for name, data in out_negative.items() if data.size()}
++
++        loss_reconstruct_p = [torch.nn.BCEWithLogitsLoss()(predict_p, label_p[edge])
++                              for edge, predict_p in out_positive.items() if predict_p.size()]
++        loss_reconstruct_n = [torch.nn.BCEWithLogitsLoss()(predict_n, label_n[edge])
++                              for edge, predict_n in out_negative.items() if predict_n.size()]
++        loss_reconstruct_graph = sum([item for item in loss_reconstruct_p if item > 0]) + \
++                                 sum([item for item in loss_reconstruct_n if item > 0])
++
++        if self.params['reconstruct']:
++            h_hat = {name: self.mlp[name](data) for name, data in h_hidden.items() if name.endswith('cell')}
++            loss_mlp = [self.loss_mlp(data, graph.ndata['feature'][name]) for name, data in h_hat.items()]
++            loss_mlp = sum(loss_mlp)
++        else:
++            loss_mlp = 0
++        loss = loss_reconstruct_graph - loss_domain + loss_mlp
++
++        # backward
++        self.optimizer_generator.zero_grad()
++        loss.backward()
++        # torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1)
++        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=20, norm_type=2)
++        self.optimizer_generator.step()
++
++        loss_total += loss.item()
++
++        # if self.params['cluster'] and self.epoch_current_pretrain > self.cluster_epoch:
++        #     # encode
++        #     h_hidden = self.encoder(graph, graph.ndata['feature'])
++        #     # prediction
++        #     prediction = {name: self.cluster_classifier[name](data, 1) for name, data in h_hidden.items() if name.endswith('cell')}
++        #     # cluster_label
++        #     cluster_label = graph.ndata['cluster_label']
++        #     # loss
++        #     loss_cluster = [self.loss_cluster(data, cluster_label[name]) for name, data in prediction.items()
++        #                     if name.endswith('cell')]
++        #     loss_cluster = sum(loss_cluster) * 0.1
++        #     self.optimizer_cluster.zero_grad()
++        #     # backward
++        #     loss_cluster.backward()
++        #     torch.nn.utils.clip_grad_value_(self.encoder.parameters(), clip_value=1)
++        #     torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=20, norm_type=2)
++        #     self.optimizer_cluster.step()
++
++        # if self.params['cluster'] and self.epoch_current_pretrain >= 10:
++        #     #
++        #     if self.epoch_current_pretrain == 10:
++        #         from torch.nn.parameter import Parameter
++        #         self.model.cluster_classifier.params_dict = nn.ParameterDict({name: Parameter(torch.Tensor(centers).to(device))
++        #                                                                       for name, centers in self.cluster_centers.items()})
++        #     # encode
++        #     h_hidden = self.encoder(graph, graph.ndata['feature'])
++        #     # prediction
++        #     q, p = self.cluster(h_hidden)
++        #     loss_cluster = [F.kl_div(data.log(), p[name], reduction='batchmean') for name, data in q.items()]
++        #     # loss
++        #     loss_cluster = sum(loss_cluster) * 0.1
++        #     self.optimizer_cluster.zero_grad()
++        #     # backward
++        #     loss_cluster.backward()
++        #     torch.nn.utils.clip_grad_value_(self.encoder.parameters(), clip_value=1)
++        #     torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=20, norm_type=2)
++        #     self.optimizer_cluster.step()
++
++        return loss_total
++
++    def _batch_annotation(self, graph, device, step='d'):
++        # empty_cache
++        # torch.cuda.empty_cache()
++        # to device
++        self.model.to(device)
++        graph = graph.to(device)
++
++        # if self.params['domain']:
++        #     # encode
++        #     h_hidden = self.encoder(graph, graph.ndata['feature'])
++        #     # domain
++        #     prediction = self.domain(h_hidden, 1)
++        #     # domain label TODO
++        #     domain_label = {}
++        #     counter = 0
++        #     for name, data in prediction.items():
++        #         if name.endswith('cell'):
++        #             label = torch.tensor([counter] * len(data)).long().to(device)
++        #             domain_label[name] = label
++        #             counter += 1
++        #     # loss
++        #     loss_domain = [self.loss_domain(data, domain_label[name]) for name, data in prediction.items() if
++        #                    name.endswith('cell')]
++        #     loss_domain = sum(loss_domain) * 0.1
++        #
++        #     if step == 'd':
++        #         self.optimizer_domain.zero_grad()
++        #         # backward
++        #         loss_domain.backward()
++        #         torch.nn.utils.clip_grad_value_(self.domain.parameters(), clip_value=1)    # TODO
++        #         torch.nn.utils.clip_grad_norm_(self.domain.parameters(), max_norm=20, norm_type=2)
++        #         self.optimizer_domain.step()
++        #         return loss_domain
++        # else:
++        #     loss_domain = 0
++
++        # zero_grad
++        # self.optimizer_classifier.zero_grad()
++        self.optimizer_classifier.zero_grad()
++        # dataset type, semi-supervised training
++        data_ref = [name for name, ty in self.dgl_data.data_type.items() if ty == 'reference']
++
++        # encode
++        h_hidden = self.encoder(graph, graph.ndata['feature'])
++        # class
++        h_class = self.classifier(graph, h_hidden)
++
++        # loss list
++        loss_class_list = [self.loss_classification(h_class[name + 'cell'], graph.ndata['cell_label_cl'][name + 'cell'])
++                           for name in data_ref]
++        loss_class = sum(loss_class_list)
++        loss = loss_class
++        # loss
++        loss.backward()
++        torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=1)  # 裁剪梯度
++        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=20, norm_type=2)
++        # step
++        # self.optimizer_classifier.step()
++        self.optimizer_classifier.step()
++        # loss
++        loss = loss.item()
++        return loss
++
++    def integration(self):
++        self._generate_model()
++        self._generate_optimizer()
++        print('--------------------------------------------- integration ---------------------------------------------')
++        device = self.params['device']
++        n_epoch = self.params['epoch_integration']
++
++        for epoch in range(n_epoch):
++            #
++            self.epoch_current_integration = epoch
++            # train
++            self.model.train()
++            loss_sum = 0
++
++            # if epoch >= 5:
++            #     #
++            #     self.clustering()
++
++            # full_batch，
++            if self.train_mode == 'full_batch':
++                # batch == epoch
++                if epoch >= 20 and self.params['domain']:
++                    loss = self._batch_integration(self.dgl_data.graph, device, step='d')
++                loss = self._batch_integration(self.dgl_data.graph, device, step='g')
++                loss_sum = loss
++
++            # mini_batch
++            elif self.train_mode == 'mini_batch':
++                # sampler
++                sampler_list = [3]  # TODO
++                # sampler_list = [5] * (1 + self.params['gnn_layer_num'] + 1)     # Take only 5 neighbors per layer
++                sampler = dgl.dataloading.ShaDowKHopSampler(sampler_list)
++                #
++                train_nids = self.dgl_data.graph.ndata['index']
++                # dataloader
++                dataloader = _dgl_node_dataloader(self.dgl_data.graph,
++                                                            train_nids,
++                                                            sampler,
++                                                            batch_size=self.params['batch_size'],
++                                                            shuffle=True,
++                                                            drop_last=True)
++                for batch_num, (input_nodes, output_nodes, block) in enumerate(dataloader):
++                    # domain alpha
++                    p = float(batch_num + epoch * len(dataloader)) / n_epoch / len(dataloader)
++                    alpha = 2. / (1. + np.exp(-10 * p)) - 1
++                    # train
++                    if epoch >= 5 and self.params['domain']:
++                        loss = self._batch_integration(block, device, step='d')
++                    loss = self._batch_integration(block, device, step='g')
++                    loss_sum += loss
++                loss_sum = loss_sum / len(dataloader)
++
++            print(f'epoch: {self.epoch_current_integration}, loss: {loss_sum}')
++
++        # eval
++        self._evaluation_integration(loss_sum)
++        self.adata_whole.obsm['X_CAMEX_Integration'] = np.concatenate(
++            [self.log_integration['best_hidden'][name + 'cell'] for name in self.adata_whole.uns['data_order']])
++
++        # save
++        self._store_integration()
++
++    def annotation(self):
++        self._generate_model()
++        self._generate_optimizer()
++        print('--------------------------------------------- annotation ---------------------------------------------')
++        # train
++        device = self.params['device']
++        n_epoch = self.params['epoch_annotation']
++
++        for epoch in range(n_epoch):
++            # # TODO test
++            # self.get_feature_importance()
++            #
++            self.model.to(device)
++            # 当前epoch
++            self.epoch_current_train = epoch
++            # train
++            self.model.train()
++            # loss_sum
++            loss_sum = 0
++
++            # full_batch
++            if self.train_mode == 'full_batch':
++                loss = self._batch_annotation(self.dgl_data.graph, device, step='g')
++                loss_sum += loss
++
++            # mini_batch
++            elif self.train_mode == 'mini_batch':
++                # sampler
++                sampler_list = [3]  # TODO
++                # sampler_list = [5] * (1 + self.params['gnn_layer_num'] + 1)     #
++                sampler = dgl.dataloading.ShaDowKHopSampler(sampler_list)
++                # t
++                # data_ref = [name for name, ty in self.dgl_data.data_type.items() if ty == 'reference']
++                train_nids = self.dgl_data.graph.ndata['index']
++                # train_nids = {item + 'cell': train_nids[item + 'cell'] for item in data_ref}    # TODO
++                if len(train_nids) == 0:
++                    print('the num of ref is 0!')
++                    raise NotImplementedError
++                # dataloader
++                dataloader = _dgl_node_dataloader(self.dgl_data.graph,
++                                                            train_nids,
++                                                            sampler,
++                                                            batch_size=self.params['batch_size'],
++                                                            shuffle=True,
++                                                            drop_last=True)
++                loss_sum = 0
++                for batch_num, (input_nodes, output_nodes, block) in enumerate(dataloader):
++                    loss = self._batch_annotation(block, device)
++                    loss_sum += loss
++
++                loss_sum = loss_sum
++
++            # eval
++            print(f'epoch: {self.epoch_current_train}, loss: {loss_sum}')
++            self._evaluation_annotation()
++
++            # checkpoint
++            if self.epoch_current_train - self.log_train['best_epoch'] > int(n_epoch / 10):
++            # if self.epoch_current_train - self.log_train['best_epoch'] > 5:
++                self.model.load_state_dict(self.log_train['best_model_params'])  # load model params
++                self.log_train['best_epoch'] = self.epoch_current_train  #
++
++        # save
++        self._store_train()
++
++    def _evaluation_integration(self, loss_sum):
++        """
++        评估时不需要model.eval
++        :return:
++        """
++        # dataloader or one batch
++        with torch.no_grad():
++            model = self.model.to('cpu')
++            graph_temp = self.dgl_data.graph.to('cpu')
++            node_feature_temp = graph_temp.ndata['feature']
++            hidden = model.encoder(graph_temp, node_feature_temp)
++            del graph_temp
++
++        # if self.epoch_current_pretrain == 0 and self.epoch_current_pretrain % 2 == 0:   # TODO
++        if self.params['cluster'] and self.epoch_current_integration == self.cluster_epoch:   # TODO
++            print('clustering...')
++            self.clustering(hidden)
++
++        hidden = tensor_to_numpy(hidden)
++
++        # loss
++        evaluation_dict = {'loss': loss_sum}
++        evaluation = pd.DataFrame(evaluation_dict, index=[self.epoch_current_integration])
++        self.log_integration['evaluation'] = pd.concat([self.log_integration['evaluation'], evaluation])
++
++        # save
++        self.log_integration['best_hidden'] = hidden
++        self.log_integration['best_model_params'] = self.model.state_dict()
++
++    def _evaluation_annotation(self):
++        """
++        model.eval
++        :return:
++        """
++        # eval prepare, forward
++        with torch.no_grad():
++            self.model.train()
++            self.model.to('cpu')
++            graph_temp = self.dgl_data.graph.to('cpu')
++            h_hidden = self.encoder(graph_temp, graph_temp.ndata['feature'])
++            h_class = self.classifier(graph_temp, h_hidden)
++            del graph_temp
++
++        with torch.no_grad():
++            self.model.eval()
++            self.model.to('cpu')
++            graph_temp = self.dgl_data.graph.to('cpu')
++            h_hidden_eval = self.encoder(graph_temp, graph_temp.ndata['feature'])
++            h_class_eval = self.classifier(graph_temp, h_hidden_eval)
++            del graph_temp
++
++        # label true
++        y_true = self.dgl_data.graph.ndata['cell_label_class']
++        data_ref = [name for name, ty in self.dgl_data.data_type.items() if ty == 'reference']
++        data_query = [name for name, ty in self.dgl_data.data_type.items() if ty == 'query']
++        y_true_train = tensor_to_numpy({name: label for name, label in y_true.items() if name[: -4] in data_ref})
++        y_true_test = tensor_to_numpy({name: label for name, label in y_true.items() if name[: -4] in data_query})
++        y_cluster = tensor_to_numpy(self.dgl_data.graph.ndata['cluster_label'])     # TODO
++
++        # label predict
++        y_predict_prob = {name: nn.Softmax(dim=-1)(data) for name, data in h_class.items()}
++        y_predict = tensor_to_numpy({name: torch.max(data, -1)[1] for name, data in y_predict_prob.items() if name.endswith('cell')})     # TODO
++        y_predict_prob_train = {name: y_predict_prob[name] for name, label in y_true_train.items()}
++        y_predict_prob_test = {name: y_predict_prob[name] for name, label in y_true_test.items()}
++
++        # without unknown
++        y_predict_train = tensor_to_numpy({dataset_name: torch.max(label, -1)[1] for dataset_name, label in
++                                           y_predict_prob_train.items()})
++        y_predict_test = tensor_to_numpy({dataset_name: torch.max(label, -1)[1] for dataset_name, label in
++                                          y_predict_prob_test.items()})
++        # # with unknown
++        # unknown_num = self.adata_whole.uns['cell_type']['unknown']
++        # y_predict_train = cal_pred_with_unknown(y_predict_prob_train, unknown_num)
++        # y_predict_test = cal_pred_with_unknown(y_predict_prob_test, unknown_num)
++
++        # metrics
++        train_acc = get_acc(y_true_train, y_predict_train)  # dict
++        train_acc_list = [value for value in train_acc.values()]
++        train_f1_weighted = get_f1(y_true_train, y_predict_train, average='weighted')
++
++        test_acc = get_acc(y_true_test, y_predict_test)
++        test_acc_list = [value for value in test_acc.values()]
++        test_f1_weighted = get_f1(y_true_test, y_predict_test, average='weighted')
++
++        # AMI
++        test_AMI = get_ami(y_cluster, y_predict)     # TODO 训练集的ami 或者 聚类标签和预测标签的ami
++
++        # if round(sum(train_acc_list), 4) > self.log_train['best_train_acc'] or self.epoch_current_train == 0:  #
++        if sum(test_AMI.values()) > self.log_train['best_test_AMI'] or self.epoch_current_train == 0:  # the first
++            self.log_train['best_train_acc'] = round(sum(train_acc_list), 4)
++            self.log_train['best_test_acc'] = copy.deepcopy(round(sum(test_acc_list), 4))
++            self.log_train['best_epoch'] = copy.deepcopy(self.epoch_current_train)
++            self.log_train['best_class'] = tensor_to_numpy(h_class)  #
++            self.log_train['best_hidden'] = tensor_to_numpy(h_hidden)  #
++            self.log_train['best_hidden_eval'] = tensor_to_numpy(h_hidden_eval)  #
++            self.log_train['best_model_params'] = self.model.state_dict()  #
++            self.log_train['best_test_AMI'] = sum(test_AMI.values())  #
++
++        # save evaluation
++        evaluation_dict = {}
++        evaluation_dict.update(train_acc)
++        evaluation_dict.update(train_f1_weighted)
++        evaluation_dict.update(test_acc)
++        evaluation_dict.update(test_f1_weighted)
++        evaluation_dict.update(test_f1_weighted)
++        evaluation_dict.update(test_AMI)
++
++        evaluation = pd.DataFrame(evaluation_dict, index=[self.epoch_current_train])
++        self.log_train['evaluation'] = pd.concat([self.log_train['evaluation'], evaluation])
++
++        # print
++        info = f'train_acc: {train_acc}, test_acc: {test_acc}, train_ami:{test_AMI}, best_epoch: {self.log_train["best_epoch"]}'
++        print(info)
++        return
++
++    def _store_integration(self):
++        # cell embedding
++        cell_h_hidden = []
++        for k in self.adata_whole.uns['data_order']:
++            cell_h_hidden.extend(self.log_integration['best_hidden'][str(k) + 'cell'])
++        self.adata_whole.obsm['X_CAMEX_Integration'] = np.array(cell_h_hidden)
++
++        # gene embedding
++        gene_embedding_dict = {}
++        for name, gene_name in self.dgl_data.node_gene.items():
++            gene_embedding = self.log_integration['best_hidden'][name + 'gene']
++            gene_embedding_dict[name] = pd.DataFrame(data=gene_embedding, index=gene_name)
++        import scanpy as sc
++        embedding = pd.concat([v for k, v in gene_embedding_dict.items()])
++        gene_integration = sc.AnnData(X=embedding.to_numpy(), obs=pd.DataFrame(index=embedding.index))
++        # NOTE (pandas>=2 compat): flatten the concatenated single-column frame
++        # to 1-D; pandas>=2 rejects assigning a 2-D (N,1) array to a column.
++        gene_integration.obs.loc[:, 'batch'] = np.concatenate([np.array(len(v) * [k]) for k, v in gene_embedding_dict.items()])
++        gene_integration.obsm['X_emb'] = embedding.to_numpy()
++        gene_integration.write_h5ad(self.params['log_path'] + 'gene_integration_hidden.h5ad')
++        # torch.save(gene_embedding_dict, self.params['log_path'] + 'gene_embedding_integration.pt')
++
++        # save evaluation
++        self.log_integration['evaluation'].to_csv(f'{self.params["log_path"]}/evaluation_integration.csv', index=False)
++        # save model_params
++        torch.save(self.log_integration['best_model_params'], f'{self.params["log_path"]}/model_params_integration.pt')
++
++    def _store_train(self):
++        # save cell embedding
++        cell_class = []
++        cell_hidden = []
++        cell_hidden_eval = []
++        for k in self.adata_whole.uns['data_order']:
++            cell_class.extend(self.log_train['best_class'][str(k) + 'cell'])
++            cell_hidden.extend(self.log_train['best_hidden'][str(k) + 'cell'])
++            cell_hidden_eval.extend(self.log_train['best_hidden_eval'][str(k) + 'cell'])
++        # obsm
++        self.adata_whole.obsm['cell_train_class'] = np.array(cell_class)
++        self.adata_whole.obsm['X_CAMEX_Annotation'] = np.array(cell_hidden)
++        self.adata_whole.obsm['X_CAMEX_Annotation_eval'] = np.array(cell_hidden_eval)
++
++        # #
++        # prob = nn.Softmax()(torch.tensor(self.adata_whole.obsm['cell_train_class'])).numpy()
++        # prob_df = pd.DataFrame(data=prob, columns=self.adata_whole.uns['cell_type'].values())
++
++        # save gene embedding
++        gene_embedding_hidden_dict = {}
++        gene_embedding_class_dict = {}
++        for name, gene_name in self.dgl_data.node_gene.items():
++            gene_embedding_hidden = self.log_train['best_hidden'][name + 'gene']
++            gene_embedding_hidden_dict[name] = pd.DataFrame(data=gene_embedding_hidden, index=gene_name)
++
++            gene_embedding_class = self.log_train['best_class'][name + 'gene']
++            gene_embedding_class_dict[name] = pd.DataFrame(data=gene_embedding_class, index=gene_name)
++
++        import scanpy as sc
++        embedding = pd.concat([v for k, v in gene_embedding_hidden_dict.items()])
++        gene_train_hidden = sc.AnnData(X=embedding.to_numpy(), obs=pd.DataFrame(index=embedding.index))
++        # pandas>=2 compat: flatten to 1-D (see _store_integration).
++        gene_train_hidden.obs.loc[:, 'batch'] = np.concatenate(
++            [np.array(len(v) * [k]) for k, v in gene_embedding_hidden_dict.items()])
++        gene_train_hidden.obsm['X_emb'] = embedding.to_numpy()
++        gene_train_hidden.write_h5ad(self.params['log_path'] + 'gene_train_hidden.h5ad')
++        # torch.save(gene_embedding_hidden_dict, self.params['log_path'] + 'gene_embedding_train_hidden.pt')
++        embedding = pd.concat([v for k, v in gene_embedding_class_dict.items()])
++        gene_train_class = sc.AnnData(X=embedding.to_numpy(), obs=pd.DataFrame(index=embedding.index))
++        # pandas>=2 compat: flatten to 1-D (see _store_integration).
++        gene_train_class.obs.loc[:, 'batch'] = np.concatenate(
++            [np.array(len(v) * [k]) for k, v in gene_embedding_class_dict.items()])
++        gene_train_class.obsm['X_emb'] = embedding.to_numpy()
++        gene_train_class.write_h5ad(self.params['log_path'] + 'gene_train_class.h5ad')
++        # torch.save(gene_embedding_class_dict, self.params['log_path'] + 'gene_embedding_train_class.pt')
++
++        # save evaluation
++        self.log_train['evaluation'].to_csv(f'{self.params["log_path"]}/evaluation_train.csv', index=False)
++        # save model_params
++        torch.save(self.log_train['best_model_params'], f'{self.params["log_path"]}/model_params_train.pt')
++
++    def predict(self, device='cpu'):
++        """
++        TODO
++        ...
++
++        :return:
++        """
++        # eval prepare, forward
++        self.model.to(device)
++        graph_temp = self.dgl_data.graph.to('cpu')
++        h_hidden = self.encoder(graph_temp, graph_temp.ndata['feature'])
++        h_class = self.classifier(graph_temp, h_hidden)
++        del graph_temp
++        return h_hidden, h_class
++
++    def get_feature_importance(self, cell_type: int = 0, device='cpu'):
++        """
++        TODO
++        ...
++        :param device:
++        :param cell_type:
++        :return:
++        """
++        # # TODO method1
++        # #
++        # from torchcam.methods import GradCAM, GradCAMpp, ISCAM, LayerCAM, SSCAM, ScoreCAM, SmoothGradCAMpp, XGradCAM
++        # cam_extractor = GradCAM(self.model, 'encoder')
++        #
++        # #
++        # self.model.to(device)
++        # graph_temp = self.dgl_data.graph.to(device)
++        # h_class = self.model(graph_temp, graph_temp.ndata['feature'])
++        # y_predict = tensor_to_numpy({dataset_name: torch.max(label, -1)[1] for dataset_name, label in h_class.items()})
++        #
++        # #
++        # activation_map_cam = cam_extractor(y_predict, h_class)  # TODO
++        # del activation_map_cam
++
++        # # TODO method2
++        # from pytorch_grad_cam import GradCAM
++        # target_layers = [self.model.encoder]
++        # cam = GradCAM(model=self.model, target_layers=target_layers, use_cuda=False)
++        # from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
++        # targets = [ClassifierOutputTarget(22)]
++        # #
++        # graph_temp = self.dgl_data.graph.to(device)
++        # cam_map = cam(input_tensor=(graph_temp, graph_temp.ndata['feature']), targets=targets)[0]  # 不加平滑
++
++    def clustering(self, feature):
++        from sklearn.cluster import KMeans
++        for name, data in feature.items():
++            if name.endswith('cell'):  # TODO gene and cell
++                kmeans = KMeans(n_clusters=self.cluster_num, n_init=20)
++                y_pred = kmeans.fit_predict(data.cpu().numpy())
++                self.cluster_centers[name] = kmeans.cluster_centers_
++                self.dgl_data.graph.nodes[name].data['cluster_label'] = torch.tensor(y_pred, device='cpu', dtype=torch.int64)
++
++
++def sce_loss(x, y, alpha=3):
++    x = F.normalize(x, p=2, dim=-1)
++    y = F.normalize(y, p=2, dim=-1)
++
++    # loss =  - (x * y).sum(dim=-1)
++    # loss = (x_h - y_h).norm(dim=1).pow(alpha)
++
++    loss = (1 - (x * y).sum(dim=-1)).pow_(alpha)
++
++    loss = loss.mean()
++    return loss
++
++
++def add_noise(graph):
++    # add noise 1, drop and add edge, useless
++    from dgl import DropEdge, AddEdge, FeatMask
++    transform_d = DropEdge(p=0.2)
++    transform_a = AddEdge(ratio=0.2)
++    transform_f = FeatMask(p=0.2)
++    graph = transform_d(graph)
++    graph = transform_a(graph)
++    graph = transform_f(graph)
++    return graph
+diff --git a/omicverse/single/_cross_species.py b/omicverse/single/_cross_species.py
+index bdd16e96d..8dff44fe7 100644
+--- a/omicverse/single/_cross_species.py
++++ b/omicverse/single/_cross_species.py
+@@ -26,6 +26,9 @@
+   Self-Assembling Manifold), vendored under ``omicverse.external.samap``.
+ * ``method='saturn'`` — **SATURN** (ESM2 protein-embedding macrogenes),
+   vendored under ``omicverse.external.saturn``.
++* ``method='camex'`` — **CAMEX** (heterogeneous GNN over a many-to-many
++  homology graph; native **multi-species (>2)** integration + annotation),
++  vendored under ``omicverse.external.camex``.
+ 
+ The ortholog *preprocessing* (align + concat + normalize/HVG/scale/PCA) lives in
+ :func:`omicverse.tl.cross_species_align`.
+@@ -344,7 +347,7 @@ def _collapse_duplicate_vars(adata: anndata.AnnData, how: str = "sum") -> anndat
+ # method values that route to the ortholog route (one-to-one orthologs +
+ # ov.single.batch_correction). Anything not 'samap'/'saturn' is treated as an
+ # ortholog backend and forwarded to batch_correction as its ``methods=``.
+-_HOMOLOGY_METHODS = {"samap", "saturn"}
++_HOMOLOGY_METHODS = {"samap", "saturn", "camex"}
+ 
+ 
+ @register_function(
+@@ -385,6 +388,10 @@ class CrossSpecies:
+         * ``'saturn'`` — **SATURN** (ESM2 protein-embedding macrogenes). Needs
+           ``embedding_paths=``; see
+           :func:`omicverse.external.saturn._run.run_saturn`.
++        * ``'camex'`` — **CAMEX** (heterogeneous GNN on a many-to-many homology
++          graph; supports >2 species + annotation transfer). Builds the
++          many-to-many homology from BioMart automatically (or pass
++          ``homology=``); see :func:`omicverse.external.camex._run.run_camex`.
+     ref_species, batch_key, orthology_type, n_top_genes, n_pcs, target_sum,
+     host, cache_dir, use_cache
+         Ortholog-route settings (forwarded to :func:`ov.tl.cross_species_align`).
+@@ -444,6 +451,8 @@ def fit(self) -> "CrossSpecies":
+             self._fit_samap()
+         elif m == "saturn":
+             self._fit_saturn()
++        elif m == "camex":
++            self._fit_camex()
+         else:
+             self._fit_ortholog()
+         return self
+@@ -487,6 +496,35 @@ def _fit_saturn(self) -> None:
+             self.adata = res
+         self.adata.uns.setdefault("cross_species", {})["method"] = "saturn"
+ 
++    def _fit_camex(self) -> None:
++        from ..external.camex._run import run_camex
++
++        kw = dict(self.kwargs)
++        ref_index = kw.pop("ref_index", 0)
++        if self.ref_species is not None:
++            norm = [_normalize_species(s) for s in self.species]
++            if _normalize_species(self.ref_species) in norm:
++                ref_index = norm.index(_normalize_species(self.ref_species))
++        ref_species = self.species[ref_index]
++
++        # Many-to-many homology (BioMart) linking the reference species to each
++        # other — CAMEX exploits the full homolog graph, not just 1:1 orthologs.
++        homology = kw.pop("homology", None)
++        if homology is None:
++            homology = {}
++            for sp in self.species:
++                if _normalize_species(sp) == _normalize_species(ref_species):
++                    continue
++                ort = get_orthologs(ref_species, sp, orthology_type="all",
++                                    host=self.host, cache_dir=self.cache_dir,
++                                    use_cache=self.use_cache)
++                homology[(ref_species, sp)] = ort[["source_symbol", "target_symbol"]]
++
++        self.adata = run_camex(self.adatas, self.species, homology=homology,
++                               ref_index=ref_index, label_col=kw.pop("label_col", "cell_type"),
++                               **kw)
++        self.adata.uns.setdefault("cross_species", {})["method"] = "camex"
++
+     def save(self, path: str) -> str:
+         """Persist this run (config + integrated AnnData + model) to ``path``
+         via :func:`omicverse.io.save` (pickle, cloudpickle fallback)."""
+@@ -510,6 +548,7 @@ def load(cls, path: str) -> "CrossSpecies":
+         "adata = ov.single.cross_species_integrate([a1,a2], ['human','mouse'], method='scVI')",
+         "adata = ov.single.cross_species_integrate([zeb,frog], ['zebrafish','frog'], method='samap', ids=['zf','fr'], proteomes=..., blast_maps='maps/')",
+         "adata = ov.single.cross_species_integrate([zeb,frog], ['zebrafish','frog'], method='saturn', embedding_paths=...)",
++        "adata = ov.single.cross_species_integrate([a1,a2,a3], ['human','mouse','zebrafish'], method='camex')  # multi-species",
+     ],
+     related=["single.CrossSpecies", "single.get_orthologs", "tl.cross_species_align"],
+ )
+diff --git a/tests/single/test_camex_vendored.py b/tests/single/test_camex_vendored.py
+new file mode 100644
+index 000000000..e5c7b904c
+--- /dev/null
++++ b/tests/single/test_camex_vendored.py
+@@ -0,0 +1,41 @@
++"""CAMEX (cross-species cell-type annotation & integration via multi-species
++expression graphs) is vendored under ``omicverse.external.camex`` because its
++upstream pins conflicting deps (numpy<=1.24.4 / scanpy<=1.9.3 / pandas==1.5.3 /
++numba==0.56.4 / harmonypy==0.0.9) and is not on PyPI.
++
++These tests check that the vendored package imports and exposes a callable
++``run_camex`` entry point under the current environment (numpy 2.x / new
++scanpy). The heavy end-to-end GNN training run is validated separately, not in
++CI. Mirrors ``tests/single/test_cross_species_backends.py``.
++"""
++import importlib
++
++import pytest
++
++
++def test_camex_vendored_imports():
++    # CAMEX builds a DGL heterograph and trains a torch GNN
++    pytest.importorskip("torch")
++    pytest.importorskip("dgl")
++
++    # importing the package itself must stay light (lazy heavy submodules)
++    m = importlib.import_module("omicverse.external.camex")
++    run = importlib.import_module("omicverse.external.camex._run")
++    assert callable(run.run_camex)
++    # lazy re-export from the package namespace
++    assert callable(m.run_camex)
++
++
++def test_camex_core_submodules_import():
++    """The compat risk: the vendored base/trainer (which import torch+dgl and
++    rely on the DataLoader/pandas-2 patches) must actually import under the
++    installed torch/dgl/pandas, not just the light package shell."""
++    pytest.importorskip("torch")
++    pytest.importorskip("dgl")
++
++    base = importlib.import_module("omicverse.external.camex.base")
++    trainer = importlib.import_module("omicverse.external.camex.trainer")
++    assert isinstance(base.Dataset, type)
++    assert isinstance(trainer.Trainer, type)
++    # DGL>=1.0 NodeDataLoader compat shim is present
++    assert callable(trainer._dgl_node_dataloader)

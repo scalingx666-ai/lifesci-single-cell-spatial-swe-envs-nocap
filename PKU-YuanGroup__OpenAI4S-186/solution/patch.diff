@@ -1,0 +1,468 @@
+diff --git a/openai4s/agent/actions.py b/openai4s/agent/actions.py
+index 85b342de3..dbd57435c 100644
+--- a/openai4s/agent/actions.py
++++ b/openai4s/agent/actions.py
+@@ -257,3 +257,31 @@ def has_incomplete_code_block(text: str) -> bool:
+     "```python or ```r cell beginning before its first required dependency. "
+     "Do not continue from or paste only the truncated tail."
+ )
++
++# Appended to the native results when the same reply also carried a complete
++# cell. ``route_action`` runs only the native calls, and the model used to see
++# nothing but their results: a reply that wrote a script with ``write_file``
++# and ran it in a cell got back the file's byte count and no trace of the run,
++# sent the identical pair again, and the no-progress circuit stopped the turn
++# on its third identical ``write_file``.
++UNEXECUTED_CELL_NOTE = (
++    "\n[system] NOTE: your reply also contained a ```{language} code cell. It "
++    "was NOT executed — a reply that contains native tool calls runs only "
++    "those calls, so nothing from that cell ran and it produced no output. "
++    "If the cell still needs to run, send it as the ONLY action of your next "
++    "reply, with no tool calls."
++)
++
++
++def unexecuted_cell_note(content: str, action: Action | None) -> str:
++    """The note for a native action that displaced a cell, else ``""``.
++
++    It names the cell ``extract_action`` would have run had the reply carried
++    no native calls, so it fires exactly when routing made that choice.
++    """
++    if not isinstance(action, (NativeToolBatch, FinalizeAction)):
++        return ""
++    cell = extract_action(content if isinstance(content, str) else "")
++    if cell is None:
++        return ""
++    return UNEXECUTED_CELL_NOTE.format(language=cell.language)
+diff --git a/openai4s/agent/engine.py b/openai4s/agent/engine.py
+index 668cbc32e..c41f3c22a 100644
+--- a/openai4s/agent/engine.py
++++ b/openai4s/agent/engine.py
+@@ -2,9 +2,10 @@
+ 
+ from __future__ import annotations
+ 
++from dataclasses import replace
+ from typing import Any, Callable, Iterable, Mapping, cast
+ 
+-from .actions import route_action
++from .actions import route_action, unexecuted_cell_note
+ from .events import (
+     ActionRouted,
+     OutcomeProduced,
+@@ -125,6 +126,9 @@ def on_delta(text: str) -> None:
+             outcome = self.executor.execute(action, reply, state)
+             if not isinstance(outcome, ExecutionOutcome):
+                 raise TypeError("executor must return ExecutionOutcome")
++            outcome = self._note_unexecuted_cell(
++                outcome, unexecuted_cell_note(reply.content, action)
++            )
+             circuit.observe_execution(action, outcome)
+             state.messages.extend(dict(message) for message in outcome.history_messages)
+             state.turn += 1
+@@ -156,6 +160,34 @@ def _state(
+             raise ValueError("max_turns must be non-negative")
+         return state
+ 
++    @staticmethod
++    def _note_unexecuted_cell(outcome: ExecutionOutcome, note: str) -> ExecutionOutcome:
++        """Put ``note`` on the last tool result the model is about to read.
++
++        Routing is decided here, so this is the one place every executor's
++        outcome passes through after a native action displaced a cell. The
++        note rides inside a tool result because every wire carries that text,
++        while a separate message between a tool batch and its results is a
++        request Anthropic rejects. It is recorded like any other result, so a
++        restored history reads the same words the live run did.
++        """
++        if not note:
++            return outcome
++        history = [dict(message) for message in outcome.history_messages]
++        for message in reversed(history):
++            content = message.get("content")
++            if message.get("role") == "tool" and isinstance(content, str):
++                message["content"] = content + note
++                break
++        else:
++            return outcome
++        observation = outcome.observation
++        if isinstance(observation, str):
++            observation += note
++        return replace(
++            outcome, history_messages=tuple(history), observation=observation
++        )
++
+     @staticmethod
+     def _reply(value: ModelReply | Mapping[str, Any]) -> ModelReply:
+         return (
+diff --git a/openai4s/llm/providers/openai.py b/openai4s/llm/providers/openai.py
+index 517c8f089..01b5c5c03 100644
+--- a/openai4s/llm/providers/openai.py
++++ b/openai4s/llm/providers/openai.py
+@@ -127,6 +127,32 @@ class _StreamStartError(Exception):
+ }
+ 
+ 
++def _fragment_index(fragment: dict, calls: dict[int, dict]) -> int:
++    """The streamed tool call a ``tool_calls`` delta fragment belongs to.
++
++    OpenAI keys the fragments by ``index``; some compatible relays leave it
++    out. Reading a missing index as 0 merged parallel calls into one -- each
++    name overwrote the last and the arguments concatenated into
++    ``{"a":1}{"b":2}`` -- so the whole batch reached the engine as one
++    malformed call, and two such replies stopped the turn. Without an index,
++    a fragment carrying a new call ``id`` opens the next call and any other
++    fragment continues the latest one.
++    """
++    raw = fragment.get("index")
++    if raw is not None:
++        try:
++            return int(raw)
++        except (TypeError, ValueError):
++            return len(calls)
++    if not calls:
++        return 0
++    latest = max(calls)
++    call_id = fragment.get("id")
++    if call_id and calls[latest].get("id") not in (None, call_id):
++        return latest + 1
++    return latest
++
++
+ def _chat_openai_stream(url, payload, headers, cfg, on_delta, *, post_sse) -> dict:
+     payload["stream"] = True
+     # Ask for a usage row on the terminal chunk (ignored by proxies that don't
+@@ -206,10 +232,7 @@ def _on_event(evt: dict) -> bool | None:
+             reasoning.append(rc)
+         for fragment in delta.get("tool_calls") or ():
+             state["output_committed"] = True
+-            try:
+-                index = int(fragment.get("index", 0))
+-            except (TypeError, ValueError):
+-                index = len(state["tool_calls"])
++            index = _fragment_index(fragment, state["tool_calls"])
+             acc = state["tool_calls"].setdefault(
+                 index, {"id": None, "type": "function", "name": "", "arguments": []}
+             )
+diff --git a/openai4s/llm/tooling.py b/openai4s/llm/tooling.py
+index d30b94ea7..ba434c03a 100644
+--- a/openai4s/llm/tooling.py
++++ b/openai4s/llm/tooling.py
+@@ -55,6 +55,15 @@ def _canonical_tool_specs(tools: list[Any] | tuple[Any, ...] | None) -> list[dic
+ 
+ def _parse_tool_arguments(value: Any) -> tuple[str, dict | None, str | None]:
+     """Preserve exact arguments while exposing a validated object view."""
++    if value is None or (isinstance(value, str) and not value.strip()):
++        # A call to a tool that takes no parameters. OpenAI-compatible relays
++        # forward it as "" (an Anthropic tool_use with an empty input streams
++        # no input_json at all) or leave the field null; the Anthropic adapter
++        # already reads its own empty input as {}. Refusing it answered every
++        # zero-argument call with a parse error the model cannot fix, and the
++        # no-progress circuit stopped the turn after the second identical one.
++        # "{}" is also what goes back on the wire when the call is replayed.
++        return "{}", {}, None
+     if isinstance(value, str):
+         raw = value
+         try:
+diff --git a/tests/test_agent_engine.py b/tests/test_agent_engine.py
+index 6f5e9723e..8960329d7 100644
+--- a/tests/test_agent_engine.py
++++ b/tests/test_agent_engine.py
+@@ -6,6 +6,8 @@
+ import copy
+ from pathlib import Path
+ 
++import pytest
++
+ import openai4s.agent.engine as engine_module
+ from openai4s.agent.actions import CodeCell, NativeToolBatch
+ from openai4s.agent.engine import AgentEngine
+@@ -425,3 +427,94 @@ def test_cancelled_model_reply_is_not_recorded_as_history():
+         RunFinished,
+     ]
+     assert result.messages[-1] == {"role": "user", "content": "first request"}
++
++
++_WRITE = {"path": "cell1_setup_probe.py", "content": "import sys\nprint(sys.version)\n"}
++_WRITTEN = '{"path": "cell1_setup_probe.py", "bytes": 32}'
++
++
++@pytest.mark.parametrize("name", ["write_file", "finalize_response"])
++def test_native_call_that_displaces_a_cell_says_the_cell_did_not_run(name):
++    # The Web session that prompted this: the model wrote a probe script with
++    # write_file and ran it in a ```python cell of the SAME reply. Only the
++    # native call runs, the model saw nothing but a byte count, sent the same
++    # pair again, and the circuit stopped the turn on the third write.
++    call = _call(name=name, arguments=dict(_WRITE))
++    result_message = {"role": "tool", "tool_call_id": "call_1", "content": _WRITTEN}
++    engine, model, _, _, events, _, _ = _engine(
++        [
++            _reply(
++                "```python\nexec(open('cell1_setup_probe.py').read())\n```",
++                tool_calls=[call],
++            ),
++            _reply("Done."),
++        ],
++        [
++            ExecutionOutcome(
++                history_messages=(result_message,), observation="[Tool Results]"
++            )
++        ],
++        max_turns=2,
++    )
++
++    engine.run([{"role": "user", "content": "probe the environment"}])
++
++    seen = model.calls[1][-1]
++    note = seen["content"][len(_WRITTEN) :]
++    assert seen["role"] == "tool" and seen["content"].startswith(_WRITTEN)
++    assert "```python code cell. It was NOT executed" in note
++    assert "ONLY action of your next reply" in note
++    # The Action Ledger records OutcomeProduced, so a restored history reads
++    # the same words the live model did.
++    produced = [e.outcome for e in events.events if isinstance(e, OutcomeProduced)]
++    assert produced[0].history_messages[-1] == seen
++    assert produced[0].observation == "[Tool Results]" + note
++    assert result_message["content"] == _WRITTEN
++
++
++@pytest.mark.parametrize(
++    "content",
++    [
++        "Writing the probe script now.",
++        '```json\n{"path": "cell1_setup_probe.py"}\n```',
++        "```python\nprint('never closed')\n",
++    ],
++)
++def test_native_call_without_a_displaced_cell_is_left_alone(content):
++    call = _call(name="write_file", arguments=dict(_WRITE))
++    result_message = {"role": "tool", "tool_call_id": "call_1", "content": _WRITTEN}
++    engine, model, _, _, _, _, _ = _engine(
++        [_reply(content, tool_calls=[call]), _reply("Done.")],
++        [ExecutionOutcome(history_messages=(result_message,))],
++        max_turns=2,
++    )
++
++    engine.run([{"role": "user", "content": "probe the environment"}])
++
++    assert model.calls[1][-1] == result_message
++
++
++def test_a_model_that_ignores_the_note_is_still_stopped_by_the_circuit():
++    call = _call(name="write_file", arguments=dict(_WRITE))
++    reply = _reply("```python\nprint(1)\n```", tool_calls=[call])
++
++    def written(action, reply, state):
++        return ExecutionOutcome(
++            history_messages=(
++                {"role": "tool", "tool_call_id": "call_1", "content": _WRITTEN},
++            )
++        )
++
++    engine, model, _, _, _, _, _ = _engine(
++        [copy.deepcopy(reply) for _ in range(4)],
++        executor=FakeExecutor(handler=written),
++        max_turns=4,
++    )
++
++    result = engine.run([{"role": "user", "content": "probe the environment"}])
++
++    assert (result.stop_reason, result.progress_reason) == (
++        "no_progress",
++        "same_action",
++    )
++    assert len(model.calls) == 3
+diff --git a/tests/test_llm_openai_tool_calls.py b/tests/test_llm_openai_tool_calls.py
+index 1c3ba5c5f..9ad4d9f49 100644
+--- a/tests/test_llm_openai_tool_calls.py
++++ b/tests/test_llm_openai_tool_calls.py
+@@ -553,3 +553,189 @@ def unsupported(*_args):
+         )
+ 
+     _assert_stream_fallback(monkeypatch, unsupported)
++
++
++_STATUS = ToolSpec(
++    "session_status",
++    "Report the session state.",
++    {"type": "object", "properties": {}},
++)
++
++
++@pytest.mark.parametrize("arguments", ["", "  \n", None])
++def test_zero_argument_call_is_an_empty_object_not_a_parse_error(
++    monkeypatch, arguments
++):
++    # OpenAI-compatible relays forward a call to a parameterless tool with
++    # `arguments: ""` (or null). Read as JSON that was a parse error: the call
++    # never ran, and the no-progress circuit stopped the turn after two.
++    raw_call = {
++        "id": "call-empty-1",
++        "type": "function",
++        "function": {"name": "session_status", "arguments": arguments},
++    }
++    _install(
++        monkeypatch,
++        {
++            "choices": [
++                {
++                    "message": {
++                        "role": "assistant",
++                        "content": None,
++                        "tool_calls": [raw_call],
++                    },
++                    "finish_reason": "tool_calls",
++                }
++            ],
++            "usage": {},
++        },
++    )
++
++    result = llm.chat([{"role": "user", "content": "Status?"}], _cfg(), tools=[_STATUS])
++
++    assert result["tool_calls"] == [
++        _call("call-empty-1", "{}", {}, name="session_status")
++    ]
++
++
++def test_streamed_zero_argument_call_parses_and_replays_as_an_empty_object(
++    monkeypatch,
++):
++    def relay(url, payload, headers, timeout, on_event):
++        # What an Anthropic -> OpenAI relay streams for an empty tool_use
++        # input: the opening fragment carries `arguments: ""`, and nothing
++        # else ever arrives for that call.
++        on_event(
++            {
++                "choices": [
++                    {
++                        "delta": {
++                            "tool_calls": [
++                                {
++                                    "index": 0,
++                                    "id": "call-empty-2",
++                                    "type": "function",
++                                    "function": {
++                                        "name": "session_status",
++                                        "arguments": "",
++                                    },
++                                }
++                            ]
++                        }
++                    }
++                ]
++            }
++        )
++        on_event({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
++
++    monkeypatch.setattr(llm.transport, "post_sse", relay)
++    monkeypatch.setenv("OPENAI4S_LLM_STREAM", "1")
++    result = llm.chat(
++        [{"role": "user", "content": "Status?"}],
++        _cfg(),
++        tools=[_STATUS],
++        on_delta=lambda _text: None,
++    )
++    call = result["tool_calls"][0]
++
++    assert call == _call(
++        "call-empty-2",
++        "{}",
++        {},
++        name="session_status",
++        meta={"type": "function", "index": 0},
++    )
++
++    # Replayed as history the call goes back as "{}", never as the "" a relay
++    # translating to another wire would have to parse again.
++    cap = _install(monkeypatch, _text_body())
++    llm.chat(
++        [
++            {"role": "user", "content": "Status?"},
++            result["assistant_message"],
++            {
++                "role": "tool",
++                "tool_call_id": call["id"],
++                "wire_id": call["wire_id"],
++                "name": "session_status",
++                "content": "idle",
++            },
++        ],
++        _cfg(),
++        tools=[_STATUS],
++    )
++    replayed = cap.payload["messages"][1]["tool_calls"]
++    assert [item["function"]["arguments"] for item in replayed] == ["{}"]
++
++
++def _index_less_relay(calls):
++    """Stream `calls` the way a relay that omits `tool_calls[].index` does."""
++
++    def relay(url, payload, headers, timeout, on_event):
++        for call_id, name, parts, repeat_id in calls:
++            on_event(
++                {
++                    "choices": [
++                        {
++                            "delta": {
++                                "tool_calls": [
++                                    {
++                                        "id": call_id,
++                                        "type": "function",
++                                        "function": {"name": name, "arguments": ""},
++                                    }
++                                ]
++                            }
++                        }
++                    ]
++                }
++            )
++            for part in parts:
++                fragment = {"function": {"arguments": part}}
++                if repeat_id:
++                    fragment["id"] = call_id
++                on_event({"choices": [{"delta": {"tool_calls": [fragment]}}]})
++        on_event({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
++
++    return relay
++
++
++def test_streamed_parallel_calls_without_index_stay_separate(monkeypatch):
++    # With every missing index read as 0 the two calls merged into one
++    # `calculate` call whose arguments were '{"query":"ATP synthase"}{"value":2}'
++    # -- a single malformed call, and `lookup` vanished from the batch.
++    monkeypatch.setattr(
++        llm.transport,
++        "post_sse",
++        _index_less_relay(
++            [
++                ("call-a", "lookup", ['{"query":', '"ATP synthase"}'], False),
++                ("call-b", "calculate", ['{"value":', "2}"], True),
++            ]
++        ),
++    )
++    monkeypatch.setenv("OPENAI4S_LLM_STREAM", "1")
++
++    result = llm.chat(
++        [{"role": "user", "content": "Use both tools."}],
++        _cfg(),
++        tools=[_LOOKUP, _CALCULATE],
++        on_delta=lambda _text: None,
++    )
++
++    assert result["tool_calls"] == [
++        _call(
++            "call-a",
++            '{"query":"ATP synthase"}',
++            {"query": "ATP synthase"},
++            meta={"type": "function", "index": 0},
++        ),
++        _call(
++            "call-b",
++            '{"value":2}',
++            {"value": 2},
++            name="calculate",
++            ordinal=1,
++            meta={"type": "function", "index": 1},
++        ),
++    ]

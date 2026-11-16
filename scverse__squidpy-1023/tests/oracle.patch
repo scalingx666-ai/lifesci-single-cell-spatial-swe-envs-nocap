@@ -1,0 +1,1826 @@
+diff --git a/docs/api.md b/docs/api.md
+index f9f70e56d..690f7713a 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -65,6 +65,7 @@ import squidpy as sq
+     pl.spatial_scatter
+     pl.spatial_segment
+     pl.nhood_enrichment
++    pl.nhood_enrichment_dotplot
+     pl.centrality_scores
+     pl.interaction_matrix
+     pl.ligrec
+diff --git a/docs/references.bib b/docs/references.bib
+index db0f6e105..17b6b4e21 100644
+--- a/docs/references.bib
++++ b/docs/references.bib
+@@ -225,3 +225,13 @@ @article{palla:22
+     issn = {1548-7105},
+     doi = {10.1038/s41592-021-01358-2},
+ }
++
++@article{schiller2025,
++    author = {Schiller, Chiara and Ibarra-Arellano, Miguel A. and Bestak, Kresimir
++              and Tanevski, Jovan and Schapiro, Denis},
++    title = {Comparison and Optimization of Cellular Neighbor Preference Methods
++             for Quantitative Tissue Analysis},
++    journal = {bioRxiv},
++    year = {2025},
++    doi = {10.1101/2025.03.31.646289},
++}
+diff --git a/src/squidpy/gr/_nhood.py b/src/squidpy/gr/_nhood.py
+index ebf4c05eb..bbfd0887b 100644
+--- a/src/squidpy/gr/_nhood.py
++++ b/src/squidpy/gr/_nhood.py
+@@ -2,20 +2,22 @@
+ 
+ from __future__ import annotations
+ 
++import warnings
+ from collections.abc import Callable, Iterable, Sequence
+ from functools import partial
+-from typing import Any, NamedTuple
++from typing import Any, Literal, NamedTuple
+ 
+-import numba.types as nt
+ import numpy as np
+ import pandas as pd
+ import rustworkx as rx
+ from anndata import AnnData
+ from numba import njit, prange
++from numba.typed import List
++from numba_progress import ProgressBar
+ from numpy.typing import NDArray
+ from pandas import CategoricalDtype
+ from scanpy import logging as logg
+-from scipy.sparse import csr_matrix
++from scipy.sparse import csr_matrix, issparse
+ from spatialdata import SpatialData
+ 
+ from squidpy._constants._constants import Centrality
+@@ -27,8 +29,11 @@
+     SeedLike,
+     Signal,
+     SigQueue,
++    deprecated_params,
+     deprecated_randomness_param,
++    get_n_numba_threads,
+     get_n_processes,
++    numba_threads,
+     parallelize,
+ )
+ from squidpy._validators import assert_positive
+@@ -36,33 +41,30 @@
+     _assert_categorical_obs,
+     _assert_connectivity_key,
+     _save_data,
+-    _shuffle_group,
+     extract_adata_if_sdata,
+ )
+ 
+-__all__ = ["nhood_enrichment", "centrality_scores", "interaction_matrix"]
++__all__ = ["nhood_enrichment", "NhoodEnrichmentResult", "centrality_scores", "interaction_matrix"]
+ 
+ 
+ class NhoodEnrichmentResult(NamedTuple):
+     """Result of nhood_enrichment function."""
+ 
+     zscore: NDArray[np.number]
++    """Z-score values of enrichment statistic."""
+     counts: NDArray[np.number]  # NamedTuple inherits from tuple so cannot use 'count' as attribute name
++    """Enrichment count."""
++    conditional_ratio: NDArray[np.number] | None = None
++    """Conditional ratio. Only present if ``normalization='conditional'``."""
+ 
+ 
+-# data type aliases (both for numpy and numba should match)
+-dt = nt.uint32
++# integer dtype used for cluster labels and CSR index arrays (numpy/numba must match)
+ ndt = np.uint32
+-_template = """
+-from __future__ import annotations
+ 
+-from numba import njit, prange
+-import numpy as np
+ 
+-@njit(dt[:, :](dt[:], dt[:], dt[:]), parallel={parallel}, fastmath=True)
+-def _nenrich_{n_cls}_{parallel}(indices: NDArrayA, indptr: NDArrayA, clustering: NDArrayA) -> np.ndarray:
+-    '''
+-    Count how many times clusters :math:`i` and :math:`j` are connected.
++@njit(nogil=True, cache=True)
++def _nenrich(indices: NDArrayA, indptr: NDArrayA, clustering: NDArrayA, n_cls: int) -> NDArrayA:
++    """Count how many times clusters are connected.
+ 
+     Parameters
+     ----------
+@@ -71,93 +73,240 @@ def _nenrich_{n_cls}_{parallel}(indices: NDArrayA, indptr: NDArrayA, clustering:
+     indptr
+         :attr:`scipy.sparse.csr_matrix.indptr`.
+     clustering
+-        Array of shape ``(n_cells,)`` containig cluster labels ranging from `0` to `n_clusters - 1` inclusive.
++        Array of shape ``(n_cells,)`` containing cluster labels ranging from ``0`` to ``n_cls - 1`` inclusive.
++    n_cls
++        Number of clusters.
+ 
+     Returns
+     -------
+-    :class:`numpy.ndarray`
+-        Array of shape ``(n_clusters, n_clusters)`` containing the pairwise counts.
+-    '''
+-    res = np.zeros((indptr.shape[0] - 1, {n_cls}), dtype=ndt)
+-
+-    for i in prange(res.shape[0]):
+-        xs, xe = indptr[i], indptr[i + 1]
+-        cols = indices[xs:xe]
+-        for c in cols:
+-            res[i, clustering[c]] += 1
+-    {init}
+-    {loop}
+-    {finalize}
+-"""
+-
+-
+-def _create_function(n_cls: int, parallel: bool = False) -> Callable[[NDArrayA, NDArrayA, NDArrayA], NDArrayA]:
++    Array of shape ``(n_cls, n_cls)`` where entry ``(a, b)`` is the number of directed edges
++    from a cluster-``a`` cell to a cluster-``b`` neighbor.
+     """
+-    Create a :mod:`numba` function which counts the number of connections between clusters.
++    out = np.zeros((n_cls, n_cls), dtype=np.uint32)
++    for i in range(indptr.shape[0] - 1):
++        a = clustering[i]
++        for c in indices[indptr[i] : indptr[i + 1]]:
++            out[a, clustering[c]] += 1
++    return out
+ 
+-    Parameters
+-    ----------
+-    n_cls
+-        Number of clusters. We're assuming that cluster labels are `0`, `1`, ..., `n_cls - 1`.
+-    parallel
+-        Whether to enable :mod:`numba` parallelization.
+ 
+-    Returns
+-    -------
+-    The aforementioned function.
++@njit(nogil=True, cache=True)
++def _counts_and_conditional(
++    indices: NDArrayA, indptr: NDArrayA, clustering: NDArrayA, n_cls: int
++) -> tuple[NDArrayA, NDArrayA]:
++    """One traversal yielding both the edge counts and the COZI conditional denominator.
++
++    ``normalization='conditional'`` needs :func:`_nenrich`'s directed-edge counts *and*, per cluster
++    pair ``(a, b)``, how many cluster-``a`` cells have at least one cluster-``b`` neighbor. Both are
++    row-local, so a single pass produces them. ``stamp[b]`` holds the row that last touched cluster
++    ``b``, which makes "already counted for this cell" a comparison rather than a per-row array to
++    wipe and sweep — so the cost stays O(nnz) instead of growing with ``n_cls``.
++
++    Returns ``(counts, cond)`` as ``(n_cls, n_cls)`` ``uint32`` / ``float64`` arrays. The counts are
++    bit-identical to :func:`_nenrich`: the same additions happen in the same per-row order.
+     """
+-    if n_cls <= 1:
+-        raise ValueError(f"Expected at least `2` clusters, found `{n_cls}`.")
++    out = np.zeros((n_cls, n_cls), dtype=np.uint32)
++    cond = np.zeros((n_cls, n_cls), dtype=np.float64)
++    stamp = np.full(n_cls, -1, dtype=np.int64)  # -1 sits below every row index, so row 0 is correct
++    for i in range(indptr.shape[0] - 1):
++        a = clustering[i]
++        for c in indices[indptr[i] : indptr[i + 1]]:
++            b = clustering[c]
++            out[a, b] += 1
++            if stamp[b] != i:
++                stamp[b] = i
++                cond[a, b] += 1.0
++    return out, cond
++
++
++@njit(nogil=True, cache=True)
++def _normalize_total(cnt: NDArrayA, sizes: NDArrayA) -> NDArrayA:
++    """Divide edge counts by the number of index cells (SEA), i.e. neighbors per cell of type ``a``.
++
++    ``sizes[a]`` is the number of cluster-``a`` cells, which label permutation leaves unchanged --
++    so unlike the conditional denominator this one is a constant of the null. An empty cluster
++    divides by ``1`` and stays zero.
++    """
++    out = np.zeros(cnt.shape, dtype=np.float64)
++    for a in range(cnt.shape[0]):
++        s = sizes[a] if sizes[a] != 0.0 else 1.0
++        for b in range(cnt.shape[1]):
++            out[a, b] = cnt[a, b] / s
++    return out
+ 
+-    rng = range(n_cls)
+-    init = "".join(
+-        f"""
+-    g{i} = np.zeros(({n_cls},), dtype=ndt)"""
+-        for i in rng
+-    )
+ 
+-    loop_body = """
+-        if cl == 0:
+-            g0 += res[row]"""
+-    loop_body = loop_body + "".join(
+-        f"""
+-        elif cl == {i}:
+-            g{i} += res[row]"""
+-        for i in range(1, n_cls)
+-    )
+-    loop = f"""
+-    for row in prange(res.shape[0]):
+-        cl = clustering[row]
+-        {loop_body}
+-        else:
+-            assert False, "Unhandled case."
++@njit(nogil=True, cache=True)
++def _normalize_conditional(cnt: NDArrayA, cond: NDArrayA) -> NDArrayA:
++    """Divide edge counts by the COZI denominator (COZI). A zero denominator divides by ``1``."""
++    out = np.zeros(cnt.shape, dtype=np.float64)
++    for a in range(cnt.shape[0]):
++        for b in range(cnt.shape[1]):
++            d = cond[a, b] if cond[a, b] != 0.0 else 1.0
++            out[a, b] = cnt[a, b] / d
++    return out
++
++
++@njit(nogil=True, cache=True)
++def _shuffled_labels(
++    int_clust: NDArrayA,
++    group_offsets: NDArrayA,
++    group_indices: NDArrayA,
++    rng: Any,
++) -> NDArrayA:
++    """Shuffle cluster labels within each group, drawing once per group from ``rng``.
++
++    Groups are visited in category order with ascending indices, so for a given generator state
++    the draw sequence, and hence the result, is fully determined.
+     """
+-    finalize = ", ".join(f"g{i}" for i in rng)
+-    finalize = f"return np.stack(({finalize}))"  # must really be a tuple
++    shuffled = int_clust.copy()
++    # one group covering every cell has ascending indices `0..n-1`, so the gather/scatter below is
++    # the identity; shuffling in place draws from ``rng`` identically and skips two passes
++    if group_offsets.shape[0] == 2 and group_offsets[1] == int_clust.shape[0]:
++        rng.shuffle(shuffled)
++        return shuffled
++    for g in range(group_offsets.shape[0] - 1):
++        s, e = group_offsets[g], group_offsets[g + 1]
++        sub = np.empty(e - s, dtype=int_clust.dtype)
++        for t in range(e - s):
++            sub[t] = int_clust[group_indices[s + t]]
++        rng.shuffle(sub)
++        for t in range(e - s):
++            shuffled[group_indices[s + t]] = sub[t]
++    return shuffled
++
++
++@njit(parallel=True, nogil=True, cache=True)
++def _permutation_moments_counts(
++    indices: NDArrayA,
++    indptr: NDArrayA,
++    int_clust: NDArrayA,
++    group_offsets: NDArrayA,
++    group_indices: NDArrayA,
++    n_cls: int,
++    observed: NDArrayA,
++    generators: Any,
++    progress: Any,
++) -> tuple[NDArrayA, NDArrayA]:
++    """Exact integer moments of the permutation distribution for ``normalization='none'``.
++
++    The unnormalized statistic is a directed-edge count, so every ``d = permuted - observed`` is a
++    whole number. Accumulating in :obj:`numpy.int64` makes the ``prange`` reduction exactly
++    order-independent — the result is bit-identical for any thread count by construction rather
++    than by luck — and keeps ``sum(d * d)`` exact up to ``2**63`` instead of float64's ``2**53``,
++    which a large graph can genuinely exceed.
++
++    Returns ``(sum_d, sum_d2)``; the caller turns these into the mean, std and z-score.
++    """
++    n_perms = len(generators)
++    sum_d = np.zeros((n_cls, n_cls), dtype=np.int64)
++    sum_d2 = np.zeros((n_cls, n_cls), dtype=np.int64)
++    for p in prange(n_perms):
++        # explicit int64 index: under prange the loop var is uint64 and indexing the typed list
++        # would otherwise trigger a (harmless) uint64->int64 NumbaTypeSafetyWarning
++        rng = generators[np.int64(p)]
++        shuffled = _shuffled_labels(int_clust, group_offsets, group_indices, rng)
++        out = _nenrich(indices, indptr, shuffled, n_cls)
++
++        # the temporaries are needed because numba only recognizes whole-array in-place updates as
++        # a reduction -- `sum_d[a, b] += dev` here would race instead
++        local_d = np.zeros((n_cls, n_cls), dtype=np.int64)
++        local_d2 = np.zeros((n_cls, n_cls), dtype=np.int64)
++        for a in range(n_cls):
++            for b in range(n_cls):
++                dev = np.int64(out[a, b]) - observed[a, b]
++                local_d[a, b] = dev
++                local_d2[a, b] = dev * dev
++        sum_d += local_d
++        sum_d2 += local_d2
++        progress.update(1)
++    return sum_d, sum_d2
++
++
++@njit(parallel=True, nogil=True, cache=True)
++def _permutation_moments_normalized(
++    indices: NDArrayA,
++    indptr: NDArrayA,
++    int_clust: NDArrayA,
++    group_offsets: NDArrayA,
++    group_indices: NDArrayA,
++    n_cls: int,
++    norm_code: int,
++    sizes: NDArrayA,
++    observed: NDArrayA,
++    generators: Any,
++    progress: Any,
++) -> tuple[NDArrayA, NDArrayA]:
++    """Moments of the permutation distribution for the ``'total'`` / ``'conditional'`` modes.
++
++    Normalizing divides by a row sum or a conditional denominator, so the statistic is fractional
++    and has to be accumulated in float64. Deviations are still taken against ``observed``, which
++    sits on the same scale as the null distribution: a raw sum-of-squares would cancel badly.
++    The summation order depends on the thread count, so the result matches to rounding rather than
++    bit-for-bit (measured at <= 1e-14 relative).
++
++    Returns ``(sum_d, sum_d2)``; the caller turns these into the mean, std and z-score.
++    """
++    n_perms = len(generators)
++    sum_d = np.zeros((n_cls, n_cls), dtype=np.float64)
++    sum_d2 = np.zeros((n_cls, n_cls), dtype=np.float64)
++    for p in prange(n_perms):
++        rng = generators[np.int64(p)]
++        shuffled = _shuffled_labels(int_clust, group_offsets, group_indices, rng)
++
++        if norm_code == 1:  # total
++            out = _normalize_total(_nenrich(indices, indptr, shuffled, n_cls), sizes)
++        else:  # conditional: one fused walk yields both the numerator and its denominator
++            cnt, cond = _counts_and_conditional(indices, indptr, shuffled, n_cls)
++            out = _normalize_conditional(cnt, cond)
++
++        local_d = np.zeros((n_cls, n_cls), dtype=np.float64)
++        local_d2 = np.zeros((n_cls, n_cls), dtype=np.float64)
++        for a in range(n_cls):
++            for b in range(n_cls):
++                dev = out[a, b] - observed[a, b]
++                local_d[a, b] = dev
++                local_d2[a, b] = dev * dev
++        sum_d += local_d
++        sum_d2 += local_d2
++        progress.update(1)
++    return sum_d, sum_d2
++
++
++_NORM_CODES = {"none": 0, "total": 1, "conditional": 2}
++
++
++def _filter_clusters_by_min_cell_count(
++    adj: csr_matrix,
++    int_clust: NDArrayA,
++    min_cell_count: int,
++) -> tuple[NDArrayA, NDArrayA, NDArrayA]:
++    clust_sizes = pd.Series(int_clust).value_counts()
++    valid_clusters = clust_sizes[clust_sizes >= min_cell_count].index.to_numpy()
+ 
+-    fn_key = f"_nenrich_{n_cls}_{parallel}"
+-    if fn_key not in globals():
+-        template = _template.format(init=init, loop=loop, finalize=finalize, n_cls=n_cls, parallel=parallel)
+-        exec(compile(template, "", "exec"), globals())
++    valid_mask = np.isin(int_clust, valid_clusters)
++    valid_cells_idx = np.where(valid_mask)[0]
++    int_clust = int_clust[valid_mask]
+ 
+-    return globals()[fn_key]  # type: ignore[no-any-return]
++    return int_clust, adj[np.ix_(valid_cells_idx, valid_cells_idx)], valid_mask
+ 
+ 
+ @d.get_sections(base="nhood_ench", sections=["Parameters"])
+ @d.dedent
+ @deprecated_randomness_param
++@deprecated_params({"numba_parallel": "1.10.0", "backend": "1.10.0"})
+ def nhood_enrichment(
+     adata: AnnData | SpatialData,
+     cluster_key: str,
+     library_key: str | None = None,
+     connectivity_key: str | None = None,
+     n_perms: int = 1000,
+-    numba_parallel: bool = False,
+     rng: SeedLike | RNGLike | None = None,
+     copy: bool = False,
+     n_jobs: int | None = None,
+-    backend: str = "loky",
+     show_progress_bar: bool = True,
++    normalization: str = "none",
++    min_cell_count: int = 0,
++    handle_nan: Literal["keep", "zero"] = "keep",
+     *,
+     table_key: str | None = None,
+ ) -> NhoodEnrichmentResult | None:
+@@ -176,19 +325,40 @@ def nhood_enrichment(
+     %(library_key)s
+     %(conn_key)s
+     %(n_perms)s
+-    %(numba_parallel)s
+     %(rng)s
+     %(copy)s
+-    %(parallelize)s
++    %(n_jobs_threads)s
++    %(show_progress_bar)s
++    normalization
++        Normalization mode to use, as compared in :cite:`schiller2025`:
++
++        - ``'none'``: No normalization of neighbor counts.
++        - ``'total'``: Divide by the number of cells of the index cluster (SEA). Cluster sizes are
++          unchanged by the permutation, so this rescales the statistic without changing the z-score.
++        - ``'conditional'``: Divide by the number of index-cluster cells having at least one
++          neighbor of the given type (COZI).
++    min_cell_count
++        Minimum number of cells a cluster must contain to be included. Clusters with fewer cells are
++        dropped before counting (default ``0`` keeps all clusters) and their z-scores are `NaN`
++        whatever ``handle_nan`` says. Worth raising: a cluster too small to give the permutation
++        null a spread of values yields an unreliable z-score, and in ``'conditional'`` mode a rare
++        cluster pair can leave the denominator at zero, which is reported as ``0``.
++    handle_nan
++        How to handle NaN values in z-scores:
++
++        - ``'zero'``: Replace NaN values with 0
++        - ``'keep'``: Keep NaN values (undefined enrichment)
+ 
+     Returns
+     -------
+     If ``copy = True``, returns a :class:`~squidpy.gr.NhoodEnrichmentResult` with the z-score and the enrichment count.
++    If normalization = "conditional", also contains the conditional ratio, otherwise it is None.
+ 
+     Otherwise, modifies the ``adata`` with the following keys:
+ 
+         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_nhood_enrichment']['zscore']`` - the enrichment z-score.
+         - :attr:`anndata.AnnData.uns` ``['{cluster_key}_nhood_enrichment']['count']`` - the enrichment count.
++        - :attr:`anndata.AnnData.uns` ``['{cluster_key}_nhood_enrichment']['conditional_ratio']`` - the ratio of cells of type A that neighbor type B.
+     """
+     adata = extract_adata_if_sdata(adata, table_key=table_key)
+     connectivity_key = Key.obsp.spatial_conn(connectivity_key)
+@@ -196,53 +366,169 @@ def nhood_enrichment(
+     _assert_connectivity_key(adata, connectivity_key)
+     assert_positive(n_perms, name="n_perms")
+ 
++    if normalization not in _NORM_CODES:
++        raise ValueError(f"Invalid normalization mode `{normalization}`. Choose from {sorted(_NORM_CODES)}.")
++    if handle_nan not in ("keep", "zero"):
++        raise ValueError(f"Invalid `handle_nan` mode `{handle_nan}`. Choose from 'keep', 'zero'.")
++
+     adj = adata.obsp[connectivity_key]
++    if not issparse(adj):
++        raise TypeError(
++            f"Expected `adata.obsp[{connectivity_key!r}]` to be a sparse matrix, found `{type(adj).__name__}`."
++        )
++    # CSC has `indices`/`indptr` too, but column-wise: without this the counts come out transposed
++    adj = adj.tocsr()
++    # The kernels read `indices`/`indptr` only, so anything the CSR stores is counted as an edge:
++    # a stored zero (what pruning in place, `adj.data[mask] = 0`, leaves behind) and each half of a
++    # duplicated `(i, j)` entry, which scipy defines as one edge whose value is the sum. Copy before
++    # canonicalizing -- `tocsr()` hands back the caller's own matrix when it is already CSR, and
++    # `count_nonzero()` cannot be used to test for this because it sums duplicates in place.
++    if not adj.has_canonical_format or (adj.data == 0).any():
++        adj = adj.copy()
++        adj.sum_duplicates()
++        adj.eliminate_zeros()
+     original_clust = adata.obs[cluster_key]
+-    clust_map = {v: i for i, v in enumerate(original_clust.cat.categories.values)}  # map categories
+-    int_clust = np.array([clust_map[c] for c in original_clust], dtype=ndt)
+-
++    # `.cat.codes` already holds each cell's index into `cat.categories`. NaN shows up as `-1`,
++    # which `ndt` would wrap into a huge cluster id, so reject it rather than let it index out of
++    # range.
++    codes = original_clust.cat.codes.to_numpy()
++    if (codes < 0).any():
++        raise ValueError(f"Found `NaN` values in `adata.obs[{cluster_key!r}]`; every cell needs a cluster.")
++    int_clust = codes.astype(ndt)
++    n_total_cells = len(int_clust)
++
++    # `min_cell_count=0` keeps every cluster, so the filter would rebuild `adj` into an identical
++    # copy -- an `nnz`-sized allocation on the default path.
++    if min_cell_count > 0:
++        int_clust, adj, valid_mask = _filter_clusters_by_min_cell_count(adj, int_clust, min_cell_count)
++    else:
++        valid_mask = np.ones(n_total_cells, dtype=bool)
+     if library_key is not None:
+         _assert_categorical_obs(adata, key=library_key)
+-        libraries: pd.Series | None = adata.obs[library_key]
++        if (adata.obs[library_key].cat.codes.to_numpy() < 0).any():
++            raise ValueError(f"Found `NaN` values in `adata.obs[{library_key!r}]`; every cell needs a library.")
++        # subset to the kept cells so the per-cell series stays aligned with the filtered
++        libraries: pd.Series | None = adata.obs[library_key].iloc[valid_mask].cat.remove_unused_categories()
+     else:
+         libraries = None
+ 
++    n_filtered = n_total_cells - len(int_clust)
++    if n_filtered > 0:
++        warnings.warn(
++            f"{n_filtered / n_total_cells * 100:.3f}% of cells were excluded because their clusters "
++            f"had fewer than {min_cell_count} cells.",
++            UserWarning,
++            # +2 for the `deprecated_randomness_param` and `deprecated_params` wrappers
++            stacklevel=4,
++        )
++
+     indices, indptr = (adj.indices.astype(ndt), adj.indptr.astype(ndt))
+-    n_cls = len(clust_map)
++    n_cls = len(original_clust.cat.categories)
++    if n_cls <= 1:
++        raise ValueError(f"Expected at least `2` clusters, found `{n_cls}`.")
+ 
+-    _test = _create_function(n_cls, parallel=numba_parallel)
+-    count = _test(indices, indptr, int_clust)
++    conditional_ratio = np.full((n_cls, n_cls), np.nan, dtype=np.float64)
+ 
+-    n_jobs = get_n_processes(n_jobs)
+-    start = logg.info(f"Calculating neighborhood enrichment using `{n_jobs}` core(s)")
+-    generators = np.random.default_rng(rng).spawn(n_perms)
+-
+-    perms = parallelize(
+-        _nhood_enrichment_helper,
+-        collection=np.arange(n_perms).tolist(),
+-        extractor=np.vstack,
+-        n_jobs=n_jobs,
+-        backend=backend,
+-        show_progress_bar=show_progress_bar,
+-    )(
+-        callback=_test,
+-        indices=indices,
+-        indptr=indptr,
+-        int_clust=int_clust,
+-        libraries=libraries,
+-        n_cls=n_cls,
+-        generators=generators,
+-    )
+-    zscore = (count - perms.mean(axis=0)) / perms.std(axis=0)
++    # label permutation preserves cluster sizes, so this is a constant of the null
++    cluster_sizes = np.bincount(int_clust, minlength=n_cls).astype(np.float64)
++
++    if normalization == "conditional":
++        # one fused walk: this mode is the only one that needs the conditional denominator too
++        count, cond_counts = _counts_and_conditional(indices, indptr, int_clust, n_cls)
++
++        nonempty = cluster_sizes > 0
++        conditional_ratio[nonempty] = cond_counts[nonempty] / cluster_sizes[nonempty, None]
++
++        count_normalized = _normalize_conditional(count, cond_counts)
++    else:
++        count = _nenrich(indices, indptr, int_clust, n_cls)
++        if normalization == "total":
++            count_normalized = _normalize_total(count, cluster_sizes)
++        else:  # "none"
++            count_normalized = count.copy()
++
++    n_jobs = get_n_numba_threads(n_jobs)
++    start = logg.info(f"Calculating neighborhood enrichment using `{n_jobs}` thread(s)")
++    norm_code = _NORM_CODES[normalization]
++
++    generators = List(np.random.default_rng(rng).spawn(n_perms))
++
++    # Group structure for within-group shuffling, as a CSR-like (offsets, indices) pair in category
++    # order with ascending indices per group. Without a `library_key` there is a single group
++    # spanning all cells, which reproduces a plain global shuffle.
++    group_offsets, group_indices = _build_shuffle_groups(libraries, len(int_clust))
++
++    # A single numba ``prange`` kernel shuffles + counts + normalizes per thread with the GIL
++    # released, and ticks the progress bar from inside the loop; numba owns the parallelism.
++    # Unnormalized counts go through the integer kernel, which is exactly order-independent.
++    with (
++        numba_threads(n_jobs),
++        ProgressBar(total=n_perms, unit="perm", desc="nhood_enrichment", disable=not show_progress_bar) as progress,
++    ):
++        if norm_code == 0:
++            sum_d, sum_d2 = _permutation_moments_counts(
++                indices,
++                indptr,
++                int_clust,
++                group_offsets,
++                group_indices,
++                n_cls,
++                np.ascontiguousarray(count_normalized, dtype=np.int64),
++                generators,
++                progress,
++            )
++        else:
++            sum_d, sum_d2 = _permutation_moments_normalized(
++                indices,
++                indptr,
++                int_clust,
++                group_offsets,
++                group_indices,
++                n_cls,
++                norm_code,
++                cluster_sizes,
++                np.ascontiguousarray(count_normalized, dtype=np.float64),
++                generators,
++                progress,
++            )
++
++    # ``sum_d``/``sum_d2`` are moments of ``permuted - observed``, so the mean deviation *is* the
++    # (negated) numerator of the z-score and no permutation ever has to be kept around. The int64
++    # sums are exact, so converting here is a single deterministic rounding, not an accumulated one.
++    n = float(n_perms)
++    mean_d = sum_d / n
++    var = (sum_d2 - sum_d * mean_d) / n  # population variance, i.e. ddof=0
++    std = np.sqrt(np.maximum(var, 0.0))  # clamp: rounding can push an all-equal column just below 0
++    std[std == 0] = np.nan
++    zscore = -mean_d / std
++
++    if handle_nan == "zero":
++        zscore = np.nan_to_num(zscore, nan=0.0)
++
++    # `handle_nan` governs enrichments the permutation test leaves undefined. A cluster dropped by
++    # `min_cell_count` was never measured at all, so it stays NaN either way -- otherwise `'zero'`
++    # would render "excluded" and "no enrichment" as the same number.
++    dropped = cluster_sizes == 0
++    if dropped.any():
++        zscore[dropped, :] = np.nan
++        zscore[:, dropped] = np.nan
++
++    result_kwargs = {"zscore": zscore, "count": count}
++    if normalization == "conditional":
++        result_kwargs["conditional_ratio"] = conditional_ratio
+ 
+     if copy:
+-        return NhoodEnrichmentResult(zscore=zscore, counts=count)
++        return NhoodEnrichmentResult(
++            zscore=result_kwargs["zscore"],
++            counts=result_kwargs["count"],
++            conditional_ratio=result_kwargs.get("conditional_ratio"),
++        )
+ 
+     _save_data(
+         adata,
+         attr="uns",
+         key=Key.uns.nhood_enrichment(cluster_key),
+-        data={"zscore": zscore, "count": count},
++        data=result_kwargs,
+         time=start,
+     )
+ 
+@@ -518,35 +804,21 @@ def _centrality_scores_helper(
+     return pd.DataFrame(res_list, columns=[method], index=cat)
+ 
+ 
+-def _nhood_enrichment_helper(
+-    ixs: NDArrayA,
+-    callback: Callable[[NDArrayA, NDArrayA, NDArrayA], NDArrayA],
+-    indices: NDArrayA,
+-    indptr: NDArrayA,
+-    int_clust: NDArrayA,
++def _build_shuffle_groups(
+     libraries: pd.Series[CategoricalDtype] | None,
+-    n_cls: int,
+-    generators: Sequence[np.random.Generator],
+-    queue: SigQueue | None = None,
+-) -> NDArrayA:
+-    perms = np.empty((len(ixs), n_cls, n_cls), dtype=np.float64)
+-    int_clust = int_clust.copy()  # threading; used as a read-only base for each permutation
+-
+-    for i, ix in enumerate(ixs):
+-        # shuffle from the same base with a per-permutation generator, so each permutation is
+-        # independent of the others and of how the permutations are split across jobs
+-        rng = generators[ix]
+-        if libraries is not None:
+-            shuffled = _shuffle_group(int_clust, libraries, rng)
+-        else:
+-            shuffled = int_clust.copy()
+-            rng.shuffle(shuffled)
+-        perms[i, ...] = callback(indices, indptr, shuffled)
+-
+-        if queue is not None:
+-            queue.put(Signal.UPDATE)
++    n_cells: int,
++) -> tuple[NDArrayA, NDArrayA]:
++    """Build a CSR-like ``(offsets, indices)`` description of the within-group shuffling.
+ 
+-    if queue is not None:
+-        queue.put(Signal.FINISH)
+-
+-    return perms
++    ``indices[offsets[g]:offsets[g + 1]]`` are the cell indices of group ``g`` in ascending order,
++    with groups in category order. Without a ``library_key`` there is a single group spanning all
++    cells, which reproduces a global shuffle.
++    """
++    if libraries is None:
++        return np.array([0, n_cells], dtype=np.int64), np.arange(n_cells, dtype=np.int64)
++
++    codes = libraries.cat.codes.to_numpy()
++    n_groups = len(libraries.cat.categories)
++    group_indices = np.argsort(codes, kind="stable").astype(np.int64)
++    group_offsets = np.concatenate(([0], np.cumsum(np.bincount(codes, minlength=n_groups)))).astype(np.int64)
++    return group_offsets, group_indices
+diff --git a/src/squidpy/gr/_utils.py b/src/squidpy/gr/_utils.py
+index ac942b6d2..c07babc6f 100644
+--- a/src/squidpy/gr/_utils.py
++++ b/src/squidpy/gr/_utils.py
+@@ -7,7 +7,6 @@
+ from typing import Any
+ 
+ import numpy as np
+-import pandas as pd
+ from anndata import AnnData
+ from anndata.utils import make_index_unique
+ from pandas import CategoricalDtype
+@@ -180,34 +179,3 @@ def key_present() -> bool:
+             # in principle we assume the callee doesn't change the index
+             # otherwise, would need to check whether it has been changed and add an option to determine what to do
+             adata.var.index = var_names
+-
+-
+-def _shuffle_group(
+-    cluster_annotation: NDArrayA,
+-    libraries: pd.Series[CategoricalDtype],
+-    rs: np.random.Generator,
+-) -> NDArrayA:
+-    """
+-    Shuffle values in ``arr`` for each category in ``categories``.
+-
+-    Useful when the shuffling of categories is used in permutation tests where the order of values in ``arr`` matters
+-    (e.g. you only want to shuffle cluster annotations for the same slide/library_key, and not across slides)
+-
+-    Parameters
+-    ----------
+-    cluster_annotation
+-        Array to shuffle.
+-    libraries
+-        Categories (e.g. libraries) to subset for shuffling.
+-
+-    Returns
+-    -------
+-    Shuffled annotations.
+-    """
+-    cluster_annotation_output = np.empty(libraries.shape, dtype=cluster_annotation.dtype)
+-    for c in libraries.cat.categories:
+-        idx = np.where(libraries == c)[0]
+-        arr_group = cluster_annotation[idx].copy()
+-        rs.shuffle(arr_group)  # it's done in place hence copy before
+-        cluster_annotation_output[idx] = arr_group
+-    return cluster_annotation_output
+diff --git a/src/squidpy/pl/__init__.py b/src/squidpy/pl/__init__.py
+index 9ddbf2386..313ff7364 100644
+--- a/src/squidpy/pl/__init__.py
++++ b/src/squidpy/pl/__init__.py
+@@ -7,6 +7,7 @@
+     co_occurrence,
+     interaction_matrix,
+     nhood_enrichment,
++    nhood_enrichment_dotplot,
+     ripley,
+ )
+ from squidpy.pl._ligrec import ligrec
+diff --git a/src/squidpy/pl/_graph.py b/src/squidpy/pl/_graph.py
+index f2077603b..18d8cb127 100644
+--- a/src/squidpy/pl/_graph.py
++++ b/src/squidpy/pl/_graph.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import warnings
+ from collections.abc import Mapping, Sequence
+ from pathlib import Path
+ from types import MappingProxyType
+@@ -10,6 +11,7 @@
+ import matplotlib.pyplot as plt
+ import numpy as np
+ import pandas as pd
++import scanpy as sc
+ import seaborn as sns
+ from anndata import AnnData
+ from matplotlib.axes import Axes
+@@ -22,7 +24,14 @@
+ from squidpy.pl._color_utils import Palette_t, _get_palette, _maybe_set_colors
+ from squidpy.pl._utils import _heatmap, save_fig
+ 
+-__all__ = ["centrality_scores", "interaction_matrix", "nhood_enrichment", "ripley", "co_occurrence"]
++__all__ = [
++    "centrality_scores",
++    "interaction_matrix",
++    "nhood_enrichment",
++    "nhood_enrichment_dotplot",
++    "ripley",
++    "co_occurrence",
++]
+ 
+ 
+ def _get_data(adata: AnnData, cluster_key: str, func_name: str, attr: str = "uns", **kwargs: Any) -> Any:
+@@ -237,6 +246,116 @@ def nhood_enrichment(
+         save_fig(fig, path=save)
+ 
+ 
++@d.dedent
++def nhood_enrichment_dotplot(
++    adata: AnnData,
++    cluster_key: str,
++    annotate: bool = False,
++    title: str | None = None,
++    cmap: str = "RdBu_r",
++    figsize: tuple[float, float] | None = None,
++    dpi: int | None = None,
++    size_range: tuple[float, float] = (10, 200),
++    save: str | Path | None = None,
++    ax: Axes | None = None,
++    **kwargs: Any,
++) -> None:
++    """
++    Dot plot of neighborhood enrichment.
++
++    The enrichment is computed by :func:`squidpy.gr.nhood_enrichment`. Color shows the z-score,
++    dot size the conditional cell ratio (CCR) from ``normalization='conditional'`` -- the fraction
++    of cells of the row type having at least one neighbor of the column type.
++
++    Parameters
++    ----------
++    %(adata)s
++    %(cluster_key)s
++    annotate
++        Whether to annotate the dots with their CCR values.
++    title
++        The title of the plot.
++    cmap
++        Diverging colormap for the z-score, centered on zero whenever the data spans both signs.
++    size_range
++        Smallest and largest dot size, which the CCR is scaled onto.
++    %(plotting)s
++    ax
++        Axes, :class:`matplotlib.axes.Axes`.
++    kwargs
++        Keyword arguments for :meth:`scanpy.pl.DotPlot.style`.
++
++    Returns
++    -------
++    %(plotting_returns)s
++    """
++    _assert_categorical_obs(adata, key=cluster_key)
++    enrichment = _get_data(adata, cluster_key=cluster_key, func_name="nhood_enrichment")
++
++    zscore = enrichment["zscore"]
++    ccr = enrichment.get("conditional_ratio")
++
++    if ccr is None:
++        warnings.warn(
++            "'conditional_ratio' is None in nhood_enrichment results. Please run nhood_enrichment "
++            "with normalization = 'conditional'. Dot size will not reflect conditional cell ratios.",
++            UserWarning,
++            stacklevel=2,
++        )
++        ccr = np.ones_like(zscore)
++        annotate = False  # the values are a placeholder; printing them would look like real data
++
++    cats = list(adata.obs[cluster_key].cat.categories)
++    # `DotPlot` reads its values from ``dot_color_df``/``dot_size_df``, so this stand-in only has to
++    # carry the right groups and var names; ``X`` is never touched.
++    grid = AnnData(
++        np.zeros((len(cats), len(cats)), dtype=np.float32),
++        obs=pd.DataFrame({cluster_key: pd.Categorical(cats, categories=cats)}, index=cats),
++        var=pd.DataFrame(index=pd.Index(cats)),
++    )
++    # A z-score is signed, so anchor the colormap at zero. Only when the data actually straddles
++    # zero, since TwoSlopeNorm requires vmin < vcenter < vmax -- and only with explicit bounds,
++    # because undefined enrichments are NaN by default and autoscaling over them yields NaN.
++    finite = zscore[np.isfinite(zscore)]
++    if finite.size and finite.min() < 0 < finite.max():
++        vmin, vmax, vcenter = float(finite.min()), float(finite.max()), 0.0
++    else:
++        vmin = vmax = vcenter = None
++    dp = (
++        sc.pl.DotPlot(
++            grid,
++            var_names=cats,
++            groupby=cluster_key,
++            dot_color_df=pd.DataFrame(zscore, index=cats, columns=cats),
++            dot_size_df=pd.DataFrame(ccr, index=cats, columns=cats),
++            title=title,
++            figsize=figsize,
++            vmin=vmin,
++            vmax=vmax,
++            vcenter=vcenter,
++            ax=ax,
++        )
++        .style(cmap=cmap, smallest_dot=size_range[0], largest_dot=size_range[1], **kwargs)
++        .legend(colorbar_title="Z-score", size_title="CCR")
++    )
++    dp.make_figure()
++
++    main_ax = dp.get_axes()["mainplot_ax"]
++    main_ax.set_xlabel("Neighbor cell type")
++    main_ax.set_ylabel("Index cell type")
++    if annotate:
++        for i in range(len(cats)):
++            for j in range(len(cats)):
++                main_ax.text(j + 0.5, i + 0.5, f"{ccr[i, j]:.2f}", ha="center", va="center")
++
++    fig = main_ax.figure
++    if dpi is not None:
++        fig.set_dpi(dpi)
++    if save is not None:
++        # `set_dpi` is not honoured by `savefig`, so the saved file needs it passed through
++        save_fig(fig, path=save, **({} if dpi is None else {"dpi": dpi}))
++
++
+ @d.dedent
+ def ripley(
+     adata: AnnData,
+diff --git a/tests/_images/Graph_nhood_enrichment_dotplot.png b/tests/_images/Graph_nhood_enrichment_dotplot.png
+new file mode 100644
+index 000000000..63a810ee1
+Binary files /dev/null and b/tests/_images/Graph_nhood_enrichment_dotplot.png differ
+diff --git a/tests/graph/test_nhood.py b/tests/graph/test_nhood.py
+index dc71674fa..5aa4f7315 100644
+--- a/tests/graph/test_nhood.py
++++ b/tests/graph/test_nhood.py
+@@ -1,8 +1,11 @@
+ from __future__ import annotations
+ 
++import warnings
++
+ import numpy as np
+ import pandas as pd
+ import pytest
++import scipy.sparse as sp
+ from anndata import AnnData
+ 
+ from squidpy._constants._pkg_constants import Key
+@@ -30,11 +33,25 @@ def test_nhood_enrichment(self, adata: AnnData):
+ 
+         self._assert_common(adata)
+ 
+-    @pytest.mark.parametrize("backend", ["threading", "multiprocessing", "loky"])
+-    def test_parallel_works(self, adata: AnnData, backend: str):
++    @pytest.mark.parametrize("param", ["numba_parallel", "backend"])
++    def test_deprecated_params_are_ignored(self, adata: AnnData, param: str):
++        """A deprecated argument is stripped before the call, so it cannot change the result."""
+         spatial_neighbors_grid(adata)
+ 
+-        nhood_enrichment(adata, cluster_key=_CK, n_jobs=2, n_perms=20, backend=backend)
++        kw = {"cluster_key": _CK, "rng": 42, "n_perms": 20, "copy": True}
++        expected = nhood_enrichment(adata, **kw)
++        with pytest.warns(FutureWarning, match=rf"`{param}`.*is deprecated"):
++            got = nhood_enrichment(adata, **kw, **{param: "loky" if param == "backend" else True})
++
++        np.testing.assert_array_equal(got.zscore, expected.zscore)
++        np.testing.assert_array_equal(got.counts, expected.counts)
++
++    def test_no_deprecation_warning_by_default(self, adata: AnnData):
++        spatial_neighbors_grid(adata)
++
++        with warnings.catch_warnings():
++            warnings.simplefilter("error", FutureWarning)
++            nhood_enrichment(adata, cluster_key=_CK, n_perms=20)
+ 
+         self._assert_common(adata)
+ 
+@@ -65,7 +82,12 @@ def test_reproducibility(self, adata: AnnData, n_jobs: int):
+         np.testing.assert_array_equal(res3.counts, res2.counts)
+ 
+     def test_n_jobs_invariance(self, adata: AnnData):
+-        """The number of workers must not change the result (one seed is spawned per permutation)."""
++        """The number of workers must not change the result (one seed is spawned per permutation).
++
++        The default ``normalization='none'`` accumulates its moments in int64, where addition is
++        associative, so the reduction is bit-identical regardless of thread count. See
++        ``test_zscore_independent_of_n_jobs`` for the normalized modes, which are float64.
++        """
+         spatial_neighbors_grid(adata)
+ 
+         kw = {"cluster_key": _CK, "rng": 42, "n_perms": 20, "copy": True}
+@@ -86,7 +108,7 @@ def test_centrality_scores(nhood_data: AnnData):
+ 
+     key = Key.uns.centrality_scores(_CK)
+ 
+-    assert key in adata.uns_keys()
++    assert key in adata.uns
+     assert isinstance(adata.uns[key], pd.DataFrame)
+     assert len(adata.obs[_CK].unique()) == adata.uns[key].shape[0]
+     assert adata.uns[key]["degree_centrality"].dtype == np.dtype("float64")
+@@ -126,10 +148,10 @@ def test_interaction_matrix_copy(nhood_data: AnnData, copy: bool):
+ 
+     if not copy:
+         assert res is None
+-        assert key in adata.uns_keys()
++        assert key in adata.uns
+         res = adata.uns[key]
+     else:
+-        assert key not in adata.uns_keys()
++        assert key not in adata.uns
+ 
+     assert isinstance(res, np.ndarray)
+     assert res.shape == (n_cls, n_cls)
+@@ -177,3 +199,227 @@ def test_interaction_matrix_nan_values(adata_intmat: AnnData):
+ 
+     np.testing.assert_array_equal(expected_weighted, result_weighted)
+     np.testing.assert_array_equal(expected_unweighted, result_unweighted)
++
++
++@pytest.mark.parametrize("normalization", ["none", "total", "conditional"])
++def test_nhood_enrichment_normalization_modes(adata: AnnData, normalization: str):
++    spatial_neighbors_grid(adata)
++    result = nhood_enrichment(adata, cluster_key=_CK, normalization=normalization, n_jobs=1, n_perms=20, copy=True)
++
++    z, count, ccr = result
++
++    assert isinstance(z, np.ndarray)
++    assert isinstance(count, np.ndarray)
++    if normalization == "conditional":
++        assert isinstance(ccr, np.ndarray)
++        assert z.shape == ccr.shape
++        assert count.shape == ccr.shape
++    assert z.shape == count.shape
++    assert z.shape[0] == adata.obs[_CK].cat.categories.shape[0]
++
++
++def test_conditional_normalization_zero_division(adata: AnnData):
++    adata = adata.copy()
++    min_cells = 10
++    adata.obs[_CK] = adata.obs[_CK].cat.add_categories("isolated")
++    adata.obs.loc[adata.obs.index[0], _CK] = "isolated"
++    spatial_neighbors_grid(adata)
++    valid_clusters = [c for c, count in adata.obs[_CK].value_counts().items() if count >= min_cells]
++    valid_idx = [i for i, cat in enumerate(adata.obs[_CK].cat.categories) if cat in valid_clusters]
++
++    result = nhood_enrichment(adata, cluster_key=_CK, normalization="conditional", copy=True)
++    assert result is not None
++    zscore, count_normalized, conditional_ratio = result
++    assert not np.any(np.isinf(zscore))
++    assert not np.any(np.isinf(count_normalized))
++    assert not np.any(np.isinf(conditional_ratio))
++    assert not np.isnan(zscore[np.ix_(valid_idx, valid_idx)]).any()
++    assert not np.isnan(count_normalized[np.ix_(valid_idx, valid_idx)]).any()
++    assert not np.isnan(conditional_ratio[np.ix_(valid_idx, valid_idx)]).any()
++
++
++def _asymmetric_adata(n: int = 200, n_cls: int = 4) -> AnnData:
++    """An adata whose connectivity is deliberately asymmetric, so a transpose is visible."""
++    rng = np.random.default_rng(0)
++    adj = sp.random(n, n, density=0.03, format="csr", random_state=0)
++    adj.data[:] = 1.0
++    adj.setdiag(0)
++    adj.eliminate_zeros()
++    assert (adj != adj.T).nnz > 0, "graph must be asymmetric for this test to mean anything"
++
++    adata = AnnData(
++        np.zeros((n, 1), dtype=np.float32),
++        obs=pd.DataFrame(
++            {_CK: pd.Categorical(rng.integers(0, n_cls, n).astype(str))}, index=[f"c{i}" for i in range(n)]
++        ),
++        obsp={Key.obsp.spatial_conn(): adj},
++    )
++    return adata
++
++
++@pytest.mark.parametrize(
++    "convert",
++    [sp.csr_matrix, sp.csr_array, sp.csc_matrix, sp.csc_array],
++    ids=["csr_matrix", "csr_array", "csc_matrix", "csc_array"],
++)
++def test_sparse_formats_agree(convert):
++    """CSC exposes ``indices``/``indptr`` too, but column-wise -- it must not yield the transpose."""
++    adata = _asymmetric_adata()
++    kw = {"cluster_key": _CK, "n_perms": 5, "rng": 0, "n_jobs": 1, "copy": True}
++    reference = nhood_enrichment(adata, **kw)
++    assert not np.array_equal(reference.counts, reference.counts.T), "asymmetry must reach the counts"
++
++    adata.obsp[Key.obsp.spatial_conn()] = convert(adata.obsp[Key.obsp.spatial_conn()])
++    np.testing.assert_array_equal(nhood_enrichment(adata, **kw).counts, reference.counts)
++
++
++@pytest.mark.parametrize("densify", [np.asarray, np.asmatrix], ids=["ndarray", "matrix"])
++def test_dense_connectivity_raises(densify):
++    """A dense ``obsp`` has no ``indices``/``indptr``; refuse it instead of densifying or crashing."""
++    adata = _asymmetric_adata()
++    adata.obsp[Key.obsp.spatial_conn()] = densify(adata.obsp[Key.obsp.spatial_conn()].toarray())
++    with pytest.raises(TypeError, match=r"to be a sparse matrix, found"):
++        nhood_enrichment(adata, cluster_key=_CK, n_perms=5, rng=0, copy=True)
++
++
++def _nan_cluster(adata: AnnData) -> None:
++    adata.obs[_CK] = adata.obs[_CK].cat.add_categories("tmp")
++    adata.obs.loc[adata.obs.index[0], _CK] = "tmp"
++    adata.obs[_CK] = adata.obs[_CK].replace("tmp", np.nan).astype("category")
++
++
++def _one_cluster(adata: AnnData) -> None:
++    adata.obs[_CK] = pd.Categorical(["only"] * adata.n_obs)
++
++
++@pytest.mark.parametrize(
++    ("mutate", "kwargs", "match"),
++    [
++        (None, {"handle_nan": "nonsense"}, "Invalid `handle_nan` mode"),
++        (None, {"normalization": "invalid_mode"}, "Invalid normalization mode"),
++        (_nan_cluster, {}, "Found `NaN` values"),
++        (_one_cluster, {}, "Expected at least `2` clusters"),
++    ],
++    ids=["handle_nan", "normalization", "nan_cluster", "one_cluster"],
++)
++def test_nhood_enrichment_rejects(adata: AnnData, mutate, kwargs, match: str):
++    adata = adata.copy()
++    spatial_neighbors_grid(adata)
++    if mutate is not None:
++        mutate(adata)
++
++    with pytest.raises(ValueError, match=match):
++        nhood_enrichment(adata, cluster_key=_CK, n_perms=5, copy=True, **kwargs)
++
++
++def test_handle_nan_zero_replaces_undefined_zscores(adata: AnnData):
++    """``'keep'`` leaves undefined enrichments as NaN; ``'zero'`` replaces them and nothing else."""
++    spatial_neighbors_grid(adata)
++    kw = {"cluster_key": _CK, "n_perms": 20, "rng": 0, "copy": True}
++
++    kept = nhood_enrichment(adata, handle_nan="keep", **kw)
++    assert np.isnan(kept.zscore).any(), "fixture should produce at least one undefined z-score"
++
++    zeroed = nhood_enrichment(adata, handle_nan="zero", **kw)
++    assert not np.isnan(zeroed.zscore).any()
++    defined = ~np.isnan(kept.zscore)
++    np.testing.assert_array_equal(zeroed.zscore[defined], kept.zscore[defined])
++
++
++def test_interaction_matrix_all_nan_raises(adata: AnnData):
++    adata = adata.copy()
++    spatial_neighbors_grid(adata)
++    adata.obs[_CK] = pd.Categorical([np.nan] * adata.n_obs, categories=["a", "b"])
++
++    with pytest.raises(RuntimeError, match="none remain"):
++        interaction_matrix(adata, cluster_key=_CK, copy=True)
++
++
++@pytest.mark.parametrize("show_progress_bar", [False, True])
++def test_centrality_scores_single_score(nhood_data: AnnData, show_progress_bar: bool):
++    """A bare string selects one measure; ``show_progress_bar`` is what builds parallelize's queue."""
++    df = centrality_scores(
++        nhood_data, cluster_key=_CK, score="degree_centrality", show_progress_bar=show_progress_bar, copy=True
++    )
++    assert list(df.columns) == ["degree_centrality"]
++
++
++def test_duplicate_entries_count_once():
++    """scipy defines a repeated ``(i, j)`` as one edge whose value is the sum, not two edges."""
++    adj = sp.csr_matrix((np.array([1.0, 1.0, 1.0, 1.0]), np.array([1, 1, 2, 0]), np.array([0, 3, 4, 4])), shape=(3, 3))
++    before = (adj.nnz, adj.indices.copy(), adj.data.copy())
++    adata = AnnData(
++        np.zeros((3, 1), dtype=np.float32),
++        obs=pd.DataFrame({_CK: pd.Categorical(["a", "b", "b"], categories=["a", "b"])}, index=list("xyz")),
++        obsp={Key.obsp.spatial_conn(): adj},
++    )
++
++    result = nhood_enrichment(adata, cluster_key=_CK, n_perms=5, rng=0, copy=True)
++    np.testing.assert_array_equal(result.counts, [[0, 2], [1, 0]])
++
++    # canonicalizing must happen on a copy: `count_nonzero()` would have summed these in place
++    stored = adata.obsp[Key.obsp.spatial_conn()]
++    assert (stored.nnz, stored.indices.tolist(), stored.data.tolist()) == (
++        before[0],
++        before[1].tolist(),
++        before[2].tolist(),
++    )
++
++
++def test_stored_zeros_are_not_edges():
++    """Pruning a graph in place leaves explicit zeros behind; they must not count as neighbors."""
++    adata = _asymmetric_adata(n=120, n_cls=3)
++    adj = adata.obsp[Key.obsp.spatial_conn()].copy()
++
++    rng = np.random.default_rng(0)
++    adj.data[rng.random(adj.nnz) < 0.4] = 0.0  # prune, sparse-safe: structure and nnz unchanged
++    adata.obsp[Key.obsp.spatial_conn()] = adj
++    assert adj.nnz != adj.count_nonzero(), "the fixture must actually contain stored zeros"
++
++    pruned = adj.copy()
++    pruned.eliminate_zeros()
++    expected = adata.copy()
++    expected.obsp[Key.obsp.spatial_conn()] = pruned
++
++    kw = {"cluster_key": _CK, "n_perms": 20, "rng": 0, "n_jobs": 1, "copy": True}
++    np.testing.assert_array_equal(nhood_enrichment(adata, **kw).counts, nhood_enrichment(expected, **kw).counts)
++    # and the caller's matrix is left as they gave it
++    assert adata.obsp[Key.obsp.spatial_conn()].nnz == adj.nnz
++
++
++def test_nan_library_key_raises():
++    adata = _asymmetric_adata(n=60, n_cls=3)
++    adata.obs["lib"] = pd.Categorical([np.nan] + ["s1"] * (adata.n_obs - 1), categories=["s1"])
++
++    with pytest.raises(ValueError, match="Found `NaN` values"):
++        nhood_enrichment(adata, cluster_key=_CK, library_key="lib", n_perms=5, copy=True)
++
++
++@pytest.mark.parametrize("handle_nan", ["keep", "zero"])
++def test_min_cell_count_excludes_clusters(adata: AnnData, handle_nan: str):
++    """Dropped clusters are excluded, not measured: NaN whatever ``handle_nan`` says, and the
++    clusters that survive must see exactly the graph they would if the dropped cells never existed.
++    """
++    adata = adata.copy()
++    spatial_neighbors_grid(adata)
++    cats = list(adata.obs[_CK].cat.categories)
++    sizes = adata.obs[_CK].value_counts()
++    threshold = 10
++
++    dropped = [i for i, c in enumerate(cats) if sizes[c] < threshold]
++    kept = [i for i, c in enumerate(cats) if sizes[c] >= threshold]
++    assert dropped and len(kept) >= 2, f"fixture needs both sides of the threshold: {sizes.to_dict()}"
++
++    with pytest.warns(UserWarning, match="were excluded"):
++        got = nhood_enrichment(
++            adata, cluster_key=_CK, min_cell_count=threshold, handle_nan=handle_nan, n_perms=20, rng=0, copy=True
++        )
++
++    for i in dropped:
++        assert np.isnan(got.zscore[i, :]).all() and np.isnan(got.zscore[:, i]).all()
++        assert (got.counts[i, :] == 0).all() and (got.counts[:, i] == 0).all()
++
++    subset = adata[adata.obs[_CK].isin([cats[i] for i in kept])].copy()
++    subset.obs[_CK] = subset.obs[_CK].cat.remove_unused_categories()
++    expected = nhood_enrichment(subset, cluster_key=_CK, n_perms=20, rng=0, copy=True)
++    np.testing.assert_array_equal(got.counts[np.ix_(kept, kept)], expected.counts)
+diff --git a/tests/graph/test_nhood_correctness.py b/tests/graph/test_nhood_correctness.py
+new file mode 100644
+index 000000000..8420f6d08
+--- /dev/null
++++ b/tests/graph/test_nhood_correctness.py
+@@ -0,0 +1,457 @@
++"""Correctness tests for :func:`squidpy.gr.nhood_enrichment`.
++
++These tests pin down the *numerical* behaviour of neighborhood enrichment, as
++opposed to the shape/dtype smoke tests in ``test_nhood.py``.
++
++The reference implementations below are written from scratch with plain Python
++loops and share no code with the numba kernels in ``squidpy.gr._nhood``. Their
++only purpose is to be an independent specification: when the reference and the
++real implementation agree, the numba kernels *and* the normalization math are
++validated. They are deliberately slow and simple.
++
++They also act as the regression guard for the permutation / parallelization
++machinery. Each permutation gets its own generator spawned from a single
++:class:`numpy.random.SeedSequence`, and numba's ``Generator.shuffle`` reproduces
++numpy's bit-for-bit, so :func:`_reference_nhood_enrichment` reproduces the exact
++z-score independently of the thread count.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData
++from scipy.sparse import csr_matrix
++
++from squidpy._utils import RNGLike, SeedLike
++from squidpy.gr import nhood_enrichment, spatial_neighbors_grid
++from squidpy.gr._nhood import _build_shuffle_groups, _shuffled_labels
++
++_CK = "leiden"
++
++
++# --------------------------------------------------------------------------- #
++# Independent reference implementations (plain Python, no numba)
++# --------------------------------------------------------------------------- #
++def _ref_shuffle_group(
++    cluster_annotation: np.ndarray,
++    libraries: pd.Series,
++    rs: np.random.Generator,
++) -> np.ndarray:
++    """Shuffle ``cluster_annotation`` within each category of ``libraries``.
++
++    An independent statement of within-group shuffling, deliberately sharing no code with
++    ``_build_shuffle_groups`` + ``_shuffled_labels``, which it exists to check.
++    """
++    cluster_annotation_output = np.empty(libraries.shape, dtype=cluster_annotation.dtype)
++    for c in libraries.cat.categories:
++        idx = np.where(libraries == c)[0]
++        arr_group = cluster_annotation[idx].copy()
++        rs.shuffle(arr_group)  # it's done in place hence copy before
++        cluster_annotation_output[idx] = arr_group
++    return cluster_annotation_output
++
++
++def _ref_count(adj: csr_matrix, int_clust: np.ndarray, n_cls: int) -> np.ndarray:
++    """``count[a, b]`` = number of directed edges from a cluster-``a`` cell to a cluster-``b`` neighbor."""
++    adj = adj.tocsr()
++    count = np.zeros((n_cls, n_cls), dtype=np.uint32)
++    for i in range(adj.shape[0]):
++        a = int_clust[i]
++        for j in adj.indices[adj.indptr[i] : adj.indptr[i + 1]]:
++            count[a, int_clust[j]] += 1
++    return count
++
++
++def _ref_total(count: np.ndarray, int_clust: np.ndarray, n_cls: int) -> np.ndarray:
++    """SEA: interactions between ``a`` and ``b`` divided by the number of cells of type ``a``.
++
++    Counted straight from ``int_clust`` rather than from ``count``, so this stays an independent
++    statement of the definition -- dividing by the row sum of ``count`` would merely restate the
++    implementation and could not catch a wrong denominator.
++    """
++    sizes = np.array([(int_clust == a).sum() for a in range(n_cls)], dtype=np.float64)
++    sizes[sizes == 0] = 1.0
++    return count / sizes[:, None]
++
++
++def _ref_conditional(adj: csr_matrix, int_clust: np.ndarray, n_cls: int) -> tuple[np.ndarray, np.ndarray]:
++    """Return ``(count_normalized, conditional_ratio)`` for the conditional mode."""
++    adj = adj.tocsr()
++    count = _ref_count(adj, int_clust, n_cls)
++
++    # per-cell, per-cluster neighbor counts -> boolean "has at least one neighbor of type b"
++    has_neighbor = np.zeros((len(int_clust), n_cls), dtype=bool)
++    for i in range(len(int_clust)):
++        for j in adj.indices[adj.indptr[i] : adj.indptr[i + 1]]:
++            has_neighbor[i, int_clust[j]] = True
++
++    cond_counts = np.zeros((n_cls, n_cls), dtype=np.float64)
++    conditional_ratio = np.full((n_cls, n_cls), np.nan, dtype=np.float64)
++    for a in range(n_cls):
++        a_cells = int_clust == a
++        n_a = int(a_cells.sum())
++        if n_a == 0:
++            continue
++        for b in range(n_cls):
++            cond_counts[a, b] = has_neighbor[a_cells, b].sum()
++        conditional_ratio[a, :] = cond_counts[a, :] / n_a
++
++    safe = cond_counts.copy()
++    safe[safe == 0] = 1.0
++    return count / safe, conditional_ratio
++
++
++def _ref_normalize(adj: csr_matrix, int_clust: np.ndarray, n_cls: int, normalization: str) -> np.ndarray:
++    """``count_normalized`` for an arbitrary normalization mode."""
++    count = _ref_count(adj, int_clust, n_cls)
++    if normalization == "none":
++        return count.astype(np.float64)
++    if normalization == "total":
++        return _ref_total(count, int_clust, n_cls)
++    if normalization == "conditional":
++        return _ref_conditional(adj, int_clust, n_cls)[0]
++    raise ValueError(normalization)
++
++
++def _reference_nhood_enrichment(
++    adj: csr_matrix,
++    int_clust: np.ndarray,
++    n_cls: int,
++    *,
++    n_perms: int,
++    rng: SeedLike | RNGLike | None,
++    normalization: str,
++    libraries: pd.Series | None = None,
++) -> np.ndarray:
++    """Full z-score reference replicating the production per-permutation seeding scheme.
++
++    Permutation ``p`` uses ``np.random.default_rng(rng).spawn(n_perms)[p]`` and shuffles a private copy of the
++    original labels once. Because a permutation's stream depends only on its global index, the
++    result is independent of how permutations are spread across threads (i.e. of ``n_jobs``).
++    Numba's ``Generator.shuffle`` reproduces numpy's bit-for-bit, so this matches
++    :func:`squidpy.gr._nhood._permutation_moments_counts` exactly.
++    """
++    observed = _ref_normalize(adj, int_clust, n_cls, normalization)
++
++    generators = np.random.default_rng(rng).spawn(n_perms)
++    perms = np.empty((n_perms, n_cls, n_cls), dtype=np.float64)
++    for p in range(n_perms):
++        gen = generators[p]
++        if libraries is not None:
++            shuffled = _ref_shuffle_group(int_clust, libraries, gen)
++        else:
++            shuffled = int_clust.copy()
++            gen.shuffle(shuffled)
++        perms[p] = _ref_normalize(adj, shuffled, n_cls, normalization)
++
++    std = perms.std(axis=0)
++    std[std == 0] = np.nan
++    return (observed - perms.mean(axis=0)) / std
++
++
++# --------------------------------------------------------------------------- #
++# Tiny, fully deterministic graph
++# --------------------------------------------------------------------------- #
++@pytest.fixture()
++def adata_tiny() -> AnnData:
++    """A 6-cell, 3-cluster graph with a hand-chosen, symmetric adjacency.
++
++    Layout (clusters in brackets)::
++
++        0[0] - 1[0] - 2[1] - 3[1] - 4[2] - 5[2]
++        |_______________________________________|   (0-5 edge closes the ring)
++                       |_______|                      (2-4 cross edge)
++    """
++    n = 6
++    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0), (2, 4)]
++    rows, cols = [], []
++    for i, j in edges:
++        rows += [i, j]
++        cols += [j, i]
++    data = np.ones(len(rows), dtype=np.float64)
++    adj = csr_matrix((data, (rows, cols)), shape=(n, n))
++
++    clusters = pd.Categorical.from_codes([0, 0, 1, 1, 2, 2], categories=["A", "B", "C"])
++    adata = AnnData(
++        np.zeros((n, n)),
++        obs={_CK: clusters},
++        obsp={"spatial_connectivities": adj},
++    )
++    return adata
++
++
++def _int_clust(adata: AnnData) -> np.ndarray:
++    return adata.obs[_CK].cat.codes.to_numpy()
++
++
++# --------------------------------------------------------------------------- #
++# Deterministic output: counts
++# --------------------------------------------------------------------------- #
++def test_counts_match_reference_tiny(adata_tiny: AnnData):
++    adj = adata_tiny.obsp["spatial_connectivities"]
++    int_clust = _int_clust(adata_tiny)
++    n_cls = 3
++
++    result = nhood_enrichment(adata_tiny, cluster_key=_CK, n_perms=20, rng=0, copy=True)
++
++    expected = _ref_count(adj, int_clust, n_cls)
++    np.testing.assert_array_equal(result.counts, expected)
++    # the counts matrix is independent of the normalization mode
++    assert result.counts.dtype == np.uint32
++
++
++def test_counts_hardcoded_tiny(adata_tiny: AnnData):
++    """A fully hand-computable expectation, so the reference itself can't drift silently."""
++    result = nhood_enrichment(adata_tiny, cluster_key=_CK, n_perms=20, rng=0, copy=True)
++    # cluster A = {0,1}, B = {2,3}, C = {4,5}
++    # directed edges by (src cluster -> dst cluster), counting both directions of each undirected edge:
++    #   A-A: 0-1            -> 2
++    #   A-B: 1-2            -> 1 each way
++    #   A-C: 5-0            -> 1 each way
++    #   B-B: 2-3            -> 2
++    #   B-C: 3-4, 2-4       -> 2 each way
++    #   C-C: 4-5            -> 2
++    expected = np.array(
++        [
++            [2, 1, 1],
++            [1, 2, 2],
++            [1, 2, 2],
++        ],
++        dtype=np.uint32,
++    )
++    np.testing.assert_array_equal(result.counts, expected)
++
++
++@pytest.mark.parametrize("normalization", ["none", "total", "conditional"])
++def test_counts_invariant_to_normalization(adata_tiny: AnnData, normalization: str):
++    """Raw ``counts`` must be the observed edge counts regardless of normalization."""
++    adj = adata_tiny.obsp["spatial_connectivities"]
++    expected = _ref_count(adj, _int_clust(adata_tiny), 3)
++    result = nhood_enrichment(adata_tiny, cluster_key=_CK, normalization=normalization, n_perms=20, rng=0, copy=True)
++    np.testing.assert_array_equal(result.counts, expected)
++
++
++# --------------------------------------------------------------------------- #
++# Deterministic output: conditional_ratio
++# --------------------------------------------------------------------------- #
++def test_conditional_ratio_matches_reference_tiny(adata_tiny: AnnData):
++    adj = adata_tiny.obsp["spatial_connectivities"]
++    int_clust = _int_clust(adata_tiny)
++    _, expected_ratio = _ref_conditional(adj, int_clust, 3)
++
++    result = nhood_enrichment(adata_tiny, cluster_key=_CK, normalization="conditional", n_perms=20, rng=0, copy=True)
++    np.testing.assert_allclose(result.conditional_ratio, expected_ratio)
++    # a fraction of cells, so bounded -- checked here rather than as its own test, since it follows
++    assert np.all((result.conditional_ratio >= 0) & (result.conditional_ratio <= 1))
++
++
++@pytest.mark.parametrize("normalization", ["none", "total"])
++def test_conditional_ratio_none_for_other_modes(adata_tiny: AnnData, normalization: str):
++    result = nhood_enrichment(adata_tiny, cluster_key=_CK, normalization=normalization, n_perms=20, rng=0, copy=True)
++    assert result.conditional_ratio is None
++
++
++# --------------------------------------------------------------------------- #
++# Full z-score: independent numpy reference for the numba permutation kernel
++# --------------------------------------------------------------------------- #
++@pytest.mark.parametrize("n_jobs", [1, 2, 3])
++@pytest.mark.parametrize("normalization", ["none", "total", "conditional"])
++def test_zscore_matches_reference_tiny(adata_tiny: AnnData, normalization: str, n_jobs: int):
++    adj = adata_tiny.obsp["spatial_connectivities"]
++    int_clust = _int_clust(adata_tiny)
++    rng, n_perms = 0, 50
++
++    result = nhood_enrichment(
++        adata_tiny,
++        cluster_key=_CK,
++        normalization=normalization,
++        n_perms=n_perms,
++        rng=rng,
++        n_jobs=n_jobs,
++        copy=True,
++    )
++    expected = _reference_nhood_enrichment(adj, int_clust, 3, n_perms=n_perms, rng=rng, normalization=normalization)
++    np.testing.assert_allclose(result.zscore, expected, equal_nan=True)
++
++
++@pytest.mark.parametrize("n_jobs", [1, 2, 3])
++def test_zscore_reference_holds_on_real_data(adata: AnnData, n_jobs: int):
++    """The numpy per-index reference must reproduce z-scores on a realistic graph, for every n_jobs.
++
++    Numba's ``Generator.shuffle`` matches numpy's bit-for-bit, so the kernel and this reference
++    agree exactly regardless of thread count.
++    """
++    spatial_neighbors_grid(adata)
++    adj = adata.obsp["spatial_connectivities"]
++    int_clust = adata.obs[_CK].cat.codes.to_numpy()
++    n_cls = adata.obs[_CK].cat.categories.shape[0]
++    rng, n_perms = 7, 30
++
++    result = nhood_enrichment(adata, cluster_key=_CK, n_perms=n_perms, rng=rng, n_jobs=n_jobs, copy=True)
++    expected = _reference_nhood_enrichment(adj, int_clust, n_cls, n_perms=n_perms, rng=rng, normalization="none")
++    np.testing.assert_allclose(result.zscore, expected, equal_nan=True)
++
++
++@pytest.mark.parametrize("normalization", ["none", "total", "conditional"])
++def test_zscore_independent_of_n_jobs(adata_tiny: AnnData, normalization: str):
++    """Per-index seeding makes the z-score independent of the worker/thread count.
++
++    The moments are accumulated as a ``prange`` reduction, so the summation order depends on how
++    many threads run. ``'none'`` goes through the int64 kernel, where integer addition is
++    associative and the z-score is therefore bit-identical for any thread count. The normalized
++    modes divide by a row sum / conditional denominator, so they accumulate in float64 and match
++    only to rounding (measured <= 1e-14 relative); the tolerance below leaves several orders of
++    headroom while staying far tighter than the O(1) discrepancy a real thread-dependent bug would
++    produce. Counts are integer and always exact.
++    """
++    kw = {"cluster_key": _CK, "normalization": normalization, "n_perms": 50, "rng": 0, "copy": True}
++    r1 = nhood_enrichment(adata_tiny, n_jobs=1, **kw)
++    r8 = nhood_enrichment(adata_tiny, n_jobs=8, **kw)
++    if normalization == "none":
++        np.testing.assert_array_equal(r1.zscore, r8.zscore)
++    else:
++        np.testing.assert_allclose(r1.zscore, r8.zscore, rtol=1e-10, atol=1e-12)
++    np.testing.assert_array_equal(r1.counts, r8.counts)
++
++
++@pytest.mark.parametrize("n_jobs", [1, 3])
++@pytest.mark.parametrize("normalization", ["none", "total", "conditional"])
++def test_zscore_library_key_matches_reference(adata_tiny: AnnData, normalization: str, n_jobs: int):
++    """The numba within-group shuffle must reproduce the ``_ref_shuffle_group`` oracle, per ``library_key``."""
++    adata = adata_tiny.copy()
++    # two libraries over the six cells, intentionally uneven and interleaved
++    adata.obs["library"] = pd.Categorical.from_codes([0, 0, 1, 1, 0, 1], categories=["s1", "s2"])
++    adj = adata.obsp["spatial_connectivities"]
++    int_clust = _int_clust(adata)
++    rng, n_perms = 0, 50
++
++    result = nhood_enrichment(
++        adata,
++        cluster_key=_CK,
++        library_key="library",
++        normalization=normalization,
++        n_perms=n_perms,
++        rng=rng,
++        n_jobs=n_jobs,
++        copy=True,
++    )
++    expected = _reference_nhood_enrichment(
++        adj, int_clust, 3, n_perms=n_perms, rng=rng, normalization=normalization, libraries=adata.obs["library"]
++    )
++    np.testing.assert_allclose(result.zscore, expected, equal_nan=True)
++
++
++def test_single_group_shuffle_draws_like_numpy(adata_tiny: AnnData):
++    """The single-group fast path must consume ``rng`` exactly like a plain ``numpy`` shuffle."""
++    int_clust = (np.arange(200) % 7).astype(np.uint32)
++    offsets, indices = _build_shuffle_groups(None, len(int_clust))
++
++    # The fast path skips the gather/scatter through ``group_indices``, so it is only valid while a
++    # lone group yields identity indices. ``libraries=None`` returns ``arange`` outright; the other
++    # way in is a single-category ``library_key``, where identity rests on the stable ``argsort``.
++    one_library = pd.Series(pd.Categorical(["s1"] * len(int_clust)))
++    lib_offsets, lib_indices = _build_shuffle_groups(one_library, len(int_clust))
++    np.testing.assert_array_equal(lib_offsets, offsets)
++    np.testing.assert_array_equal(lib_indices, np.arange(len(int_clust)))
++    np.testing.assert_array_equal(indices, np.arange(len(int_clust)))
++
++    expected = int_clust.copy()
++    np.random.default_rng(0).shuffle(expected)
++    np.testing.assert_array_equal(_shuffled_labels(int_clust, offsets, indices, np.random.default_rng(0)), expected)
++
++    # and end to end: one library over every cell is the same shuffle as no ``library_key`` at all
++    adata = adata_tiny.copy()
++    adata.obs["library"] = pd.Categorical(["s1"] * adata.n_obs)
++    kw = {"cluster_key": _CK, "n_perms": 20, "rng": 0, "n_jobs": 1, "copy": True}
++    np.testing.assert_array_equal(
++        nhood_enrichment(adata, **kw).zscore,
++        nhood_enrichment(adata, library_key="library", **kw).zscore,
++    )
++
++
++@pytest.mark.parametrize("n_jobs", [1, 3])
++@pytest.mark.parametrize("normalization", ["none", "conditional"])
++def test_zscore_library_key_with_min_cell_count(normalization: str, n_jobs: int):
++    """``min_cell_count`` must keep ``library_key`` aligned with the filtered cells."""
++    # 8-cell ring; cluster C is a single cell so it is dropped by ``min_cell_count=2``.
++    n = 8
++    edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 0), (0, 4)]
++    rows, cols = [], []
++    for i, j in edges:
++        rows += [i, j]
++        cols += [j, i]
++    adj_full = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
++
++    codes = np.array([0, 0, 0, 1, 1, 1, 1, 2])  # A x3, B x4, C x1
++    clusters = pd.Categorical.from_codes(codes, categories=["A", "B", "C"])
++    lib = pd.Categorical.from_codes([0, 1, 0, 1, 0, 1, 0, 1], categories=["s1", "s2"])
++    adata = AnnData(
++        np.zeros((n, n)),
++        obs={_CK: clusters, "library": lib},
++        obsp={"spatial_connectivities": adj_full},
++    )
++
++    min_cell_count, rng, n_perms = 2, 0, 50
++    with pytest.warns(UserWarning, match="were excluded"):
++        result = nhood_enrichment(
++            adata,
++            cluster_key=_CK,
++            library_key="library",
++            normalization=normalization,
++            min_cell_count=min_cell_count,
++            n_perms=n_perms,
++            rng=rng,
++            n_jobs=n_jobs,
++            copy=True,
++        )
++
++    # Replicate the production filtering: drop cells of clusters below ``min_cell_count``,
++    # keeping the full category count (``n_cls = 3``) and the filtered per-cell arrays aligned.
++    sizes = pd.Series(codes).value_counts()
++    keep_clusters = sizes[sizes >= min_cell_count].index.to_numpy()
++    mask = np.isin(codes, keep_clusters)
++    idx = np.where(mask)[0]
++    adj_f = adj_full[np.ix_(idx, idx)]
++    int_clust_f = codes[mask]
++    lib_f = adata.obs["library"].iloc[mask]
++
++    expected = _reference_nhood_enrichment(
++        adj_f, int_clust_f, 3, n_perms=n_perms, rng=rng, normalization=normalization, libraries=lib_f
++    )
++    np.testing.assert_allclose(result.zscore, expected, equal_nan=True)
++
++
++# --------------------------------------------------------------------------- #
++# Statistical sanity: structure that survives RNG changes
++# --------------------------------------------------------------------------- #
++def test_self_enrichment_positive_for_clustered_graph():
++    """Cells wired preferentially to their own cluster must show positive diagonal z-scores."""
++    rng = np.random.RandomState(0)
++    n_per = 40
++    n_cls = 3
++    n = n_per * n_cls
++    labels = np.repeat(np.arange(n_cls), n_per)
++
++    rows, cols = [], []
++    for c in range(n_cls):
++        members = np.where(labels == c)[0]
++        # connect each cell to several same-cluster neighbors -> strong self-enrichment
++        for i in members:
++            for j in rng.choice(members[members != i], size=4, replace=False):
++                rows += [i, j]
++                cols += [j, i]
++    adj = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
++
++    adata = AnnData(
++        np.zeros((n, 1)),
++        obs={_CK: pd.Categorical.from_codes(labels, categories=list("ABC"))},
++        obsp={"spatial_connectivities": adj},
++    )
++    result = nhood_enrichment(adata, cluster_key=_CK, n_perms=200, rng=0, n_jobs=1, copy=True)
++
++    diag = np.diag(result.zscore)
++    off_diag = result.zscore[~np.eye(n_cls, dtype=bool)]
++    assert np.all(diag > 0), diag
++    assert np.all(diag > off_diag.max()), (diag, off_diag)
+diff --git a/tests/graph/test_utils.py b/tests/graph/test_utils.py
+index e35fc9222..67180e341 100644
+--- a/tests/graph/test_utils.py
++++ b/tests/graph/test_utils.py
+@@ -1,7 +1,6 @@
+ from __future__ import annotations
+ 
+ import numpy as np
+-import pandas as pd
+ import pytest
+ import spatialdata as sd
+ from anndata import AnnData
+@@ -9,7 +8,7 @@
+ 
+ from squidpy._constants._pkg_constants import Key
+ from squidpy.gr import spatial_autocorr
+-from squidpy.gr._utils import _shuffle_group, extract_adata_if_sdata
++from squidpy.gr._utils import extract_adata_if_sdata
+ 
+ 
+ class TestExtractAdata:
+@@ -70,27 +69,6 @@ def test_spatial_key_suffix_not_partial_match(self):
+         assert Key.obsp.spatial_dist("my_dist") == "my_dist_distances"
+ 
+ 
+-class TestUtils:
+-    @pytest.mark.parametrize("cluster_annotations_type", [int, str])
+-    @pytest.mark.parametrize("library_annotations_type", [int, str])
+-    @pytest.mark.parametrize("seed", [422, 422222])
+-    def test_shuffle_group(self, cluster_annotations_type: type, library_annotations_type: type, seed: int):
+-        size = 6
+-        rng = np.random.default_rng(seed)
+-        if isinstance(cluster_annotations_type, int):
+-            libraries = pd.Series(rng.choice([1, 2, 3, 4], size=(size,)), dtype="category")
+-        else:
+-            libraries = pd.Series(rng.choice(["a", "b", "c"], size=(size,)), dtype="category")
+-
+-        if isinstance(library_annotations_type, int):
+-            cluster_annotations = rng.choice([1, 2, 3, 4], size=(size,))
+-        else:
+-            cluster_annotations = rng.choice(["X", "Y", "Z"], size=(size,))
+-        out = _shuffle_group(cluster_annotations, libraries, rng)
+-        for c in libraries.cat.categories:
+-            assert set(out[libraries == c]) == set(cluster_annotations[libraries == c])
+-
+-
+ class TestRngParam:
+     """SPEC-7 ``rng``: accepts generators as well as seeds, and the old names still work."""
+ 
+diff --git a/tests/plotting/test_graph.py b/tests/plotting/test_graph.py
+index 09295847a..1a345a57c 100644
+--- a/tests/plotting/test_graph.py
++++ b/tests/plotting/test_graph.py
+@@ -9,6 +9,7 @@
+ import pytest
+ import scanpy as sc
+ from anndata import AnnData
++from PIL import Image
+ 
+ from squidpy import gr, pl
+ from tests.conftest import DPI, PlotTester, PlotTesterMeta
+@@ -66,6 +67,12 @@ def test_plot_nhood_enrichment_ax(self, adata: AnnData):
+         fig, ax = plt.subplots(figsize=(2, 2), constrained_layout=True)
+         pl.nhood_enrichment(adata, cluster_key=C_KEY, ax=ax)
+ 
++    def test_plot_nhood_enrichment_dotplot(self, adata: AnnData):
++        gr.spatial_neighbors_grid(adata)
++        gr.nhood_enrichment(adata, cluster_key=C_KEY, normalization="conditional")
++
++        pl.nhood_enrichment_dotplot(adata, cluster_key=C_KEY)
++
+     def test_plot_nhood_enrichment_dendro(self, adata: AnnData):
+         gr.spatial_neighbors_grid(adata)
+         gr.nhood_enrichment(adata, cluster_key=C_KEY)
+@@ -208,3 +215,52 @@ def test_plot_kwargs(self, ligrec_result: Mapping[str, pd.DataFrame]):
+ 
+     def test_plot_remove_nonsig_interactions(self, ligrec_result: Mapping[str, pd.DataFrame]):
+         pl.ligrec(ligrec_result, remove_nonsig_interactions=True, alpha=1e-4)
++
++
++# --------------------------------------------------------------------------- #
++# nhood_enrichment_dotplot: behaviour, not appearance (no `test_plot_` prefix, so
++# these are not image comparisons)
++# --------------------------------------------------------------------------- #
++@pytest.fixture()
++def dotplot_adata(adata: AnnData) -> AnnData:
++    gr.spatial_neighbors_grid(adata)
++    gr.nhood_enrichment(adata, cluster_key=C_KEY, normalization="conditional", n_perms=20, rng=0)
++    return adata
++
++
++def test_dotplot_dpi_reaches_the_saved_file(dotplot_adata: AnnData, tmp_path):
++    """``Figure.set_dpi`` alone does not survive ``savefig``; the value has to be passed through."""
++    sizes = {}
++    for dpi in (None, 200):
++        path = tmp_path / f"dp_{dpi}.png"
++        pl.nhood_enrichment_dotplot(dotplot_adata, cluster_key=C_KEY, dpi=dpi, save=path)
++        sizes[dpi] = Image.open(path).size
++        plt.close("all")
++
++    assert sizes[200][0] > sizes[None][0] and sizes[200][1] > sizes[None][1], sizes
++
++
++@pytest.mark.parametrize("annotate", [False, True])
++def test_dotplot_without_conditional_ratio(adata: AnnData, annotate: bool):
++    """Without a CCR the dot sizes are a placeholder, so no value may be printed as if measured."""
++    gr.spatial_neighbors_grid(adata)
++    gr.nhood_enrichment(adata, cluster_key=C_KEY, n_perms=20, rng=0)  # no conditional_ratio
++
++    with pytest.warns(UserWarning, match="conditional_ratio"):
++        pl.nhood_enrichment_dotplot(adata, cluster_key=C_KEY, annotate=annotate)
++
++    drawn = [t.get_text() for ax in plt.gcf().axes for t in ax.texts]
++    assert "1.00" not in drawn, drawn
++    plt.close("all")
++
++
++def test_dotplot_size_range(dotplot_adata: AnnData):
++    size_range = (12.0, 90.0)
++    pl.nhood_enrichment_dotplot(dotplot_adata, cluster_key=C_KEY, size_range=size_range)
++
++    # the main grid and the size legend are PathCollections; the colorbar draws Line/QuadMesh
++    dots = [c for ax in plt.gcf().axes for c in ax.collections if hasattr(c, "get_sizes")]
++    drawn = np.concatenate([c.get_sizes() for c in dots if len(c.get_sizes())])
++    assert drawn.min() >= size_range[0] - 1e-6
++    assert drawn.max() <= size_range[1] + 1e-6
++    plt.close("all")

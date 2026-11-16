@@ -1,0 +1,884 @@
+diff --git a/docs/api/scanpy_gpu.md b/docs/api/scanpy_gpu.md
+index 07604694f..7088b88cf 100644
+--- a/docs/api/scanpy_gpu.md
++++ b/docs/api/scanpy_gpu.md
+@@ -21,6 +21,7 @@ Other than `tools`, preprocessing steps usually don’t return an easily interpr
+    pp.filter_cells
+    pp.filter_genes
+    pp.normalize_total
++   pp.normalize_shifted_clr
+    pp.log1p
+    pp.sqrt
+    pp.highly_variable_genes
+diff --git a/docs/references.bib b/docs/references.bib
+index 4dbeba4ed..829c0a363 100644
+--- a/docs/references.bib
++++ b/docs/references.bib
+@@ -470,3 +470,13 @@ @article{phipson2010
+   year = {2010},
+   month = jan
+ }
++
++@article{Booeshaghi2022,
++  author    = {Booeshaghi, A. Sina and Hallgrímsdóttir, Ingileif B. and Gálvez-Merchán, Ángel and Pachter, Lior},
++  title     = {Normalization for sampled count data},
++  year      = {2026},
++  url       = {https://doi.org/10.1101/2022.05.06.490859},
++  doi       = {10.1101/2022.05.06.490859},
++  publisher = {Cold Spring Harbor Laboratory},
++  journal   = {bioRxiv},
++}
+diff --git a/docs/release-notes/0.19.0.md b/docs/release-notes/0.19.0.md
+index efee755e8..2482f6859 100644
+--- a/docs/release-notes/0.19.0.md
++++ b/docs/release-notes/0.19.0.md
+@@ -3,6 +3,7 @@
+ ```{rubric} Features
+ ```
+ 
++- Add {func}`~rapids_singlecell.pp.normalize_shifted_clr`, the PFlog shifted centered log-ratio of scanpy's `normalize_shifted_clr` ([scverse/scanpy#4160](https://github.com/scverse/scanpy/pull/4160)) {cite:p}`Booeshaghi2022`, with a fused CUDA kernel for CSR input {pr}`702` {smaller}`S Dicks`
+ - Add dsb normalization of CITE-seq protein (ADT) counts with {func}`~rapids_singlecell.pp.dsb`, a GPU port of the dsb R package covering `DSBNormalizeProtein` and `ModelNegativeADTnorm`; with `dtype=np.float64` it matches R to ~1e-10, and the stabilized float32 default stays within ~1e-5 of float64 {smaller}`S Dicks`
+ - Add weighted nearest neighbor (WNN) analysis for multimodal data with {func}`~rapids_singlecell.pp.wnn`, a GPU port of Seurat's `FindMultiModalNeighbors` that accepts {class}`~anndata.AnnData` and `MuData` {pr}`838` {smaller}`S Dicks`
+ - Add `dtype="bfloat16"` to {func}`~rapids_singlecell.pp.harmony_integrate`, which keeps the cluster assignments in bfloat16 to save GPU memory and time; several batch keys or the `fast` correction fall back to float32 with a warning {pr}`829` {smaller}`S Dicks`
+diff --git a/src/rapids_singlecell/_cuda/norm/kernels_norm.cuh b/src/rapids_singlecell/_cuda/norm/kernels_norm.cuh
+index a4b2bb32d..410cb8dc6 100644
+--- a/src/rapids_singlecell/_cuda/norm/kernels_norm.cuh
++++ b/src/rapids_singlecell/_cuda/norm/kernels_norm.cuh
+@@ -300,3 +300,75 @@ __global__ void prescaled_mul_dense_kernel(T* __restrict__ data,
+     for (int i = threadIdx.x; i < ncols; i += blockDim.x)
+         data[row_offset + i] *= scale;
+ }
++
++// Block-wide sum of a double, returned to every thread of the block.
++__device__ __forceinline__ double block_sum_broadcast(double val) {
++    __shared__ double warp_sums[32];
++    int laneIdx = threadIdx.x & 31;
++    int warpIdx = threadIdx.x >> 5;
++    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
++        val += __shfl_down_sync(0xffffffff, val, offset);
++    if (laneIdx == 0) warp_sums[warpIdx] = val;
++    __syncthreads();
++
++    if (warpIdx == 0) {
++        int nWarps = (blockDim.x + 31) >> 5;
++        val = (laneIdx < nWarps) ? warp_sums[laneIdx] : 0.0;
++        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
++            val += __shfl_down_sync(0xffffffff, val, offset);
++        if (laneIdx == 0) warp_sums[0] = val;
++    }
++    __syncthreads();
++    return warp_sums[0];
++}
++
++// ---------- shifted_clr_csr ----------
++// One block per row. Writes the dense row log1p(scale * x) minus its mean over
++// all ncols columns (the shifted CLR); the row sum is accumulated in double.
++template <typename T, typename IdxT>
++__global__ void shifted_clr_csr_kernel(const IdxT* __restrict__ indptr,
++                                       const IdxT* __restrict__ indices,
++                                       const T* __restrict__ data,
++                                       T* __restrict__ out, int nrows,
++                                       int ncols, T scale) {
++    int row = blockIdx.x;
++    if (row >= nrows) return;
++
++    IdxT start = indptr[row];
++    IdxT end = indptr[row + 1];
++
++    double val = 0.0;
++    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
++        val += static_cast<double>(log1p(data[i] * scale));
++    T offset = static_cast<T>(block_sum_broadcast(val) / ncols);
++
++    // Zeros map to -offset; fill the row before scattering the stored values.
++    T* out_row = out + static_cast<long long>(row) * ncols;
++    for (int i = threadIdx.x; i < ncols; i += blockDim.x) out_row[i] = -offset;
++    __syncthreads();
++    for (IdxT i = start + threadIdx.x; i < end; i += blockDim.x)
++        out_row[indices[i]] = log1p(data[i] * scale) - offset;
++}
++
++// ---------- shifted_clr_dense ----------
++// One block per row. Same transform as shifted_clr_csr for a dense row.
++template <typename T>
++__global__ void shifted_clr_dense_kernel(const T* __restrict__ data,
++                                         T* __restrict__ out, int nrows,
++                                         int ncols, T scale) {
++    int row = blockIdx.x;
++    if (row >= nrows) return;
++
++    long long row_offset = static_cast<long long>(row) * ncols;
++    double val = 0.0;
++    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
++        T v = log1p(data[row_offset + i] * scale);
++        out[row_offset + i] = v;
++        val += static_cast<double>(v);
++    }
++    T offset = static_cast<T>(block_sum_broadcast(val) / ncols);
++
++    // Each thread only revisits the entries it wrote above.
++    for (int i = threadIdx.x; i < ncols; i += blockDim.x)
++        out[row_offset + i] -= offset;
++}
+diff --git a/src/rapids_singlecell/_cuda/norm/norm.cu b/src/rapids_singlecell/_cuda/norm/norm.cu
+index 597520c03..b499ed7d4 100644
+--- a/src/rapids_singlecell/_cuda/norm/norm.cu
++++ b/src/rapids_singlecell/_cuda/norm/norm.cu
+@@ -96,6 +96,29 @@ static inline void launch_prescaled_mul_dense(T* data, const T* scales,
+     CUDA_CHECK_LAST_ERROR(prescaled_mul_dense_kernel);
+ }
+ 
++template <typename T, typename IdxT>
++static inline void launch_shifted_clr_csr(const IdxT* indptr,
++                                          const IdxT* indices, const T* data,
++                                          T* out, int nrows, int ncols, T scale,
++                                          cudaStream_t stream) {
++    dim3 block(BLOCK_SIZE);
++    dim3 grid(nrows);
++    shifted_clr_csr_kernel<T, IdxT><<<grid, block, 0, stream>>>(
++        indptr, indices, data, out, nrows, ncols, scale);
++    CUDA_CHECK_LAST_ERROR(shifted_clr_csr_kernel);
++}
++
++template <typename T>
++static inline void launch_shifted_clr_dense(const T* data, T* out, int nrows,
++                                            int ncols, T scale,
++                                            cudaStream_t stream) {
++    dim3 block(BLOCK_SIZE);
++    dim3 grid(nrows);
++    shifted_clr_dense_kernel<T>
++        <<<grid, block, 0, stream>>>(data, out, nrows, ncols, scale);
++    CUDA_CHECK_LAST_ERROR(shifted_clr_dense_kernel);
++}
++
+ template <typename T, typename IdxT, typename Device>
+ void def_mul_csr(nb::module_& m) {
+     m.def(
+@@ -215,6 +238,35 @@ void def_prescaled_mul_dense(nb::module_& m) {
+         "stream"_a = 0);
+ }
+ 
++template <typename T, typename IdxT, typename Device>
++void def_shifted_clr_csr(nb::module_& m) {
++    m.def(
++        "shifted_clr_csr",
++        [](gpu_array_c<const IdxT, Device> indptr,
++           gpu_array_c<const IdxT, Device> indices,
++           gpu_array_c<const T, Device> data, gpu_array_c<T, Device> out,
++           int nrows, int ncols, T scale, std::uintptr_t stream) {
++            launch_shifted_clr_csr<T, IdxT>(indptr.data(), indices.data(),
++                                            data.data(), out.data(), nrows,
++                                            ncols, scale, (cudaStream_t)stream);
++        },
++        "indptr"_a, "indices"_a, "data"_a, nb::kw_only(), "out"_a, "nrows"_a,
++        "ncols"_a, "scale"_a, "stream"_a = 0);
++}
++
++template <typename T, typename Device>
++void def_shifted_clr_dense(nb::module_& m) {
++    m.def(
++        "shifted_clr_dense",
++        [](gpu_array_c<const T, Device> data, gpu_array_c<T, Device> out,
++           int nrows, int ncols, T scale, std::uintptr_t stream) {
++            launch_shifted_clr_dense<T>(data.data(), out.data(), nrows, ncols,
++                                        scale, (cudaStream_t)stream);
++        },
++        "data"_a, nb::kw_only(), "out"_a, "nrows"_a, "ncols"_a, "scale"_a,
++        "stream"_a = 0);
++}
++
+ template <typename Device>
+ void register_bindings(nb::module_& m) {
+     def_mul_dense<float, Device>(m);
+@@ -252,6 +304,14 @@ void register_bindings(nb::module_& m) {
+ 
+     def_prescaled_mul_dense<float, Device>(m);
+     def_prescaled_mul_dense<double, Device>(m);
++
++    def_shifted_clr_csr<float, int, Device>(m);
++    def_shifted_clr_csr<float, long long, Device>(m);
++    def_shifted_clr_csr<double, int, Device>(m);
++    def_shifted_clr_csr<double, long long, Device>(m);
++
++    def_shifted_clr_dense<float, Device>(m);
++    def_shifted_clr_dense<double, Device>(m);
+ }
+ 
+ NB_MODULE(_norm_cuda, m) {
+diff --git a/src/rapids_singlecell/pp.py b/src/rapids_singlecell/pp.py
+index d73f384fd..bea001238 100644
+--- a/src/rapids_singlecell/pp.py
++++ b/src/rapids_singlecell/pp.py
+@@ -11,6 +11,7 @@
+     log1p,
+     neighbors,
+     normalize_pearson_residuals,
++    normalize_shifted_clr,
+     normalize_total,
+     pca,
+     regress_out,
+@@ -38,6 +39,7 @@
+     "log1p",
+     "neighbors",
+     "normalize_pearson_residuals",
++    "normalize_shifted_clr",
+     "normalize_total",
+     "pca",
+     "regress_out",
+diff --git a/src/rapids_singlecell/preprocessing/__init__.py b/src/rapids_singlecell/preprocessing/__init__.py
+index 5d135a5cd..c5bf0a320 100644
+--- a/src/rapids_singlecell/preprocessing/__init__.py
++++ b/src/rapids_singlecell/preprocessing/__init__.py
+@@ -4,7 +4,7 @@
+ from ._harmony_integrate import harmony_integrate
+ from ._hvg import highly_variable_genes
+ from ._neighbors import bbknn, neighbors, wnn
+-from ._normalize import log1p, normalize_pearson_residuals, normalize_total, sqrt
++from ._normalize import log1p, normalize_pearson_residuals, normalize_shifted_clr, normalize_total, sqrt
+ from ._pca import pca
+ from ._qc import calculate_qc_metrics
+ from ._regress_out import regress_out
+diff --git a/src/rapids_singlecell/preprocessing/_normalize.py b/src/rapids_singlecell/preprocessing/_normalize.py
+index f13087e8a..892d01c09 100644
+--- a/src/rapids_singlecell/preprocessing/_normalize.py
++++ b/src/rapids_singlecell/preprocessing/_normalize.py
+@@ -18,7 +18,7 @@
+ )
+ from rapids_singlecell.get import _get_obs_rep, _set_obs_rep
+ 
+-from ._utils import _check_gpu_X, _check_nonnegative_integers
++from ._utils import _check_gpu_X, _check_nonnegative_integers, _get_mean_var
+ 
+ if TYPE_CHECKING:
+     from cupyx.scipy.sparse import spmatrix
+@@ -639,3 +639,143 @@ def normalize_pearson_residuals(
+     else:
+         return residuals
+     return None
++
++
++def _estimate_nb_overdispersion(X: ArrayTypesDask) -> float:
++    r"""Closed-form least squares of :math:`\mathrm{Var}_g = μ_g + α μ_g^2` across genes."""
++    mu, var = _get_mean_var(X, axis=0, correction=0)
++    mu2 = mu**2
++    numerator = cp.sum((var - mu) * mu2)
++    denominator = cp.sum(mu2 * mu2)
++    if isinstance(X, DaskArray):
++        import dask
++
++        numerator, denominator = dask.compute(numerator, denominator)
++    if float(denominator) == 0.0:
++        msg = "Cannot estimate overdispersion: every gene has zero mean. Pass a positive `alpha` explicitly."
++        raise ValueError(msg)
++    alpha = float(numerator / denominator)
++    if not alpha > 0:
++        msg = f"Estimated overdispersion is non-positive (alpha = {alpha}); pass a positive `alpha` explicitly."
++        raise ValueError(msg)
++    return alpha
++
++
++def _shifted_clr(X: cp.ndarray | sparse.csr_matrix, scale: float) -> cp.ndarray:
++    """Dense ``log1p(scale * X)`` centered on its per-cell mean."""
++    from rapids_singlecell._cuda import _norm_cuda as _nc
++
++    n_rows, n_cols = X.shape
++    out = cp.empty((n_rows, n_cols), dtype=X.dtype)
++    if n_rows == 0 or n_cols == 0:
++        return out
++    if isinstance(X, cp.ndarray):
++        _nc.shifted_clr_dense(
++            cp.ascontiguousarray(X),
++            out=out,
++            nrows=n_rows,
++            ncols=n_cols,
++            scale=float(scale),
++            stream=cp.cuda.get_current_stream().ptr,
++        )
++    else:
++        _nc.shifted_clr_csr(
++            X.indptr,
++            X.indices,
++            X.data,
++            out=out,
++            nrows=n_rows,
++            ncols=n_cols,
++            scale=float(scale),
++            stream=cp.cuda.get_current_stream().ptr,
++        )
++    return out
++
++
++def normalize_shifted_clr(
++    adata: AnnData,
++    *,
++    alpha: float | None = None,
++    layer: str | None = None,
++    inplace: bool = True,
++    copy: bool = False,
++) -> Union[AnnData, dict[str, cp.ndarray | DaskArray], None]:  # noqa: UP007
++    r"""Normalize counts with the shifted centered log-ratio (PFlog) transform :cite:p:`Booeshaghi2022`.
++
++    If `alpha` is not provided, it is estimated from the input matrix. PFlog is
++    then computed as
++
++    .. math::
++        T(x)_i = \log(1 + 4 α x_i)
++            - \frac{1}{D} \sum_{j=1}^D \log(1 + 4 α x_j),
++
++    which is equivalent to centering :math:`\log(x_i + 1 / (4 α))` because the
++    constant :math:`\log(4 α)` cancels during CLR centering.
++
++    .. note::
++        CLR centering generally maps zeros to non-zero values, so the resulting
++        matrix is dense even when the input is sparse.
++
++    Parameters
++    ----------
++        adata
++            The annotated data matrix of shape `n_obs` × `n_vars`.
++            Rows correspond to cells and columns to genes.
++        alpha
++            Negative-binomial overdispersion of the dataset (``var = μ + α·μ²``).
++            If `None`, it is estimated from the input matrix. A positive numeric
++            value uses that value directly. PFlog applies ``log1p(4 * alpha * x)``
++            before CLR centering.
++        layer
++            Layer to normalize instead of `X`.
++        inplace
++            Whether to update `adata` or return a dictionary with the normalized
++            matrix.
++        copy
++            Whether to modify a copied input object. Not compatible with
++            `inplace=False`.
++
++    Returns
++    -------
++    Returns a dictionary with the normalized matrix or updates `adata`, depending
++    on `inplace`.
++    """
++    if copy:
++        if not inplace:
++            raise ValueError("`copy=True` cannot be used with `inplace=False`.")
++        adata = adata.copy()
++
++    view_to_actual(adata)
++
++    X = _get_obs_rep(adata, layer=layer)
++    _check_gpu_X(X, allow_dask=True)
++    if sparse.isspmatrix_csc(X):
++        X = X.tocsr()
++    if X.dtype.kind in "iub":
++        X = X.astype(cp.float64)
++
++    if alpha is None:
++        alpha = _estimate_nb_overdispersion(X)
++    elif not alpha > 0:
++        msg = f"`alpha` must be positive to compute PFlog, got {alpha}. The data may be underdispersed."
++        raise ValueError(msg)
++    scale = 4.0 * float(alpha)
++
++    if isinstance(X, DaskArray):
++        if len(X.chunks[1]) > 1:
++            raise ValueError("Dask arrays must be chunked along the first axis only.")
++        X = X.map_blocks(_shifted_clr, scale, meta=_meta_dense(X.dtype), dtype=X.dtype)
++    else:
++        cell_depths = X.sum(axis=1)
++        if not bool((cell_depths > 0).all()):
++            warnings.warn("Some cells have zero counts", UserWarning, stacklevel=2)
++        X = _shifted_clr(X, scale)
++
++    if inplace:
++        _set_obs_rep(adata, X, layer=layer)
++
++    if copy:
++        return adata
++    elif not inplace:
++        return {"X": X}
++    return None
+diff --git a/src/rapids_singlecell/preprocessing/_utils.py b/src/rapids_singlecell/preprocessing/_utils.py
+index d4cf48dcf..aa0591130 100644
+--- a/src/rapids_singlecell/preprocessing/_utils.py
++++ b/src/rapids_singlecell/preprocessing/_utils.py
+@@ -62,7 +62,7 @@ def _sanitize_column(adata: AnnData, column: str):
+         adata.obs[column] = c
+ 
+ 
+-def _mean_var_major(X, major, minor):
++def _mean_var_major(X, major, minor, *, correction=1):
+     from rapids_singlecell._cuda import _mean_var_cuda as _mv
+ 
+     mean = cp.zeros(major, dtype=cp.float64)
+@@ -80,11 +80,11 @@ def _mean_var_major(X, major, minor):
+     mean = mean / minor
+     var = var / minor
+     var -= cp.power(mean, 2)
+-    var *= minor / (minor - 1)
++    var *= minor / (minor - correction)
+     return mean, var
+ 
+ 
+-def _mean_var_minor(X, major, minor):
++def _mean_var_minor(X, major, minor, *, correction=1):
+     from rapids_singlecell._cuda import _mean_var_cuda as _mv
+ 
+     mean = cp.zeros(minor, dtype=cp.float64)
+@@ -100,11 +100,11 @@ def _mean_var_minor(X, major, minor):
+     mean /= major
+     var /= major
+     var -= mean**2
+-    var *= major / (major - 1)
++    var *= major / (major - correction)
+     return mean, var
+ 
+ 
+-def _mean_var_minor_dask(X, major, minor):
++def _mean_var_minor_dask(X, major, minor, *, correction=1):
+     """Implements sum operation for dask array when the backend is cupy sparse csr matrix"""
+     from rapids_singlecell._cuda import _mean_var_cuda as _mv
+ 
+@@ -131,12 +131,12 @@ def __mean_var(X_part):
+     ).sum(axis=0)
+     mean /= major
+     var /= major
+-    var = (var - mean**2) * (major / (major - 1))
++    var = (var - mean**2) * (major / (major - correction))
+     return mean, var
+ 
+ 
+ # todo: Implement this dynamically for csc matrix as well
+-def _mean_var_major_dask(X, major, minor):
++def _mean_var_major_dask(X, major, minor, *, correction=1):
+     """Implements sum operation for dask array when the backend is cupy sparse csr matrix"""
+     from rapids_singlecell._cuda import _mean_var_cuda as _mv
+ 
+@@ -166,11 +166,11 @@ def __mean_var(X_part):
+     mean = mean / minor
+     var = var / minor
+     var -= mean**2
+-    var *= minor / (minor - 1)
++    var *= minor / (minor - correction)
+     return mean, var
+ 
+ 
+-def _mean_var_dense_dask(X, axis):
++def _mean_var_dense_dask(X, axis, *, correction=1):
+     """Implements sum operation for dask array when the backend is cupy dense matrix"""
+     from ._kernels._mean_var_kernel import mean_sum, sq_sum
+ 
+@@ -200,11 +200,11 @@ def __mean_var(X_part):
+     mean = mean / X.shape[axis]
+     var = var / X.shape[axis]
+     var -= mean**2
+-    var *= X.shape[axis] / (X.shape[axis] - 1)
++    var *= X.shape[axis] / (X.shape[axis] - correction)
+     return mean, var
+ 
+ 
+-def _mean_var_dense(X, axis):
++def _mean_var_dense(X, axis, *, correction=1):
+     from ._kernels._mean_var_kernel import mean_sum, sq_sum
+ 
+     var = sq_sum(X, axis=axis)
+@@ -212,30 +212,30 @@ def _mean_var_dense(X, axis):
+     mean = mean / X.shape[axis]
+     var = var / X.shape[axis]
+     var -= cp.power(mean, 2)
+-    var *= X.shape[axis] / (X.shape[axis] - 1)
++    var *= X.shape[axis] / (X.shape[axis] - correction)
+     return mean, var
+ 
+ 
+-def _get_mean_var(X, axis=0):
++def _get_mean_var(X, axis=0, *, correction=1):
+     if issparse(X):
+         if axis == 0:
+             if isspmatrix_csr(X):
+                 major = X.shape[0]
+                 minor = X.shape[1]
+-                mean, var = _mean_var_minor(X, major, minor)
++                mean, var = _mean_var_minor(X, major, minor, correction=correction)
+             elif isspmatrix_csc(X):
+                 major = X.shape[1]
+                 minor = X.shape[0]
+-                mean, var = _mean_var_major(X, major, minor)
++                mean, var = _mean_var_major(X, major, minor, correction=correction)
+         elif axis == 1:
+             if isspmatrix_csr(X):
+                 major = X.shape[0]
+                 minor = X.shape[1]
+-                mean, var = _mean_var_major(X, major, minor)
++                mean, var = _mean_var_major(X, major, minor, correction=correction)
+             elif isspmatrix_csc(X):
+                 major = X.shape[1]
+                 minor = X.shape[0]
+-                mean, var = _mean_var_minor(X, major, minor)
++                mean, var = _mean_var_minor(X, major, minor, correction=correction)
+         else:
+             raise ValueError("axis must be either 0 or 1")
+     elif isinstance(X, DaskArray):
+@@ -243,19 +243,19 @@ def _get_mean_var(X, axis=0):
+             if axis == 0:
+                 major = X.shape[0]
+                 minor = X.shape[1]
+-                mean, var = _mean_var_minor_dask(X, major, minor)
++                mean, var = _mean_var_minor_dask(X, major, minor, correction=correction)
+             if axis == 1:
+                 major = X.shape[0]
+                 minor = X.shape[1]
+-                mean, var = _mean_var_major_dask(X, major, minor)
++                mean, var = _mean_var_major_dask(X, major, minor, correction=correction)
+         elif isinstance(X._meta, cp.ndarray):
+-            mean, var = _mean_var_dense_dask(X, axis)
++            mean, var = _mean_var_dense_dask(X, axis, correction=correction)
+         else:
+             raise ValueError(
+                 "Type not supported. Please provide a CuPy ndarray or a CuPy sparse matrix. Or a Dask array with a CuPy ndarray or a CuPy sparse matrix as meta."
+             )
+     else:
+-        mean, var = _mean_var_dense(X, axis)
++        mean, var = _mean_var_dense(X, axis, correction=correction)
+     return mean, var
+ 
+ 
+diff --git a/tests/dask/test_dask_mean_var.py b/tests/dask/test_dask_mean_var.py
+index ee4e9543f..cb1354be8 100644
+--- a/tests/dask/test_dask_mean_var.py
++++ b/tests/dask/test_dask_mean_var.py
+@@ -17,7 +17,8 @@
+ @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+ @pytest.mark.parametrize("axis", [0, 1])
+ @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+-def test_mean_var(client, data_kind, axis, dtype):
++@pytest.mark.parametrize("correction", [0, 1])
++def test_mean_var(client, data_kind, axis, dtype, correction):
+     if data_kind == "dense":
+         adata = pbmc68k_reduced()
+         adata.X = adata.X.astype(dtype)
+@@ -31,8 +32,8 @@ def test_mean_var(client, data_kind, axis, dtype):
+         dask_data.X = as_sparse_cupy_dask_array(dask_data.X).persist()
+         rsc.get.anndata_to_GPU(adata)
+ 
+-    mean, var = _get_mean_var(adata.X, axis=axis)
+-    dask_mean, dask_var = _get_mean_var(dask_data.X, axis=axis)
++    mean, var = _get_mean_var(adata.X, axis=axis, correction=correction)
++    dask_mean, dask_var = _get_mean_var(dask_data.X, axis=axis, correction=correction)
+     dask_mean, dask_var = dask_mean.compute(), dask_var.compute()
+ 
+     cp.testing.assert_allclose(mean, dask_mean)
+diff --git a/tests/dask/test_dask_shifted_clr.py b/tests/dask/test_dask_shifted_clr.py
+new file mode 100644
+index 000000000..e27a368ff
+--- /dev/null
++++ b/tests/dask/test_dask_shifted_clr.py
+@@ -0,0 +1,31 @@
++from __future__ import annotations
++
++import cupy as cp
++import pytest
++from anndata import AnnData
++
++import rapids_singlecell as rsc
++from rapids_singlecell._compat import DaskArray
++from testing.rapids_singlecell._helper import (
++    as_dense_cupy_dask_array,
++    as_sparse_cupy_dask_array,
++)
++
++from ..test_shifted_clr import _counts, _scanpy_shifted_clr, needs_scanpy_shifted_clr  # noqa: TID252
++
++
++@needs_scanpy_shifted_clr
++@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
++@pytest.mark.parametrize("alpha", [None, 0.3], ids=["estimated", "explicit"])
++def test_normalize_shifted_clr(client, data_kind, alpha):
++    x = _counts()
++    expected = _scanpy_shifted_clr(x, alpha=alpha)
++    to_dask = as_sparse_cupy_dask_array if data_kind == "sparse" else as_dense_cupy_dask_array
++    adata = AnnData(to_dask(x))
++    assert adata.X.numblocks[0] > 1
++
++    rsc.pp.normalize_shifted_clr(adata, alpha=alpha)
++
++    assert isinstance(adata.X, DaskArray)
++    assert isinstance(adata.X._meta, cp.ndarray)
++    cp.testing.assert_allclose(adata.X.compute(), expected, rtol=1e-12, atol=1e-12)
+diff --git a/tests/test_mean_var.py b/tests/test_mean_var.py
+index 96c6f0d39..f6aeb18ae 100644
+--- a/tests/test_mean_var.py
++++ b/tests/test_mean_var.py
+@@ -13,7 +13,8 @@
+ @pytest.mark.parametrize("data_kind", ["csc", "csr", "dense"])
+ @pytest.mark.parametrize("axis", [0, 1])
+ @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+-def test_mean_var(data_kind, axis, dtype):
++@pytest.mark.parametrize("correction", [0, 1])
++def test_mean_var(data_kind, axis, dtype, correction):
+     if data_kind == "dense":
+         adata = pbmc68k_reduced()
+     else:
+@@ -24,8 +25,8 @@ def test_mean_var(data_kind, axis, dtype):
+     adata.X = adata.X.astype(dtype)
+     cudata = rsc.get.anndata_to_GPU(adata, copy=True)
+ 
+-    mean, var = sc_get_mean_var(adata.X, axis=axis, correction=1)
+-    rsc_mean, rsc_var = rsc_get_mean_var(cudata.X, axis=axis)
++    mean, var = sc_get_mean_var(adata.X, axis=axis, correction=correction)
++    rsc_mean, rsc_var = rsc_get_mean_var(cudata.X, axis=axis, correction=correction)
+ 
+     cp.testing.assert_allclose(mean, rsc_mean)
+     cp.testing.assert_allclose(var, rsc_var)
+diff --git a/tests/test_shifted_clr.py b/tests/test_shifted_clr.py
+new file mode 100644
+index 000000000..e0acddc90
+--- /dev/null
++++ b/tests/test_shifted_clr.py
+@@ -0,0 +1,249 @@
++from __future__ import annotations
++
++import cupy as cp
++import numpy as np
++import pytest
++import scanpy as sc
++from anndata import AnnData
++from cupyx.scipy.sparse import csc_matrix, csr_matrix
++
++import rapids_singlecell as rsc
++from rapids_singlecell.preprocessing._normalize import _estimate_nb_overdispersion
++
++ARRAY_TYPES = [cp.asarray, csr_matrix, csc_matrix]
++
++# TODO: drop this skip once a scanpy release ships `normalize_shifted_clr` (scverse/scanpy#4160);
++# until then only the `dev` CI env, which installs scanpy main, compares against scanpy.
++needs_scanpy_shifted_clr = pytest.mark.skipif(
++    not hasattr(sc.pp, "normalize_shifted_clr"),
++    reason="installed scanpy has no `normalize_shifted_clr` (scverse/scanpy#4160)",
++)
++
++
++def _counts() -> np.ndarray:
++    """RNA-like overdispersed counts with an empty cell and an empty gene."""
++    rng = np.random.default_rng(0)
++    mu = rng.lognormal(0.5, 1.2, size=30)
++    x = rng.negative_binomial(2, 2 / (2 + mu), size=(40, 30)).astype(np.float64)
++    x[3] = 0
++    x[:, 7] = 0
++    return x
++
++
++def _scanpy_shifted_clr(x: np.ndarray, **kwargs) -> np.ndarray:
++    adata = AnnData(x.copy())
++    with pytest.warns(UserWarning, match="Some cells have zero counts"):
++        sc.pp.normalize_shifted_clr(adata, **kwargs)
++    return np.asarray(adata.X)
++
++
++# Same hand-computed cases as scanpy's tests
++X_clr = np.array([[5, 0, 3, 2], [1, 1, 0, 4], [0, 7, 2, 1], [3, 3, 3, 3]], dtype="float32")
++# Each gene has mean 2 and variance 4, so alpha = (4 - 2) / 2**2 = 0.5;
++# log1p(4 * 0.5 * [0, 4]) = [0, ln 9], centered on its mean ln 3.
++X_clr_estimated = np.array([[0, 4], [4, 0]], dtype="float32")
++X_clr_estimated_expected = np.log(3) * np.array([[-1.0, 1.0], [1.0, -1.0]])
++# alpha = 0.25: log1p([0, 1, 3]) = [0, ln 2, 2 ln 2], centered on its mean ln 2.
++X_clr_explicit = np.array([[0, 1, 3]], dtype="float32")
++X_clr_explicit_expected = np.log(2) * np.array([[-1.0, 0.0, 1.0]])
++
++
++def _dense(X):
++    return cp.asnumpy(X.toarray() if hasattr(X, "toarray") else X)
++
++
++def _clr(x, array_type=cp.asarray, **kwargs) -> np.ndarray:
++    adata = AnnData(array_type(cp.asarray(x, dtype=cp.float32)))
++    rsc.pp.normalize_shifted_clr(adata, **kwargs)
++    assert isinstance(adata.X, cp.ndarray)
++    return cp.asnumpy(adata.X)
++
++
++@needs_scanpy_shifted_clr
++@pytest.mark.parametrize("array_type", ARRAY_TYPES)
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++@pytest.mark.parametrize("alpha", [None, 0.3], ids=["estimated", "explicit"])
++def test_matches_scanpy(array_type, dtype, alpha):
++    x = _counts().astype(dtype)
++    expected = _scanpy_shifted_clr(x, alpha=alpha)
++    adata = AnnData(array_type(cp.asarray(x)))
++    with pytest.warns(UserWarning, match="Some cells have zero counts"):
++        rsc.pp.normalize_shifted_clr(adata, alpha=alpha)
++
++    assert isinstance(adata.X, cp.ndarray)
++    assert adata.X.dtype == dtype
++    tol = 1e-6 if dtype == np.float32 else 1e-12
++    np.testing.assert_allclose(cp.asnumpy(adata.X), expected, rtol=tol, atol=tol)
++
++
++@needs_scanpy_shifted_clr
++def test_estimate_alpha_matches_scanpy():
++    from scanpy.preprocessing._normalization import _estimate_nb_overdispersion as sc_estimate
++
++    x = _counts()
++    alpha = _estimate_nb_overdispersion(csr_matrix(cp.asarray(x)))
++    assert alpha == pytest.approx(sc_estimate(x), rel=1e-12)
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES)
++def test_values(array_type):
++    """Check values with the estimated `alpha` against hand-computed results."""
++    np.testing.assert_allclose(_clr(X_clr_estimated, array_type), X_clr_estimated_expected, rtol=1e-5, atol=1e-6)
++
++
++def test_values_integer_input():
++    adata = AnnData(cp.asarray(X_clr_estimated, dtype=cp.int64))
++    rsc.pp.normalize_shifted_clr(adata)
++    assert adata.X.dtype == cp.float64
++    np.testing.assert_allclose(cp.asnumpy(adata.X), X_clr_estimated_expected, rtol=1e-12, atol=1e-12)
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES)
++def test_explicit_alpha(array_type):
++    """Check values with an explicit `alpha` against hand-computed results."""
++    np.testing.assert_allclose(
++        _clr(X_clr_explicit, array_type, alpha=0.25), X_clr_explicit_expected, rtol=1e-5, atol=1e-6
++    )
++
++
++@pytest.mark.parametrize("alpha", [None, 0.5], ids=["estimated", "explicit"])
++def test_zero_sum(alpha):
++    """Every cell lies on the zero-sum (Aitchison) hyperplane."""
++    result = _clr(X_clr, alpha=alpha)
++    np.testing.assert_allclose(result.sum(axis=1), 0.0, atol=1e-5)
++    # a cell with equal counts for every gene maps to all zeros
++    np.testing.assert_allclose(result[3], 0.0, atol=1e-6)
++
++
++def test_within_cell_rank_order():
++    """Higher counts in a cell give higher values, and equal counts equal values."""
++    result = _clr(X_clr, csr_matrix)
++    order = np.argsort(X_clr, axis=1, kind="stable")
++    count_steps = np.diff(np.take_along_axis(X_clr, order, axis=1), axis=1)
++    value_steps = np.diff(np.take_along_axis(result, order, axis=1), axis=1)
++    np.testing.assert_array_equal(np.sign(value_steps), np.sign(count_steps))
++
++
++@pytest.mark.parametrize("axis", [0, 1], ids=["cells", "genes"])
++def test_permutation_equivariance(axis):
++    """Reordering cells or genes reorders the output the same way."""
++    perm = np.array([2, 0, 3, 1])
++    np.testing.assert_allclose(
++        _clr(np.take(X_clr, perm, axis=axis), csr_matrix),
++        np.take(_clr(X_clr, csr_matrix), perm, axis=axis),
++        atol=1e-6,
++    )
++
++
++def test_log_ratio():
++    """With fixed `alpha`, a within-cell log-ratio ignores the other genes' counts."""
++    changed = X_clr.copy()
++    changed[0, 3] = 50
++    result, result_changed = _clr(X_clr, alpha=0.5), _clr(changed, alpha=0.5)
++    np.testing.assert_allclose(result_changed[0, 0] - result_changed[0, 2], result[0, 0] - result[0, 2], atol=1e-6)
++    # other cells are normalized independently
++    np.testing.assert_allclose(result_changed[1:], result[1:], atol=1e-6)
++
++
++def test_alpha_scales_with_counts():
++    """Scaling counts by k and `alpha` by 1/k leaves the result unchanged."""
++    k = 3
++    np.testing.assert_allclose(_clr(X_clr * k, alpha=0.5 / k), _clr(X_clr, alpha=0.5), atol=1e-6)
++
++
++@pytest.mark.parametrize("alpha", [0.1, 0.3, 1.0])
++def test_estimate_nb_overdispersion_simulated(alpha):
++    """Recover a known `alpha` from negative-binomial counts."""
++    rng = np.random.default_rng(0)
++    mu = rng.uniform(0.5, 20, size=300)
++    n = 1 / alpha  # numpy's NB has var = mu + mu**2 / n
++    x = rng.negative_binomial(n, n / (n + mu), size=(5000, mu.size))
++    assert _estimate_nb_overdispersion(csr_matrix(cp.asarray(x, dtype=cp.float64))) == pytest.approx(alpha, rel=0.05)
++
++
++@pytest.mark.parametrize("alpha", [0.0, -0.5], ids=["zero", "negative"])
++def test_nonpositive_alpha_raises(alpha):
++    adata = AnnData(csr_matrix(cp.asarray(X_clr)))
++    with pytest.raises(ValueError, match=r"alpha.*positive"):
++        rsc.pp.normalize_shifted_clr(adata, alpha=alpha)
++
++
++def test_estimated_alpha_zero_mean_raises():
++    adata = AnnData(cp.zeros((3, 4), dtype=cp.float32))
++    with pytest.raises(ValueError, match="Cannot estimate overdispersion"):
++        rsc.pp.normalize_shifted_clr(adata)
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES)
++def test_zero_cell(array_type):
++    """Keep an empty cell finite and all-zero."""
++    x = X_clr.copy()
++    x[1] = 0
++    adata = AnnData(array_type(cp.asarray(x)))
++    with pytest.warns(UserWarning, match="Some cells have zero counts"):
++        rsc.pp.normalize_shifted_clr(adata)
++    result = cp.asnumpy(adata.X)
++    assert np.isfinite(result).all()
++    np.testing.assert_allclose(result[1], 0.0, atol=1e-6)
++
++
++@pytest.mark.parametrize("array_type", [csr_matrix, csc_matrix])
++@pytest.mark.parametrize("n_vars", [5, 3000])
++def test_sparse_matches_dense(array_type, n_vars):
++    rng = np.random.default_rng(1)
++    x = rng.negative_binomial(1, 0.3, size=(200, n_vars)).astype(np.float64)
++    x[rng.random(x.shape) < 0.6] = 0
++    x[:, 0] += 1  # no empty cells
++    np.testing.assert_allclose(_clr(x, array_type, alpha=0.7), _clr(x, cp.asarray, alpha=0.7), rtol=1e-6, atol=1e-6)
++
++
++def test_inplace_false():
++    adata = AnnData(csr_matrix(cp.asarray(X_clr_estimated)))
++    x_before = _dense(adata.X).copy()
++    out = rsc.pp.normalize_shifted_clr(adata, inplace=False)
++
++    assert isinstance(out, dict)
++    assert set(out) == {"X"}
++    np.testing.assert_allclose(cp.asnumpy(out["X"]), X_clr_estimated_expected, rtol=1e-5, atol=1e-6)
++    # input is left untouched
++    assert isinstance(adata.X, csr_matrix)
++    np.testing.assert_array_equal(_dense(adata.X), x_before)
++
++
++def test_copy():
++    adata = AnnData(csr_matrix(cp.asarray(X_clr_estimated)))
++    returned = rsc.pp.normalize_shifted_clr(adata, copy=True)
++
++    assert isinstance(returned, AnnData)
++    assert returned is not adata
++    np.testing.assert_allclose(cp.asnumpy(returned.X), X_clr_estimated_expected, rtol=1e-5, atol=1e-6)
++    assert isinstance(adata.X, csr_matrix)
++
++
++def test_copy_inplace_error():
++    adata = AnnData(csr_matrix(cp.asarray(X_clr)))
++    with pytest.raises(ValueError, match="`copy=True` cannot be used with `inplace=False`"):
++        rsc.pp.normalize_shifted_clr(adata, copy=True, inplace=False)
++
++
++def test_layer():
++    """`layer` selects the input layer and leaves `X` untouched."""
++    adata = AnnData(
++        csr_matrix(cp.asarray(X_clr_estimated)),
++        layers={"counts": csr_matrix(cp.asarray(X_clr_estimated))},
++    )
++    x_before = _dense(adata.X).copy()
++    rsc.pp.normalize_shifted_clr(adata, layer="counts")
++
++    np.testing.assert_array_equal(_dense(adata.X), x_before)
++    assert isinstance(adata.layers["counts"], cp.ndarray)
++    np.testing.assert_allclose(cp.asnumpy(adata.layers["counts"]), X_clr_estimated_expected, rtol=1e-5, atol=1e-6)
++
++
++def test_view():
++    adata = AnnData(cp.asarray(X_clr))
++    v = adata[:, :]
++    with pytest.warns(UserWarning, match=r"Received a view"):
++        rsc.pp.normalize_shifted_clr(v)
++    assert not v.is_view
++    cp.testing.assert_array_equal(adata.X, cp.asarray(X_clr))

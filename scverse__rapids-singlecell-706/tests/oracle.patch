@@ -1,0 +1,1922 @@
+diff --git a/docs/api/pertpy_gpu.md b/docs/api/pertpy_gpu.md
+index 7f1a2d6c2..3125ceb2e 100644
+--- a/docs/api/pertpy_gpu.md
++++ b/docs/api/pertpy_gpu.md
+@@ -93,15 +93,38 @@
+ 
+         ~Mixscape.perturbation_signature
+         ~Mixscape.mixscape
+-        ~Mixscape.mixscale
+         ~Mixscape.lda
+ 
+     .. automethod:: perturbation_signature
+         :no-index:
+     .. automethod:: mixscape
+         :no-index:
+-    .. automethod:: mixscale
+-        :no-index:
+     .. automethod:: lda
+         :no-index:
+ ```
++
++## Mixscale
++
++```{eval-rst}
++.. autosummary::
++    :toctree: generated
++
++    Mixscale
++```
++
++```{eval-rst}
++.. autoclass:: Mixscale
++    :no-index:
++
++    .. rubric:: Methods
++
++    .. autosummary::
++
++        ~Mixscale.perturbation_signature
++        ~Mixscale.mixscale
++
++    .. automethod:: perturbation_signature
++        :no-index:
++    .. automethod:: mixscale
++        :no-index:
++```
+diff --git a/docs/release-notes/0.16.0.md b/docs/release-notes/0.16.0.md
+index 229396aa1..f0e8a36cf 100644
+--- a/docs/release-notes/0.16.0.md
++++ b/docs/release-notes/0.16.0.md
+@@ -4,7 +4,7 @@
+ ```
+ * Reworked GPU {func}`~rapids_singlecell.tl.rank_genes_groups` Wilcoxon onto dedicated nanobind CUDA kernels {pr}`636` {smaller}`S Dicks`
+ * {func}`~rapids_singlecell.tl.rank_genes_groups` no longer truncates gene names longer than 50 characters in ``uns[...]['names']`` (the field is now ``object`` dtype, matching Scanpy) {pr}`636` {smaller}`S Dicks`
+-* Add {class}`~rapids_singlecell.ptg.Mixscape` for GPU-accelerated Mixscape (`perturbation_signature`, `mixscape`, `mixscale`, `lda`) {pr}`688` {smaller}`S Dicks`
++* Add {class}`~rapids_singlecell.ptg.Mixscape` (`perturbation_signature`, `mixscape`, `lda`) and {class}`~rapids_singlecell.ptg.Mixscale` (`perturbation_signature`, `mixscale`) for GPU-accelerated perturbation-efficacy analysis {pr}`688` {smaller}`S Dicks`
+ 
+ ```{rubric} Performance
+ ```
+diff --git a/src/rapids_singlecell/pertpy_gpu/__init__.py b/src/rapids_singlecell/pertpy_gpu/__init__.py
+index a40cf64d3..fc907e56e 100644
+--- a/src/rapids_singlecell/pertpy_gpu/__init__.py
++++ b/src/rapids_singlecell/pertpy_gpu/__init__.py
+@@ -2,4 +2,5 @@
+ 
+ from ._distance import Distance, MeanVar
+ from ._guide_assignment import GuideAssignment
++from ._mixscale import Mixscale
+ from ._mixscape import Mixscape
+diff --git a/src/rapids_singlecell/pertpy_gpu/_base.py b/src/rapids_singlecell/pertpy_gpu/_base.py
+new file mode 100644
+index 000000000..8a1344d8d
+--- /dev/null
++++ b/src/rapids_singlecell/pertpy_gpu/_base.py
+@@ -0,0 +1,314 @@
++from __future__ import annotations
++
++import warnings
++from typing import TYPE_CHECKING, Literal
++
++import cupy as cp
++import numpy as np
++import pandas as pd
++from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
++from cupyx.scipy.sparse import issparse as cp_issparse
++from scanpy.get import _get_obs_rep, _set_obs_rep
++
++from rapids_singlecell.get import X_to_GPU
++
++if TYPE_CHECKING:
++    from anndata import AnnData
++
++# Below this many variables ``perturbation_signature`` uses ``.X`` rather than a
++# PCA representation when ``use_rep`` is not given (mirrors scanpy).
++_NN_REPRESENTATION_AUTO_MAX_VARS = 50
++# Sentinel groupby label for cells outside the current split during differential
++# expression, so they are excluded without copying/subsetting the matrix.
++_DE_IGNORE_LABEL = "__mixscape_other__"
++
++
++class PerturbationEfficacyAnalyzer:
++    """Shared substrate for the GPU perturbation-efficacy tools.
++
++    Holds the steps that both the binary
++    :class:`~rapids_singlecell.ptg.Mixscape` classification and the continuous
++    :class:`~rapids_singlecell.ptg.Mixscale` scoring build on: computing the
++    perturbation signature and detecting the differentially expressed marker
++    genes per perturbation.
++    """
++
++    def perturbation_signature(
++        self,
++        adata: AnnData,
++        pert_key: str,
++        control: str,
++        *,
++        ref_selection_mode: Literal["nn", "split_by"] = "nn",
++        split_by: str | None = None,
++        n_neighbors: int = 20,
++        use_rep: str | None = None,
++        n_dims: int | None = 15,
++        n_pcs: int | None = None,
++        knn_algorithm: str = "brute",
++        knn_kwargs: dict | None = None,
++        copy: bool = False,
++    ) -> AnnData | None:
++        """Calculate the perturbation signature.
++
++        The perturbation signature replaces each cell's expression with the
++        residual against comparable control cells, removing confounding
++        variation so that what remains reflects the perturbation. The result is
++        written to ``adata.layers["X_pert"]``. As in the original
++        implementation, this is intended to run on unscaled log-normalized data.
++
++        Parameters
++        ----------
++        adata
++            The annotated data object.
++        pert_key
++            The column of ``.obs`` with perturbation categories; must also
++            contain ``control``.
++        control
++            Name of the control category in ``pert_key``.
++        ref_selection_mode
++            How reference cells are selected. ``"nn"`` uses the ``n_neighbors``
++            nearest control cells in the chosen representation; ``"split_by"``
++            uses all control cells within the same ``split_by`` group.
++        split_by
++            Column of ``.obs`` used to compute the signature separately per
++            group (e.g. biological replicate). Required for
++            ``ref_selection_mode="split_by"``.
++        n_neighbors
++            Number of control neighbors used for ``ref_selection_mode="nn"``.
++            Capped to the number of control cells available in each split, so a
++            split with fewer controls than ``n_neighbors`` still runs (pertpy
++            would error).
++        use_rep
++            Representation to use for neighbor selection. ``"X"`` or any
++            ``.obsm`` key. If ``None``, ``.X`` is used when ``n_vars`` is below
++            50, otherwise ``"X_pca"`` (computed if absent).
++        n_dims
++            Number of dimensions of the representation to use. ``None`` uses all.
++        n_pcs
++            Number of principal components to compute if a PCA representation is
++            built.
++        knn_algorithm
++            Nearest-neighbor backend for ``ref_selection_mode="nn"``: ``"brute"``
++            (exact, default), or the approximate cuVS backends ``"ivfflat"``,
++            ``"cagra"``, ``"ivfpq"`` which are much faster for large datasets.
++        knn_kwargs
++            Extra parameters for the approximate backends (e.g. ``n_lists`` /
++            ``n_probes`` for ``"ivfflat"``).
++        copy
++            Whether to return a copy of ``adata``.
++
++        Returns
++        -------
++        Returns the modified copy if ``copy=True``, otherwise writes
++        ``adata.layers["X_pert"]`` in place and returns ``None``.
++        """
++        if ref_selection_mode not in ("nn", "split_by"):
++            raise ValueError("ref_selection_mode must be either 'nn' or 'split_by'.")
++        if ref_selection_mode == "split_by" and split_by is None:
++            raise ValueError(
++                "split_by must be provided if ref_selection_mode is 'split_by'."
++            )
++
++        if copy:
++            adata = adata.copy()
++
++        X = _to_dense_gpu(_get_obs_rep(adata))
++        control_mask = (adata.obs[pert_key] == control).to_numpy()
++        X_pert = X.copy()
++
++        if ref_selection_mode == "split_by":
++            for split in adata.obs[split_by].unique():
++                split_mask = (adata.obs[split_by] == split).to_numpy()
++                control_group_np = control_mask & split_mask
++                if not control_group_np.any():
++                    warnings.warn(
++                        f"No control cells in split {split!r}; leaving its "
++                        "perturbation signature equal to the input.",
++                        UserWarning,
++                        stacklevel=2,
++                    )
++                    continue
++                control_mean = X[cp.asarray(control_group_np)].mean(axis=0)
++                split_dev = cp.asarray(split_mask)
++                X_pert[split_dev] = control_mean[None, :] - X_pert[split_dev]
++        else:
++            if split_by is None:
++                split_masks = [np.ones(adata.n_obs, dtype=bool)]
++            else:
++                split_obs = adata.obs[split_by]
++                split_masks = [
++                    (split_obs == cat).to_numpy() for cat in split_obs.unique()
++                ]
++
++            from rapids_singlecell.preprocessing._neighbors._neighbors import (
++                KNN_ALGORITHMS,
++            )
++
++            if knn_algorithm not in KNN_ALGORITHMS:
++                raise ValueError(
++                    f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, "
++                    f"got {knn_algorithm!r}"
++                )
++            knn = KNN_ALGORITHMS[knn_algorithm]
++            algorithm_kwds = dict(knn_kwargs) if knn_kwargs is not None else {}
++
++            representation = _choose_representation_gpu(
++                adata, use_rep=use_rep, n_pcs=n_pcs
++            )
++            if n_dims is not None and n_dims < representation.shape[1]:
++                representation = representation[:, :n_dims]
++            representation = cp.ascontiguousarray(representation)
++
++            for split_mask in split_masks:
++                control_mask_split = control_mask & split_mask
++                n_split = int(split_mask.sum())
++                n_control = int(control_mask_split.sum())
++                if n_control == 0:
++                    warnings.warn(
++                        "No control cells in a split; leaving its perturbation "
++                        "signature equal to the input.",
++                        UserWarning,
++                        stacklevel=2,
++                    )
++                    continue
++                R_split = representation[cp.asarray(split_mask)]
++                R_control = representation[cp.asarray(control_mask_split)]
++                k = min(n_neighbors, n_control)
++
++                indices, _ = knn(
++                    R_control,
++                    R_split,
++                    k,
++                    metric="euclidean",
++                    metric_kwds={},
++                    algorithm_kwds=algorithm_kwds,
++                )
++
++                X_control = cp.expm1(X[cp.asarray(control_mask_split)])
++                col_indices = indices.ravel().astype(cp.int32, copy=False)
++                row_indices = cp.repeat(cp.arange(n_split, dtype=cp.int32), k)
++                neigh_matrix = cp_csr_matrix(
++                    (
++                        cp.full(col_indices.size, 1.0 / k, dtype=X.dtype),
++                        (row_indices, col_indices),
++                    ),
++                    shape=(n_split, n_control),
++                )
++                split_dev = cp.asarray(split_mask)
++                X_pert[split_dev] = (
++                    cp.log1p(neigh_matrix @ X_control) - X_pert[split_dev]
++                )
++
++        _set_obs_rep(adata, X_pert, layer="X_pert")
++
++        if copy:
++            return adata
++        return None
++
++    def _get_perturbation_markers(
++        self,
++        adata: AnnData,
++        *,
++        split_masks: list[np.ndarray],
++        categories: list[str],
++        pert_key: str,
++        control: str,
++        layer: str | None,
++        pval_cutoff: float,
++        min_de_genes: int,
++        logfc_threshold: float,
++        test_method: str,
++    ) -> dict[tuple, np.ndarray]:
++        """Differentially expressed genes per split and target gene."""
++        from rapids_singlecell.tools import rank_genes_groups
++
++        perturbation_markers: dict[tuple, np.ndarray] = {}
++        pert_str = adata.obs[pert_key].astype(str).to_numpy()
++        group_key = "_mixscape_de_groupby"
++        rgg_key = "_mixscape_rank_genes_groups"
++        for split, split_mask in enumerate(split_masks):
++            category = categories[split]
++            gene_targets = sorted(set(pert_str[split_mask]) - {control})
++            if len(gene_targets) == 0:
++                continue
++            # Mask-based grouping instead of ``adata[split_mask].copy()``: cells
++            # outside the split get a sentinel label so they belong to neither a
++            # target group nor the control reference. rank_genes_groups computes
++            # per-group stats over the full matrix (via Aggregate); nothing is
++            # copied or subsetted.
++            group_labels = np.where(split_mask, pert_str, _DE_IGNORE_LABEL)
++            adata.obs[group_key] = pd.Categorical(group_labels)
++            try:
++                with warnings.catch_warnings():
++                    warnings.simplefilter("ignore", RuntimeWarning)
++                    rank_genes_groups(
++                        adata,
++                        group_key,
++                        groups=gene_targets,
++                        reference=control,
++                        layer=layer,
++                        method=test_method,
++                        use_raw=False,
++                        key_added=rgg_key,
++                    )
++                rgg = adata.uns[rgg_key]
++                for gene in gene_targets:
++                    logfc_mask = np.abs(rgg["logfoldchanges"][gene]) >= logfc_threshold
++                    de_genes = rgg["names"][gene][logfc_mask]
++                    pvals_adj = rgg["pvals_adj"][gene][logfc_mask]
++                    de_genes = de_genes[pvals_adj < pval_cutoff]
++                    if len(de_genes) < min_de_genes:
++                        de_genes = np.array([])
++                    perturbation_markers[category, gene] = de_genes
++            finally:
++                adata.obs.drop(columns=group_key, inplace=True, errors="ignore")
++                adata.uns.pop(rgg_key, None)
++
++        return perturbation_markers
++
++
++def _to_dense_gpu(X) -> cp.ndarray:
++    """Return ``X`` as a contiguous dense float CuPy array on the GPU.
++
++    ``float32``/``float64`` are preserved (so ``float64`` input keeps pertpy's
++    precision end to end); any other dtype is cast to ``float32``.
++    """
++    X = X_to_GPU(X)
++    if X.dtype not in (cp.float32, cp.float64):
++        X = X.astype(cp.float32)
++    if cp_issparse(X):
++        from rapids_singlecell.preprocessing._utils import _sparse_to_dense
++
++        return _sparse_to_dense(X, order="C")
++    return X
++
++
++def _choose_representation_gpu(
++    adata: AnnData, *, use_rep: str | None, n_pcs: int | None
++) -> cp.ndarray:
++    """GPU analogue of scanpy's ``_choose_representation`` for neighbor search.
++
++    Always returns a float32 representation: neighbor selection does not need
++    float64 precision, and the cuVS backends (ivfflat/cagra) only accept float32.
++    """
++    if use_rep is None:
++        if adata.n_vars < _NN_REPRESENTATION_AUTO_MAX_VARS:
++            rep = _to_dense_gpu(_get_obs_rep(adata))
++        else:
++            if "X_pca" not in adata.obsm or (
++                n_pcs is not None and adata.obsm["X_pca"].shape[1] < n_pcs
++            ):
++                from rapids_singlecell.preprocessing import pca
++
++                pca(adata, n_comps=n_pcs)
++            rep = X_to_GPU(adata.obsm["X_pca"])
++    elif use_rep == "X":
++        rep = _to_dense_gpu(_get_obs_rep(adata))
++    else:
++        rep = X_to_GPU(adata.obsm[use_rep])
++
++    rep = cp.asarray(rep, dtype=cp.float32)
++    if n_pcs is not None and n_pcs < rep.shape[1]:
++        rep = rep[:, :n_pcs]
++    return rep
+diff --git a/src/rapids_singlecell/pertpy_gpu/_mixscale.py b/src/rapids_singlecell/pertpy_gpu/_mixscale.py
+new file mode 100644
+index 000000000..87be9b750
+--- /dev/null
++++ b/src/rapids_singlecell/pertpy_gpu/_mixscale.py
+@@ -0,0 +1,258 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import cupy as cp
++import numpy as np
++
++from rapids_singlecell.get import X_to_GPU
++
++from ._base import PerturbationEfficacyAnalyzer, _to_dense_gpu
++
++if TYPE_CHECKING:
++    from anndata import AnnData
++
++
++class Mixscale(PerturbationEfficacyAnalyzer):
++    """GPU-accelerated Mixscale for continuous perturbation-efficiency scoring.
++
++    Unlike :class:`~rapids_singlecell.ptg.Mixscape`, which performs a binary
++    knocked-out/non-perturbed classification with a Gaussian mixture, Mixscale
++    assigns each cell a *continuous* perturbation-efficiency score. It follows
++    Seurat's Mixscale and pertpy's :class:`~pertpy.tools.Mixscale`; the
++    perturbation signature is computed via
++    :meth:`~rapids_singlecell.ptg.Mixscale.perturbation_signature` and the
++    per-gene projection and z-score scoring run on the GPU.
++    """
++
++    def mixscale(
++        self,
++        adata: AnnData,
++        pert_key: str,
++        control: str,
++        *,
++        new_class_name: str = "mixscale_score",
++        layer: str | None = None,
++        min_de_genes: int = 5,
++        max_de_genes: int = 100,
++        logfc_threshold: float = 0.25,
++        de_layer: str | None = None,
++        test_method: str = "wilcoxon",
++        scale: bool = True,
++        split_by: str | None = None,
++        pval_cutoff: float = 5e-2,
++        perturbation_type: str = "KO",
++        copy: bool = False,
++    ) -> AnnData | None:
++        """Continuous perturbation efficiency scores (Mixscale).
++
++        Unlike :meth:`~rapids_singlecell.ptg.Mixscape.mixscape`, which performs a
++        binary knocked-out/non-perturbed classification with a Gaussian mixture,
++        this assigns each cell a *continuous* perturbation-efficiency score: the
++        scalar projection of its perturbation signature onto the per-gene
++        perturbation direction (mean perturbed minus mean control), z-score
++        standardized relative to the non-targeting control distribution. This is
++        useful for CRISPRi/CRISPRa screens where cells show a gradient of
++        perturbation strength rather than a binary knockout. Control cells
++        receive a score of 0.
++
++        Implements Jiang, Dalgarno et al., "Systematic reconstruction of molecular
++        pathway signatures using scalable single-cell perturbation screens",
++        Nature Cell Biology (2025), following pertpy's
++        :meth:`~pertpy.tools.Mixscale.mixscale`.
++
++        Parameters
++        ----------
++        adata
++            The annotated data object.
++        pert_key
++            The column of ``.obs`` with target gene labels.
++        control
++            Control category in ``pert_key``.
++        new_class_name
++            Name of the ``.obs`` column for the continuous score.
++        layer
++            Layer used for scoring. Defaults to ``.layers["X_pert"]``.
++        min_de_genes
++            Minimum number of differentially expressed genes required to score a
++            gene; genes with fewer are skipped.
++        max_de_genes
++            Maximum number of (top-ranked) differentially expressed genes used to
++            define the perturbation direction.
++        logfc_threshold
++            Minimum absolute log fold change for a gene to count as
++            differentially expressed.
++        de_layer
++            Layer used for differential expression. ``None`` uses ``.X``.
++        test_method
++            Differential-expression test passed to
++            :func:`rapids_singlecell.tl.rank_genes_groups`.
++        scale
++            Scale the per-gene sub-matrix before computing scores.
++        split_by
++            ``.obs`` column with a condition/cell-type annotation if
++            perturbations are condition specific.
++        pval_cutoff
++            Adjusted p-value cutoff for differentially expressed genes.
++        perturbation_type
++            Accepted for ``pertpy.tl.Mixscale.mixscale`` API compatibility; has no
++            effect on the continuous score.
++        copy
++            Whether to return a copy of ``adata``.
++
++        Returns
++        -------
++        Returns the modified copy if ``copy=True``, otherwise writes
++        ``adata.obs[new_class_name]`` in place and returns ``None``. Higher
++        absolute values indicate a stronger perturbation effect; control cells
++        and any gene that cannot be scored receive 0.
++        """
++        if copy:
++            adata = adata.copy()
++
++        if split_by is None:
++            split_masks = [np.ones(adata.n_obs, dtype=bool)]
++            categories = ["all"]
++        else:
++            split_obs = adata.obs[split_by]
++            categories = list(split_obs.unique())
++            split_masks = [
++                (split_obs == category).to_numpy() for category in categories
++            ]
++
++        perturbation_markers = self._get_perturbation_markers(
++            adata,
++            split_masks=split_masks,
++            categories=categories,
++            pert_key=pert_key,
++            control=control,
++            layer=de_layer,
++            pval_cutoff=pval_cutoff,
++            min_de_genes=min_de_genes,
++            logfc_threshold=logfc_threshold,
++            test_method=test_method,
++        )
++
++        if layer is not None:
++            X = X_to_GPU(adata.layers[layer])
++        else:
++            try:
++                X = X_to_GPU(adata.layers["X_pert"])
++            except KeyError:
++                raise KeyError(
++                    "No 'X_pert' found in .layers! Please run perturbation_signature "
++                    "first to calculate the perturbation signature!"
++                ) from None
++        X = _to_dense_gpu(X)
++
++        var_names = np.asarray(adata.var_names)
++        var_to_idx = {name: i for i, name in enumerate(var_names)}
++        # Integer codes let every per-gene cell mask be built with a fast integer
++        # comparison over the full obs, and no cells are ever copied out of adata.
++        pert_cat = adata.obs[pert_key].astype("category")
++        codes = pert_cat.cat.codes.to_numpy()
++        cat_names = [str(c) for c in pert_cat.cat.categories]
++        control_code = {name: i for i, name in enumerate(cat_names)}.get(control, -1)
++
++        # One job per scorable gene (indices + masks, cheap host work); the
++        # gather, scaling, projection and z-score for all genes then run in a
++        # single batched kernel that reads each block straight from X.
++        gene_jobs: list[dict] = []
++        for split, split_mask in enumerate(split_masks):
++            category = categories[split]
++            nt_mask = (codes == control_code) & split_mask
++            split_gene_codes = sorted(set(codes[split_mask].tolist()) - {control_code})
++
++            for gene_code in split_gene_codes:
++                gene = cat_names[gene_code]
++                de_genes = perturbation_markers[category, gene]
++                if len(de_genes) == 0:
++                    continue
++                # Keep only the top-ranked DE genes (markers are score-ranked).
++                if len(de_genes) > max_de_genes:
++                    de_genes = de_genes[:max_de_genes]
++                de_genes_indices = np.fromiter(
++                    (var_to_idx[g] for g in de_genes if g in var_to_idx),
++                    dtype=np.int32,
++                )
++                if de_genes_indices.size == 0:
++                    continue
++
++                orig_mask = (codes == gene_code) & split_mask
++                all_mask = orig_mask | nt_mask
++                nt_in_all_np = nt_mask[all_mask]
++                if not nt_in_all_np.any():
++                    # No control cells: cannot define a perturbation direction.
++                    continue
++
++                gene_jobs.append(
++                    {
++                        "row_ids": np.flatnonzero(all_mask).astype(np.int32),
++                        "col_ids": de_genes_indices,
++                        "is_guide": orig_mask[all_mask],
++                        "nt_in_all": nt_in_all_np,
++                    }
++                )
++
++        # Control cells stay 0; the kernel writes only guide cells. float64
++        # output matches pertpy's ``obs[...] = 0.0`` column.
++        scores_gpu = cp.zeros(adata.n_obs, dtype=X.dtype)
++        if gene_jobs:
++            _project_scores_batched(X, gene_jobs, scores_gpu, do_scale=scale)
++        adata.obs[new_class_name] = cp.asnumpy(scores_gpu).astype(
++            np.float64, copy=False
++        )
++
++        if copy:
++            return adata
++        return None
++
++
++def _project_scores_batched(
++    X: cp.ndarray, gene_jobs: list[dict], scores_gpu: cp.ndarray, *, do_scale: bool
++) -> None:
++    """Batched Mixscale scoring for all genes in one kernel launch.
++
++    Flattens each gene's cell indices, DE-gene indices and guide/control masks
++    into gene-blocked buffers and runs ``_mixscale_cuda.project_score`` once,
++    writing each guide cell's standardized score into ``scores_gpu`` at its obs
++    index (controls stay 0; the scatter is race-free, one gene per guide cell).
++    """
++    from rapids_singlecell._cuda import _mixscale_cuda as _msc
++
++    # Kernel indexes X row-major; ensure C-order (no-op if already contiguous).
++    X = cp.ascontiguousarray(X)
++
++    n_genes = len(gene_jobs)
++    n_list = np.array([job["row_ids"].shape[0] for job in gene_jobs], dtype=np.int64)
++    k_list = np.array([job["col_ids"].shape[0] for job in gene_jobs], dtype=np.int64)
++    cell_off = np.concatenate([[0], np.cumsum(n_list)]).astype(np.int32)
++    feat_off = np.concatenate([[0], np.cumsum(k_list)]).astype(np.int32)
++    max_k = int(k_list.max())
++
++    row_ids = cp.asarray(np.concatenate([job["row_ids"] for job in gene_jobs]))
++    col_ids = cp.asarray(np.concatenate([job["col_ids"] for job in gene_jobs]))
++    is_guide = cp.asarray(np.concatenate([job["is_guide"] for job in gene_jobs]))
++    nt_flat = cp.asarray(np.concatenate([job["nt_in_all"] for job in gene_jobs]))
++    # double scratch: the kernel accumulates projections/stats in 64-bit so
++    # float32 inputs keep full precision (matches mean_var's accumulation).
++    pvec_scratch = cp.empty(int(cell_off[-1]), dtype=cp.float64)
++
++    _msc.project_score(
++        X,
++        int(X.shape[1]),
++        row_ids,
++        col_ids,
++        cp.asarray(n_list.astype(np.int32)),
++        cp.asarray(k_list.astype(np.int32)),
++        cp.asarray(cell_off),
++        cp.asarray(feat_off),
++        is_guide,
++        nt_flat,
++        pvec_scratch,
++        scores_gpu,
++        n_genes=n_genes,
++        max_k=max_k,
++        do_scale=do_scale,
++        stream=cp.cuda.get_current_stream().ptr,
++    )
+diff --git a/src/rapids_singlecell/pertpy_gpu/_mixscape.py b/src/rapids_singlecell/pertpy_gpu/_mixscape.py
+index 327f10fc1..e32dea523 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_mixscape.py
++++ b/src/rapids_singlecell/pertpy_gpu/_mixscape.py
+@@ -1,17 +1,16 @@
+ from __future__ import annotations
+ 
+-import warnings
+-from typing import TYPE_CHECKING, Literal
++from typing import TYPE_CHECKING
+ 
+ import cupy as cp
+ import numpy as np
+ import pandas as pd
+-from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+-from cupyx.scipy.sparse import issparse as cp_issparse
+-from scanpy.get import _get_obs_rep, _set_obs_rep
++from scanpy.get import _get_obs_rep
+ 
+ from rapids_singlecell.get import X_to_GPU
+ 
++from ._base import PerturbationEfficacyAnalyzer, _to_dense_gpu
++
+ if TYPE_CHECKING:
+     from anndata import AnnData
+ 
+@@ -20,15 +19,9 @@
+ _KO_POSTERIOR_CUTOFF = 0.5
+ # Iterations for the per-gene Gaussian mixture fit (pertpy default).
+ _GMM_MAX_ITER = 100
+-# Below this many variables ``perturbation_signature`` uses ``.X`` rather than a
+-# PCA representation when ``use_rep`` is not given (mirrors scanpy).
+-_NN_REPRESENTATION_AUTO_MAX_VARS = 50
+-# Sentinel groupby label for cells outside the current split during differential
+-# expression, so they are excluded without copying/subsetting the matrix.
+-_DE_IGNORE_LABEL = "__mixscape_other__"
+ 
+ 
+-class Mixscape:
++class Mixscape(PerturbationEfficacyAnalyzer):
+     """GPU-accelerated Mixscape for pooled CRISPR screens.
+ 
+     Identifies cells with a detectable perturbation effect and separates them
+@@ -39,179 +32,6 @@ class Mixscape:
+     kernel (one block per gene), via ``_gmm_cuda.mixscape_project_em``.
+     """
+ 
+-    def perturbation_signature(
+-        self,
+-        adata: AnnData,
+-        pert_key: str,
+-        control: str,
+-        *,
+-        ref_selection_mode: Literal["nn", "split_by"] = "nn",
+-        split_by: str | None = None,
+-        n_neighbors: int = 20,
+-        use_rep: str | None = None,
+-        n_dims: int | None = 15,
+-        n_pcs: int | None = None,
+-        knn_algorithm: str = "brute",
+-        knn_kwargs: dict | None = None,
+-        copy: bool = False,
+-    ) -> AnnData | None:
+-        """Calculate the perturbation signature.
+-
+-        The perturbation signature replaces each cell's expression with the
+-        residual against comparable control cells, removing confounding
+-        variation so that what remains reflects the perturbation. The result is
+-        written to ``adata.layers["X_pert"]``. As in the original
+-        implementation, this is intended to run on unscaled log-normalized data.
+-
+-        Parameters
+-        ----------
+-        adata
+-            The annotated data object.
+-        pert_key
+-            The column of ``.obs`` with perturbation categories; must also
+-            contain ``control``.
+-        control
+-            Name of the control category in ``pert_key``.
+-        ref_selection_mode
+-            How reference cells are selected. ``"nn"`` uses the ``n_neighbors``
+-            nearest control cells in the chosen representation; ``"split_by"``
+-            uses all control cells within the same ``split_by`` group.
+-        split_by
+-            Column of ``.obs`` used to compute the signature separately per
+-            group (e.g. biological replicate). Required for
+-            ``ref_selection_mode="split_by"``.
+-        n_neighbors
+-            Number of control neighbors used for ``ref_selection_mode="nn"``.
+-            Capped to the number of control cells available in each split, so a
+-            split with fewer controls than ``n_neighbors`` still runs (pertpy
+-            would error).
+-        use_rep
+-            Representation to use for neighbor selection. ``"X"`` or any
+-            ``.obsm`` key. If ``None``, ``.X`` is used when ``n_vars`` is below
+-            50, otherwise ``"X_pca"`` (computed if absent).
+-        n_dims
+-            Number of dimensions of the representation to use. ``None`` uses all.
+-        n_pcs
+-            Number of principal components to compute if a PCA representation is
+-            built.
+-        knn_algorithm
+-            Nearest-neighbor backend for ``ref_selection_mode="nn"``: ``"brute"``
+-            (exact, default), or the approximate cuVS backends ``"ivfflat"``,
+-            ``"cagra"``, ``"ivfpq"`` which are much faster for large datasets.
+-        knn_kwargs
+-            Extra parameters for the approximate backends (e.g. ``n_lists`` /
+-            ``n_probes`` for ``"ivfflat"``).
+-        copy
+-            Whether to return a copy of ``adata``.
+-
+-        Returns
+-        -------
+-        Returns the modified copy if ``copy=True``, otherwise writes
+-        ``adata.layers["X_pert"]`` in place and returns ``None``.
+-        """
+-        if ref_selection_mode not in ("nn", "split_by"):
+-            raise ValueError("ref_selection_mode must be either 'nn' or 'split_by'.")
+-        if ref_selection_mode == "split_by" and split_by is None:
+-            raise ValueError(
+-                "split_by must be provided if ref_selection_mode is 'split_by'."
+-            )
+-
+-        if copy:
+-            adata = adata.copy()
+-
+-        X = _to_dense_gpu(_get_obs_rep(adata))
+-        control_mask = (adata.obs[pert_key] == control).to_numpy()
+-        X_pert = X.copy()
+-
+-        if ref_selection_mode == "split_by":
+-            for split in adata.obs[split_by].unique():
+-                split_mask = (adata.obs[split_by] == split).to_numpy()
+-                control_group_np = control_mask & split_mask
+-                if not control_group_np.any():
+-                    warnings.warn(
+-                        f"No control cells in split {split!r}; leaving its "
+-                        "perturbation signature equal to the input.",
+-                        UserWarning,
+-                        stacklevel=2,
+-                    )
+-                    continue
+-                control_mean = X[cp.asarray(control_group_np)].mean(axis=0)
+-                split_dev = cp.asarray(split_mask)
+-                X_pert[split_dev] = control_mean[None, :] - X_pert[split_dev]
+-        else:
+-            if split_by is None:
+-                split_masks = [np.ones(adata.n_obs, dtype=bool)]
+-            else:
+-                split_obs = adata.obs[split_by]
+-                split_masks = [
+-                    (split_obs == cat).to_numpy() for cat in split_obs.unique()
+-                ]
+-
+-            from rapids_singlecell.preprocessing._neighbors._neighbors import (
+-                KNN_ALGORITHMS,
+-            )
+-
+-            if knn_algorithm not in KNN_ALGORITHMS:
+-                raise ValueError(
+-                    f"knn_algorithm must be one of {sorted(KNN_ALGORITHMS)}, "
+-                    f"got {knn_algorithm!r}"
+-                )
+-            knn = KNN_ALGORITHMS[knn_algorithm]
+-            algorithm_kwds = dict(knn_kwargs) if knn_kwargs is not None else {}
+-
+-            representation = _choose_representation_gpu(
+-                adata, use_rep=use_rep, n_pcs=n_pcs
+-            )
+-            if n_dims is not None and n_dims < representation.shape[1]:
+-                representation = representation[:, :n_dims]
+-            representation = cp.ascontiguousarray(representation)
+-
+-            for split_mask in split_masks:
+-                control_mask_split = control_mask & split_mask
+-                n_split = int(split_mask.sum())
+-                n_control = int(control_mask_split.sum())
+-                if n_control == 0:
+-                    warnings.warn(
+-                        "No control cells in a split; leaving its perturbation "
+-                        "signature equal to the input.",
+-                        UserWarning,
+-                        stacklevel=2,
+-                    )
+-                    continue
+-                R_split = representation[cp.asarray(split_mask)]
+-                R_control = representation[cp.asarray(control_mask_split)]
+-                k = min(n_neighbors, n_control)
+-
+-                indices, _ = knn(
+-                    R_control,
+-                    R_split,
+-                    k,
+-                    metric="euclidean",
+-                    metric_kwds={},
+-                    algorithm_kwds=algorithm_kwds,
+-                )
+-
+-                X_control = cp.expm1(X[cp.asarray(control_mask_split)])
+-                col_indices = indices.ravel().astype(cp.int32, copy=False)
+-                row_indices = cp.repeat(cp.arange(n_split, dtype=cp.int32), k)
+-                neigh_matrix = cp_csr_matrix(
+-                    (
+-                        cp.full(col_indices.size, 1.0 / k, dtype=X.dtype),
+-                        (row_indices, col_indices),
+-                    ),
+-                    shape=(n_split, n_control),
+-                )
+-                split_dev = cp.asarray(split_mask)
+-                X_pert[split_dev] = (
+-                    cp.log1p(neigh_matrix @ X_control) - X_pert[split_dev]
+-                )
+-
+-        _set_obs_rep(adata, X_pert, layer="X_pert")
+-
+-        if copy:
+-            return adata
+-        return None
+-
+     def mixscape(
+         self,
+         adata: AnnData,
+@@ -437,187 +257,6 @@ def mixscape(
+             return adata
+         return None
+ 
+-    def mixscale(
+-        self,
+-        adata: AnnData,
+-        pert_key: str,
+-        control: str,
+-        *,
+-        new_class_name: str = "mixscale_score",
+-        layer: str | None = None,
+-        min_de_genes: int = 5,
+-        max_de_genes: int = 100,
+-        logfc_threshold: float = 0.25,
+-        de_layer: str | None = None,
+-        test_method: str = "wilcoxon",
+-        scale: bool = True,
+-        split_by: str | None = None,
+-        pval_cutoff: float = 5e-2,
+-        perturbation_type: str = "KO",
+-        copy: bool = False,
+-    ) -> AnnData | None:
+-        """Continuous perturbation efficiency scores (Mixscale).
+-
+-        Unlike :meth:`mixscape`, which performs a binary knocked-out/non-perturbed
+-        classification with a Gaussian mixture, this assigns each cell a
+-        *continuous* perturbation-efficiency score: the scalar projection of its
+-        perturbation signature onto the per-gene perturbation direction
+-        (mean perturbed minus mean control), z-score standardized relative to the
+-        non-targeting control distribution. This is useful for CRISPRi/CRISPRa
+-        screens where cells show a gradient of perturbation strength rather than a
+-        binary knockout. Control cells receive a score of 0.
+-
+-        Implements Jiang, Dalgarno et al., "Systematic reconstruction of molecular
+-        pathway signatures using scalable single-cell perturbation screens",
+-        Nature Cell Biology (2025), following pertpy's
+-        :meth:`~pertpy.tools.Mixscape.mixscale`.
+-
+-        Parameters
+-        ----------
+-        adata
+-            The annotated data object.
+-        pert_key
+-            The column of ``.obs`` with target gene labels.
+-        control
+-            Control category in ``pert_key``.
+-        new_class_name
+-            Name of the ``.obs`` column for the continuous score.
+-        layer
+-            Layer used for scoring. Defaults to ``.layers["X_pert"]``.
+-        min_de_genes
+-            Minimum number of differentially expressed genes required to score a
+-            gene; genes with fewer are skipped.
+-        max_de_genes
+-            Maximum number of (top-ranked) differentially expressed genes used to
+-            define the perturbation direction.
+-        logfc_threshold
+-            Minimum absolute log fold change for a gene to count as
+-            differentially expressed.
+-        de_layer
+-            Layer used for differential expression. ``None`` uses ``.X``.
+-        test_method
+-            Differential-expression test passed to
+-            :func:`rapids_singlecell.tl.rank_genes_groups`.
+-        scale
+-            Scale the per-gene sub-matrix before computing scores.
+-        split_by
+-            ``.obs`` column with a condition/cell-type annotation if
+-            perturbations are condition specific.
+-        pval_cutoff
+-            Adjusted p-value cutoff for differentially expressed genes.
+-        perturbation_type
+-            Accepted for ``pertpy.tl.Mixscape.mixscale`` API compatibility; has no
+-            effect on the continuous score.
+-        copy
+-            Whether to return a copy of ``adata``.
+-
+-        Returns
+-        -------
+-        Returns the modified copy if ``copy=True``, otherwise writes
+-        ``adata.obs[new_class_name]`` in place and returns ``None``. Higher
+-        absolute values indicate a stronger perturbation effect; control cells
+-        and any gene that cannot be scored receive 0.
+-        """
+-        if copy:
+-            adata = adata.copy()
+-
+-        if split_by is None:
+-            split_masks = [np.ones(adata.n_obs, dtype=bool)]
+-            categories = ["all"]
+-        else:
+-            split_obs = adata.obs[split_by]
+-            categories = list(split_obs.unique())
+-            split_masks = [
+-                (split_obs == category).to_numpy() for category in categories
+-            ]
+-
+-        perturbation_markers = self._get_perturbation_markers(
+-            adata,
+-            split_masks=split_masks,
+-            categories=categories,
+-            pert_key=pert_key,
+-            control=control,
+-            layer=de_layer,
+-            pval_cutoff=pval_cutoff,
+-            min_de_genes=min_de_genes,
+-            logfc_threshold=logfc_threshold,
+-            test_method=test_method,
+-        )
+-
+-        if layer is not None:
+-            X = X_to_GPU(adata.layers[layer])
+-        else:
+-            try:
+-                X = X_to_GPU(adata.layers["X_pert"])
+-            except KeyError:
+-                raise KeyError(
+-                    "No 'X_pert' found in .layers! Please run perturbation_signature "
+-                    "first to calculate the perturbation signature!"
+-                ) from None
+-        X = _to_dense_gpu(X)
+-
+-        var_names = np.asarray(adata.var_names)
+-        var_to_idx = {name: i for i, name in enumerate(var_names)}
+-        # Integer codes let every per-gene cell mask be built with a fast integer
+-        # comparison over the full obs, and no cells are ever copied out of adata.
+-        pert_cat = adata.obs[pert_key].astype("category")
+-        codes = pert_cat.cat.codes.to_numpy()
+-        cat_names = [str(c) for c in pert_cat.cat.categories]
+-        control_code = {name: i for i, name in enumerate(cat_names)}.get(control, -1)
+-
+-        # One job per scorable gene (indices + masks, cheap host work); the
+-        # gather, scaling, projection and z-score for all genes then run in a
+-        # single batched kernel that reads each block straight from X.
+-        gene_jobs: list[dict] = []
+-        for split, split_mask in enumerate(split_masks):
+-            category = categories[split]
+-            nt_mask = (codes == control_code) & split_mask
+-            split_gene_codes = sorted(set(codes[split_mask].tolist()) - {control_code})
+-
+-            for gene_code in split_gene_codes:
+-                gene = cat_names[gene_code]
+-                de_genes = perturbation_markers[category, gene]
+-                if len(de_genes) == 0:
+-                    continue
+-                # Keep only the top-ranked DE genes (markers are score-ranked).
+-                if len(de_genes) > max_de_genes:
+-                    de_genes = de_genes[:max_de_genes]
+-                de_genes_indices = np.fromiter(
+-                    (var_to_idx[g] for g in de_genes if g in var_to_idx),
+-                    dtype=np.int32,
+-                )
+-                if de_genes_indices.size == 0:
+-                    continue
+-
+-                orig_mask = (codes == gene_code) & split_mask
+-                all_mask = orig_mask | nt_mask
+-                nt_in_all_np = nt_mask[all_mask]
+-                if not nt_in_all_np.any():
+-                    # No control cells: cannot define a perturbation direction.
+-                    continue
+-
+-                gene_jobs.append(
+-                    {
+-                        "row_ids": np.flatnonzero(all_mask).astype(np.int32),
+-                        "col_ids": de_genes_indices,
+-                        "is_guide": orig_mask[all_mask],
+-                        "nt_in_all": nt_in_all_np,
+-                    }
+-                )
+-
+-        # Control cells stay 0; the kernel writes only guide cells. float64
+-        # output matches pertpy's ``obs[...] = 0.0`` column.
+-        scores_gpu = cp.zeros(adata.n_obs, dtype=X.dtype)
+-        if gene_jobs:
+-            _project_scores_batched(X, gene_jobs, scores_gpu, do_scale=scale)
+-        adata.obs[new_class_name] = cp.asnumpy(scores_gpu).astype(
+-            np.float64, copy=False
+-        )
+-
+-        if copy:
+-            return adata
+-        return None
+-
+     def lda(
+         self,
+         adata: AnnData,
+@@ -887,83 +526,6 @@ def _fit_genes_batched(
+             post = post_final[gi]
+             job["post_prob"] = post if not isinstance(post, float) else 0.0
+ 
+-    def _get_perturbation_markers(
+-        self,
+-        adata: AnnData,
+-        *,
+-        split_masks: list[np.ndarray],
+-        categories: list[str],
+-        pert_key: str,
+-        control: str,
+-        layer: str | None,
+-        pval_cutoff: float,
+-        min_de_genes: int,
+-        logfc_threshold: float,
+-        test_method: str,
+-    ) -> dict[tuple, np.ndarray]:
+-        """Differentially expressed genes per split and target gene."""
+-        from rapids_singlecell.tools import rank_genes_groups
+-
+-        perturbation_markers: dict[tuple, np.ndarray] = {}
+-        pert_str = adata.obs[pert_key].astype(str).to_numpy()
+-        group_key = "_mixscape_de_groupby"
+-        rgg_key = "_mixscape_rank_genes_groups"
+-        for split, split_mask in enumerate(split_masks):
+-            category = categories[split]
+-            gene_targets = sorted(set(pert_str[split_mask]) - {control})
+-            if len(gene_targets) == 0:
+-                continue
+-            # Mask-based grouping instead of ``adata[split_mask].copy()``: cells
+-            # outside the split get a sentinel label so they belong to neither a
+-            # target group nor the control reference. rank_genes_groups computes
+-            # per-group stats over the full matrix (via Aggregate); nothing is
+-            # copied or subsetted.
+-            group_labels = np.where(split_mask, pert_str, _DE_IGNORE_LABEL)
+-            adata.obs[group_key] = pd.Categorical(group_labels)
+-            try:
+-                with warnings.catch_warnings():
+-                    warnings.simplefilter("ignore", RuntimeWarning)
+-                    rank_genes_groups(
+-                        adata,
+-                        group_key,
+-                        groups=gene_targets,
+-                        reference=control,
+-                        layer=layer,
+-                        method=test_method,
+-                        use_raw=False,
+-                        key_added=rgg_key,
+-                    )
+-                rgg = adata.uns[rgg_key]
+-                for gene in gene_targets:
+-                    logfc_mask = np.abs(rgg["logfoldchanges"][gene]) >= logfc_threshold
+-                    de_genes = rgg["names"][gene][logfc_mask]
+-                    pvals_adj = rgg["pvals_adj"][gene][logfc_mask]
+-                    de_genes = de_genes[pvals_adj < pval_cutoff]
+-                    if len(de_genes) < min_de_genes:
+-                        de_genes = np.array([])
+-                    perturbation_markers[category, gene] = de_genes
+-            finally:
+-                adata.obs.drop(columns=group_key, inplace=True, errors="ignore")
+-                adata.uns.pop(rgg_key, None)
+-
+-        return perturbation_markers
+-
+-
+-def _to_dense_gpu(X) -> cp.ndarray:
+-    """Return ``X`` as a contiguous dense float CuPy array on the GPU.
+-
+-    ``float32``/``float64`` are preserved (so ``float64`` input keeps pertpy's
+-    precision end to end); any other dtype is cast to ``float32``.
+-    """
+-    X = X_to_GPU(X)
+-    if X.dtype not in (cp.float32, cp.float64):
+-        X = X.astype(cp.float32)
+-    if cp_issparse(X):
+-        from rapids_singlecell.preprocessing._utils import _sparse_to_dense
+-
+-        return _sparse_to_dense(X, order="C")
+-    return X
+-
+ 
+ def _scale_gpu(dat: cp.ndarray) -> cp.ndarray:
+     """Zero-center and unit-scale columns (matches ``scanpy.pp.scale``)."""
+@@ -973,56 +535,6 @@ def _scale_gpu(dat: cp.ndarray) -> cp.ndarray:
+     return (dat - mean) / std
+ 
+ 
+-def _project_scores_batched(
+-    X: cp.ndarray, gene_jobs: list[dict], scores_gpu: cp.ndarray, *, do_scale: bool
+-) -> None:
+-    """Batched Mixscale scoring for all genes in one kernel launch.
+-
+-    Flattens each gene's cell indices, DE-gene indices and guide/control masks
+-    into gene-blocked buffers and runs ``_mixscale_cuda.project_score`` once,
+-    writing each guide cell's standardized score into ``scores_gpu`` at its obs
+-    index (controls stay 0; the scatter is race-free, one gene per guide cell).
+-    """
+-    from rapids_singlecell._cuda import _mixscale_cuda as _msc
+-
+-    # Kernel indexes X row-major; ensure C-order (no-op if already contiguous).
+-    X = cp.ascontiguousarray(X)
+-
+-    n_genes = len(gene_jobs)
+-    n_list = np.array([job["row_ids"].shape[0] for job in gene_jobs], dtype=np.int64)
+-    k_list = np.array([job["col_ids"].shape[0] for job in gene_jobs], dtype=np.int64)
+-    cell_off = np.concatenate([[0], np.cumsum(n_list)]).astype(np.int32)
+-    feat_off = np.concatenate([[0], np.cumsum(k_list)]).astype(np.int32)
+-    max_k = int(k_list.max())
+-
+-    row_ids = cp.asarray(np.concatenate([job["row_ids"] for job in gene_jobs]))
+-    col_ids = cp.asarray(np.concatenate([job["col_ids"] for job in gene_jobs]))
+-    is_guide = cp.asarray(np.concatenate([job["is_guide"] for job in gene_jobs]))
+-    nt_flat = cp.asarray(np.concatenate([job["nt_in_all"] for job in gene_jobs]))
+-    # double scratch: the kernel accumulates projections/stats in 64-bit so
+-    # float32 inputs keep full precision (matches mean_var's accumulation).
+-    pvec_scratch = cp.empty(int(cell_off[-1]), dtype=cp.float64)
+-
+-    _msc.project_score(
+-        X,
+-        int(X.shape[1]),
+-        row_ids,
+-        col_ids,
+-        cp.asarray(n_list.astype(np.int32)),
+-        cp.asarray(k_list.astype(np.int32)),
+-        cp.asarray(cell_off),
+-        cp.asarray(feat_off),
+-        is_guide,
+-        nt_flat,
+-        pvec_scratch,
+-        scores_gpu,
+-        n_genes=n_genes,
+-        max_k=max_k,
+-        do_scale=do_scale,
+-        stream=cp.cuda.get_current_stream().ptr,
+-    )
+-
+-
+ def _lda_fit_transform_gpu(
+     X: cp.ndarray, y: cp.ndarray, *, n_components: int, tol: float = 1e-4
+ ) -> cp.ndarray:
+@@ -1073,33 +585,3 @@ def _lda_fit_transform_gpu(
+     embedding = (X - xbar) @ scalings
+     max_components = min(n_components, embedding.shape[1])
+     return embedding[:, :max_components]
+-
+-
+-def _choose_representation_gpu(
+-    adata: AnnData, *, use_rep: str | None, n_pcs: int | None
+-) -> cp.ndarray:
+-    """GPU analogue of scanpy's ``_choose_representation`` for neighbor search.
+-
+-    Always returns a float32 representation: neighbor selection does not need
+-    float64 precision, and the cuVS backends (ivfflat/cagra) only accept float32.
+-    """
+-    if use_rep is None:
+-        if adata.n_vars < _NN_REPRESENTATION_AUTO_MAX_VARS:
+-            rep = _to_dense_gpu(_get_obs_rep(adata))
+-        else:
+-            if "X_pca" not in adata.obsm or (
+-                n_pcs is not None and adata.obsm["X_pca"].shape[1] < n_pcs
+-            ):
+-                from rapids_singlecell.preprocessing import pca
+-
+-                pca(adata, n_comps=n_pcs)
+-            rep = X_to_GPU(adata.obsm["X_pca"])
+-    elif use_rep == "X":
+-        rep = _to_dense_gpu(_get_obs_rep(adata))
+-    else:
+-        rep = X_to_GPU(adata.obsm[use_rep])
+-
+-    rep = cp.asarray(rep, dtype=cp.float32)
+-    if n_pcs is not None and n_pcs < rep.shape[1]:
+-        rep = rep[:, :n_pcs]
+-    return rep
+diff --git a/tests/pertpy/conftest.py b/tests/pertpy/conftest.py
+new file mode 100644
+index 000000000..5cebdd113
+--- /dev/null
++++ b/tests/pertpy/conftest.py
+@@ -0,0 +1,45 @@
++from __future__ import annotations
++
++import anndata
++import numpy as np
++import pandas as pd
++import pytest
++from scipy import sparse
++
++NUM_CELLS_PER_GROUP = 10
++NUM_NOT_DE = 10
++NUM_DE = 10
++
++
++@pytest.fixture
++def mixscape_adata() -> anndata.AnnData:
++    """Synthetic screen mirroring pertpy's mixscape test fixture.
++
++    Cells 0-9 are non-targeting (NT); cells 10-19 express the guide but escape
++    perturbation (NP); cells 20-29 are perturbed (KO). Genes 10-19 are
++    differentially expressed in the KO subpopulation only.
++    """
++    rng = np.random.default_rng(seed=1)
++    X = None
++    for _ in range(NUM_NOT_DE):
++        cols = [
++            np.clip(rng.normal(0, 1, NUM_CELLS_PER_GROUP), 0, None) for _ in range(3)
++        ]
++        gene_i = np.concatenate(cols)[:, None]
++        X = gene_i if X is None else np.concatenate((X, gene_i), axis=1)
++    for i in range(NUM_DE):
++        nt = np.clip(rng.normal(i + 2, 0.5 + 0.05 * i, NUM_CELLS_PER_GROUP), 0, None)
++        npert = np.clip(rng.normal(i + 2, 0.5 + 0.05 * i, NUM_CELLS_PER_GROUP), 0, None)
++        ko = np.clip(rng.normal(i + 4, 0.5 + 0.1 * i, NUM_CELLS_PER_GROUP), 0, None)
++        gene_i = np.concatenate((nt, npert, ko))[:, None]
++        X = np.concatenate((X, gene_i), axis=1)
++
++    obs = pd.DataFrame(
++        {
++            "gene_target": ["NT"] * NUM_CELLS_PER_GROUP
++            + ["target_gene_a"] * NUM_CELLS_PER_GROUP * 2
++        }
++    )
++    obs = obs.set_index(np.arange(NUM_CELLS_PER_GROUP * 3).astype(str))
++    var = pd.DataFrame(index=[f"gene{i}" for i in range(1, NUM_NOT_DE + NUM_DE + 1)])
++    return anndata.AnnData(X=sparse.csr_matrix(X), obs=obs, var=var)
+diff --git a/tests/pertpy/test_mixscale.py b/tests/pertpy/test_mixscale.py
+new file mode 100644
+index 000000000..dbe60dc0f
+--- /dev/null
++++ b/tests/pertpy/test_mixscale.py
+@@ -0,0 +1,291 @@
++from __future__ import annotations
++
++import anndata
++import cupy as cp
++import numpy as np
++import pandas as pd
++import pytest
++from scipy import sparse
++
++import rapids_singlecell as rsc
++
++
++@pytest.fixture
++def mixscale_adata() -> anndata.AnnData:
++    """Synthetic screen with strong and weak knockouts for mixscale scoring.
++
++    Mirrors pertpy's mixscale fixture: 100 non-targeting controls, then for
++    GeneA 100 strong-KO and 100 weak-KO cells (effect on the first 20 genes),
++    and 50 GeneB cells (moderate effect on genes 20-39). The planted gradient
++    lets a continuous score separate strong from weak knockdowns.
++    """
++    rng = np.random.default_rng(42)
++    n_genes = 200
++    n_cells = 350
++    X = rng.standard_normal((n_cells, n_genes)).astype(np.float32)
++    X[100:200, :20] -= 3.0  # GeneA strong KO
++    X[200:300, :20] -= 1.0  # GeneA weak KO
++    X[300:350, 20:40] -= 2.0  # GeneB moderate
++    labels = ["NT"] * 100 + ["GeneA"] * 200 + ["GeneB"] * 50
++    obs = pd.DataFrame(
++        {"gene_target": labels}, index=[f"Cell_{i}" for i in range(n_cells)]
++    )
++    var = pd.DataFrame(index=[f"Gene_{i}" for i in range(n_genes)])
++    adata = anndata.AnnData(X=X, obs=obs, var=var)
++    adata.layers["X_pert"] = adata.X.copy()
++    return adata
++
++
++def test_mixscale_basic_scoring(mixscale_adata):
++    """mixscale runs, writes a float score column, and controls score 0."""
++    adata = mixscale_adata
++    rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test"
++    )
++    assert "mixscale_score" in adata.obs
++    assert adata.obs["mixscale_score"].dtype.kind == "f"
++    nt_scores = adata.obs.loc[adata.obs["gene_target"] == "NT", "mixscale_score"]
++    assert (nt_scores == 0).all()
++
++
++def test_mixscale_perturbed_cells_nonzero(mixscale_adata):
++    """Perturbed cells receive non-zero scores."""
++    adata = mixscale_adata
++    rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test"
++    )
++    ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
++    assert ko.abs().mean() > 0
++
++
++def test_mixscale_strong_vs_weak(mixscale_adata):
++    """Strongly perturbed cells get larger absolute scores than weak ones."""
++    adata = mixscale_adata
++    rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test"
++    )
++    scores = adata.obs["mixscale_score"].to_numpy()
++    # Strong and weak share the 'GeneA' label (one model is fit over both), so
++    # require a clear margin rather than a bare inequality.
++    strong_mean = np.abs(scores[100:200]).mean()  # GeneA strong KO
++    weak_mean = np.abs(scores[200:300]).mean()  # GeneA weak KO
++    assert strong_mean > 1.5 * weak_mean
++
++
++def test_mixscale_multiple_perturbations(mixscale_adata):
++    """Every target gene with enough DE genes is scored."""
++    adata = mixscale_adata
++    rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test"
++    )
++    for gene in ("GeneA", "GeneB"):
++        s = adata.obs.loc[adata.obs["gene_target"] == gene, "mixscale_score"]
++        assert s.abs().mean() > 0
++
++
++def test_mixscale_custom_column_name(mixscale_adata):
++    adata = mixscale_adata
++    rsc.ptg.Mixscale().mixscale(
++        adata,
++        pert_key="gene_target",
++        control="NT",
++        test_method="t-test",
++        new_class_name="my_score",
++    )
++    assert "my_score" in adata.obs
++    assert "mixscale_score" not in adata.obs
++
++
++def test_mixscale_copy_mode(mixscale_adata):
++    adata = mixscale_adata
++    result = rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test", copy=True
++    )
++    assert result is not None
++    assert result is not adata
++    assert "mixscale_score" in result.obs
++    assert "mixscale_score" not in adata.obs
++
++
++def test_mixscale_requires_signature(mixscale_adata):
++    del mixscale_adata.layers["X_pert"]
++    with pytest.raises(KeyError, match="X_pert"):
++        rsc.ptg.Mixscale().mixscale(
++            mixscale_adata, pert_key="gene_target", control="NT", test_method="t-test"
++        )
++
++
++def test_mixscale_sparse_input(mixscale_adata):
++    """Sparse layers score the same as dense (matrix is densified internally)."""
++    adata = mixscale_adata
++    adata.layers["X_pert"] = sparse.csr_matrix(adata.layers["X_pert"])
++    rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test"
++    )
++    pert = adata.obs.loc[adata.obs["gene_target"] != "NT", "mixscale_score"]
++    assert not np.isnan(pert.to_numpy()).any()
++
++
++def test_mixscale_matches_pertpy(mixscape_adata):
++    """Continuous scores match pertpy's mixscale to numerical precision.
++
++    Skips until the installed pertpy ships ``Mixscale.mixscale`` (PR #945).
++    """
++    pt = pytest.importorskip("pertpy")
++    if not hasattr(pt.tl, "Mixscale"):
++        pytest.skip("installed pertpy has no Mixscale")
++
++    ad_rsc = mixscape_adata
++    ad_rsc.layers["X_pert"] = ad_rsc.X.copy()
++    ad_pt = ad_rsc.copy()
++
++    rsc.ptg.Mixscale().mixscale(
++        ad_rsc, pert_key="gene_target", control="NT", test_method="t-test"
++    )
++    pt.tl.Mixscale().mixscale(
++        ad_pt,
++        pert_key="gene_target",
++        control="NT",
++        layer="X_pert",
++        test_method="t-test",
++    )
++    np.testing.assert_allclose(
++        ad_rsc.obs["mixscale_score"].to_numpy(dtype=float),
++        ad_pt.obs["mixscale_score"].to_numpy(dtype=float),
++        rtol=1e-5,
++        atol=1e-5,
++    )
++
++
++def _ref_mixscale_gene(block, is_guide, is_nt, *, do_scale):
++    """NumPy reference for one gene's Mixscale score (pertpy's formula): z-score
++    each column, project onto the (guide-mean − control-mean) direction, then
++    standardize each guide cell's projection against the control distribution."""
++    x = block.astype(np.float64)
++    n, k = x.shape
++    if do_scale:
++        cmean = x.mean(0)
++        sd = x.std(0, ddof=1)
++        sd = np.where(sd == 0.0, 1.0, sd)
++    else:
++        cmean = np.zeros(k)
++        sd = np.ones(k)
++    vec = (x[is_guide].mean(0) - x[is_nt].mean(0)) / sd
++    dotvv = float(vec @ vec)
++    pvec = ((x - cmean) / sd) @ vec / max(dotvv, 1e-12)
++    nt = pvec[is_nt]
++    nt_mean = nt.mean()
++    nt_std = nt.std(ddof=0) or 1.0
++    out = np.zeros(n)
++    out[is_guide] = (pvec[is_guide] - nt_mean) / nt_std
++    return out
++
++
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++def test_mixscale_matches_numpy_reference(dtype):
++    """The batched scoring kernel matches an independent NumPy implementation of
++    pertpy's Mixscale formula, per gene, at float32 and float64. This is the
++    executed numerical-parity check (test_mixscale_matches_pertpy only runs once
++    pertpy ships Mixscale.mixscale)."""
++    from rapids_singlecell.pertpy_gpu._mixscale import _project_scores_batched
++
++    rng = np.random.default_rng(0)
++    n_obs, n_vars = 600, 40
++    X = rng.normal(0.0, 1.0, (n_obs, n_vars)).astype(dtype)
++    ctrl = np.arange(0, 200)  # control cells, shared across genes
++    genes = {
++        0: (np.arange(200, 350), np.array([1, 4, 7, 9, 12], dtype=np.int32)),
++        1: (np.arange(350, 600), np.array([2, 5, 8, 20, 31, 33], dtype=np.int32)),
++    }
++    for gi, (guide, cols) in genes.items():
++        X[np.ix_(guide, cols)] += 2.0 + gi  # plant a clear perturbation direction
++
++    gene_jobs: list[dict] = []
++    ref = np.zeros(n_obs)
++    for guide, cols in genes.values():
++        rows = np.concatenate([ctrl, guide]).astype(np.int32)
++        is_guide = np.concatenate(
++            [np.zeros(ctrl.size, bool), np.ones(guide.size, bool)]
++        )
++        nt_in_all = ~is_guide
++        gene_jobs.append(
++            {
++                "row_ids": rows,
++                "col_ids": cols,
++                "is_guide": is_guide,
++                "nt_in_all": nt_in_all,
++            }
++        )
++        block_scores = _ref_mixscale_gene(
++            X[rows][:, cols], is_guide, nt_in_all, do_scale=True
++        )
++        ref[guide] = block_scores[is_guide]
++
++    Xg = cp.asarray(X)
++    scores = cp.zeros(n_obs, dtype=Xg.dtype)
++    _project_scores_batched(Xg, gene_jobs, scores, do_scale=True)
++    atol = 2e-3 if dtype == np.float32 else 1e-9
++    np.testing.assert_allclose(cp.asnumpy(scores), ref, atol=atol)
++
++
++def test_mixscale_no_scale(mixscale_adata):
++    """The scale=False path runs and produces finite, non-zero perturbed scores."""
++    adata = mixscale_adata
++    rsc.ptg.Mixscale().mixscale(
++        adata, pert_key="gene_target", control="NT", test_method="t-test", scale=False
++    )
++    assert not np.isnan(adata.obs["mixscale_score"].to_numpy()).any()
++    ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
++    assert ko.abs().mean() > 0
++
++
++def test_mixscale_float32_matches_float64():
++    """float32 scores match the float64 result (in-kernel 64-bit accumulation)."""
++    rng = np.random.default_rng(0)
++    n_genes, n = 200, 120
++    X = rng.standard_normal((2 * n, n_genes)).astype(np.float64)
++    X[n:, :40] -= 2.0
++    obs = pd.DataFrame(
++        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
++    )
++    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
++    ad64 = anndata.AnnData(X=X, obs=obs, var=var)
++    ad64.layers["X_pert"] = ad64.X.copy()
++    ad32 = anndata.AnnData(X=X.astype(np.float32), obs=obs.copy(), var=var.copy())
++    ad32.layers["X_pert"] = ad32.X.copy()
++    for ad_ in (ad64, ad32):
++        rsc.ptg.Mixscale().mixscale(
++            ad_, pert_key="pert", control="NT", test_method="t-test"
++        )
++    np.testing.assert_allclose(
++        ad32.obs["mixscale_score"].to_numpy(dtype=float),
++        ad64.obs["mixscale_score"].to_numpy(dtype=float),
++        rtol=1e-4,
++        atol=1e-5,
++    )
++
++
++def test_mixscale_large_de_set_shared_mem_optin():
++    """Many DE genes per perturbation exercise the >48KB dynamic shared-mem
++    opt-in path (3 * k * 8 bytes exceeds the 48KB default for k > ~1700)."""
++    rng = np.random.default_rng(0)
++    n_genes, n = 2500, 120
++    X = rng.standard_normal((2 * n, n_genes)).astype(np.float32)
++    X[n:] -= 2.0  # every gene differentially expressed in the guide group
++    obs = pd.DataFrame(
++        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
++    )
++    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
++    adata = anndata.AnnData(X=X, obs=obs, var=var)
++    adata.layers["X_pert"] = adata.X.copy()
++    rsc.ptg.Mixscale().mixscale(
++        adata,
++        pert_key="pert",
++        control="NT",
++        test_method="t-test",
++        max_de_genes=n_genes,
++    )
++    g = adata.obs.loc[adata.obs["pert"] == "g", "mixscale_score"].to_numpy()
++    assert g.shape[0] == n
++    assert not np.isnan(g).any()
++    assert np.abs(g).mean() > 0
+diff --git a/tests/pertpy/test_mixscape.py b/tests/pertpy/test_mixscape.py
+index 6f5599581..e6f48fb5e 100644
+--- a/tests/pertpy/test_mixscape.py
++++ b/tests/pertpy/test_mixscape.py
+@@ -12,45 +12,9 @@
+ from rapids_singlecell.pertpy_gpu._mixscape import _lda_fit_transform_gpu
+ 
+ NUM_CELLS_PER_GROUP = 10
+-NUM_NOT_DE = 10
+-NUM_DE = 10
+ ACCURACY_THRESHOLD = 0.8
+ 
+ 
+-@pytest.fixture
+-def mixscape_adata() -> anndata.AnnData:
+-    """Synthetic screen mirroring pertpy's mixscape test fixture.
+-
+-    Cells 0-9 are non-targeting (NT); cells 10-19 express the guide but escape
+-    perturbation (NP); cells 20-29 are perturbed (KO). Genes 10-19 are
+-    differentially expressed in the KO subpopulation only.
+-    """
+-    rng = np.random.default_rng(seed=1)
+-    X = None
+-    for _ in range(NUM_NOT_DE):
+-        cols = [
+-            np.clip(rng.normal(0, 1, NUM_CELLS_PER_GROUP), 0, None) for _ in range(3)
+-        ]
+-        gene_i = np.concatenate(cols)[:, None]
+-        X = gene_i if X is None else np.concatenate((X, gene_i), axis=1)
+-    for i in range(NUM_DE):
+-        nt = np.clip(rng.normal(i + 2, 0.5 + 0.05 * i, NUM_CELLS_PER_GROUP), 0, None)
+-        npert = np.clip(rng.normal(i + 2, 0.5 + 0.05 * i, NUM_CELLS_PER_GROUP), 0, None)
+-        ko = np.clip(rng.normal(i + 4, 0.5 + 0.1 * i, NUM_CELLS_PER_GROUP), 0, None)
+-        gene_i = np.concatenate((nt, npert, ko))[:, None]
+-        X = np.concatenate((X, gene_i), axis=1)
+-
+-    obs = pd.DataFrame(
+-        {
+-            "gene_target": ["NT"] * NUM_CELLS_PER_GROUP
+-            + ["target_gene_a"] * NUM_CELLS_PER_GROUP * 2
+-        }
+-    )
+-    obs = obs.set_index(np.arange(NUM_CELLS_PER_GROUP * 3).astype(str))
+-    var = pd.DataFrame(index=[f"gene{i}" for i in range(1, NUM_NOT_DE + NUM_DE + 1)])
+-    return anndata.AnnData(X=sparse.csr_matrix(X), obs=obs, var=var)
+-
+-
+ def _make_deterministic() -> tuple[anndata.AnnData, pd.DataFrame, np.ndarray, list]:
+     n_genes, n_per = 5, 50
+     classes, groups = ["NT", "KO", "NP"], ["Group1", "Group2"]
+@@ -359,284 +323,3 @@ def test_signature_no_control_in_split_warns():
+             split_by="group",
+             ref_selection_mode="split_by",
+         )
+-
+-
+-@pytest.fixture
+-def mixscale_adata() -> anndata.AnnData:
+-    """Synthetic screen with strong and weak knockouts for mixscale scoring.
+-
+-    Mirrors pertpy's mixscale fixture: 100 non-targeting controls, then for
+-    GeneA 100 strong-KO and 100 weak-KO cells (effect on the first 20 genes),
+-    and 50 GeneB cells (moderate effect on genes 20-39). The planted gradient
+-    lets a continuous score separate strong from weak knockdowns.
+-    """
+-    rng = np.random.default_rng(42)
+-    n_genes = 200
+-    n_cells = 350
+-    X = rng.standard_normal((n_cells, n_genes)).astype(np.float32)
+-    X[100:200, :20] -= 3.0  # GeneA strong KO
+-    X[200:300, :20] -= 1.0  # GeneA weak KO
+-    X[300:350, 20:40] -= 2.0  # GeneB moderate
+-    labels = ["NT"] * 100 + ["GeneA"] * 200 + ["GeneB"] * 50
+-    obs = pd.DataFrame(
+-        {"gene_target": labels}, index=[f"Cell_{i}" for i in range(n_cells)]
+-    )
+-    var = pd.DataFrame(index=[f"Gene_{i}" for i in range(n_genes)])
+-    adata = anndata.AnnData(X=X, obs=obs, var=var)
+-    adata.layers["X_pert"] = adata.X.copy()
+-    return adata
+-
+-
+-def test_mixscale_basic_scoring(mixscale_adata):
+-    """mixscale runs, writes a float score column, and controls score 0."""
+-    adata = mixscale_adata
+-    rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test"
+-    )
+-    assert "mixscale_score" in adata.obs
+-    assert adata.obs["mixscale_score"].dtype.kind == "f"
+-    nt_scores = adata.obs.loc[adata.obs["gene_target"] == "NT", "mixscale_score"]
+-    assert (nt_scores == 0).all()
+-
+-
+-def test_mixscale_perturbed_cells_nonzero(mixscale_adata):
+-    """Perturbed cells receive non-zero scores."""
+-    adata = mixscale_adata
+-    rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test"
+-    )
+-    ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
+-    assert ko.abs().mean() > 0
+-
+-
+-def test_mixscale_strong_vs_weak(mixscale_adata):
+-    """Strongly perturbed cells get larger absolute scores than weak ones."""
+-    adata = mixscale_adata
+-    rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test"
+-    )
+-    scores = adata.obs["mixscale_score"].to_numpy()
+-    # Strong and weak share the 'GeneA' label (one model is fit over both), so
+-    # require a clear margin rather than a bare inequality.
+-    strong_mean = np.abs(scores[100:200]).mean()  # GeneA strong KO
+-    weak_mean = np.abs(scores[200:300]).mean()  # GeneA weak KO
+-    assert strong_mean > 1.5 * weak_mean
+-
+-
+-def test_mixscale_multiple_perturbations(mixscale_adata):
+-    """Every target gene with enough DE genes is scored."""
+-    adata = mixscale_adata
+-    rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test"
+-    )
+-    for gene in ("GeneA", "GeneB"):
+-        s = adata.obs.loc[adata.obs["gene_target"] == gene, "mixscale_score"]
+-        assert s.abs().mean() > 0
+-
+-
+-def test_mixscale_custom_column_name(mixscale_adata):
+-    adata = mixscale_adata
+-    rsc.ptg.Mixscape().mixscale(
+-        adata,
+-        pert_key="gene_target",
+-        control="NT",
+-        test_method="t-test",
+-        new_class_name="my_score",
+-    )
+-    assert "my_score" in adata.obs
+-    assert "mixscale_score" not in adata.obs
+-
+-
+-def test_mixscale_copy_mode(mixscale_adata):
+-    adata = mixscale_adata
+-    result = rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test", copy=True
+-    )
+-    assert result is not None
+-    assert result is not adata
+-    assert "mixscale_score" in result.obs
+-    assert "mixscale_score" not in adata.obs
+-
+-
+-def test_mixscale_requires_signature(mixscale_adata):
+-    del mixscale_adata.layers["X_pert"]
+-    with pytest.raises(KeyError, match="X_pert"):
+-        rsc.ptg.Mixscape().mixscale(
+-            mixscale_adata, pert_key="gene_target", control="NT", test_method="t-test"
+-        )
+-
+-
+-def test_mixscale_sparse_input(mixscale_adata):
+-    """Sparse layers score the same as dense (matrix is densified internally)."""
+-    adata = mixscale_adata
+-    adata.layers["X_pert"] = sparse.csr_matrix(adata.layers["X_pert"])
+-    rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test"
+-    )
+-    pert = adata.obs.loc[adata.obs["gene_target"] != "NT", "mixscale_score"]
+-    assert not np.isnan(pert.to_numpy()).any()
+-
+-
+-def test_mixscale_matches_pertpy(mixscape_adata):
+-    """Continuous scores match pertpy's mixscale to numerical precision.
+-
+-    Skips until the installed pertpy ships ``Mixscape.mixscale`` (PR #945).
+-    """
+-    pt = pytest.importorskip("pertpy")
+-    if not hasattr(pt.tl.Mixscape, "mixscale"):
+-        pytest.skip("installed pertpy has no Mixscape.mixscale")
+-
+-    ad_rsc = mixscape_adata
+-    ad_rsc.layers["X_pert"] = ad_rsc.X.copy()
+-    ad_pt = ad_rsc.copy()
+-
+-    rsc.ptg.Mixscape().mixscale(
+-        ad_rsc, pert_key="gene_target", control="NT", test_method="t-test"
+-    )
+-    pt.tl.Mixscape().mixscale(
+-        ad_pt,
+-        pert_key="gene_target",
+-        control="NT",
+-        layer="X_pert",
+-        test_method="t-test",
+-    )
+-    np.testing.assert_allclose(
+-        ad_rsc.obs["mixscale_score"].to_numpy(dtype=float),
+-        ad_pt.obs["mixscale_score"].to_numpy(dtype=float),
+-        rtol=1e-5,
+-        atol=1e-5,
+-    )
+-
+-
+-def _ref_mixscale_gene(block, is_guide, is_nt, *, do_scale):
+-    """NumPy reference for one gene's Mixscale score (pertpy's formula): z-score
+-    each column, project onto the (guide-mean − control-mean) direction, then
+-    standardize each guide cell's projection against the control distribution."""
+-    x = block.astype(np.float64)
+-    n, k = x.shape
+-    if do_scale:
+-        cmean = x.mean(0)
+-        sd = x.std(0, ddof=1)
+-        sd = np.where(sd == 0.0, 1.0, sd)
+-    else:
+-        cmean = np.zeros(k)
+-        sd = np.ones(k)
+-    vec = (x[is_guide].mean(0) - x[is_nt].mean(0)) / sd
+-    dotvv = float(vec @ vec)
+-    pvec = ((x - cmean) / sd) @ vec / max(dotvv, 1e-12)
+-    nt = pvec[is_nt]
+-    nt_mean = nt.mean()
+-    nt_std = nt.std(ddof=0) or 1.0
+-    out = np.zeros(n)
+-    out[is_guide] = (pvec[is_guide] - nt_mean) / nt_std
+-    return out
+-
+-
+-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+-def test_mixscale_matches_numpy_reference(dtype):
+-    """The batched scoring kernel matches an independent NumPy implementation of
+-    pertpy's Mixscale formula, per gene, at float32 and float64. This is the
+-    executed numerical-parity check (test_mixscale_matches_pertpy only runs once
+-    pertpy ships Mixscape.mixscale)."""
+-    from rapids_singlecell.pertpy_gpu._mixscape import _project_scores_batched
+-
+-    rng = np.random.default_rng(0)
+-    n_obs, n_vars = 600, 40
+-    X = rng.normal(0.0, 1.0, (n_obs, n_vars)).astype(dtype)
+-    ctrl = np.arange(0, 200)  # control cells, shared across genes
+-    genes = {
+-        0: (np.arange(200, 350), np.array([1, 4, 7, 9, 12], dtype=np.int32)),
+-        1: (np.arange(350, 600), np.array([2, 5, 8, 20, 31, 33], dtype=np.int32)),
+-    }
+-    for gi, (guide, cols) in genes.items():
+-        X[np.ix_(guide, cols)] += 2.0 + gi  # plant a clear perturbation direction
+-
+-    gene_jobs: list[dict] = []
+-    ref = np.zeros(n_obs)
+-    for guide, cols in genes.values():
+-        rows = np.concatenate([ctrl, guide]).astype(np.int32)
+-        is_guide = np.concatenate(
+-            [np.zeros(ctrl.size, bool), np.ones(guide.size, bool)]
+-        )
+-        nt_in_all = ~is_guide
+-        gene_jobs.append(
+-            {
+-                "row_ids": rows,
+-                "col_ids": cols,
+-                "is_guide": is_guide,
+-                "nt_in_all": nt_in_all,
+-            }
+-        )
+-        block_scores = _ref_mixscale_gene(
+-            X[rows][:, cols], is_guide, nt_in_all, do_scale=True
+-        )
+-        ref[guide] = block_scores[is_guide]
+-
+-    Xg = cp.asarray(X)
+-    scores = cp.zeros(n_obs, dtype=Xg.dtype)
+-    _project_scores_batched(Xg, gene_jobs, scores, do_scale=True)
+-    atol = 2e-3 if dtype == np.float32 else 1e-9
+-    np.testing.assert_allclose(cp.asnumpy(scores), ref, atol=atol)
+-
+-
+-def test_mixscale_no_scale(mixscale_adata):
+-    """The scale=False path runs and produces finite, non-zero perturbed scores."""
+-    adata = mixscale_adata
+-    rsc.ptg.Mixscape().mixscale(
+-        adata, pert_key="gene_target", control="NT", test_method="t-test", scale=False
+-    )
+-    assert not np.isnan(adata.obs["mixscale_score"].to_numpy()).any()
+-    ko = adata.obs.loc[adata.obs["gene_target"] == "GeneA", "mixscale_score"]
+-    assert ko.abs().mean() > 0
+-
+-
+-def test_mixscale_float32_matches_float64():
+-    """float32 scores match the float64 result (in-kernel 64-bit accumulation)."""
+-    rng = np.random.default_rng(0)
+-    n_genes, n = 200, 120
+-    X = rng.standard_normal((2 * n, n_genes)).astype(np.float64)
+-    X[n:, :40] -= 2.0
+-    obs = pd.DataFrame(
+-        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
+-    )
+-    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+-    ad64 = anndata.AnnData(X=X, obs=obs, var=var)
+-    ad64.layers["X_pert"] = ad64.X.copy()
+-    ad32 = anndata.AnnData(X=X.astype(np.float32), obs=obs.copy(), var=var.copy())
+-    ad32.layers["X_pert"] = ad32.X.copy()
+-    for ad_ in (ad64, ad32):
+-        rsc.ptg.Mixscape().mixscale(
+-            ad_, pert_key="pert", control="NT", test_method="t-test"
+-        )
+-    np.testing.assert_allclose(
+-        ad32.obs["mixscale_score"].to_numpy(dtype=float),
+-        ad64.obs["mixscale_score"].to_numpy(dtype=float),
+-        rtol=1e-4,
+-        atol=1e-5,
+-    )
+-
+-
+-def test_mixscale_large_de_set_shared_mem_optin():
+-    """Many DE genes per perturbation exercise the >48KB dynamic shared-mem
+-    opt-in path (3 * k * 8 bytes exceeds the 48KB default for k > ~1700)."""
+-    rng = np.random.default_rng(0)
+-    n_genes, n = 2500, 120
+-    X = rng.standard_normal((2 * n, n_genes)).astype(np.float32)
+-    X[n:] -= 2.0  # every gene differentially expressed in the guide group
+-    obs = pd.DataFrame(
+-        {"pert": ["NT"] * n + ["g"] * n}, index=[str(i) for i in range(2 * n)]
+-    )
+-    var = pd.DataFrame(index=[f"g{i}" for i in range(n_genes)])
+-    adata = anndata.AnnData(X=X, obs=obs, var=var)
+-    adata.layers["X_pert"] = adata.X.copy()
+-    rsc.ptg.Mixscape().mixscale(
+-        adata,
+-        pert_key="pert",
+-        control="NT",
+-        test_method="t-test",
+-        max_de_genes=n_genes,
+-    )
+-    g = adata.obs.loc[adata.obs["pert"] == "g", "mixscale_score"].to_numpy()
+-    assert g.shape[0] == n
+-    assert not np.isnan(g).any()
+-    assert np.abs(g).mean() > 0

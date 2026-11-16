@@ -1,0 +1,196 @@
+diff --git a/spateo/configuration.py b/spateo/configuration.py
+index 393b6b19..28aba4f9 100755
+--- a/spateo/configuration.py
++++ b/spateo/configuration.py
+@@ -30,6 +30,7 @@ class SpateoAdataKeyManager:
+     UNS_SPATIAL_SCALE_KEY = "scale"
+     UNS_SPATIAL_SCALE_UNIT_KEY = "scale_unit"
+     UNS_SPATIAL_SEGMENTATION_KEY = "segmentation"
++    UNS_SPATIAL_ALIGNMENT_KEY = "alignment"
+ 
+     SPLICED_LAYER_KEY = "spliced"
+     UNSPLICED_LAYER_KEY = "unspliced"
+diff --git a/spateo/preprocessing/segmentation/__init__.py b/spateo/preprocessing/segmentation/__init__.py
+index 30506186..ac13c71a 100755
+--- a/spateo/preprocessing/segmentation/__init__.py
++++ b/spateo/preprocessing/segmentation/__init__.py
+@@ -1,6 +1,7 @@
+ """A complete solution of spatialtemporal dynamics analyses toolkit of single cell spatial transcriptomics
+ """
+-from . import bp, density, em, icell, label
++from . import align, bp, density, em, icell, label
++from .align import refine_alignment
+ from .density import segment_densities
+ from .icell import mask_cells_from_stain, mask_nuclei_from_stain, score_and_mask_pixels
+ from .label import expand_labels, label_connected_components, watershed, watershed_markers
+diff --git a/spateo/preprocessing/segmentation/align.py b/spateo/preprocessing/segmentation/align.py
+new file mode 100755
+index 00000000..9e7ae339
+--- /dev/null
++++ b/spateo/preprocessing/segmentation/align.py
+@@ -0,0 +1,133 @@
++"""Functions to refine staining and RNA alignments.
++"""
++from typing import List, Optional
++
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from anndata import AnnData
++from tqdm import tqdm
++
++from ...configuration import SKM
++from ...errors import PreprocessingError
++
++
++class AlignmentRefiner(nn.Module):
++    """Pytorch module to refine alignment between two images.
++    Performs Autograd on the affine transformation matrix.
++    """
++
++    def __init__(self, reference: np.ndarray, to_align: np.ndarray):
++        if reference.dtype != np.dtype(bool) or to_align.dtype != np.dtype(bool):
++            raise PreprocessingError("`AlignmentRefiner` only supports boolean arrays.")
++
++        super().__init__()
++        self.reference = torch.tensor(reference)[None][None].float()
++        self.to_align = torch.tensor(to_align)[None][None].float()
++
++        self.weight = torch.tensor(
++            np.where(reference, reference.size / (2 * reference.sum()), reference.size / (2 * (~reference).sum()))
++        )[None][None]
++
++        # Affine matrix
++        self.theta = nn.Parameter(
++            torch.tensor(
++                [
++                    [1.0, 0.0, 0.0],
++                    [0.0, 1.0, 0.0],
++                ]
++            )
++        )
++
++        self.__optimizer = None
++        self.history = {}
++
++    def forward(self, x=None):
++        if x is None:
++            x = self.to_align
++        grid = F.affine_grid(self.theta.unsqueeze(0), x.size(), align_corners=False)
++        return F.grid_sample(x, grid, align_corners=False)
++
++    def loss(self, pred):
++        return torch.sum(self.weight * (pred - self.reference) ** 2) / self.weight.numel()
++
++    def optimizer(self):
++        if self.__optimizer is None:
++            self.__optimizer = torch.optim.Adam(self.parameters())
++        return self.__optimizer
++
++    def train(self, n_epochs: int = 100):
++        optimizer = self.optimizer()
++
++        with tqdm(total=n_epochs) as pbar:
++            for i in range(n_epochs):
++                pred = self()
++                loss = self.loss(pred)
++                self.history.setdefault("loss", []).append(loss.item())
++
++                pbar.set_description(f"Loss {loss.item():.4f}")
++                pbar.update(1)
++
++                optimizer.zero_grad()
++                loss.backward()
++                optimizer.step()
++
++    def transform(self, x=None):
++        if x is None:
++            x = self.to_align
++        else:
++            x = torch.tensor(x)[None][None].float()
++        return self.forward(x).detach().numpy().squeeze()
++
++    def affine(self):
++        return self.theta.detach().numpy()
++
++
++def refine_alignment(
++    adata: AnnData,
++    stain_layer: str = SKM.STAIN_LAYER_KEY,
++    rna_layer: str = SKM.UNSPLICED_LAYER_KEY,
++    n_epochs: int = 100,
++    transform_layers: Optional[List[str]] = None,
++):
++    """Refine the alignment between the staining image and RNA coordinates.
++
++    There are often small misalignments between the staining image and RNA, which
++    results in incorrect aggregation of pixels into cells based on staining.
++    This function attempts to refine these alignments based on the staining and
++    (unspliced) RNA masks.
++
++    Args:
++        adata: Input Anndata
++        stain_layer: Layer containing staining image. First will look for layer
++            `{stain_layer}_mask`. Otherwise, this will be taken as a literal.
++        rna_layer: Layer containing (unspliced) RNA. First, will look for layer
++            `{rna_layer}_mask`. Otherwise, this will be taken as a literal.
++        n_epochs: Number of epochs to run optimization
++        transform_layers: Layers to transform and overwrite inplace.
++    """
++    layer = SKM.gen_new_layer_key(stain_layer, SKM.MASK_SUFFIX)
++    if layer not in adata.layers:
++        layer = stain_layer
++    stain_mask = SKM.select_layer_data(adata, layer)
++
++    layer = SKM.gen_new_layer_key(rna_layer, SKM.MASK_SUFFIX)
++    if layer not in adata.layers:
++        layer = rna_layer
++    rna_mask = SKM.select_layer_data(adata, layer)
++
++    aligner = AlignmentRefiner(rna_mask, stain_mask)
++    aligner.train(n_epochs)
++    theta = aligner.affine()
++
++    uns_alignment = {"theta": theta}
++    SKM.set_uns_spatial_attribute(adata, SKM.UNS_SPATIAL_ALIGNMENT_KEY, uns_alignment)
++
++    if transform_layers:
++        for layer in transform_layers:
++            data = SKM.select_layer_data(adata, layer)
++            transformed = aligner.transform(data)
++            if data.dtype == np.dtype(bool):
++                transformed = transformed > 0.5
++            SKM.set_layer_data(adata, layer, transformed)
+diff --git a/spateo/preprocessing/segmentation/assign.py b/spateo/preprocessing/segmentation/assign.py
+index ff2e3fda..db26727d 100755
+--- a/spateo/preprocessing/segmentation/assign.py
++++ b/spateo/preprocessing/segmentation/assign.py
+@@ -1,11 +1,4 @@
+ """Assign spots to individual cells.
+-
+-Todo:
+-    * Instead of writing a new matrix file with the assigned cell labels,
+-        the `cell_labels` and `cens` should be used directly by an IO function
+-        to create an AnnData. In this sense, this file is probably going to be
+-        removed, and its functionality split across `pp.segmentation.label`
+-        and `io`.
+ """
+ from collections import Counter
+ from typing import Dict, Tuple
+diff --git a/spateo/preprocessing/segmentation/label.py b/spateo/preprocessing/segmentation/label.py
+index a707978b..45acd4e7 100755
+--- a/spateo/preprocessing/segmentation/label.py
++++ b/spateo/preprocessing/segmentation/label.py
+@@ -46,7 +46,7 @@ def watershed_markers(
+     layer: str = SKM.STAIN_LAYER_KEY,
+     k: int = 3,
+     square: bool = False,
+-    min_area: int = 100,
++    min_area: int = 80,
+     n_iter: int = -1,
+     float_k: int = 5,
+     float_threshold: Optional[float] = None,
+diff --git a/tests/preprocessing/segmentation/test_align.py b/tests/preprocessing/segmentation/test_align.py
+new file mode 100755
+index 00000000..e69de29b

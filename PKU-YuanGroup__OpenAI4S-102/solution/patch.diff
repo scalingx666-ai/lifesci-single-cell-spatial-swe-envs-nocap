@@ -1,0 +1,498 @@
+diff --git a/docs/auto-mode.md b/docs/auto-mode.md
+index 183a4df78..4b46ebfe0 100644
+--- a/docs/auto-mode.md
++++ b/docs/auto-mode.md
+@@ -140,6 +140,22 @@ none silently resubmits the same finding or action. Guardian timeout fails the
+ proposed action closed. Either Guardian denial threshold opens its durable
+ denial circuit. Cancellation remains separate and Auto Mode never resumes it.
+ 
++## Finding identity
++
++A finding has two keys and they answer different questions. Its **fingerprint**
++is content only -- severity, category, claim and evidence refs -- because Stage
++5 compares fingerprints across repair rounds to notice that a finding did not
++go away. Its **identity** (`finding_id`) is that content *within one review
++run*, so two sessions that reach the same conclusion record two findings rather
++than colliding on one row. `review_findings.finding_id` is globally unique, and
++must stay so: session import resolves a finding's owner by id alone.
++
++Deriving the identity from content alone made the two keys the same key. The
++second session to reach a given conclusion failed its `complete_review` insert
++on the primary key, its Auto Run stayed in `reviewing`, and the branch refused
++every later turn -- and a recurring wrong claim is precisely the finding most
++likely to recur.
++
+ ## State vocabulary and sole entry conditions
+ 
+ These names belong to one Auto Run. A run is identified by
+diff --git a/openai4s/server/scientific_review.py b/openai4s/server/scientific_review.py
+index cb62c0d26..a6521fde8 100644
+--- a/openai4s/server/scientific_review.py
++++ b/openai4s/server/scientific_review.py
+@@ -13,7 +13,7 @@
+ import json
+ import re
+ import uuid
+-from collections.abc import Callable, Mapping
++from collections.abc import Callable, Mapping, MutableMapping
+ from dataclasses import asdict
+ from typing import Any
+ 
+@@ -34,6 +34,33 @@
+ )
+ from openai4s.storage.auto_mode import AutoModeConflictError
+ 
++
++def scoped_finding_id(review_run_id: str, fingerprint: str) -> str:
++    """The durable identity of one finding: its content *within one review*.
++
++    `fingerprint` is content-only on purpose -- Stage 5 compares fingerprints
++    across repair rounds to notice that a finding did not go away -- so it
++    cannot also be the identity. `review_findings.finding_id` is a global
++    PRIMARY KEY, so deriving the id from content alone meant two sessions that
++    reached the same conclusion collided: the second one's insert raised
++    `UNIQUE constraint failed: review_findings.finding_id`, its review died,
++    and the turn was reported `review_unavailable` instead of its real verdict.
++    A recurring wrong claim is exactly the finding most likely to recur, so the
++    collision landed on the case that mattered most.
++
++    Global uniqueness still has to hold, because the session-import owner check
++    looks a finding up by id alone (`SELECT run_id FROM review_findings WHERE
++    finding_id=?`). Hashing the review scope together with the fingerprint gives
++    each allowed pair a stable, collision-resistant identity; the table also
++    declares `UNIQUE(review_run_id, fingerprint)`.
++    """
++
++    digest = hashlib.sha256(
++        f"{review_run_id}|{fingerprint}".encode("utf-8")
++    ).hexdigest()
++    return f"fnd-{digest[:16]}"
++
++
+ EventSink = Callable[[dict], None]
+ ChatCall = Callable[..., dict[str, Any]]
+ 
+@@ -1374,6 +1401,46 @@ def _proof_from_handle(
+             "close_event_id": close_event.get("event_id") if closed else None,
+         }
+ 
++    def _bind_finding_identities(
++        self, review_run_id: str, result: Mapping[str, Any]
++    ) -> list[dict[str, Any]]:
++        """Give every finding the durable id it will be stored under.
++
++        Idempotent: :func:`scoped_finding_id` is a pure function of the review
++        run and the fingerprint, so calling this again cannot change an answer.
++        That is what lets `close_review_run` stay correct when called on its
++        own, without the caller having to remember to bind first. Read-only
++        mappings are normalized so a valid finding is never silently omitted.
++        """
++
++        bound: list[dict[str, Any]] = []
++        for item in result.get("findings") or []:
++            if not isinstance(item, Mapping):
++                continue
++            normalized = dict(item)
++            fingerprint = normalized.get("fingerprint")
++            if not fingerprint:
++                rebuilt = self._finding(
++                    severity=str(normalized.get("severity") or "medium"),
++                    category=str(normalized.get("category") or "other"),
++                    claim_ref=str(
++                        normalized.get("claim_ref")
++                        or normalized.get("claim")
++                        or "finding"
++                    ),
++                    evidence_refs=list(normalized.get("evidence_refs") or []),
++                    reproduction=str(normalized.get("reproduction") or ""),
++                )
++                fingerprint = rebuilt["fingerprint"]
++                normalized["fingerprint"] = fingerprint
++            normalized["finding_id"] = scoped_finding_id(
++                review_run_id, str(fingerprint)
++            )
++            bound.append(normalized)
++        if isinstance(result, MutableMapping):
++            result["findings"] = bound
++        return bound
++
+     def close_review_run(
+         self,
+         handle: Mapping[str, Any],
+@@ -1384,24 +1451,14 @@ def close_review_run(
+         """Record the verdict on the review opened by :meth:`open_review_run`."""
+ 
+         review_run_id = str(handle["review_run_id"])
++        # Idempotent, and the reason the id the caller goes on to quote is the
++        # id that was stored: Stage 5 hands these to `start_auto_mode_repair`,
++        # which checks they exist.
++        bound_findings = self._bind_finding_identities(review_run_id, result)
+         findings = []
+-        for item in result.get("findings") or []:
+-            if not isinstance(item, Mapping):
+-                continue
+-            finding_id = item.get("finding_id")
+-            fingerprint = item.get("fingerprint")
+-            if not finding_id or not fingerprint:
+-                rebuilt = self._finding(
+-                    severity=str(item.get("severity") or "medium"),
+-                    category=str(item.get("category") or "other"),
+-                    claim_ref=str(
+-                        item.get("claim_ref") or item.get("claim") or "finding"
+-                    ),
+-                    evidence_refs=list(item.get("evidence_refs") or []),
+-                    reproduction=str(item.get("reproduction") or ""),
+-                )
+-                finding_id = rebuilt["finding_id"]
+-                fingerprint = rebuilt["fingerprint"]
++        for item in bound_findings:
++            fingerprint = str(item.get("fingerprint") or "")
++            finding_id = str(item.get("finding_id") or "")
+             findings.append(
+                 {
+                     "finding_id": finding_id,
+diff --git a/tests/README.md b/tests/README.md
+index 2efc61a64..ac6ee0912 100644
+--- a/tests/README.md
++++ b/tests/README.md
+@@ -155,6 +155,7 @@ Every `test_*.py` file is listed below, with the reason the module exists rather
+ | [`test_scientific_review_service.py`](test_scientific_review_service.py) | Shadow orchestrator: independence fail-closed, same-model review_only, deterministic claim checks, forged refs, plan-included shadow steps, and flag-off inertness. |
+ | [`test_scientific_review_golden.py`](test_scientific_review_golden.py) | Stage 3 Go/No-Go pack: ≥100 golden/injected cases through the shipped evaluator, high/medium recall, clean-task false positives, and zero forged evidence refs. |
+ | [`test_completion_gate.py`](test_completion_gate.py) | Stage 4 promotion order: candidate before terminal, issues stay unverified, flag-off is inert, and reopen reads the durable message/setting stamp. |
++| [`test_review_finding_identity.py`](test_review_finding_identity.py) | A finding's identity is its content within one review, not its content: two sessions reaching the identical conclusion both persist and both reach their real terminal, the id the caller quotes is the one stored, a storage failure never escapes as a bare exception, and a collision no longer strands the branch in `reviewing`. |
+ | [`test_stage4_atomic_promotion.py`](test_stage4_atomic_promotion.py) | Stage 4's final transaction: one exact Candidate message, its optional committed Stage 1 delivery, and the Auto Run terminal/event promote together or all roll back. It covers scope/content CAS faults, post-update event faults, exact replay, and rejection of omitted or changed promotion identities. |
+ | [`test_stage4_candidate_promotion.py`](test_stage4_candidate_promotion.py) | Stage 4 candidate → review → promotion: the answer is withheld until a verdict exists, the candidate is durable before the reviewer is called, a repaired candidate is handed back for delivery, Verified requires the delivered bytes to be the reviewed bytes, and a delivery that fails after the review retracts the promotion. |
+ | [`test_auto_repair.py`](test_auto_repair.py) | Stage 5 planted residual-row and missing-value cases, version reuse on identical bytes, no self-certify, and review_only never repairs. |
+diff --git a/tests/README_zh.md b/tests/README_zh.md
+index 9651e3485..113a65d2a 100644
+--- a/tests/README_zh.md
++++ b/tests/README_zh.md
+@@ -154,6 +154,7 @@ OpenAI4S 的离线正确性门禁。`uv run pytest` 用确定性 fake 跑完这
+ | [`test_scientific_review_service.py`](test_scientific_review_service.py) | Shadow 编排：独立性失败即关闭、同模型 review_only、确定性数值核对、伪造引用、包含 Plan 的 shadow step，以及 flag 关闭时惰性。 |
+ | [`test_scientific_review_golden.py`](test_scientific_review_golden.py) | Stage 3 Go/No-Go：≥100 个 golden/注入案例走真实 evaluator，高/中召回、干净任务误报，以及伪造 evidence ref 为零。 |
+ | [`test_completion_gate.py`](test_completion_gate.py) | Stage 4 晋升顺序：candidate 早于 terminal，issues 保持未验证，flag 关闭时惰性，reopen 读持久的 message/setting 戳记。 |
++| [`test_review_finding_identity.py`](test_review_finding_identity.py) | finding 的身份是「单次 review 内的内容」而不是内容本身：两个会话得出相同结论时都能落库并各自到达真实终态，调用方引用的 id 就是入库的 id，存储失败不会以裸异常逃逸，冲突也不再把分支卡在 `reviewing`。 |
+ | [`test_stage4_atomic_promotion.py`](test_stage4_atomic_promotion.py) | Stage 4 的最终事务：精确 Candidate 消息、可选的 committed Stage 1 delivery 与 Auto Run terminal/event 要么一起晋升，要么全部回滚。覆盖作用域／内容 CAS 故障、更新后的 event 故障、精确重放，以及遗漏或改变 promotion 身份时的拒绝。 |
+ | [`test_stage4_candidate_promotion.py`](test_stage4_candidate_promotion.py) | Stage 4 candidate → review → promotion：有裁决前不投递答案，candidate 在调用 Reviewer 之前已持久化，修复后的候选可被真正交付，Verified 只能盖在被审阅的同一份字节上，审核之后交付失败会撤回晋升。 |
+ | [`test_auto_repair.py`](test_auto_repair.py) | Stage 5 的残差行数与缺失值误述种植案例、相同字节复用版本、禁止自我认证，以及 review_only 不修复。 |
+diff --git a/tests/test_review_finding_identity.py b/tests/test_review_finding_identity.py
+new file mode 100644
+index 000000000..6c98708dc
+--- /dev/null
++++ b/tests/test_review_finding_identity.py
+@@ -0,0 +1,315 @@
++"""A finding's identity is its content *within one review*, not its content.
++
++`review_findings.finding_id` is a global PRIMARY KEY, and it used to be derived
++from the finding's content alone. Two sessions that reached the same conclusion
++therefore collided: the second one's `complete_review` raised
++`UNIQUE constraint failed: review_findings.finding_id`, its review died, and the
++turn reported `review_unavailable` instead of the `completed_with_issues` it had
++actually earned. The finding most likely to recur across sessions is a recurring
++wrong claim, so the collision landed on exactly the case worth catching.
++
++The content-only `fingerprint` stays content-only -- Stage 5 compares
++fingerprints across repair rounds to notice a finding did not go away.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from types import MappingProxyType, SimpleNamespace
++
++import pytest
++
++from openai4s.config import AutoModeConfig, Config, RoadmapFeatureFlags
++from openai4s.server.completion_gate import CompletionGateService
++from openai4s.server.scientific_review import ScientificReviewService, scoped_finding_id
++from openai4s.store import Store
++
++FINDING = {
++    "severity": "high",
++    "category": "wrong_claim",
++    "claim_ref": "n=100",
++    "evidence_refs": [],
++    "reproduction": "the table has 97 rows",
++    "suggested_fix": "recount from the table",
++    "confidence": "high",
++}
++
++
++def _cfg():
++    return Config(
++        roadmap_features=RoadmapFeatureFlags(
++            stage2_auto_run_storage=True,
++            stage3_scientific_review_shadow=True,
++            stage4_review_completion_gate=True,
++        ),
++        auto_mode=AutoModeConfig(result_review_mode="review_only"),
++    )
++
++
++def _llm(model):
++    return SimpleNamespace(
++        provider="openai",
++        model=model,
++        base_url="https://review.example/v1",
++        timeout_s=30,
++        max_tokens=400,
++    )
++
++
++def _issues_chat(messages, cfg, **kwargs):
++    """Always the same finding -- the whole point of the regression."""
++
++    return {
++        "content": json.dumps(
++            {
++                "verdict": "issues",
++                "summary": "the count is wrong",
++                "findings": [dict(FINDING)],
++            }
++        ),
++        "usage": {},
++    }
++
++
++def _store(tmp_path):
++    store = Store(tmp_path / "identity.db")
++    store.create_project(name="p", project_id="project-1")
++    return store
++
++
++def _frame(store, frame_id):
++    store._conn.execute(
++        "INSERT INTO frames(frame_id,parent_id,project_id,root_frame_id,kind,"
++        "status,depth,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
++        (frame_id, None, "project-1", frame_id, "turn", "processing", 0, 1, 1),
++    )
++    store._conn.commit()
++    store.ensure_session_branch(root_frame_id=frame_id, branch_id=frame_id)
++
++
++def _gate(store, cfg):
++    auto = SimpleNamespace(
++        get=lambda frame_id: {
++            "selection": {
++                "result_review_mode": "review_only",
++                "preset": "off",
++                "approvals_reviewer": "user",
++            }
++        }
++    )
++    review = ScientificReviewService(
++        store=store, config=cfg, auto_mode=auto, chat_call=_issues_chat
++    )
++    return CompletionGateService(
++        store=store, config=cfg, scientific_review=review, auto_mode=auto
++    )
++
++
++def _run(gate, frame_id, turn_id):
++    return gate.gate_after_turn(
++        root_frame_id=frame_id,
++        project_id="project-1",
++        branch_id=frame_id,
++        turn_id=turn_id,
++        execution_id="exec-" + turn_id,
++        user_request="how many rows?",
++        candidate_answer="the dataset has n=100 rows",
++        agent_cfg=_llm("agent"),
++        reviewer_cfg=_llm("reviewer"),
++    )
++
++
++def test_two_sessions_with_the_identical_finding_both_complete(tmp_path):
++    store = _store(tmp_path)
++    _frame(store, "root-1")
++    _frame(store, "root-2")
++    gate = _gate(store, _cfg())
++
++    first = _run(gate, "root-1", "turn-1")
++    second = _run(gate, "root-2", "turn-2")
++
++    # Both reached the verdict they earned. Before, the second was
++    # `review_unavailable (review_did_not_run)`.
++    for result in (first, second):
++        assert result["terminal"] == "completed_with_issues", result["user_truth"]
++
++    rows = store._conn.execute(
++        "SELECT finding_id, fingerprint, review_run_id FROM review_findings "
++        "ORDER BY rowid"
++    ).fetchall()
++    assert len(rows) == 2, rows
++    # Same content, so the same fingerprint -- Stage 5 depends on that.
++    assert rows[0]["fingerprint"] == rows[1]["fingerprint"]
++    # Different reviews, so different identities.
++    assert rows[0]["finding_id"] != rows[1]["finding_id"]
++    assert rows[0]["finding_id"] == scoped_finding_id(
++        rows[0]["review_run_id"], rows[0]["fingerprint"]
++    )
++    store.close()
++
++
++def test_the_id_the_caller_quotes_is_the_id_that_was_stored(tmp_path):
++    """Stage 5 hands these ids back to `start_auto_mode_repair`, which checks
++    they exist. A durable id the in-memory result never learned about would
++    fail that check on every repair."""
++
++    store = _store(tmp_path)
++    _frame(store, "root-1")
++    result = _run(_gate(store, _cfg()), "root-1", "turn-1")
++
++    stored = {
++        row["finding_id"]
++        for row in store._conn.execute("SELECT finding_id FROM review_findings")
++    }
++    in_memory = {
++        str(item["finding_id"]) for item in result["findings"] if item.get("finding_id")
++    }
++    assert in_memory and in_memory <= stored, (in_memory, stored)
++    store.close()
++
++
++def test_a_storage_failure_does_not_escape_as_a_bare_exception(tmp_path):
++    """The turn keeps its verdict; only the promotion is refused.
++
++    A narrow `except` tuple let `sqlite3.IntegrityError` out of
++    `shadow_after_turn`, the gate discarded the entire result far upstream, and
++    the user was told the review did not run when it had reached a verdict.
++    """
++
++    store = _store(tmp_path)
++    _frame(store, "root-1")
++    gate = _gate(store, _cfg())
++    review = gate.scientific_review
++
++    def _boom(*args, **kwargs):
++        raise sqlite3.IntegrityError("UNIQUE constraint failed: review_findings.x")
++
++    review.store = SimpleNamespace(
++        **{
++            name: getattr(store, name)
++            for name in dir(store)
++            if not name.startswith("__") and callable(getattr(store, name, None))
++        }
++    )
++    review.store.complete_auto_mode_review = _boom
++
++    result = _run(gate, "root-1", "turn-1")
++
++    assert result is not None, "the verdict must survive a storage failure"
++    assert result["verdict"] == "issues"
++    # No durable pass exists, so promotion is refused -- but with a terminal
++    # that describes the turn rather than claiming the review never happened.
++    assert result["terminal"] != "verified"
++    store.close()
++
++
++@pytest.mark.parametrize("review_run_id", ["review-a", "review-b"])
++def test_scoped_ids_are_stable_and_scope_separating(review_run_id):
++    assert scoped_finding_id(review_run_id, "abc") == scoped_finding_id(
++        review_run_id, "abc"
++    )
++    assert scoped_finding_id("review-a", "abc") != scoped_finding_id("review-b", "abc")
++    assert scoped_finding_id(review_run_id, "abc") != scoped_finding_id(
++        review_run_id, "abd"
++    )
++
++
++def test_a_collision_no_longer_strands_the_branch_in_reviewing(tmp_path):
++    """Why the fix needs no data migration for existing databases.
++
++    The collision rolled `complete_review` back, so the Auto Run stayed in
++    `reviewing` -- not a terminal status -- and later work on that branch was
++    refused. The current gate returns a reviewed proposal first; the delivery
++    finalizer then commits its terminal state.
++
++    Both proposals can now be finalized, so no branch is left blocked.
++    Databases that were already stranded do not need a migration: the run
++    carries the dead daemon's `owner_instance_id`, and boot-time reconciliation
++    abandons it (see `test_auto_mode_recovery_regressions.py`).
++    """
++
++    store = _store(tmp_path)
++    _frame(store, "root-1")
++    _frame(store, "root-2")
++    gate = _gate(store, _cfg())
++
++    first = _run(gate, "root-1", "turn-1")
++    second = _run(gate, "root-2", "turn-2")
++    for frame_id, reviewed in (("root-1", first), ("root-2", second)):
++        finalized = gate.finalize_after_delivery(
++            frame_id, frame_id, reviewed, delivered=True
++        )
++        assert finalized["terminal"] == "completed_with_issues", finalized
++        assert finalized["durable_terminal"] is True
++
++    for frame_id in ("root-1", "root-2"):
++        run = store.project_auto_mode_run(frame_id, frame_id)["run"]
++        assert run is not None, frame_id
++        assert run["status"] != "reviewing", (frame_id, run["status"])
++        assert run["status"] == "completed_with_issues", (frame_id, run["status"])
++    store.close()
++
++
++def test_the_review_step_and_the_findings_table_agree_on_every_id(tmp_path):
++    """Three records of one finding, one id.
++
++    The durable close writes the findings table before the visible review step,
++    whose output JSON embeds the same findings. Binding before that close keeps
++    both records aligned; assigning an id to only one writer would recreate the
++    same two-records-disagreeing shape one layer up, and a test that reads only
++    the table would miss it.
++    """
++
++    store = _store(tmp_path)
++    _frame(store, "root-1")
++    _run(_gate(store, _cfg()), "root-1", "turn-1")
++
++    stored = {
++        row["finding_id"]
++        for row in store._conn.execute("SELECT finding_id FROM review_findings")
++    }
++    assert stored
++
++    steps = [
++        json.loads(row["output"])
++        for row in store._conn.execute(
++            "SELECT output FROM frame_steps WHERE kind='review' AND output IS NOT NULL"
++        )
++    ]
++    quoted = {
++        str(finding["finding_id"])
++        for step in steps
++        for finding in (step.get("findings") or [])
++        if finding.get("finding_id")
++    }
++    assert quoted, "the review step records its findings"
++    assert quoted <= stored, sorted(quoted - stored)
++    store.close()
++
++
++def test_read_only_mapping_finding_is_normalized_and_persisted(tmp_path):
++    """A valid Mapping must not disappear merely because it is immutable."""
++
++    store = _store(tmp_path)
++    _frame(store, "root-1")
++    gate = _gate(store, _cfg())
++    review = gate.scientific_review
++    evaluate = review.evaluate
++
++    def _read_only_findings(*args, **kwargs):
++        result = evaluate(*args, **kwargs)
++        result["findings"] = [
++            MappingProxyType(dict(item)) for item in result.get("findings") or []
++        ]
++        return result
++
++    review.evaluate = _read_only_findings
++    result = _run(gate, "root-1", "turn-1")
++
++    assert len(result["findings"]) == 1
++    assert isinstance(result["findings"][0], dict)
++    finding_id = result["findings"][0]["finding_id"]
++    stored = store._conn.execute("SELECT finding_id FROM review_findings").fetchall()
++    assert [row["finding_id"] for row in stored] == [finding_id]
++    store.close()

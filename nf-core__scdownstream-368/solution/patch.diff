@@ -1,0 +1,239 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3948f9fe..58f384c2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -70,6 +70,7 @@ Initial release of nf-core/scdownstream, created with the [nf-core](https://nf-c
+ 
+ ### `Fixed`
+ 
++- Process interleaved Scanorama batches contiguously and restore embeddings to the original cell order, by @nictru and GPT-6.1 Sol [[#368](https://github.com/nf-core/scdownstream/pull/368)].
+ - Use the experimental design when estimating pseudobulk edgePython dispersions, by @nictru and GPT-6.1 Sol [[#361](https://github.com/nf-core/scdownstream/pull/361)].
+ - Convert single-cell edgePython effect sizes from natural-log coefficients to the advertised `log2fc` units, by @nictru and GPT-6.1 Sol [[#364](https://github.com/nf-core/scdownstream/pull/364)].
+ - Use selected expression in `X` consistently for Scanpy marker ranking, filtering and plotting when `.raw` is present, by @nictru and GPT-6.1 Sol [[#362](https://github.com/nf-core/scdownstream/pull/362)].
+diff --git a/modules/local/scanorama/integrate/templates/integrate.py b/modules/local/scanorama/integrate/templates/integrate.py
+index 88c79603..3bd3dc08 100644
+--- a/modules/local/scanorama/integrate/templates/integrate.py
++++ b/modules/local/scanorama/integrate/templates/integrate.py
+@@ -13,32 +13,54 @@
+ threadpool_limits(int("${task.cpus}"))
+ 
+ adata = sc.read_h5ad("${h5ad}")
+-adata_proc = adata.copy()
+ prefix = "${prefix}"
+ batch_col = "${batch_col}"
+ input_layer = "${input_layer}"
+ log_normalize = "${log_normalize}" == "true"
+ 
+-if input_layer != "X" and input_layer not in adata_proc.layers:
++if not adata.obs_names.is_unique or adata.obs_names.hasnans:
++    raise ValueError("Scanorama requires unique, non-missing observation identifiers.")
++if batch_col not in adata.obs:
++    raise ValueError(f"Scanorama batch column {batch_col!r} is not present in obs.")
++if adata.obs[batch_col].isna().any():
++    raise ValueError(f"Scanorama batch column {batch_col!r} contains missing values.")
++
++if input_layer != "X" and input_layer not in adata.layers:
+     raise ValueError(
+-        f"input_layer {input_layer!r} is not present in adata.layers (available: {list(adata_proc.layers.keys())})"
++        f"input_layer {input_layer!r} is not present in adata.layers (available: {list(adata.layers.keys())})"
+     )
+ 
+-if input_layer != "X":
+-    adata_proc.X = adata_proc.layers[input_layer]
++working_layer = "_scanorama_work"
++if working_layer in adata.layers:
++    raise ValueError(f"Scanorama working layer {working_layer!r} already exists")
++source = adata.X if input_layer == "X" else adata.layers[input_layer]
++adata.layers[working_layer] = source.copy()
+ 
+ if log_normalize:
+-    target_sum = float(np.median(np.asarray(adata_proc.X.sum(axis=1)).ravel()))
+-    sc.pp.normalize_total(adata_proc, target_sum=target_sum)
+-    sc.pp.log1p(adata_proc)
++    target_sum = float(np.median(np.asarray(adata.layers[working_layer].sum(axis=1)).ravel()))
++    sc.pp.normalize_total(adata, layer=working_layer, target_sum=target_sum)
++    adata.layers[working_layer] = sc.pp.log1p(adata.layers[working_layer])
+ 
+-sc.pp.scale(adata_proc, max_value=10)
+-sc.pp.pca(adata_proc, n_comps=30, zero_center=False)
++adata.layers[working_layer] = sc.pp.scale(adata.layers[working_layer], max_value=10)
++pca = sc.pp.pca(
++    adata.layers[working_layer],
++    n_comps=30,
++    zero_center=False,
++    mask_var=adata.var["highly_variable"].to_numpy() if "highly_variable" in adata.var else None,
++)
++del adata.layers[working_layer]
+ 
++# Preserve first-seen batch order, including the existing contiguous-batch path.
++batch_codes, _ = pd.factorize(adata.obs[batch_col], sort=False)
++permutation = np.argsort(batch_codes, kind="stable")
++adata_proc = sc.AnnData(pca[permutation], obs=adata.obs[[batch_col]].iloc[permutation].copy())
++adata_proc.obsm["X_pca"] = adata_proc.X
+ sce.pp.scanorama_integrate(adata_proc, batch_col)
+ 
+-adata.obsm["X_scanorama"] = adata_proc.obsm["X_scanorama"]
+-adata.obsm["X_emb"] = adata_proc.obsm["X_scanorama"]
++adata_proc = adata_proc[adata.obs_names]
++embedding = adata_proc.obsm["X_scanorama"]
++adata.obsm["X_scanorama"] = embedding
++adata.obsm["X_emb"] = embedding
+ adata.write_h5ad(f"{prefix}.h5ad", compression="gzip")
+ 
+ pd.DataFrame(adata.obsm["X_emb"], index=adata.obs_names).to_pickle(f"X_{prefix}.pkl")
+diff --git a/modules/local/scanorama/integrate/tests/batch_validation.nf.test b/modules/local/scanorama/integrate/tests/batch_validation.nf.test
+new file mode 100644
+index 00000000..87c71c3e
+--- /dev/null
++++ b/modules/local/scanorama/integrate/tests/batch_validation.nf.test
+@@ -0,0 +1,64 @@
++nextflow_process {
++
++    name "Test Scanorama batch validation"
++    script "modules/local/scanorama/integrate/main.nf"
++    process "SCANORAMA_INTEGRATE"
++
++    tag "modules"
++    tag "modules_local"
++
++    test("Should reject a missing batch column before integration") {
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                input[0] = channel.of([
++                    [id: 'missing_batch_column'],
++                    file(params.pipelines_testdata_base_path + '/pbmc/combined_filtered_matrix.h5ad', checkIfExists: true)
++                ])
++                input[1] = 'missing_batch_column'
++                input[2] = 'X'
++                input[3] = true
++                """
++            }
++        }
++        then {
++            assert process.failed
++            assert process.errorReport.contains("Scanorama batch column 'missing_batch_column' is not present in obs")
++        }
++    }
++
++    test("Should reject missing batch labels before integration") {
++        setup {
++            run("ADATA_EXTEND") {
++                script "../../../adata/extend/main.nf"
++                process {
++                    """
++                    input[0] = channel.of('cell,regression_batch\\nSRR28679756::CCTTTCTTCTGCTGCT,batch_a\\n')
++                        .collectFile(name: 'missing_batch.csv')
++                        .map { obs -> [
++                            [id: 'missing_batch_labels'],
++                            file(params.pipelines_testdata_base_path + '/pbmc/combined_filtered_matrix.h5ad', checkIfExists: true),
++                            [obs], [], [], [], [], []
++                        ] }
++                    """
++                }
++            }
++        }
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad
++                input[1] = 'regression_batch'
++                input[2] = 'X'
++                input[3] = true
++                """
++            }
++        }
++        then {
++            assert process.failed
++            assert process.errorReport.contains("Scanorama batch column 'regression_batch' contains missing values")
++        }
++    }
++}
+diff --git a/modules/local/scanorama/integrate/tests/main.nf.test b/modules/local/scanorama/integrate/tests/main.nf.test
+index 4320d913..f2b302bb 100644
+--- a/modules/local/scanorama/integrate/tests/main.nf.test
++++ b/modules/local/scanorama/integrate/tests/main.nf.test
+@@ -36,6 +36,81 @@ nextflow_process {
+ 
+     }
+ 
++    test("Should preserve cell order with interleaved and contiguous batches") {
++
++        setup {
++            run("ADATA_READCSV") {
++                script "../../../adata/readcsv/main.nf"
++                process {
++                    """
++                    input[0] = channel.of([
++                        [id: 'dense'],
++                        file(params.pipelines_testdata_base_path + '/pbmc/SRR28679756_filtered_matrix.csv', checkIfExists: true)
++                    ])
++                    """
++                }
++            }
++            run("ADATA_EXTEND") {
++                script "../../../adata/extend/main.nf"
++                process {
++                    """
++                    csv = file(params.pipelines_testdata_base_path + '/pbmc/SRR28679756_filtered_matrix.csv', checkIfExists: true)
++                    cells = csv.readLines().drop(1).collect { it.split(',')[0] }
++                    obs = channel.of('interleaved', 'contiguous').map { mode ->
++                        def rows = cells.withIndex().collect { cell, i ->
++                            def batch = mode == 'interleaved' ? i % 2 : (i < 32 ? 0 : 1)
++                            cell + ',' + (batch == 0 ? 'z_batch' : 'a_batch')
++                        }
++                        [mode + '.csv', 'cell,regression_batch\\n' + rows.join('\\n') + '\\n']
++                    }.collectFile()
++                    input[0] = ADATA_READCSV.out.h5ad.combine(obs).map { meta, h5ad, fragment ->
++                        [[id: fragment.baseName], h5ad, [fragment], [], [], [], [], []]
++                    }
++                    """
++                }
++            }
++        }
++
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad.map { meta, h5ad ->
++                    [meta + [id: meta.id + '_integrated'], h5ad]
++                }
++                input[1] = 'regression_batch'
++                input[2] = 'X'
++                input[3] = true
++                """
++            }
++        }
++
++        then {
++            assert process.success
++            assert process.out.h5ad.size() == 2
++            assert process.out.obsm.size() == 2
++            process.out.h5ad.each { meta, output ->
++                def adata = anndata(output)
++                def base = anndata(new File(file(output).parent, meta.id.replace('_integrated', '') + '.h5ad').toString())
++                assert adata.n_obs == 64
++                assert adata.n_vars == 128
++                assert 'X_scanorama' in adata.obsm
++                assert 'X_emb' in adata.obsm
++                def expected = (0..<64).collect { i ->
++                    (meta.id.startsWith('interleaved') ? i % 2 == 0 : i < 32) ? 'z_batch' : 'a_batch'
++                }
++                assert adata.obs.get('regression_batch').data == expected
++                assert adata.obs.index.values == base.obs.index.values
++                assert adata.var.index.values == base.var.index.values
++                assert adata.obs.colnames == base.obs.colnames
++                assert adata.layers == base.layers
++                assert adata.var.colnames == base.var.colnames
++                assert adata.uns == base.uns
++                assert '_scanorama_work' !in adata.layers
++            }
++        }
++    }
++
+     test("Should run without failures - stub") {
+ 
+         options '-stub'

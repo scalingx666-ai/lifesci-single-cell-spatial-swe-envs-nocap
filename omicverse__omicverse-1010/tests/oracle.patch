@@ -1,0 +1,181 @@
+diff --git a/docs/roadmap989-lemur.md b/docs/roadmap989-lemur.md
+new file mode 100644
+index 000000000..80051f785
+--- /dev/null
++++ b/docs/roadmap989-lemur.md
+@@ -0,0 +1,26 @@
++# pyLemur integration
++
++Fits LEMUR on explicitly selected variance-stabilized expression, preserves the input, and returns the model for condition predictions. Does not claim to implement R lemur neighborhood or pseudobulk hypothesis tests.
++
++Part of [roadmap #989](https://github.com/omicverse/omicverse/issues/989).
++
++## Usage
++
++Install the optional backend with `pip install "omicverse[lemur]"` using **Python 3.10 or later**. The optional backend has a higher Python floor than the base OmicVerse package. Importing OmicVerse does not import the backend.
++
++```python
++import omicverse as ov
++
++model = ov.single.lemur(adata, design="~ condition", layer="logcounts", n_embedding=15)
++prediction = model.predict(new_condition=model.cond(condition="treated"))
++```
++
++## Contract and validation
++
++Setup, constructor and training/solver options are passed separately. Inputs and outputs are checked; existing output embeddings require explicit overwrite. Native model/problem objects are returned rather than stored in `AnnData.uns`. Backend failures propagate.
++
++Run `python -m pytest tests/test_backend_validation.py tests/test_roadmap989_lemur.py -q`. Integration tests require the real backend; skipped tests do not establish real execution. Small synthetic training runs check execution and output contracts, not convergence on arbitrary biological data.
++
++The generic validation helper is byte-identical across the independent roadmap PRs. This PR introduces only the pyLemur public API and its optional dependency.
++
++On Windows, the validation environment used `harmonypy==0.0.10` because harmonypy 2.1.0 failed to build with MSVC. No global pin is imposed.
+diff --git a/omicverse/single/__init__.py b/omicverse/single/__init__.py
+index 1745e5c7d..2da1e5a04 100644
+--- a/omicverse/single/__init__.py
++++ b/omicverse/single/__init__.py
+@@ -119,6 +119,7 @@
+ from ._multimap import TFIDF_LSI,Wrapper,Integration,Batch
+ from ._perturbation import assign_guides, mixscape, perturbation_distance
+ from ._cellvote import get_cluster_celltype,CellVote,cellvote_consensus_score
++from ._lemur import lemur
+ from ._deg_ct import DCT,DEG
+ from ._lazy_function import lazy
+ from ._lazy_report import generate_scRNA_report
+@@ -358,6 +359,7 @@ def __getattr__(name):
+     'assign_guides',
+     'mixscape',
+     'perturbation_distance',
++    'lemur',
+     'perturbation_effect',
+     'cell_fate_perturbation',
+     'velocity_effect',
+diff --git a/omicverse/single/_lemur.py b/omicverse/single/_lemur.py
+new file mode 100644
+index 000000000..6ba3d7be9
+--- /dev/null
++++ b/omicverse/single/_lemur.py
+@@ -0,0 +1,43 @@
++"""Multi-condition expression modelling using pyLemur."""
++from __future__ import annotations
++
++from .._optional import import_optional_module
++from .._registry import register_function
++from .._backend_validation import expression, kwargs_copy, output_key, write_embedding
++
++
++@register_function(aliases=["pyLemur", "LEMUR"], category="single",
++                   description="Fit multi-condition expression regression with pyLemur")
++def lemur(adata, *, design, n_embedding=15, layer=None, align=False,
++          key_added="X_lemur", model_kwargs=None, fit_kwargs=None,
++          alignment_kwargs=None, overwrite=False):
++    """Fit pyLemur to variance-stabilized expression and return its model.
++
++    ``design`` is a formula such as ``~ condition``. Counts must be normalized
++    and transformed by the caller; this function never silently normalizes.
++    Fits on a copy to keep the input expression unchanged. Optional Harmony
++    alignment runs only with ``align=True``. The embedding is written in input
++    cell order. pyLemur does not implement R lemur's neighborhood/pseudobulk
++    hypothesis testing: returned predictions must not be called p-values.
++    """
++    matrix = expression(adata, layer)
++    if not isinstance(design, str) or not design.strip():
++        raise ValueError("design must be a nonempty model formula.")
++    if isinstance(n_embedding, bool) or not isinstance(n_embedding, int) or not 0 < n_embedding < min(adata.shape):
++        raise ValueError("n_embedding must be a positive integer smaller than both data dimensions.")
++    output_key(adata, key_added, overwrite=overwrite)
++    model_args = kwargs_copy(model_kwargs, reserved=("adata", "design", "n_embedding", "layer", "copy"))
++    fit = kwargs_copy(fit_kwargs)
++    alignment = kwargs_copy(alignment_kwargs)
++    if alignment and not align:
++        raise ValueError("alignment_kwargs requires align=True.")
++    backend = import_optional_module("pylemur.tl", feature="LEMUR", dependencies=("pylemur",),
++                                     install_hint="Install pylemur.")
++    work = adata.copy()
++    work.X = matrix.copy()
++    model = backend.LEMUR(work, design=design, n_embedding=n_embedding, **model_args)
++    model.fit(**fit)
++    if align:
++        model.align_with_harmony(**alignment)
++    write_embedding(adata, key_added, model.embedding)
++    return model
+diff --git a/pyproject.toml b/pyproject.toml
+index e6f3bd306..11c6a8f61 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -139,6 +139,10 @@ flowsig = [
+ rust = [
+     "anndataoom>=0.1.0,<1.0",
+ ]
++
++# Optional pyLemur backend (roadmap #989).
++lemur = ["pylemur>=0.3.1,<0.4"]
++
+ # Flow / spectral / mass cytometry. `flowio` (BSD-3, pure Python, numpy only) is
+ # the FCS parser behind ov.io.read_fcs and behind both pytometry and FlowKit; it
+ # was previously an UNDECLARED runtime dependency of a public function.
+diff --git a/tests/test_roadmap989_lemur.py b/tests/test_roadmap989_lemur.py
+new file mode 100644
+index 000000000..94322f018
+--- /dev/null
++++ b/tests/test_roadmap989_lemur.py
+@@ -0,0 +1,59 @@
++"""Boundary tests and separately selected real-backend integration checks."""
++import importlib
++from types import SimpleNamespace
++
++import anndata as ad
++import numpy as np
++import pandas as pd
++import pytest
++from scipy import sparse
++
++from omicverse import _backend_validation as validation
++
++
++@pytest.fixture
++def data():
++    rng = np.random.default_rng(42)
++    a = ad.AnnData(rng.poisson(4, (64, 24)).astype(np.float32))
++    a.layers["counts"] = a.X.copy()
++    a.obs["sample"] = pd.Categorical(np.repeat(["a", "b", "c", "d"], 16))
++    a.obs["time"] = np.repeat([0, 1], 32)
++    a.obs["condition"] = pd.Categorical(np.repeat(["ctrl", "stim"], 32))
++    a.obsm["spatial"] = rng.normal(size=(64, 2))
++    a.obsm["X_pca"] = rng.normal(size=(64, 4))
++    return a
++
++
++@pytest.mark.integration
++def test_real_lemur_predictions(data):
++    pytest.importorskip("pylemur", minversion="0.3.1")
++    from omicverse.single._lemur import lemur
++    data.X = np.log1p(data.X)
++    before = data.X.copy()
++    model = lemur(data, design="~ condition", n_embedding=3, fit_kwargs={"verbose": False})
++    assert data.obsm["X_lemur"].shape == (64, 3)
++    pred = model.predict(new_condition=model.cond(condition="stim"))
++    assert pred.shape == data.shape and np.isfinite(pred).all()
++    np.testing.assert_array_equal(data.X, before)
++    np.testing.assert_allclose(model.embedding, data.obsm["X_lemur"])
++
++
++def test_lemur_cannot_override_selected_expression(data):
++    from omicverse.single._lemur import lemur
++    with pytest.raises(ValueError, match="named arguments"):
++        lemur(data, design="~ condition", model_kwargs={"layer": "counts"})
++
++
++@pytest.mark.integration
++def test_lemur_recovers_known_condition_effect():
++    pytest.importorskip("pylemur", minversion="0.3.1")
++    from omicverse.single._lemur import lemur
++    rng = np.random.default_rng(42)
++    baseline = rng.normal(size=(40, 3)) @ rng.normal(size=(3, 20))
++    effect = np.r_[np.full(5, 3.), np.zeros(15)]
++    a = ad.AnnData(np.vstack([baseline, baseline + effect]))
++    a.obs["condition"] = pd.Categorical(np.repeat(["ctrl", "stim"], 40))
++    model = lemur(a, design="~ condition", n_embedding=3, fit_kwargs={"verbose": False})
++    contrast = model.predict(new_condition=model.cond(condition="stim")) - model.predict(
++        new_condition=model.cond(condition="ctrl"))
++    np.testing.assert_allclose(contrast.mean(0), effect, atol=.05)

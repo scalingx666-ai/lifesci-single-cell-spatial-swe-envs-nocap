@@ -1,0 +1,12 @@
+# Issue
+
+**Title:** [c++] Add TileDB predownload for linux arm64
+
+## Description
+
+**Changes:**
+Add support for downloading linux-arm64 binaries for TileDB core.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `63161963b709`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

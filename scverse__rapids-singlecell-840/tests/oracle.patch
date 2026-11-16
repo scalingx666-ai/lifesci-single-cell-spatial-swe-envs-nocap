@@ -1,0 +1,733 @@
+diff --git a/docs/api/squidpy_gpu.md b/docs/api/squidpy_gpu.md
+index a0c1b274d..dccc91ca5 100644
+--- a/docs/api/squidpy_gpu.md
++++ b/docs/api/squidpy_gpu.md
+@@ -28,6 +28,7 @@
+     gr.neighbors.TransformPostprocessor
+     gr.spatial_autocorr
+     gr.co_occurrence
++    gr.ripley
+     gr.sepal
+     gr.interaction_matrix
+     gr.nhood_enrichment
+diff --git a/docs/release-notes/0.18.1.md b/docs/release-notes/0.18.1.md
+index 15997ed5a..10d96a5c1 100644
+--- a/docs/release-notes/0.18.1.md
++++ b/docs/release-notes/0.18.1.md
+@@ -2,8 +2,9 @@
+ 
+ ```{rubric} Features
+ ```
+-* Add *Sepal* spatially variable gene scoring with {func}`~rapids_singlecell.gr.sepal`, a GPU port of {func}`squidpy.gr.sepal` that simulates all genes in parallel. `dtype=np.float32` (default) and `dtype=np.float64` use numerically stabilized entropy updates and reproduced squidpy's scores on all data tested {pr}`458` {smaller}`S Özleyen & S Dicks`
++* Add *Sepal* spatially variable gene scoring with {func}`~rapids_singlecell.gr.sepal` {pr}`458` {smaller}`S Özleyen & S Dicks`
+ * Add {func}`~rapids_singlecell.gr.nhood_enrichment` and {func}`~rapids_singlecell.gr.interaction_matrix`.  {smaller}`S Dicks`
++* Add Ripley's F, G and L statistics with {func}`~rapids_singlecell.gr.ripley` {pr}`840` {smaller}`S Dicks`
+ 
+ ```{rubric} Bug fixes
+ ```
+diff --git a/src/rapids_singlecell/_cuda/spatial/kernels_spatial.cuh b/src/rapids_singlecell/_cuda/spatial/kernels_spatial.cuh
+index b52f2eddf..481742f4e 100644
+--- a/src/rapids_singlecell/_cuda/spatial/kernels_spatial.cuh
++++ b/src/rapids_singlecell/_cuda/spatial/kernels_spatial.cuh
+@@ -105,13 +105,14 @@ __device__ bool kd_before(double distance, long long column, double other,
+ // behind MAXK - k fixed pads or, for MAXK == 0, in the outputs. Radius search
+ // (MAXK < 0) counts into offsets[row + 1], then fills from offsets[row]. Edges
+ // within radii beyond FLT_MAX whose float distance overflows stay infinite
+-// for callers to reject.
++// for callers to reject. External points are not in the trees, so they skip
++// no point and may omit rows.
+ template <typename T, int MAXK, bool fill = false>
+ __global__ void kd_search(const T* points, const T* tree, const int* index,
+                           const T* boxes, const long long* segments,
+                           const int* codes, int n_rows, int dims, int k,
+                           double radius, long long* offsets, long long* rows,
+-                          long long* columns, T* distances) {
++                          long long* columns, T* distances, bool external) {
+     const int row = blockIdx.x * blockDim.x + threadIdx.x;
+     if (row >= n_rows) return;
+     const int library = codes ? codes[row] : 0;
+@@ -148,7 +149,7 @@ __global__ void kd_search(const T* points, const T* tree, const int* index,
+                                  : fabs(delta);
+         const long long near = 2 * node + 1 + (delta > 0);
+         const long long far = 2 * node + 1 + (delta <= 0);
+-        if (previous == parent && index[node] != row) {
++        if (previous == parent && (external || index[node] != row)) {
+             const int column = index[node];
+             const T distance = kd_distance<T>(point, other, dims);
+             if constexpr (knn) {
+@@ -210,7 +211,7 @@ __global__ void kd_search(const T* points, const T* tree, const int* index,
+         for (int j = 0; j < size; ++j)
+             if (j >= size - k) {
+                 const long long at = (long long)row * k + j - (size - k);
+-                rows[at] = row;
++                if (rows) rows[at] = row;
+                 columns[at] = best_columns[j];
+                 distances[at] = best[j];
+             }
+diff --git a/src/rapids_singlecell/_cuda/spatial/spatial.cu b/src/rapids_singlecell/_cuda/spatial/spatial.cu
+index beb62f3f0..10f2e0162 100644
+--- a/src/rapids_singlecell/_cuda/spatial/spatial.cu
++++ b/src/rapids_singlecell/_cuda/spatial/spatial.cu
+@@ -71,7 +71,8 @@ void register_tree(nb::module_& m) {
+         "codes"_a.noconvert().none(), "segments"_a.noconvert(), "max_length"_a,
+         "index"_a.noconvert(), "boxes"_a.noconvert(), "stream"_a);
+     // k > 0 finds k nearest neighbors; k == 0 counts radius neighbors into
+-    // offsets, or fills them if rows are given.
++    // offsets, or fills them if rows are given. External points query the
++    // trees without being in them.
+     m.def(
+         "tree_search",
+         [](gpu_array_c<const T, Device> points,
+@@ -80,7 +81,8 @@ void register_tree(nb::module_& m) {
+            int k, double radius, gpu_array_c<long long, Device> offsets,
+            gpu_array_c<long long, Device> rows,
+            gpu_array_c<long long, Device> columns,
+-           gpu_array_c<T, Device> distances, std::uintptr_t stream) {
++           gpu_array_c<T, Device> distances, std::uintptr_t stream,
++           bool external) {
+             const int n = points.shape(0);
+             const auto kernel = k > 32        ? kd_search<T, 0>
+                                 : k > 16      ? kd_search<T, 32>
+@@ -91,7 +93,8 @@ void register_tree(nb::module_& m) {
+             kernel<<<(n + 127) / 128, 128, 0, (cudaStream_t)stream>>>(
+                 points.data(), tree.data(), index.data(), boxes.data(),
+                 segments.data(), codes.data(), n, points.shape(1), k, radius,
+-                offsets.data(), rows.data(), columns.data(), distances.data());
++                offsets.data(), rows.data(), columns.data(), distances.data(),
++                external);
+             CUDA_CHECK_LAST_ERROR(kd_search);
+         },
+         "points"_a.noconvert(), "tree"_a.noconvert(), "index"_a.noconvert(),
+@@ -100,7 +103,8 @@ void register_tree(nb::module_& m) {
+         "offsets"_a.noconvert().none(),
+         "rows"_a.noconvert().none() = nb::none(),
+         "columns"_a.noconvert().none() = nb::none(),
+-        "distances"_a.noconvert().none() = nb::none(), "stream"_a);
++        "distances"_a.noconvert().none() = nb::none(), "stream"_a,
++        "external"_a = false);
+     m.def(
+         "library_percentile",
+         [](gpu_array_c<const double, Device> index,
+diff --git a/src/rapids_singlecell/gr.py b/src/rapids_singlecell/gr.py
+index f41d2561b..8bb26f848 100644
+--- a/src/rapids_singlecell/gr.py
++++ b/src/rapids_singlecell/gr.py
+@@ -13,6 +13,7 @@
+     ligrec,
+     neighbors,
+     nhood_enrichment,
++    ripley,
+     sepal,
+     spatial_autocorr,
+     spatial_neighbors_delaunay,
+@@ -37,6 +38,7 @@
+     "co_occurrence",
+     "interaction_matrix",
+     "ligrec",
++    "ripley",
+     "sepal",
+     "nhood_enrichment",
+     "spatial_autocorr",
+diff --git a/src/rapids_singlecell/squidpy_gpu/__init__.py b/src/rapids_singlecell/squidpy_gpu/__init__.py
+index 6bca84c7a..cd960f93c 100644
+--- a/src/rapids_singlecell/squidpy_gpu/__init__.py
++++ b/src/rapids_singlecell/squidpy_gpu/__init__.py
+@@ -10,6 +10,7 @@
+     calculate_niche_neighborhood,
+     calculate_niche_utag,
+ )
++from ._ripley import ripley
+ from ._sepal import sepal
+ from ._spatial_neighbors import (
+     SpatialNeighborsResult,
+diff --git a/src/rapids_singlecell/squidpy_gpu/_ripley.py b/src/rapids_singlecell/squidpy_gpu/_ripley.py
+new file mode 100644
+index 000000000..ba2b933f2
+--- /dev/null
++++ b/src/rapids_singlecell/squidpy_gpu/_ripley.py
+@@ -0,0 +1,324 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Literal
++
++import cupy as cp
++import numpy as np
++import pandas as pd
++from scipy.spatial import ConvexHull
++
++from rapids_singlecell._cuda import _spatial_cuda
++from rapids_singlecell._utils import _create_category_index_mapping
++
++from ._co_oc import _co_occurrence_gpu
++from ._spatial_data import _extract_adata
++from ._spatial_neighbors_backend import _build_kdtree
++from ._utils import _assert_categorical_obs, _assert_spatial_basis
++
++if TYPE_CHECKING:
++    from anndata import AnnData
++    from spatialdata import SpatialData
++
++# Libraries per pair-count launch; its counts buffer grows with the square.
++_PAIR_CHUNK = 128
++
++
++def ripley(
++    adata: AnnData | SpatialData,
++    cluster_key: str,
++    *,
++    mode: Literal["F", "G", "L"] = "F",
++    spatial_key: str = "spatial",
++    metric: str = "euclidean",
++    n_neigh: int = 2,
++    n_simulations: int = 100,
++    n_observations: int = 1000,
++    max_dist: float | None = None,
++    n_steps: int = 50,
++    rng: int | np.random.Generator | None = None,
++    copy: bool = False,
++    table_key: str | None = None,
++) -> dict[str, pd.DataFrame | np.ndarray] | None:
++    r"""
++    Calculate Ripley's statistics for point processes.
++
++    GPU port of :func:`squidpy.gr.ripley`. Depending on ``mode``, it computes
++    Ripley's ``'F'``, ``'G'`` or ``'L'`` statistic per cluster and compares it
++    to simulated Spatial Poisson Point Processes on the convex hull of all
++    observations.
++
++    ``'F'`` and ``'G'`` are defined as
++
++    .. math::
++
++        F(t),G(t)=P( d_{i,j} \le t )
++
++    where :math:`d_{i,j}` are the distances from random points of a Spatial
++    Poisson Point Process (``'F'``) or from points of other clusters (``'G'``)
++    to their ``n_neigh`` nearest points of the cluster. ``'L'`` stabilizes the
++    variance of
++
++    .. math::
++
++        K(t) = \frac{1}{\lambda} \sum_{i \ne j} \frac{I(d_{i,j} \le t)}{n}
++
++    as :math:`L(t) = (K(t) / \pi)^{1/2}`.
++
++    Parameters
++    ----------
++    adata
++        Annotated data matrix or a SpatialData object containing the selected table.
++    cluster_key
++        Key in :attr:`anndata.AnnData.obs` with the cluster labels.
++    mode
++        Which Ripley's statistic to compute.
++    spatial_key
++        Key in :attr:`anndata.AnnData.obsm` with the 2D spatial coordinates.
++    metric
++        Distance metric. Only ``'euclidean'`` is supported.
++    n_neigh
++        Number of nearest neighbors whose distances enter ``'F'`` and ``'G'``.
++    n_simulations
++        How many simulations to run for computing p-values.
++    n_observations
++        How many observations to generate for each Spatial Poisson Point Process.
++    max_dist
++        Maximum distance of the support. If `None`, ``max_dist`` is
++        :math:`\sqrt{area / 2}` of the convex hull.
++    n_steps
++        Number of steps of the support.
++    rng
++        Seed or :class:`numpy.random.Generator` that seeds the GPU random
++        number generator for the simulated point processes.
++    copy
++        If ``True``, return the result, otherwise save it to ``adata``.
++    table_key
++        Key in ``SpatialData.tables``; required for SpatialData input.
++        All reads and writes use this table; ignored for AnnData input.
++
++    Returns
++    -------
++    If ``copy = True``, returns a :class:`dict` with the following keys:
++
++        - ``'{mode}_stat'`` - :class:`pandas.DataFrame` with the statistic per cluster and bin.
++        - ``'sims_stat'`` - :class:`pandas.DataFrame` with the statistic per simulation and bin.
++        - ``'bins'`` - the support of the statistic.
++        - ``'pvalues'`` - p-values of shape ``(n_clusters, n_steps)``.
++
++    Otherwise, modifies the ``adata`` with the following key:
++
++        - :attr:`anndata.AnnData.uns` ``['{cluster_key}_ripley_{mode}']`` - the above mentioned :class:`dict`.
++
++    Notes
++    -----
++    Distances for ``'F'`` and ``'G'`` are exact in double precision. ``'L'``
++    counts pairs in single precision around the centroid of the coordinates,
++    so pairs within rounding error of a support value may land in the
++    neighboring bin. Random points are drawn on the GPU, so simulations do not
++    reproduce :func:`squidpy.gr.ripley` for the same ``rng``.
++    """
++    adata = _extract_adata(adata, table_key=table_key)
++    _assert_categorical_obs(adata, key=cluster_key)
++    _assert_spatial_basis(adata, key=spatial_key)
++    if mode not in ("F", "G", "L"):
++        raise ValueError(
++            f"Expected `mode` to be one of 'F', 'G' or 'L', found {mode!r}."
++        )
++    if metric != "euclidean":
++        raise ValueError(
++            f"Unsupported metric {metric!r}. Ripley's statistics on the GPU "
++            "support only 'euclidean'."
++        )
++
++    spatial = adata.obsm[spatial_key]
++    coordinates = np.ascontiguousarray(
++        spatial.get() if isinstance(spatial, cp.ndarray) else spatial,
++        dtype=np.float64,
++    )
++    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
++        raise ValueError(
++            f"Expected 2D spatial coordinates, found shape {coordinates.shape}."
++        )
++    clusters = adata.obs[cluster_key]
++    if clusters.isna().any():
++        raise ValueError(
++            f"`adata.obs[{cluster_key!r}]` has `{clusters.isna().sum()}` missing "
++            "labels; drop or label those observations first."
++        )
++    classes, cluster_idx = np.unique(np.asarray(clusters), return_inverse=True)
++    n_clusters = len(classes)
++    if mode != "L":
++        sizes = np.bincount(cluster_idx, minlength=n_clusters)
++        if sizes.min() < n_neigh:
++            small = classes[sizes.argmin()]
++            raise ValueError(
++                f"Cluster {small!r} has `{sizes.min()}` observations, fewer than "
++                f"`n_neigh={n_neigh}`."
++            )
++
++    N = coordinates.shape[0]
++    hull = ConvexHull(coordinates)
++    area = hull.volume
++    if max_dist is None:
++        max_dist = (area / 2) ** 0.5
++    support = np.linspace(0, max_dist, n_steps)
++
++    # Every random draw, F's per-cluster points first, comes from one stream.
++    n_patterns = n_simulations + (n_clusters if mode == "F" else 0)
++    generator = cp.random.default_rng(
++        np.random.default_rng(rng).integers(np.iinfo(np.int64).max)
++    )
++    random = _ppp(hull, n_patterns * n_observations, generator)
++    random = random.reshape(n_patterns, n_observations, 2)
++    sims_random = random[n_patterns - n_simulations :]
++    sim_codes = cp.repeat(cp.arange(n_simulations, dtype=cp.int32), n_observations)
++    coords = cp.asarray(coordinates)
++    codes = cp.asarray(cluster_idx, dtype=cp.int32)
++
++    if mode == "L":
++        counts = (
++            _pair_counts(coords, codes, n_clusters, support),
++            _pair_counts(sims_random.reshape(-1, 2), sim_codes, n_simulations, support),
++        )
++        # Unordered pairs count twice as ordered pairs.
++        obs_arr, sims = (np.sqrt(2 * c / N / (N / area) / np.pi) for c in counts)
++    else:
++        support_gpu = cp.asarray(support)
++        tree = _build_kdtree(coords, codes)
++        sim_tree = _build_kdtree(sims_random.reshape(-1, 2), sim_codes)
++        obs_hist = cp.empty((n_clusters, n_steps - 1), dtype=cp.int64)
++        sim_hist = cp.empty((n_simulations, n_steps - 1), dtype=cp.int64)
++        for i in range(n_clusters):
++            queries = random[i] if mode == "F" else coords[codes != i]
++            distances = _query(queries, tree, i, n_neigh)
++            obs_hist[i] = cp.histogram(distances, support_gpu)[0]
++        # Simulations query with F's points of the last cluster, like squidpy.
++        queries = random[n_clusters - 1] if mode == "F" else coords
++        for i in range(n_simulations):
++            sim_hist[i] = cp.histogram(_query(queries, sim_tree, i, 1), support_gpu)[0]
++        obs_arr, sims = (_f_g_function(h.get()) for h in (obs_hist, sim_hist))
++
++    pvalues = 1 + (sims[None, :, :] >= obs_arr[:, None, :]).sum(axis=1)
++    pvalues = pvalues / (n_simulations + 1)
++    pvalues = np.minimum(pvalues, 1 - pvalues)
++
++    obs_df = _reshape_res(
++        obs_arr.T, columns=classes, index=support, var_name=cluster_key
++    )
++    sims_df = _reshape_res(
++        sims.T,
++        columns=np.arange(n_simulations),
++        index=support,
++        var_name="simulations",
++    )
++    res = {
++        f"{mode}_stat": obs_df,
++        "sims_stat": sims_df,
++        "bins": support,
++        "pvalues": pvalues,
++    }
++    if copy:
++        return res
++    adata.uns[f"{cluster_key}_ripley_{mode}"] = res
++
++
++def _ppp(hull: ConvexHull, n: int, generator: cp.random.Generator) -> cp.ndarray:
++    """Draw ``n`` uniform points in a convex hull by rejection from its bounding box."""
++    lower, upper = hull.min_bound, hull.max_bound
++    acceptance = hull.volume / np.prod(upper - lower)
++    # Inside points satisfy normal @ point + offset <= 0 for every facet.
++    equations = cp.asarray(hull.equations)
++    max_batch = max((1 << 26) // len(equations), 1024)
++    lower, extent = cp.asarray(lower), cp.asarray(upper - lower)
++    parts, found = [], 0
++    while found < n:
++        batch = min(int((n - found) / acceptance * 1.1) + 64, max_batch)
++        candidates = lower + generator.random((batch, 2)) * extent
++        inside = (candidates @ equations[:, :2].T + equations[:, 2] <= 0).all(axis=1)
++        parts.append(candidates[inside])
++        found += len(parts[-1])
++    return cp.ascontiguousarray(cp.concatenate(parts)[:n])
++
++
++def _query(
++    queries: cp.ndarray,
++    tree: tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray],
++    library: int,
++    k: int,
++) -> cp.ndarray:
++    """Distances from ``queries`` to their ``k`` nearest points of one library."""
++    points, index, boxes, segments = tree
++    columns = cp.empty((len(queries), k), dtype=cp.int64)
++    distances = cp.empty((len(queries), k), dtype=queries.dtype)
++    _spatial_cuda.tree_search(
++        cp.ascontiguousarray(queries),
++        points,
++        index,
++        boxes,
++        segments[library : library + 2],
++        None,
++        k,
++        0.0,
++        None,
++        columns=columns,
++        distances=distances,
++        stream=cp.cuda.get_current_stream().ptr,
++        external=True,
++    )
++    return distances
++
++
++def _f_g_function(hist: np.ndarray) -> np.ndarray:
++    """Cumulative fractions of each histogram, after a leading zero."""
++    with np.errstate(invalid="ignore", divide="ignore"):
++        fracs = np.cumsum(hist, axis=1) / hist.sum(axis=1, keepdims=True)
++    return np.pad(fracs, ((0, 0), (1, 0)))
++
++
++def _pair_counts(
++    points: cp.ndarray, codes: cp.ndarray, n_libraries: int, support: np.ndarray
++) -> np.ndarray:
++    """Unordered pairs of each library within each support distance."""
++    # Centering keeps more float32 bits; distances do not change.
++    points = (points - points.mean(axis=0)).astype(cp.float32)
++    thresholds = cp.asarray(support**2, dtype=cp.float32)
++    device = cp.cuda.Device().id
++    counts = np.empty((n_libraries, len(support)), dtype=np.int64)
++    for start in range(0, n_libraries, _PAIR_CHUNK):
++        stop = min(start + _PAIR_CHUNK, n_libraries)
++        in_chunk = (codes >= start) & (codes < stop)
++        chunk_points = cp.ascontiguousarray(points[in_chunk])
++        cat_offsets, cell_indices = _create_category_index_mapping(
++            codes[in_chunk] - start, stop - start
++        )
++        diagonal = cp.arange(stop - start, dtype=cp.int32)
++        chunk, ok = _co_occurrence_gpu(
++            spatial=chunk_points,
++            thresholds=thresholds,
++            cat_offsets=cat_offsets,
++            cell_indices=cell_indices,
++            pair_left=diagonal,
++            pair_right=diagonal,
++            n_cells=len(chunk_points),
++            k=stop - start,
++            l_val=len(support),
++            device_ids=[device],
++        )
++        if not ok:
++            raise ValueError(
++                f"`n_steps={len(support)}` needs more shared memory than the "
++                "GPU provides for Ripley's L."
++            )
++        counts[start:stop] = chunk[diagonal, diagonal].get()
++    return counts
++
++
++def _reshape_res(
++    results: np.ndarray, columns: np.ndarray, index: np.ndarray, var_name: str
++) -> pd.DataFrame:
++    df = pd.DataFrame(results, columns=columns, index=index)
++    df.index.set_names(["bins"], inplace=True)
++    df = df.melt(var_name=var_name, value_name="stats", ignore_index=False)
++    df[var_name] = df[var_name].astype("category", copy=True)
++    df.reset_index(inplace=True)
++    return df
+diff --git a/src/rapids_singlecell_skills/data/rapids-singlecell/references/spatial.md b/src/rapids_singlecell_skills/data/rapids-singlecell/references/spatial.md
+index 887183aba..3d4a13e4a 100644
+--- a/src/rapids_singlecell_skills/data/rapids-singlecell/references/spatial.md
++++ b/src/rapids_singlecell_skills/data/rapids-singlecell/references/spatial.md
+@@ -88,6 +88,8 @@ for k in range(5, 16):
+   Rank genes by Moran's I, not p-values, and interpret within cell type at single-cell resolution.
+ - `rsc.gr.sepal(adata, max_neighs=6)` scores spatially variable genes on Visium hexagonal (`6`) or square-grid (`4`) spot or bin graphs from `rsc.gr.spatial_neighbors_grid`; single-cell graphs are not regular grids.
+ - `rsc.gr.co_occurrence(adata, cluster_key="cell_type", interval=...)` runs on the GPU.
++- `rsc.gr.ripley(adata, cluster_key="cell_type", mode="L")` computes Ripley's F, G or L on the GPU; simulations differ from squidpy for the same `rng`.
++  Neighborhood enrichment has no rsc port, so use `sq.gr.nhood_enrichment` with `backend="threading"` when `n_jobs > 1`.
+ - `rsc.gr.nhood_enrichment(adata, cluster_key="cell_type", library_key="sample")` runs all permutations on the GPU.
+   `library_key` permutes labels only within each sample; cells without a label are dropped with their edges.
+ - Read enrichment between cell types as co-compartmentalization and summarize it per sample.
+diff --git a/tests/test_ripley.py b/tests/test_ripley.py
+new file mode 100644
+index 000000000..57fd795e3
+--- /dev/null
++++ b/tests/test_ripley.py
+@@ -0,0 +1,218 @@
++from __future__ import annotations
++
++from pathlib import Path
++
++import cupy as cp
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData, read_h5ad
++from scipy.spatial import ConvexHull
++from scipy.spatial.distance import pdist
++from sklearn.neighbors import NearestNeighbors
++
++import rapids_singlecell as rsc
++from rapids_singlecell.squidpy_gpu._ripley import _ppp, _query
++from rapids_singlecell.squidpy_gpu._spatial_neighbors_backend import _build_kdtree
++
++CLUSTER_KEY = "leiden"
++MODES = ["F", "G", "L"]
++
++
++@pytest.fixture
++def adata() -> AnnData:
++    adata = read_h5ad(Path(__file__).parent / "_data/dummy.h5ad")
++    adata.obs[CLUSTER_KEY] = adata.obs.cluster.astype("category")
++    return adata
++
++
++@pytest.fixture
++def clustered() -> AnnData:
++    rng = np.random.default_rng(0)
++    n, k = 3000, 4
++    centers = rng.uniform(0, 1000, (k, 2))
++    labels = rng.integers(0, k, n)
++    coords = np.where(
++        rng.random((n, 1)) < 0.5,
++        centers[labels] + rng.normal(0, 40, (n, 2)),
++        rng.uniform(0, 1000, (n, 2)),
++    )
++    adata = AnnData(
++        obs=pd.DataFrame(
++            {CLUSTER_KEY: pd.Categorical([f"c{i}" for i in labels])},
++            index=np.arange(n).astype(str),
++        )
++    )
++    adata.obsm["spatial"] = coords
++    return adata
++
++
++def _support(coords: np.ndarray, n_steps: int = 50) -> np.ndarray:
++    return np.linspace(0, (ConvexHull(coords).volume / 2) ** 0.5, n_steps)
++
++
++def _f_g_reference(distances: np.ndarray, support: np.ndarray) -> np.ndarray:
++    # squidpy's `_f_g_function`
++    counts, _ = np.histogram(distances, bins=support)
++    return np.concatenate(([0.0], np.cumsum(counts) / counts.sum()))
++
++
++@pytest.mark.parametrize("mode", MODES)
++def test_ripley_modes(adata: AnnData, mode: str):
++    """Adapted from squidpy: keys and shapes of the stored result."""
++    rsc.gr.ripley(adata, cluster_key=CLUSTER_KEY, mode=mode)
++
++    uns_key = f"{CLUSTER_KEY}_ripley_{mode}"
++    res = adata.uns[uns_key]
++    assert set(res) == {f"{mode}_stat", "sims_stat", "bins", "pvalues"}
++    obs_df = res[f"{mode}_stat"]
++    np.testing.assert_array_equal(
++        adata.obs[CLUSTER_KEY].cat.categories,
++        obs_df[CLUSTER_KEY].cat.categories,
++    )
++    assert obs_df.shape[1] == res["sims_stat"].shape[1]
++    assert res["pvalues"].shape[0] == adata.obs[CLUSTER_KEY].cat.categories.shape[0]
++    assert res["bins"].shape[0] == 50
++
++
++@pytest.mark.parametrize("mode", MODES)
++@pytest.mark.parametrize("n_simulations", [20, 50])
++@pytest.mark.parametrize("n_observations", [10, 100])
++@pytest.mark.parametrize("max_dist", [None, 1000])
++@pytest.mark.parametrize("n_steps", [2, 50, 100])
++def test_ripley_results(
++    adata: AnnData,
++    *,
++    mode: str,
++    n_simulations: int,
++    n_observations: int,
++    max_dist: float | None,
++    n_steps: int,
++):
++    """Adapted from squidpy: result shapes and zero first bins."""
++    n_clusters = adata.obs[CLUSTER_KEY].cat.categories.shape[0]
++    res = rsc.gr.ripley(
++        adata,
++        cluster_key=CLUSTER_KEY,
++        mode=mode,
++        n_simulations=n_simulations,
++        n_observations=n_observations,
++        max_dist=max_dist,
++        n_steps=n_steps,
++        copy=True,
++    )
++    obs_df = res[f"{mode}_stat"]
++    sims_df = res["sims_stat"]
++
++    assert obs_df.shape == (n_steps * n_clusters, 3)
++    assert res["bins"].shape == (n_steps,)
++    assert sims_df.shape == (n_steps * n_simulations, 3)
++    assert res["pvalues"].shape == (n_clusters, n_steps)
++    assert sims_df.bins.values[0] == obs_df.bins.values[0] == 0.0
++    assert sims_df.stats.values[0] == obs_df.stats.values[0] == 0.0
++    assert np.count_nonzero(obs_df.bins.values) == n_steps * n_clusters - n_clusters
++    assert ((res["pvalues"] >= 0) & (res["pvalues"] <= 0.5)).all()
++
++
++@pytest.mark.parametrize("mode", MODES)
++def test_ripley_rng(adata: AnnData, mode: str):
++    """Adapted from squidpy: seeds reproduce, differ, and vary per simulation."""
++    kw = {"cluster_key": CLUSTER_KEY, "mode": mode, "n_simulations": 20, "copy": True}
++
++    def sims(rng):
++        res = rsc.gr.ripley(adata, rng=rng, **kw)
++        return res["sims_stat"].pivot(
++            index="bins", columns="simulations", values="stats"
++        ).to_numpy(), res[f"{mode}_stat"]
++
++    sims1, obs1 = sims(np.random.default_rng(42))
++    sims2, obs2 = sims(42)
++    sims3, _ = sims(43)
++    np.testing.assert_array_equal(sims1, sims2)
++    pd.testing.assert_frame_equal(obs1, obs2)
++    assert not np.array_equal(sims1, sims3)
++    assert not np.allclose(sims1, sims1[:, [0]])
++
++
++def test_ripley_g_matches_reference(clustered: AnnData):
++    coords = clustered.obsm["spatial"]
++    labels = clustered.obs[CLUSTER_KEY].to_numpy()
++    support = _support(coords)
++    res = rsc.gr.ripley(clustered, CLUSTER_KEY, mode="G", n_neigh=3, copy=True)
++    observed = res["G_stat"].pivot(index="bins", columns=CLUSTER_KEY, values="stats")
++    for cluster in observed.columns:
++        tree = NearestNeighbors(n_neighbors=3).fit(coords[labels == cluster])
++        distances, _ = tree.kneighbors(coords[labels != cluster])
++        np.testing.assert_allclose(
++            observed[cluster].to_numpy(), _f_g_reference(distances, support)
++        )
++
++
++def test_ripley_l_matches_reference(clustered: AnnData):
++    coords = clustered.obsm["spatial"]
++    labels = clustered.obs[CLUSTER_KEY].to_numpy()
++    support = _support(coords)
++    area = ConvexHull(coords).volume
++    n = len(coords)
++    res = rsc.gr.ripley(clustered, CLUSTER_KEY, mode="L", copy=True)
++    observed = res["L_stat"].pivot(index="bins", columns=CLUSTER_KEY, values="stats")
++    for cluster in observed.columns:
++        distances = pdist(coords[labels == cluster])
++        pairs = 2 * (distances <= support[:, None]).sum(axis=1)
++        expected = np.sqrt(pairs / n / (n / area) / np.pi)
++        # Pairs are counted in float32.
++        np.testing.assert_allclose(observed[cluster].to_numpy(), expected, rtol=1e-4)
++
++
++def test_ripley_f_matches_reference(clustered: AnnData):
++    """Distances from external queries match sklearn."""
++    coords = clustered.obsm["spatial"]
++    codes = clustered.obs[CLUSTER_KEY].cat.codes.to_numpy().astype(np.int32)
++    queries = np.random.default_rng(1).uniform(0, 1000, (500, 2))
++    tree = _build_kdtree(cp.asarray(coords), cp.asarray(codes))
++    for cluster in range(codes.max() + 1):
++        distances = _query(cp.asarray(queries), tree, cluster, 2)
++        expected, _ = (
++            NearestNeighbors(n_neighbors=2)
++            .fit(coords[codes == cluster])
++            .kneighbors(queries)
++        )
++        np.testing.assert_allclose(distances.get(), expected)
++
++
++def test_ppp_uniform_in_hull():
++    # The hull is the triangle (0, 0), (2, 0), (0, 2), half its bounding box.
++    corners = np.array([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]])
++    inner = np.random.default_rng(0).uniform(0, 1, (50, 2))
++    hull = ConvexHull(np.vstack([corners, inner]))
++    points = _ppp(hull, 20000, cp.random.default_rng(0)).get()
++    assert points.shape == (20000, 2)
++    assert (points.min(axis=0) >= 0).all()
++    assert (points.sum(axis=1) <= 2).all()
++    # A quarter of the triangle's area lies at x > 1.
++    assert abs((points[:, 0] > 1).mean() - 0.25) < 0.02
++
++
++def test_ripley_cupy_coordinates(adata: AnnData):
++    expected = rsc.gr.ripley(adata, CLUSTER_KEY, mode="G", copy=True, rng=0)
++    adata.obsm["spatial"] = cp.asarray(adata.obsm["spatial"])
++    actual = rsc.gr.ripley(adata, CLUSTER_KEY, mode="G", copy=True, rng=0)
++    pd.testing.assert_frame_equal(actual["G_stat"], expected["G_stat"])
++
++
++def test_ripley_invalid_inputs(adata: AnnData):
++    with pytest.raises(ValueError, match="Unsupported metric"):
++        rsc.gr.ripley(adata, CLUSTER_KEY, mode="L", metric="cosine")
++    with pytest.raises(ValueError, match="mode"):
++        rsc.gr.ripley(adata, CLUSTER_KEY, mode="K")
++    with pytest.raises(ValueError, match="missing labels"):
++        missing = adata.copy()
++        missing.obs[CLUSTER_KEY] = missing.obs[CLUSTER_KEY].astype(object)
++        missing.obs.iloc[0, missing.obs.columns.get_loc(CLUSTER_KEY)] = np.nan
++        missing.obs[CLUSTER_KEY] = missing.obs[CLUSTER_KEY].astype("category")
++        rsc.gr.ripley(missing, CLUSTER_KEY)
++    with pytest.raises(ValueError, match="n_neigh"):
++        rsc.gr.ripley(adata, CLUSTER_KEY, mode="G", n_neigh=500)
++    adata.obsm["spatial"] = np.hstack([adata.obsm["spatial"]] * 2)[:, :3]
++    with pytest.raises(ValueError, match="2D"):
++        rsc.gr.ripley(adata, CLUSTER_KEY)
+diff --git a/tests/test_spatial_data.py b/tests/test_spatial_data.py
+index f8ea6f9d0..9260d28ca 100644
+--- a/tests/test_spatial_data.py
++++ b/tests/test_spatial_data.py
+@@ -167,6 +167,7 @@ def test_neighbors_spatialdata(sdata, name, kwargs, copy):
+             "multi_gpu": False,
+         },
+     ),
++    ("ripley", {"cluster_key": "cluster", "mode": "G", "n_neigh": 1, "rng": 0}),
+     ("interaction_matrix", {"cluster_key": "cluster", "weights": True}),
+     ("nhood_enrichment", {"cluster_key": "cluster", "n_perms": 20, "seed": 0}),
+     (
+@@ -222,6 +223,11 @@ def test_downstream_spatialdata(sdata, name, kwargs, copy):
+             actual if copy else table.uns["moranI"],
+             expected if copy else reference.uns["moranI"],
+         )
++    elif name == "ripley":
++        a = actual if copy else table.uns["cluster_ripley_G"]
++        b = expected if copy else reference.uns["cluster_ripley_G"]
++        pd.testing.assert_frame_equal(a["G_stat"], b["G_stat"])
++        pd.testing.assert_frame_equal(a["sims_stat"], b["sims_stat"])
+     elif name == "co_occurrence":
+         a = actual if copy else table.uns["cluster_co_occurrence"].values()
+         b = expected if copy else reference.uns["cluster_co_occurrence"].values()

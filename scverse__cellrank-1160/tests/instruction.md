@@ -1,0 +1,19 @@
+# Issue
+
+**Title:** Update `heatmap`
+
+## Description
+
+## Description
+<!-- Clearly and concisely describe your changes. This section will be shown in the docs. -->
+
+* Adds argument `title` to the `heatmap` function and displays it if set.
+
+## Closes
+<!-- If applicable, type `closes #XXXX` in your comment to auto-close the issue that this PR fixes. -->
+
+.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `7c8b9d4f0664`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

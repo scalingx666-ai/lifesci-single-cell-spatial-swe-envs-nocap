@@ -1,0 +1,948 @@
+diff --git a/requirements.txt b/requirements.txt
+index bead3b37..8a77e9a7 100755
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,7 +2,7 @@ anndata>=0.7.4
+ colorcet>=2.0.1
+ cvxopt>=1.2.3
+ dynamo-release>=0.9.2
+-fbgbp>=0.0.9
++fbgbp>=0.1.0
+ geopandas>=0.10.2
+ loompy>=3.0.5
+ matplotlib>=3.1.0
+diff --git a/spateo/io/bgi.py b/spateo/io/bgi.py
+index 852de068..9f974668 100755
+--- a/spateo/io/bgi.py
++++ b/spateo/io/bgi.py
+@@ -153,7 +153,6 @@ def read_bgi(
+     data = read_bgi_as_dataframe(path)
+     columns = list(data.columns)
+     total_column = columns[COUNT_COLUMN_MAPPING["total"]]
+-    gene_column, x_column, y_column = columns[:3]
+ 
+     # get cell name
+     if not label_path:
+@@ -161,9 +160,9 @@ def read_bgi(
+         x_min, y_min = np.min(x), np.min(y)
+ 
+         if alpha_hull is not None:
+-            is_inside = in_concave_hull(data.loc[:, [x_column, y_column]].values, alpha_hull)
++            is_inside = in_concave_hull(data.loc[:, ["x", "y"]].values, alpha_hull)
+             data = data.loc[is_inside, :]
+-            x, y = data[x_column].values, data[y_column].values
++            x, y = data["x"].values, data["y"].values
+ 
+         data["x_ind"] = bin_indices(x, x_min, binsize)
+         data["y_ind"] = bin_indices(y, y_min, binsize)
+@@ -199,7 +198,7 @@ def read_bgi(
+     gene_dict = dict(zip(uniq_gene, range(0, len(uniq_gene))))
+ 
+     data["csr_x_ind"] = data["cell_name"].map(cell_dict)
+-    data["csr_y_ind"] = data[gene_column].map(gene_dict)
++    data["csr_y_ind"] = data["geneID"].map(gene_dict)
+ 
+     # Important! by default, duplicate entries are summed together in the following which is needed for us!
+     X = csr_matrix(
+diff --git a/spateo/preprocessing/segmentation/__init__.py b/spateo/preprocessing/segmentation/__init__.py
+index b28e5bef..eea4f304 100755
+--- a/spateo/preprocessing/segmentation/__init__.py
++++ b/spateo/preprocessing/segmentation/__init__.py
+@@ -1,6 +1,7 @@
+ """A complete solution of spatialtemporal dynamics analyses toolkit of single cell spatial transcriptomics
+ """
+-from . import bp, em, icell, label
++from . import bp, density, em, icell, label
++from .density import segment_densities
+ from .icell import mask_nuclei_from_stain, score_pixels
+ from .label import expand_labels, watershed
+ from .utils import apply_threshold, mclose_mopen, safe_erode
+diff --git a/spateo/preprocessing/segmentation/bp.py b/spateo/preprocessing/segmentation/bp.py
+index fbb726c6..959de84b 100755
+--- a/spateo/preprocessing/segmentation/bp.py
++++ b/spateo/preprocessing/segmentation/bp.py
+@@ -90,8 +90,8 @@ def cell_marginals(
+ 
+ def run_bp(
+     X: np.ndarray,
+-    background_params: Tuple[float, float],
+-    cell_params: Tuple[float, float],
++    background_cond: np.ndarray,
++    cell_cond: np.ndarray,
+     k: int = 3,
+     square: bool = False,
+     p: float = 0.7,
+@@ -106,8 +106,8 @@ def run_bp(
+ 
+     Args:
+         X: UMI counts per pixel.
+-        background_params: Parameters estimated (with EM) for background.
+-        cell_params: Parameters estimated (with EM) for cell.
++        background_cond: Probability of observing UMIs conditioned on background.
++        cell_cond: Probability of observing UMIs conditioned on cell.
+         k: Neighborhood size
+         square: Whether the neighborhood of each node is a square around it.
+             If false, the neighborhood is a circle.
+@@ -126,16 +126,14 @@ def run_bp(
+     Returns:
+         Numpy array of marginal probabilities.
+     """
+-    background_probs = stats.nbinom(n=background_params[0], p=background_params[1]).pmf(X)
+-    cell_probs = stats.nbinom(n=cell_params[0], p=cell_params[1]).pmf(X)
+     if certain_mask is not None:
+-        background_probs = np.clip(background_probs - certain_mask, 0, 1)
+-        cell_probs = np.clip(cell_probs + certain_mask, 0, 1)
++        background_cond = np.clip(background_cond - certain_mask, 0, 1)
++        cell_cond = np.clip(cell_cond + certain_mask, 0, 1)
+ 
+     neighborhood = np.ones((k, k)) if square else utils.circle(k)
+     marginals = cell_marginals(
+-        background_probs,
+-        cell_probs,
++        background_cond,
++        cell_cond,
+         neighborhood=neighborhood,
+         p=p,
+         q=q,
+diff --git a/spateo/preprocessing/segmentation/density.py b/spateo/preprocessing/segmentation/density.py
+new file mode 100755
+index 00000000..752d6fb9
+--- /dev/null
++++ b/spateo/preprocessing/segmentation/density.py
+@@ -0,0 +1,130 @@
++"""Functions to segment regions of a slice by UMI density.
++"""
++import warnings
++from typing import Optional, Tuple, Union
++
++import cv2
++import numpy as np
++from kneed import KneeLocator
++from scipy.sparse import csr_matrix, issparse, lil_matrix, spmatrix
++from sklearn import cluster
++from tqdm import tqdm
++
++from . import utils
++from ...warnings import PreprocessingWarning
++
++
++def create_spatial_adjacency(shape: Tuple[int, int]) -> csr_matrix:
++    """Create a sparse adjacency matrix for a 2D grid graph of specified shape.
++    https://stackoverflow.com/a/16342639
++
++    Args:
++        shape: Shape of grid
++
++    Returns:
++        A sparse adjacency matrix
++    """
++    n_rows, n_cols = shape
++    n_nodes = n_rows * n_cols
++    adjacency = lil_matrix((n_nodes, n_nodes))
++    for r in range(n_rows):
++        for c in range(n_cols):
++            i = r * n_cols + c
++            # Two inner diagonals
++            if c > 0:
++                adjacency[i - 1, i] = adjacency[i, i - 1] = 1
++            # Two outer diagonals
++            if r > 0:
++                adjacency[i - n_cols, i] = adjacency[i, i - n_cols] = 1
++    return adjacency.tocsr()
++
++
++def schc(X: np.ndarray, distance_threshold: Optional[float] = None) -> np.ndarray:
++    """Spatially-constrained hierarchical clustering.
++
++    Perform hierarchical clustering with Ward linkage on an array
++    containing UMI counts per pixel. Spatial constraints are
++    imposed by limiting the neighbors of each node to immediate 4
++    pixel neighbors.
++
++    This function runs in two steps. First, it computes a Ward linkage tree
++    by calling :func:`sklearn.cluster.ward_tree`, with `return_distance=True`,
++    which yields distances between clusters. then, if `distance_threshold` is not
++    provided, a dynamic threshold is calculated by finding the inflection (knee)
++    of the distance (x) vs number of clusters (y) line using the top 1000
++    distances, making the assumption that for the vast majority of cases, there
++    will be less than 1000 density clusters.
++
++    Args:
++        X: UMI counts per pixel
++        distance_threshold: Distance threshold for the Ward linkage
++            such that clusters will not be merged if they have
++            greater than this distance.
++
++    Returns:
++        Clustering result as a Numpy array of same shape, where clusters are
++        indicated by integers.
++    """
++    adjacency = create_spatial_adjacency(X.shape)
++    X_flattened = X.flatten()
++    children, _, n_leaves, _, distances = cluster.ward_tree(X_flattened, connectivity=adjacency, return_distance=True)
++
++    # Find distance threshold if not provided
++    if not distance_threshold:
++        x = np.sort(np.unique(distances))[-1000:]
++        # NOTE: number of clusters needs a +1, as also done in sklearn
++        # https://github.com/scikit-learn/scikit-learn/blob/7e1e6d09b/sklearn/cluster/_agglomerative.py#L1017
++        y = np.array([(distances >= val).sum() + 1 for val in x])
++        kl = KneeLocator(
++            x, y, curve="convex", direction="decreasing", online=True, interp_method="polynomial", polynomial_degree=10
++        )
++        distance_threshold = kl.knee
++
++    n_clusters = (distances >= distance_threshold).sum() + 1
++    assignments = cluster._agglomerative._hc_cut(n_clusters, children, n_leaves)
++
++    return assignments.reshape(X.shape)
++
++
++def segment_densities(
++    X: Union[spmatrix, np.ndarray], k: int, distance_threshold: Optional[float] = None, dk: int = 3
++) -> np.ndarray:
++    """Segment a matrix containing UMI counts into regions by UMI density.
++
++    Args:
++        X: UMI counts per pixel
++        k: Kernel size for Gaussian blur
++        distance_threshold: Distance threshold for the Ward linkage
++            such that clusters will not be merged if they have
++            greater than this distance.
++        dk: Kernel size for final dilation
++
++    Returns:
++        Clustering result as a Numpy array of same shape, where clusters are
++        indicated by positive integers.
++    """
++    # Warn on too large array
++    if X.size > 5e5:
++        warnings.warn(
++            f"Array has {X.size} elements. This may take a while and a lot of memory. "
++            "Please consider condensing the array by increasing the binsize."
++        )
++
++    # Make dense and normalize.
++    if issparse(X):
++        X = X.A
++    X = X / X.max()
++
++    X = utils.conv2d(X, k, mode="gauss")
++
++    # Add 1 because 0 should indicate background!
++    bins = schc(X, distance_threshold=distance_threshold) + 1
++
++    dilated = np.zeros_like(bins)
++    labels = np.unique(bins)
++    for label in sorted(labels, key=lambda label: X[np.where(bins == label)].mean()):
++        mask = bins == label
++        dilate = cv2.dilate(mask.astype(np.uint8), utils.circle(dk))
++        where = np.where(utils.mclose_mopen(dilate, dk) > 0)
++        dilated[where] = label
++    return dilated
+diff --git a/spateo/preprocessing/segmentation/em.py b/spateo/preprocessing/segmentation/em.py
+index c08280f7..f58ddb3c 100755
+--- a/spateo/preprocessing/segmentation/em.py
++++ b/spateo/preprocessing/segmentation/em.py
+@@ -5,13 +5,15 @@
+ Written by @HailinPan, optimized by @Lioscro.
+ """
+ 
+-from typing import Optional, Tuple
++from typing import Dict, Optional, Tuple, Union
+ 
+ import cv2
+ import numpy as np
+ from scipy import special, stats
+ from skimage import feature
+ 
++from ...errors import PreprocessingError
++
+ 
+ def lamtheta_to_r(lam: float, theta: float) -> float:
+     """Convert lambda and theta to r."""
+@@ -57,7 +59,6 @@ def nbn_em(
+     Returns:
+         Estimated `w`, `r`, `p`.
+     """
+-
+     w = np.array(w)
+     mu = np.array(mu)
+     var = np.array(var)
+@@ -68,7 +69,7 @@ def nbn_em(
+     prev_lam = lam.copy()
+     prev_theta = theta.copy()
+ 
+-    for _ in range(max_iter):
++    for i in range(max_iter):
+         # E step
+         r = lamtheta_to_r(lam, theta)
+         bp = stats.nbinom(n=r[0], p=theta[0]).pmf(X)
+@@ -110,30 +111,79 @@ def nbn_em(
+     return (prev_w, lamtheta_to_r(prev_lam, prev_theta), prev_theta) if isnan else (w, lamtheta_to_r(lam, theta), theta)
+ 
+ 
++def conditionals(
++    X: np.ndarray,
++    em_results: Union[
++        Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
++        Dict[int, Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]],
++    ],
++    bins: Optional[np.ndarray] = None,
++) -> Tuple[np.ndarray, np.ndarray]:
++    """Compute the conditional probabilities, for each pixel, of observing the
++    observed number of UMIs given that the pixel is background/foreground.
++
++    Args:
++        X: UMI counts per pixel
++        em_results: Return value of :func:`run_em`.
++        bins: Pixel bins, as was passed to :func:`run_em`.
++
++    Returns:
++        Two Numpy arrays, the first corresponding to the background conditional
++        probabilities, and the second to the foreground conditional probabilities
++
++    Raises:
++        PreprocessingError: If `em_results` is a dictionary but `bins` was not
++            provided.
++    """
++    if isinstance(em_results, dict):
++        if bins is None:
++            raise PreprocessingError("`em_results` indicate binning was used, but `bins` was not provided")
++        background_cond = np.zeros(X.shape)
++        cell_cond = np.zeros(X.shape)
++        for label, (_, r, p) in em_results.items():
++            indices = np.where(bins == label)
++            background_cond[indices] = stats.nbinom(n=r[0], p=p[0]).pmf(X[indices])
++            cell_cond[indices] = stats.nbinom(n=r[1], p=p[1]).pmf(X[indices])
++    else:
++        _, r, p = em_results
++        background_cond = stats.nbinom(n=r[0], p=p[0]).pmf(X)
++        cell_cond = stats.nbinom(n=r[1], p=p[1]).pmf(X)
++
++    return background_cond, cell_cond
++
++
+ def confidence(
+     X: np.ndarray,
+-    w: Tuple[float, float],
+-    r: Tuple[float, float],
+-    p: Tuple[float, float],
++    em_results: Union[
++        Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
++        Dict[int, Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]],
++    ],
++    bins: Optional[np.ndarray] = None,
+ ) -> np.ndarray:
+     """Compute confidence of each pixel being a cell, using the parameters
+     estimated by the EM algorithm.
+ 
+     Args:
+         X: Numpy array containing mixture counts.
+-        w: Estimated `w` parameters.
+-        r: Estimated `r` parameters.
+-        p: Estimated `p` parameters
++        em_results: Return value of :func:`run_em`.
++        bins: Pixel bins, as was passed to :func:`run_em`.
+ 
+     Returns:
+         Numpy array of confidence scores within the range [0, 1].
+     """
+-    tau = np.zeros((2,) + X.shape)
+-    bp = stats.nbinom(n=r[0], p=p[0]).pmf(X)
+-    cp = stats.nbinom(n=r[1], p=p[1]).pmf(X)
+-    tau[0] = w[0] * bp
+-    tau[1] = w[1] * cp
+-    return tau[1] / tau.sum(axis=0)
++    bp, cp = conditionals(X, em_results, bins)
++    tau0 = np.zeros(X.shape)
++    tau1 = np.zeros(X.shape)
++    if isinstance(em_results, dict):
++        for label, (w, _, _) in em_results.items():
++            indices = np.where(bins == label)
++            tau0[indices] = w[0] * bp[indices]
++            tau1[indices] = w[1] * cp[indices]
++    else:
++        w, _, _ = em_results
++        tau0 = w[0] * bp
++        tau1 = w[1] * cp
++    return tau1 / (tau0 + tau1)
+ 
+ 
+ def run_em(
+@@ -141,13 +191,17 @@ def run_em(
+     use_peaks: bool = False,
+     min_distance: int = 21,
+     downsample: int = 1e6,
+-    w: Tuple[float, float] = (0.99, 0.01),
++    w: Tuple[float, float] = (0.9, 0.1),
+     mu: Tuple[float, float] = (10.0, 300.0),
+     var: Tuple[float, float] = (20.0, 400.0),
+     max_iter: int = 2000,
+     precision: float = 1e-6,
++    bins: Optional[np.ndarray] = None,
+     seed: Optional[int] = None,
+-) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
++) -> Union[
++    Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]],
++    Dict[int, Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]],
++]:
+     """EM
+ 
+     Args:
+@@ -156,40 +210,56 @@ def run_em(
+             EM algorithm.
+         min_distance: Minimum distance between peaks when `use_peaks=True`
+         downsample: Use at most this many samples. If `use_peaks` is False,
+-            samples are chosen uniformly at random to at most this many samples.
+-            Otherwise, peaks are chosen uniformly at random.
++            samples are chosen randomly with probability proportional to the
++            log UMI counts. When `bins` is provided, the size of each bin is
++            used as a scaling factor.
+         w: Initial proportions of cell and background as a tuple.
+         mu: Initial means of cell and background negative binomial distributions.
+         var: Initial variances of cell and background negative binomial
+             distributions.
+         max_iter: Maximum number of EM iterations.
+         precision: Stop EM algorithm once desired precision has been reached.
++        bins: Bins of pixels to estimate separately, such as those obtained by
++            density segmentation. Zeros are ignored.
+         seed: Random seed.
+ 
+     Returns:
+-        Tuple of parameters estimated by the EM algorithm.
++        Tuple of parameters estimated by the EM algorithm if `bins` is not provided.
++        Otherwise, a dictionary of tuple of parameters, with bin labels as keys.
+     """
++    samples = {}  # key 0 when bins = None
+     if use_peaks:
+-        picks = feature.peak_local_max(X, min_distance=min_distance)
++        picks = feature.peak_local_max(X, min_distance=min_distance, labels=bins)
+         b = np.zeros(X.shape, dtype=np.uint8)
+         b[picks[:, 0], picks[:, 1]] = 1
+         n_objects, labels = cv2.connectedComponents(b)
+ 
+         added = set()
+-        samples = []
+         for i in range(labels.shape[0]):
+             for j in range(labels.shape[1]):
+                 label = labels[i, j]
+                 if label > 0 and label not in added:
+-                    samples.append(X[i, j])
++                    samples.setdefault(bins[i, j] if bins is not None else 0, []).append(X[i, j])
+                     added.add(label)
+-        samples = np.array(samples)
++    elif bins is not None:
++        for label in np.unique(bins):
++            if label > 0:
++                _samples = X[np.where(bins == label)]
++                samples[label] = _samples[(_samples > 0) & (_samples <= np.quantile(_samples, 0.999))]
+     else:
+-        samples = X.flatten()
+-    downsample = int(downsample)
+-    if samples.size > downsample:
+-        rng = np.random.default_rng(seed)
+-        samples = rng.choice(samples, downsample, replace=False)
++        samples[0] = X[np.where((X > 0) & (X <= np.quantile(X, 0.999)))]
+ 
+-    w, r, p = nbn_em(samples, w=w, mu=mu, var=var, max_iter=max_iter, precision=precision)
+-    return tuple(w), tuple(r), tuple(p)
++    downsample = int(downsample)
++    rng = np.random.default_rng(seed)
++    results = {}
++    # TODO: Parallelize?
++    total = sum(len(_samples) for _samples in samples.values())
++    for label, _samples in samples.items():
++        _downsample = int(downsample * (len(_samples) / total))
++        if len(_samples) > _downsample:
++            log = np.log(_samples)
++            _samples = rng.choice(_samples, _downsample, replace=False, p=log / log.sum())
++
++        res_w, res_r, res_p = nbn_em(np.array(_samples), w=w, mu=mu, var=var, max_iter=max_iter, precision=precision)
++        results[label] = (tuple(res_w), tuple(res_r), tuple(res_p))
++    return results if bins is not None else results[0]
+diff --git a/spateo/preprocessing/segmentation/icell.py b/spateo/preprocessing/segmentation/icell.py
+index 94dd12fe..411245cd 100755
+--- a/spateo/preprocessing/segmentation/icell.py
++++ b/spateo/preprocessing/segmentation/icell.py
+@@ -56,6 +56,7 @@ def score_pixels(
+     em_kwargs: Optional[dict] = None,
+     bp_kwargs: Optional[dict] = None,
+     certain_mask: Optional[np.ndarray] = None,
++    bins: Optional[np.ndarray] = None,
+ ) -> np.ndarray:
+     """Score each pixel by how likely it is a cell. Values returned are in
+     [0, 1].
+@@ -75,12 +76,23 @@ def score_pixels(
+         certain_mask: A boolean Numpy array indicating which pixels are certain
+             to be occupied, a-priori. For example, if nuclei staining is available,
+             this would be the nuclei segmentation mask.
++        bins: Pixel bins to segment separately. Only takes effect when the EM
++            algorithm is run.
+ 
+     Returns:
+         [0, 1] score of each pixel being a cell.
++
++    Raises:
++        PreprocessingError: If `bins` and/or `certain_mask` was provided but
++            their sizes do not match `X`
+     """
+     if method.lower() not in ("gauss", "em", "em+gauss", "em+bp"):
+         raise PreprocessingError(f"Unknown method `{method}`")
++    if certain_mask is not None and X.shape != certain_mask.shape:
++        raise PreprocessingError("`certain_mask` does not have the same shape as `X`")
++    if bins is not None and X.shape != bins.shape:
++        raise PreprocessingError("`bins` does not have the same shape as `X`")
++
+     method = method.lower()
+     em_kwargs = em_kwargs or {}
+     bp_kwargs = bp_kwargs or {}
+@@ -95,21 +107,22 @@ def score_pixels(
+         X = X.A
+ 
+     # All methods require some kind of 2D convolution to start off
+-    res = utils.conv2d(X, k, mode="gauss" if method == "gauss" else "circle")
++    res = utils.conv2d(X, k, mode="gauss" if method == "gauss" else "circle", bins=bins)
+ 
+     # All methods other than gauss requires EM
+     if method != "gauss":
+-        w, r, p = em.run_em(res, **em_kwargs)
++        em_results = em.run_em(res, bins=bins, **em_kwargs)
+ 
+         if "bp" in method:
+-            res = bp.run_bp(res, (r[0], p[0]), (r[1], p[1]), certain_mask=certain_mask, **bp_kwargs)
++            background_cond, cell_cond = em.conditionals(res, em_results=em_results, bins=bins)
++            res = bp.run_bp(res, background_cond, cell_cond, certain_mask=certain_mask, **bp_kwargs)
+         else:
+-            res = em.confidence(res, w, r, p)
++            res = em.confidence(res, em_results=em_results, bins=bins)
+             if certain_mask is not None:
+                 res = np.clip(res + certain_mask, 0, 1)
+ 
+         if "gauss" in method:
+-            res = utils.conv2d(res, k, mode="gauss")
++            res = utils.conv2d(res, k, mode="gauss", bins=bins)
+     else:
+         # For just "gauss" method, we should rescale to [0, 1] because all the
+         # other methods eventually produce an array of [0, 1] values.
+diff --git a/spateo/preprocessing/segmentation/utils.py b/spateo/preprocessing/segmentation/utils.py
+index d2bb2bc4..5a24966b 100755
+--- a/spateo/preprocessing/segmentation/utils.py
++++ b/spateo/preprocessing/segmentation/utils.py
+@@ -30,8 +30,13 @@ def circle(k: int) -> np.ndarray:
+     return cv2.circle(np.zeros((k, k), dtype=np.uint8), (r, r), r, 1, -1)
+ 
+ 
+-def knee(X: np.ndarray, n_bins: int = 256) -> float:
+-    """Find the knee point of an arbitrary array.
++def knee_threshold(X: np.ndarray, n_bins: int = 256) -> float:
++    """Find the knee thresholding point of an arbitrary array.
++
++    Note:
++        This function does not find the actual knee of X. It computes a
++        value to be used to threshold the elements of X by finding the knee of
++        the cumulative counts.
+ 
+     Args:
+         X: Numpy array of values
+@@ -68,7 +73,9 @@ def gaussian_blur(X: np.ndarray, k: int) -> np.ndarray:
+     return cv2.GaussianBlur(src=X.astype(float), ksize=(k, k), sigmaX=0, sigmaY=0)
+ 
+ 
+-def conv2d(X: np.ndarray, k: int, mode: Literal["gauss", "circle", "square"]) -> np.ndarray:
++def conv2d(
++    X: np.ndarray, k: int, mode: Literal["gauss", "circle", "square"], bins: Optional[np.ndarray] = None
++) -> np.ndarray:
+     """Convolve an array with the specified kernel size and mode.
+ 
+     Args:
+@@ -78,24 +85,37 @@ def conv2d(X: np.ndarray, k: int, mode: Literal["gauss", "circle", "square"]) ->
+             gauss:
+             circle:
+             square:
++        bins: Convolve per bin. Zeros are ignored.
+ 
+     Returns:
+         The convolved array
+ 
+     Raises:
+         ValueError: if `k` is even or less than 1, or if `mode` is not a
+-            valid mode
++            valid mode, or if `bins` does not have the same shape as `X`
+     """
+     if k < 1 or k % 2 == 0:
+         raise ValueError(f"`k` must be odd and greater than 0.")
+     if mode not in ("gauss", "circle", "square"):
+         raise ValueError(f'`mode` must be one of "gauss", "circle", "square"')
+-
+-    if mode == "gauss":
+-        return gaussian_blur(X, k)
+-
+-    kernel = np.ones((k, k), dtype=np.uint8) if mode == "square" else circle(k)
+-    return signal.convolve2d(X, kernel, boundary="symm", mode="same")
++    if bins is not None and X.shape != bins.shape:
++        raise ValueError("`bins` must have the same shape as `X`")
++
++    def _conv(_X):
++        if mode == "gauss":
++            return gaussian_blur(_X, k)
++        kernel = np.ones((k, k), dtype=np.uint8) if mode == "square" else circle(k)
++        return signal.convolve2d(_X, kernel, boundary="symm", mode="same")
++
++    if bins is not None:
++        conv = np.zeros(X.shape)
++        for label in np.unique(bins):
++            if label > 0:
++                mask = bins == label
++                indices = np.where(mask)
++                conv[indices] = _conv(X * mask)[indices]
++        return conv
++    return _conv(X)
+ 
+ 
+ def scale_to_01(X: np.ndarray) -> np.ndarray:
+@@ -159,7 +179,7 @@ def apply_threshold(X: np.ndarray, k: int, threshold: Optional[Union[float, np.n
+         A boolean mask.
+     """
+     # Apply threshold and mclose,mopen
+-    threshold = threshold if threshold is not None else knee(X)
++    threshold = threshold if threshold is not None else knee_threshold(X)
+     mask = mclose_mopen(X >= threshold, k)
+     return mask
+ 
+diff --git a/tests/preprocessing/segmentation/test_bp.py b/tests/preprocessing/segmentation/test_bp.py
+index 2b05dda4..26469705 100755
+--- a/tests/preprocessing/segmentation/test_bp.py
++++ b/tests/preprocessing/segmentation/test_bp.py
+@@ -1,6 +1,7 @@
+ from unittest import TestCase
+ 
+ import numpy as np
++from scipy import stats
+ 
+ import spateo.preprocessing.segmentation.bp as bp
+ from ...mixins import TestMixin
+@@ -28,6 +29,11 @@ def test_run_bp(self):
+         rng = np.random.default_rng(2021)
+         X = rng.negative_binomial(10, 0.5, (20, 20))
+         X[5:15, 5:15] = rng.negative_binomial(100, 0.5, (10, 10))
++
+         expected = np.zeros((20, 20))
+         expected[5:15, 5:15] = 1
+-        np.testing.assert_allclose(expected, bp.run_bp(X, (10, 0.5), (100, 0.5), square=True), atol=1e-3)
++        np.testing.assert_allclose(
++            expected,
++            bp.run_bp(X, stats.nbinom(n=10, p=0.5).pmf(X), stats.nbinom(n=100, p=0.5).pmf(X), square=True),
++            atol=1e-3,
++        )
+diff --git a/tests/preprocessing/segmentation/test_density.py b/tests/preprocessing/segmentation/test_density.py
+new file mode 100755
+index 00000000..441e1daf
+--- /dev/null
++++ b/tests/preprocessing/segmentation/test_density.py
+@@ -0,0 +1,37 @@
++from unittest import mock, TestCase
++
++import networkx as nx
++import numpy as np
++from scipy import sparse
++
++import spateo.preprocessing.segmentation.density as density
++from ...mixins import TestMixin
++
++
++class TestDensity(TestMixin, TestCase):
++    def test_create_spatial_adjacency(self):
++        adjacency = density.create_spatial_adjacency((7, 8))
++        # networkx dimensions are flipped
++        np.testing.assert_array_equal(nx.adjacency_matrix(nx.grid_graph((8, 7))).A, adjacency.A)
++
++    def test_schc(self):
++        X = np.zeros((10, 10))
++        X[:3, :3] = 1 / 3
++        X[4:6, 4:6] = 2 / 3
++        X[7:, 7:] = 1
++        expected = np.zeros_like(X)
++        expected[:3, :3] = 3
++        expected[4:6, 4:6] = 2
++        expected[7:, 7:] = 1
++        np.testing.assert_array_equal(expected, density.schc(X))
++
++    def test_segment_densities(self):
++        with mock.patch("spateo.preprocessing.segmentation.density.utils.conv2d") as conv2d, mock.patch(
++            "spateo.preprocessing.segmentation.density.schc"
++        ) as schc:
++            schc.return_value = np.zeros((3, 3), dtype=int)
++            X = sparse.csr_matrix(np.random.random((3, 3)))
++            np.testing.assert_array_equal(np.ones((3, 3), dtype=int), density.segment_densities(X, 5))
++            np.testing.assert_array_equal(conv2d.call_args[0][0], X.A / X.max())
++            conv2d.assert_called_once_with(mock.ANY, 5, mode="gauss")
++            schc.assert_called_once_with(conv2d.return_value, distance_threshold=None)
+diff --git a/tests/preprocessing/segmentation/test_em.py b/tests/preprocessing/segmentation/test_em.py
+index 58687cbc..708b85bb 100755
+--- a/tests/preprocessing/segmentation/test_em.py
++++ b/tests/preprocessing/segmentation/test_em.py
+@@ -1,6 +1,7 @@
+ from unittest import TestCase
+ 
+ import numpy as np
++from scipy import stats
+ 
+ import spateo.preprocessing.segmentation.em as em
+ from ...mixins import TestMixin
+@@ -24,31 +25,78 @@ def test_confidence(self):
+                 4.99507343e-24,
+                 3.71062598e-23,
+             ],
+-            em.confidence(np.array([1, 2, 3, 4, 5]), (0.5, 0.5), (10, 100), (0.5, 0.5)),
++            em.confidence(np.array([1, 2, 3, 4, 5]), ((0.5, 0.5), (10, 100), (0.5, 0.5))),
++        )
++
++    def test_confidence_bins(self):
++        np.testing.assert_allclose(
++            [
++                np.nan,
++                np.nan,
++                6.30446161e-25,
++                4.99507343e-24,
++                3.71062598e-23,
++            ],
++            em.confidence(
++                np.array([1, 2, 3, 4, 5]), {1: ((0.5, 0.5), (10, 100), (0.5, 0.5))}, np.array([0, 0, 1, 1, 1])
++            ),
+         )
+ 
+     def test_run_em(self):
+         rng = np.random.default_rng(2021)
+         X = rng.negative_binomial(10, 0.5, (10, 10)) + rng.negative_binomial(100, 0.5, (10, 10))
+ 
+-        w, r, p = em.run_em(X)
+-        np.testing.assert_allclose([0.41884403, 0.58115597], w)
+-        np.testing.assert_allclose([53.75074877, 286.70262741], r)
+-        np.testing.assert_allclose([0.33038823, 0.72543857], p)
++        w, r, p = em.run_em(X, w=(0.99, 0.01), max_iter=100)
++        np.testing.assert_allclose([0.2383495042266562, 0.7616504957733438], w)
++        np.testing.assert_allclose([33.82400850536949, 600.8543296460896], r)
++        np.testing.assert_allclose([0.24796212737976334, 0.8454343821517696], p)
+ 
+     def test_run_em_downsample(self):
+         rng = np.random.default_rng(2021)
+         X = rng.negative_binomial(10, 0.5, (20, 20)) + rng.negative_binomial(100, 0.5, (20, 20))
+ 
+-        w, r, p = em.run_em(X, downsample=100, seed=2021)
+-        np.testing.assert_allclose([0.3591019654794112, 0.6408980345205889], w)
+-        np.testing.assert_allclose([174.5511759619999, 701.1016921390545], r)
+-        np.testing.assert_allclose([0.5981170046608679, 0.8692063871420153], p)
++        w, r, p = em.run_em(X, downsample=100, seed=2021, w=(0.99, 0.01), max_iter=100)
++        np.testing.assert_allclose([0.13265334244385113, 0.8673466575561488], w)
++        np.testing.assert_allclose([26.374527039240963, 559.0179953067875], r)
++        np.testing.assert_allclose([0.1909250367173723, 0.8367866538310141], p)
+ 
+     def test_run_em_peaks(self):
+         rng = np.random.default_rng(2021)
+         X = rng.negative_binomial(50, 0.5, (100, 100)) + rng.negative_binomial(500, 0.5, (100, 100))
+-        w, r, p = em.run_em(X, use_peaks=True, min_distance=1, seed=2021)
+-        np.testing.assert_allclose([3.06e-322, 1.0], w)
+-        np.testing.assert_allclose([145.7961865893234, 1552.4287058491911], r)
+-        np.testing.assert_allclose([0.19757881931910512, 0.7212333080184193], p)
++        w, r, p = em.run_em(X, use_peaks=True, min_distance=1, seed=2021, w=(0.99, 0.01), max_iter=100)
++        np.testing.assert_allclose([3.847497690531427e-204, 1.0], w)
++        np.testing.assert_allclose([30.091059744937105, 1031.3178918176766], r)
++        np.testing.assert_allclose([0.04729785407753589, 0.6321837694765489], p)
++
++    def test_run_em_bins(self):
++        rng = np.random.default_rng(2021)
++        X = rng.negative_binomial(50, 0.5, (100, 100)) + rng.negative_binomial(500, 0.5, (100, 100))
++        bins = np.zeros(X.shape, dtype=int)
++        bins[:50, :50] = 1
++        bins[50:, 50:] = 2
++        results = em.run_em(X, bins=bins, w=(0.99, 0.01), max_iter=100)
++        self.assertEqual(2, len(results))
++        np.testing.assert_allclose([1.6359410595079348e-111, 1.0], results[1][0])
++        np.testing.assert_allclose([25.45447008445437, 881.3329952146362], results[1][1])
++        np.testing.assert_allclose([0.049578513664564734, 0.6160205873806845], results[1][2])
++        np.testing.assert_allclose([3.08767945236589e-131, 1.0], results[2][0])
++        np.testing.assert_allclose([25.748715118551672, 888.9653114044754], results[2][1])
++        np.testing.assert_allclose([0.04636794899451994, 0.6174397965275665], results[2][2])
++
++    def test_conditionals(self):
++        X = np.array([[1, 2, 3]])
++        em_results = (0, 0), (4, 5), (0.5, 0.6)
++        results = em.conditionals(X, em_results)
++        np.testing.assert_allclose(stats.nbinom(n=4, p=0.5).pmf([[1, 2, 3]]), results[0])
++        np.testing.assert_allclose(stats.nbinom(n=5, p=0.6).pmf([[1, 2, 3]]), results[1])
++
++    def test_conditionals_bins(self):
++        X = np.array([[1, 2, 3]])
++        em_results = {
++            1: ((0, 0), (4, 5), (0.5, 0.6)),
++            2: ((0, 0), (6, 7), (0.7, 0.8)),
++        }
++        bins = np.array([[0, 1, 2]], dtype=int)
++        results = em.conditionals(X, em_results, bins=bins)
++        np.testing.assert_allclose([[0, stats.nbinom(n=4, p=0.5).pmf(2), stats.nbinom(n=6, p=0.7).pmf(3)]], results[0])
++        np.testing.assert_allclose([[0, stats.nbinom(n=5, p=0.6).pmf(2), stats.nbinom(n=7, p=0.8).pmf(3)]], results[1])
+diff --git a/tests/preprocessing/segmentation/test_icell.py b/tests/preprocessing/segmentation/test_icell.py
+index c0f768b5..bfaf414e 100755
+--- a/tests/preprocessing/segmentation/test_icell.py
++++ b/tests/preprocessing/segmentation/test_icell.py
+@@ -34,8 +34,9 @@ def test_mask_nuclei_from_stain(self):
+     def test_score_pixels_gauss(self):
+         X = mock.MagicMock()
+         result = icell.score_pixels(X, k=3, method="gauss")
+-        self.utils.conv2d.assert_called_once_with(X, 3, mode="gauss")
++        self.utils.conv2d.assert_called_once_with(X, 3, mode="gauss", bins=None)
+         self.em.run_em.assert_not_called()
++        self.em.conditional.assert_not_called()
+         self.bp.run_bp.assert_not_called()
+         self.em.confidence.assert_not_called()
+         self.utils.scale_to_01.assert_called_once_with(self.utils.conv2d.return_value)
+@@ -44,35 +45,39 @@ def test_score_pixels_gauss(self):
+     def test_score_pixels_em(self):
+         X = mock.MagicMock()
+         em_kwargs = mock.MagicMock()
+-        w = mock.MagicMock()
+-        r = mock.MagicMock()
+-        p = mock.MagicMock()
+-        self.em.run_em.return_value = w, r, p
++        background_cond = mock.MagicMock()
++        cell_cond = mock.MagicMock()
++        self.em.conditionals.return_value = background_cond, cell_cond
+         result = icell.score_pixels(X, k=3, method="EM", em_kwargs=em_kwargs)
+-        self.utils.conv2d.assert_called_once_with(X, 3, mode="circle")
+-        self.em.run_em.assert_called_once_with(self.utils.conv2d.return_value, **em_kwargs)
++        self.utils.conv2d.assert_called_once_with(X, 3, mode="circle", bins=None)
++        self.em.run_em.assert_called_once_with(self.utils.conv2d.return_value, bins=None, **em_kwargs)
++        self.em.conditional.assert_not_called()
+         self.bp.run_bp.assert_not_called()
+-        self.em.confidence.assert_called_once_with(self.utils.conv2d.return_value, w, r, p)
++        self.em.confidence.assert_called_once_with(
++            self.utils.conv2d.return_value, em_results=self.em.run_em.return_value, bins=None
++        )
+         self.utils.scale_to_01.assert_not_called()
+         self.assertEqual(result, self.em.confidence.return_value)
+ 
+     def test_score_pixels_em_gauss(self):
+         X = mock.MagicMock()
+         em_kwargs = mock.MagicMock()
+-        w = mock.MagicMock()
+-        r = mock.MagicMock()
+-        p = mock.MagicMock()
+-        self.em.run_em.return_value = w, r, p
++        background_cond = mock.MagicMock()
++        cell_cond = mock.MagicMock()
++        self.em.conditionals.return_value = background_cond, cell_cond
+         result = icell.score_pixels(X, k=3, method="EM+gauss", em_kwargs=em_kwargs)
+         self.utils.conv2d.assert_has_calls(
+             [
+-                mock.call(X, 3, mode="circle"),
+-                mock.call(self.em.confidence.return_value, 3, mode="gauss"),
++                mock.call(X, 3, mode="circle", bins=None),
++                mock.call(self.em.confidence.return_value, 3, mode="gauss", bins=None),
+             ]
+         )
+-        self.em.run_em.assert_called_once_with(self.utils.conv2d.return_value, **em_kwargs)
++        self.em.run_em.assert_called_once_with(self.utils.conv2d.return_value, bins=None, **em_kwargs)
++        self.em.conditional.assert_not_called()
+         self.bp.run_bp.assert_not_called()
+-        self.em.confidence.assert_called_once_with(self.utils.conv2d.return_value, w, r, p)
++        self.em.confidence.assert_called_once_with(
++            self.utils.conv2d.return_value, em_results=self.em.run_em.return_value, bins=None
++        )
+         self.utils.scale_to_01.assert_not_called()
+         self.assertEqual(result, self.utils.conv2d.return_value)
+ 
+@@ -80,15 +85,17 @@ def test_score_pixels_em_bp(self):
+         X = mock.MagicMock()
+         em_kwargs = mock.MagicMock()
+         bp_kwargs = mock.MagicMock()
+-        w = mock.MagicMock()
+-        r = mock.MagicMock()
+-        p = mock.MagicMock()
+-        self.em.run_em.return_value = w, r, p
++        background_cond = mock.MagicMock()
++        cell_cond = mock.MagicMock()
++        self.em.conditionals.return_value = background_cond, cell_cond
+         result = icell.score_pixels(X, k=3, method="EM+BP", em_kwargs=em_kwargs, bp_kwargs=bp_kwargs)
+-        self.utils.conv2d.assert_called_once_with(X, 3, mode="circle")
+-        self.em.run_em.assert_called_once_with(self.utils.conv2d.return_value, **em_kwargs)
++        self.utils.conv2d.assert_called_once_with(X, 3, mode="circle", bins=None)
++        self.em.run_em.assert_called_once_with(self.utils.conv2d.return_value, bins=None, **em_kwargs)
++        self.em.conditionals.assert_called_once_with(
++            self.utils.conv2d.return_value, em_results=self.em.run_em.return_value, bins=None
++        )
+         self.bp.run_bp.assert_called_once_with(
+-            self.utils.conv2d.return_value, (r[0], p[0]), (r[1], p[1]), certain_mask=None, **bp_kwargs
++            self.utils.conv2d.return_value, background_cond, cell_cond, certain_mask=None, **bp_kwargs
+         )
+         self.em.confidence.assert_not_called()
+         self.utils.scale_to_01.assert_not_called()
+diff --git a/tests/preprocessing/segmentation/test_utils.py b/tests/preprocessing/segmentation/test_utils.py
+index e0d7737a..6748ee70 100755
+--- a/tests/preprocessing/segmentation/test_utils.py
++++ b/tests/preprocessing/segmentation/test_utils.py
+@@ -15,10 +15,10 @@ def test_circle(self):
+         circle[2, 2] = 0
+         np.testing.assert_array_equal(circle, utils.circle(3))
+ 
+-    def test_knee(self):
++    def test_knee_threshold(self):
+         with mock.patch("spateo.preprocessing.segmentation.utils.KneeLocator") as KneeLocator:
+             X = np.array([0, 0, 0, 0, 1, 1, 1, 2, 3, 4, 4, 4, 5, 5, 5, 5])
+-            self.assertEqual(KneeLocator.return_value.knee, utils.knee(X))
++            self.assertEqual(KneeLocator.return_value.knee, utils.knee_threshold(X))
+             np.testing.assert_array_equal([0, 1, 2, 3, 4, 5], KneeLocator.call_args[0][0])
+             np.testing.assert_allclose(
+                 [4 / 16, 7 / 16, 8 / 16, 9 / 16, 12 / 16, 1],
+@@ -26,10 +26,10 @@ def test_knee(self):
+             )
+             KneeLocator.assert_called_once_with(mock.ANY, mock.ANY, curve="concave")
+ 
+-    def test_knee_float(self):
++    def test_knee_threshold_float(self):
+         with mock.patch("spateo.preprocessing.segmentation.utils.KneeLocator") as KneeLocator:
+             X = np.array([0.1, 0.1, 0.1, 0.2, 0.2, 0.3, 0.5, 0.7, 0.8, 0.8, 0.9, 0.9, 0.9])
+-            self.assertEqual(KneeLocator.return_value.knee, utils.knee(X, n_bins=3))
++            self.assertEqual(KneeLocator.return_value.knee, utils.knee_threshold(X, n_bins=3))
+             np.testing.assert_array_equal([0.1, 0.5, 0.9], KneeLocator.call_args[0][0])
+             np.testing.assert_allclose([3 / 13, 7 / 13, 1], KneeLocator.call_args[0][1])
+             KneeLocator.assert_called_once_with(mock.ANY, mock.ANY, curve="concave")
+@@ -50,6 +50,20 @@ def test_conv2d(self):
+             utils.conv2d(X, 3, "square"),
+         )
+ 
++    def test_conv2d_bins(self):
++        X = np.array([[0, 1, 0, 1], [1, 0, 1, 0], [0, 1, 0, 1], [1, 0, 1, 0]])
++        bins = np.zeros(X.shape, dtype=int)
++        bins[:2, :2] = 1
++        bins[2:, 2:] = 2
++        np.testing.assert_array_equal(
++            [[0.5, 0.375, 0, 0], [0.375, 0.25, 0, 0], [0, 0, 0.25, 0.375], [0, 0, 0.375, 0.5]],
++            utils.conv2d(X, 3, "gauss", bins=bins),
++        )
++        np.testing.assert_array_equal(2 * (bins > 0), utils.conv2d(X, 3, "circle", bins=bins))
++        np.testing.assert_array_equal(
++            [[4, 3, 0, 0], [3, 2, 0, 0], [0, 0, 2, 3], [0, 0, 3, 4]], utils.conv2d(X, 3, "square", bins=bins)
++        )
++
+     def test_scale_to_01(self):
+         X = np.array([0, 1, 2, 3, 4])
+         np.testing.assert_allclose([0, 0.25, 0.5, 0.75, 1], utils.scale_to_01(X))
+@@ -74,7 +88,7 @@ def test_mclose_mopen(self):
+ 
+     def test_apply_threshold(self):
+         with mock.patch("spateo.preprocessing.segmentation.utils.mclose_mopen") as mclose_mopen, mock.patch(
+-            "spateo.preprocessing.segmentation.utils.knee"
++            "spateo.preprocessing.segmentation.utils.knee_threshold"
+         ) as knee:
+             X = np.array([1, 2, 3, 4, 5])
+             self.assertEqual(mclose_mopen.return_value, utils.apply_threshold(X, 3, 4))
+@@ -84,7 +98,7 @@ def test_apply_threshold(self):
+ 
+     def test_apply_threshold_knee(self):
+         with mock.patch("spateo.preprocessing.segmentation.utils.mclose_mopen") as mclose_mopen, mock.patch(
+-            "spateo.preprocessing.segmentation.utils.knee"
++            "spateo.preprocessing.segmentation.utils.knee_threshold"
+         ) as knee:
+             X = np.array([1, 2, 3, 4, 5])
+             knee.return_value = 4

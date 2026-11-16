@@ -1,0 +1,899 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 064c141ec..77f5b13da 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2607,6 +2607,7 @@ dependencies = [
+ name = "salmon-infer"
+ version = "2.3.2"
+ dependencies = [
++ "criterion",
+  "rand 0.8.6",
+  "rand_distr",
+  "rand_pcg",
+diff --git a/Cargo.toml b/Cargo.toml
+index ed90ac31a..3bb4b45f4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -102,6 +102,16 @@ lto = "thin"
+ codegen-units = 1
+ panic = "abort"
+ 
++# Like `release`, but keeps line-table debug info and does not strip, so
++# `samply`/`cargo flamegraph` can attribute samples to functions/lines. The
++# shipped `release`/`dist` binaries are unaffected (they stay stripped), and the
++# same portable `target-cpu` floor from `.cargo/config.toml` still applies — we
++# profile the binary users actually run. Build: `cargo build --profile profiling`.
++[profile.profiling]
++inherits = "release"
++debug = "line-tables-only"
++strip = false
++
+ [profile.bench]
+ lto = "thin"
+ 
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index 477a6a5d4..9cbef2a32 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -22,7 +22,7 @@ use salmon_align::{
+     GenomeProjectOptions,
+ };
+ use salmon_index::{build as build_index, IndexBuildOptions};
+-use salmon_quant::{quantify, ChunkCodec, ProgressCounters, QuantOptions};
++use salmon_quant::{quantify, ChunkCodec, EmAccel, ProgressCounters, QuantOptions};
+ 
+ use std::io::IsTerminal;
+ use std::sync::atomic::{AtomicBool, Ordering};
+@@ -151,6 +151,25 @@ struct Cli {
+     no_version_check: bool,
+ }
+ 
++/// CLI surface for [`EmAccel`]: the EM/VBEM convergence acceleration scheme.
++#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
++enum EmAccelArg {
++    /// Plain fixed-point iteration; output unchanged from historical salmon.
++    #[default]
++    None,
++    /// SQUAREM acceleration (same fixpoint, far fewer M-steps; not byte-identical).
++    Squarem,
++}
++
++impl From<EmAccelArg> for EmAccel {
++    fn from(a: EmAccelArg) -> Self {
++        match a {
++            EmAccelArg::None => EmAccel::None,
++            EmAccelArg::Squarem => EmAccel::Squarem,
++        }
++    }
++}
++
+ // clap subcommand args structs differ in size (IndexArgs vs the larger QuantArgs);
+ // this enum is constructed exactly once at startup, so the size delta is irrelevant.
+ #[allow(clippy::large_enum_variant)]
+@@ -497,6 +516,10 @@ struct QuantArgs {
+     /// VBEM per-feature Dirichlet prior weight.
+     #[arg(long = "vbPrior", default_value_t = 1e-2)]
+     vb_prior: f64,
++    /// EM/VBEM convergence acceleration. `squarem` reaches the same abundances in
++    /// far fewer M-steps but is not byte-identical to the default `none`.
++    #[arg(long = "emAccel", value_enum, default_value_t = EmAccelArg::None)]
++    em_accel: EmAccelArg,
+     /// Mean of the fragment-length distribution prior.
+     #[arg(long = "fldMean", default_value_t = 250.0)]
+     fld_mean: f64,
+@@ -1127,6 +1150,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         opts.incompat_prior = args.incompat_prior;
+         opts.em.vb_prior = args.vb_prior;
+         opts.em.per_nucleotide_prior = args.per_nucleotide_prior;
++        opts.em.accel = args.em_accel.into();
+         opts.sig_digits = args.sig_digits;
+         opts.fld_mean = args.fld_mean;
+         opts.fld_sd = args.fld_sd;
+@@ -1286,6 +1310,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         opts.incompat_prior = args.incompat_prior;
+         opts.em.vb_prior = args.vb_prior;
+         opts.em.per_nucleotide_prior = args.per_nucleotide_prior;
++        opts.em.accel = args.em_accel.into();
+         opts.sig_digits = args.sig_digits;
+         opts.fld_mean = args.fld_mean;
+         opts.fld_sd = args.fld_sd;
+@@ -1415,6 +1440,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     // inference + fragment-length-distribution knobs
+     opts.em.vb_prior = args.vb_prior;
+     opts.em.per_nucleotide_prior = args.per_nucleotide_prior;
++    opts.em.accel = args.em_accel.into();
+     opts.sig_digits = args.sig_digits;
+     opts.max_read_occ = args.max_read_occ;
+     opts.fld_mean = args.fld_mean;
+diff --git a/crates/salmon-infer/Cargo.toml b/crates/salmon-infer/Cargo.toml
+index add92501c..130dbea5b 100644
+--- a/crates/salmon-infer/Cargo.toml
++++ b/crates/salmon-infer/Cargo.toml
+@@ -17,5 +17,14 @@ rand = { workspace = true }
+ rand_pcg = { workspace = true }
+ rand_distr = { workspace = true }
+ 
++[dev-dependencies]
++# Bench harness for the EM/VBEM convergence loop (dev-only; no shipping impact).
++# `profile.bench` already carries thin-LTO. Used by `benches/em_step.rs`.
++criterion = "0.5"
++
++[[bench]]
++name = "em_step"
++harness = false
++
+ [lints]
+ workspace = true
+diff --git a/crates/salmon-infer/benches/em_step.rs b/crates/salmon-infer/benches/em_step.rs
+new file mode 100644
+index 000000000..70c6804d4
+--- /dev/null
++++ b/crates/salmon-infer/benches/em_step.rs
+@@ -0,0 +1,151 @@
++//! Criterion benchmark for the EM/VBEM step over equivalence classes.
++//!
++//! Builds a synthetic power-law equivalence-class set (many singletons, a heavy
++//! tail of multi-transcript classes drawn with a Zipf-like bias so a handful of
++//! "hot" transcripts recur — the scatter-contention shape the real M-step guards
++//! against) and times the convergence loop through the public `optimize_packed`
++//! entry point:
++//!   - a single M-step (`min_iter = max_iter = 1`, no truncation): the surgical
++//!     per-iteration throughput measurement,
++//!   - a bounded convergence run (fixed `max_iter`): EM vs VBEM, parallel (rayon)
++//!     vs sequential.
++//!
++//! This is the guard that will quantify the SQUAREM win in Phase 2: re-run with an
++//! acceleration flag and compare wall-clock here, and iterations-to-convergence via
++//! `EmResult::iters` in the `salmon-infer` tests, on this same fixture.
++
++use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
++use salmon_eqclass::{EquivalenceClassBuilder, TranscriptGroup};
++use salmon_infer::{optimize_packed, EmAccel, EmOptions, PackedEqClasses};
++
++/// Deterministic splitmix64 PRNG — no external rng dependency, fully reproducible.
++struct Rng(u64);
++impl Rng {
++    fn next_u64(&mut self) -> u64 {
++        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = self.0;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    }
++    fn below(&mut self, n: u32) -> u32 {
++        (self.next_u64() % n as u64) as u32
++    }
++    fn unit(&mut self) -> f64 {
++        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
++    }
++}
++
++/// Zipf-ish transcript sampler: square a uniform to skew draws toward low ids, so a
++/// small set of transcripts recurs across many classes.
++fn pick(rng: &mut Rng, num_txps: u32) -> u32 {
++    let u = rng.unit();
++    (((u * u) * num_txps as f64) as u32) % num_txps
++}
++
++/// Synthetic packed eq-class set: `num_txps` transcripts, `num_classes` classes.
++/// ~70% singletons; the rest span 2..=8 transcripts drawn with the hot-transcript
++/// bias above. Effective lengths spread over a realistic range so the
++/// multiplicative update does real work.
++fn synthetic(num_txps: u32, num_classes: usize, seed: u64) -> PackedEqClasses {
++    let mut rng = Rng(seed);
++    let b = EquivalenceClassBuilder::new();
++    for _ in 0..num_classes {
++        let k = if rng.unit() < 0.70 {
++            1
++        } else {
++            2 + rng.below(7) as usize // 2..=8
++        };
++        let mut txps = Vec::with_capacity(k);
++        while txps.len() < k {
++            let t = pick(&mut rng, num_txps);
++            if !txps.contains(&t) {
++                txps.push(t);
++            }
++        }
++        let weights = vec![1.0; txps.len()];
++        let count = 1 + rng.below(50) as u64;
++        b.add_group(TranscriptGroup::new(txps), weights, count);
++    }
++    let mut eq = b.finish();
++    let eff: Vec<f64> = (0..num_txps).map(|_| 200.0 + rng.unit() * 3000.0).collect();
++    eq.update_eff_lengths(&eff);
++    PackedEqClasses::from_collapsed(&eq, num_txps as usize)
++}
++
++/// One M-step, no post-convergence truncation — isolates the hot kernel cost.
++fn single_step(use_vbem: bool) -> EmOptions {
++    EmOptions {
++        min_iter: 1,
++        max_iter: 1,
++        min_alpha: 0.0,
++        use_vbem,
++        ..Default::default()
++    }
++}
++
++/// A fixed, bounded number of iterations so wall-clock is comparable across
++/// EM/VBEM/par/seq (and, in Phase 2, plain vs SQUAREM) rather than dominated by a
++/// data-dependent convergence count.
++fn bounded(use_vbem: bool, iters: u32) -> EmOptions {
++    EmOptions {
++        min_iter: iters,
++        max_iter: iters,
++        use_vbem,
++        ..Default::default()
++    }
++}
++
++fn bench_em(c: &mut Criterion) {
++    let sizes = [(20_000u32, 50_000usize), (100_000u32, 300_000usize)];
++    let mut group = c.benchmark_group("em");
++    // Convergence loops are the expensive case; keep the sample count modest so the
++    // whole bench finishes in well under a minute.
++    group.sample_size(20);
++
++    for &(num_txps, num_classes) in &sizes {
++        let p = synthetic(num_txps, num_classes, 0xDEAD_BEEF);
++        group.throughput(Throughput::Elements(num_classes as u64));
++        let id = format!("{num_txps}txp_{num_classes}cls");
++
++        // --- single M-step (per-iteration throughput) ---
++        let step_em = single_step(false);
++        group.bench_with_input(BenchmarkId::new("step_em_par", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &step_em, true))
++        });
++        group.bench_with_input(BenchmarkId::new("step_em_seq", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &step_em, false))
++        });
++        let step_vbem = single_step(true);
++        group.bench_with_input(BenchmarkId::new("step_vbem_par", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &step_vbem, true))
++        });
++
++        // --- bounded convergence loop (EM vs VBEM, par) ---
++        let loop_em = bounded(false, 50);
++        group.bench_with_input(BenchmarkId::new("loop50_em_par", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &loop_em, true))
++        });
++        let loop_vbem = bounded(true, 50);
++        group.bench_with_input(BenchmarkId::new("loop50_vbem_par", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &loop_vbem, true))
++        });
++
++        // --- full convergence: plain EM vs SQUAREM (the headline comparison) ---
++        let conv_plain = EmOptions::default();
++        group.bench_with_input(BenchmarkId::new("converge_em_plain", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &conv_plain, true))
++        });
++        let conv_sq = EmOptions {
++            accel: EmAccel::Squarem,
++            ..Default::default()
++        };
++        group.bench_with_input(BenchmarkId::new("converge_em_squarem", &id), &p, |b, p| {
++            b.iter(|| optimize_packed(p, &conv_sq, true))
++        });
++    }
++    group.finish();
++}
++
++criterion_group!(benches, bench_em);
++criterion_main!(benches);
+diff --git a/crates/salmon-infer/src/lib.rs b/crates/salmon-infer/src/lib.rs
+index c558f91f8..0bb538985 100644
+--- a/crates/salmon-infer/src/lib.rs
++++ b/crates/salmon-infer/src/lib.rs
+@@ -11,8 +11,9 @@
+ //! - **VBEM**: replaces `alphaIn[t]` with `expTheta[t] = exp(digamma(alphaIn[t] +
+ //!   prior_t) - digamma(sum_j(alphaIn[j] + prior_j)))`.
+ //!
+-//! Parallelization with rayon and SQUAREM acceleration are deferred; plain
+-//! iteration converges to the same fixpoint.
++//! The M-steps run in parallel with rayon. Optional SQUAREM acceleration
++//! ([`EmAccel::Squarem`]) extrapolates over the plain iteration to reach the same
++//! fixpoint in far fewer M-steps.
+ 
+ use salmon_eqclass::CollapsedEqClasses;
+ 
+@@ -24,6 +25,19 @@ pub use online::OnlineInference;
+ pub use packed::PackedEqClasses;
+ pub use uncertainty::{ambiguity_counts, bootstrap, gibbs_sample, GibbsOptions};
+ 
++/// EM/VBEM acceleration scheme applied on top of the fixed-point map.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum EmAccel {
++    /// Plain fixed-point iteration (one M-step per iteration). Default; the output
++    /// is unchanged from historical salmon.
++    #[default]
++    None,
++    /// SQUAREM (SqS3): extrapolate over two M-steps with a stabilizing third,
++    /// reaching the same fixpoint in far fewer M-steps. Not byte-identical to
++    /// `None` (a different iterate sequence, same fixpoint within `rel_diff_tol`).
++    Squarem,
++}
++
+ /// Optimizer configuration. Defaults mirror salmon's command-line defaults.
+ #[derive(Debug, Clone)]
+ pub struct EmOptions {
+@@ -43,6 +57,8 @@ pub struct EmOptions {
+     /// instead of a flat per-transcript prior (salmon's `--perNucleotidePrior`;
+     /// salmon's default is the per-transcript interpretation).
+     pub per_nucleotide_prior: bool,
++    /// convergence acceleration scheme (default [`EmAccel::None`]).
++    pub accel: EmAccel,
+ }
+ 
+ impl Default for EmOptions {
+@@ -56,6 +72,7 @@ impl Default for EmOptions {
+             use_vbem: false,
+             vb_prior: 1e-2,
+             per_nucleotide_prior: false,
++            accel: EmAccel::None,
+         }
+     }
+ }
+@@ -246,48 +263,172 @@ pub(crate) fn run_em_counts(
+         Vec::new()
+     };
+ 
++    // One fixed-point M-step `dst = F(src)`, dispatched by (VBEM?, parallel?) and
++    // reusing the once-allocated shard/scratch/exp_theta buffers. Both the plain
++    // and SQUAREM loops drive `F` through this closure, so the accelerated path
++    // reuses the exact same (already tuned) kernels.
++    let mut f = |src: &[f64], dst: &mut [f64]| match (opts.use_vbem, parallel) {
++        (false, true) => packed::em_step_par(p, counts, src, dst, &mut shards),
++        (false, false) => packed::em_step_seq(p, counts, src, dst, &mut scratch),
++        (true, true) => packed::vbem_step_par(
++            p,
++            counts,
++            &prior_alphas,
++            src,
++            dst,
++            &mut exp_theta,
++            &mut shards,
++        ),
++        (true, false) => packed::vbem_step_seq(
++            p,
++            counts,
++            &prior_alphas,
++            src,
++            dst,
++            &mut exp_theta,
++            &mut scratch,
++        ),
++    };
++
+     let mut converged = false;
+     let mut it = 0u32;
+-    while it < opts.max_iter {
+-        match (opts.use_vbem, parallel) {
+-            (false, true) => {
+-                packed::em_step_par(p, counts, &alphas, &mut alphas_prime, &mut shards)
++    match opts.accel {
++        EmAccel::None => {
++            while it < opts.max_iter {
++                f(&alphas, &mut alphas_prime);
++                it += 1;
++                if it >= min_iter {
++                    let d = max_rel_diff(&alphas, &alphas_prime, opts.alpha_check_cutoff);
++                    std::mem::swap(&mut alphas, &mut alphas_prime);
++                    if d.is_finite() && d < opts.rel_diff_tol {
++                        converged = true;
++                        break;
++                    }
++                } else {
++                    std::mem::swap(&mut alphas, &mut alphas_prime);
++                }
+             }
+-            (false, false) => {
+-                packed::em_step_seq(p, counts, &alphas, &mut alphas_prime, &mut scratch)
+-            }
+-            (true, true) => packed::vbem_step_par(
+-                p,
+-                counts,
+-                &prior_alphas,
+-                &alphas,
+-                &mut alphas_prime,
+-                &mut exp_theta,
+-                &mut shards,
+-            ),
+-            (true, false) => packed::vbem_step_seq(
+-                p,
+-                counts,
+-                &prior_alphas,
+-                &alphas,
++        }
++        EmAccel::Squarem => {
++            converged = squarem_loop(
++                &mut f,
++                &mut alphas,
+                 &mut alphas_prime,
+-                &mut exp_theta,
+-                &mut scratch,
+-            ),
++                num_txps,
++                opts,
++                min_iter,
++                &mut it,
++            );
+         }
+-        it += 1;
+-        if it >= min_iter {
+-            let d = max_rel_diff(&alphas, &alphas_prime, opts.alpha_check_cutoff);
+-            std::mem::swap(&mut alphas, &mut alphas_prime);
+-            if d.is_finite() && d < opts.rel_diff_tol {
+-                converged = true;
++    }
++    (alphas, it, converged)
++}
++
++/// SQUAREM (SqS3) acceleration of the fixed-point iteration.
++///
++/// Each cycle takes two M-steps (`x1 = F(x0)`, `x2 = F(x1)`), forms `r = x1 - x0`
++/// and `v = (x2 - x1) - r`, and extrapolates
++/// `xp = x0 - 2·alpha·r + alpha²·v` with steplength `alpha = -‖r‖/‖v‖` clamped to
++/// `alpha ≤ -1` (so it is never shorter than the plain double-step, for which
++/// `alpha = -1` gives exactly `xp = x2`). If any component of `xp` goes negative
++/// the steplength is halved back toward `-1` (salmon's non-negativity fallback;
++/// worst case `xp = x2`). A stabilizing third M-step `x_next = F(xp)` guarantees a
++/// valid EM iterate (non-negative, mass-conserving), and convergence is checked on
++/// the full cycle `x0 → x_next` with the same [`max_rel_diff`] criterion as the
++/// plain loop.
++///
++/// `x0` aliases the caller's `alphas` (updated in place to the final estimate) and
++/// `x_next` reuses the caller's `alphas_prime` scratch; the vector/norm math is
++/// done sequentially (over `num_txps`, cheap next to a per-class M-step) so the
++/// result is deterministic regardless of thread count. `it` accumulates the total
++/// M-step count (comparable to the plain loop's iteration count).
++#[allow(clippy::too_many_arguments)]
++fn squarem_loop(
++    f: &mut impl FnMut(&[f64], &mut [f64]),
++    x0: &mut Vec<f64>,
++    x_next: &mut Vec<f64>,
++    num_txps: usize,
++    opts: &EmOptions,
++    min_iter: u32,
++    it: &mut u32,
++) -> bool {
++    let n = num_txps;
++    let mut x1 = vec![0.0f64; n];
++    let mut x2 = vec![0.0f64; n];
++    let mut r = vec![0.0f64; n];
++    let mut v = vec![0.0f64; n];
++    let mut xp = vec![0.0f64; n];
++
++    while *it < opts.max_iter {
++        f(x0, &mut x1);
++        *it += 1;
++        f(&x1, &mut x2);
++        *it += 1;
++
++        // r = x1 - x0 ; v = (x2 - x1) - r ; and their squared norms.
++        let mut r_sq = 0.0f64;
++        let mut v_sq = 0.0f64;
++        for i in 0..n {
++            let ri = x1[i] - x0[i];
++            let vi = (x2[i] - x1[i]) - ri;
++            r[i] = ri;
++            v[i] = vi;
++            r_sq += ri * ri;
++            v_sq += vi * vi;
++        }
++
++        // Vanishing (or non-finite) second differences ⇒ at the fixpoint: take the
++        // plain step x2. `v_sq <= 0.0` is false for NaN, so the finiteness check
++        // also guards NaN/inf.
++        if v_sq <= 0.0 || !v_sq.is_finite() {
++            std::mem::swap(x0, &mut x2);
++            return true;
++        }
++
++        // SqS3 steplength, clamped so |alpha| ≥ 1 (alpha = -1 ⇒ xp = x2).
++        let mut alpha = -(r_sq.sqrt() / v_sq.sqrt());
++        if alpha > -1.0 {
++            alpha = -1.0;
++        }
++
++        // Extrapolate, backing off toward the double-step if a component < 0.
++        let mut tries = 0u32;
++        loop {
++            let a2 = alpha * alpha;
++            let mut ok = true;
++            for i in 0..n {
++                let val = x0[i] - 2.0 * alpha * r[i] + a2 * v[i];
++                xp[i] = val;
++                if val < 0.0 {
++                    ok = false;
++                }
++            }
++            if ok {
++                break;
++            }
++            if alpha >= -1.0 || tries >= 30 {
++                // Give up accelerating this cycle: fall back to the plain x2.
++                xp.copy_from_slice(&x2);
+                 break;
+             }
++            alpha = (alpha - 1.0) / 2.0; // move toward -1
++            tries += 1;
++        }
++
++        // Stabilizing M-step, then converge-check on the whole cycle.
++        f(&xp, x_next);
++        *it += 1;
++        if *it >= min_iter {
++            let d = max_rel_diff(x0, x_next, opts.alpha_check_cutoff);
++            std::mem::swap(x0, x_next);
++            if d.is_finite() && d < opts.rel_diff_tol {
++                return true;
++            }
+         } else {
+-            std::mem::swap(&mut alphas, &mut alphas_prime);
++            std::mem::swap(x0, x_next);
+         }
+     }
+-    (alphas, it, converged)
++    false
+ }
+ 
+ #[cfg(test)]
+@@ -352,6 +493,148 @@ mod tests {
+         assert!(res.alphas[1] > res.alphas[0]);
+     }
+ 
++    /// A moderately ambiguous eq-class set that takes the plain EM many iterations
++    /// to converge — enough that SQUAREM's acceleration is exercised and its
++    /// same-fixpoint guarantee is meaningfully tested.
++    fn ambiguous() -> CollapsedEqClasses {
++        build(
++            &[
++                (vec![0], 40),
++                (vec![1], 35),
++                (vec![2], 25),
++                (vec![0, 1], 300),
++                (vec![1, 2], 260),
++                (vec![0, 2], 180),
++                (vec![0, 1, 2], 500),
++            ],
++            3,
++        )
++    }
++
++    #[test]
++    fn squarem_matches_plain_em_fixpoint() {
++        let eq = ambiguous();
++        let plain = optimize(&eq, 3, &EmOptions::default(), None);
++        let sq = optimize(
++            &eq,
++            3,
++            &EmOptions {
++                accel: EmAccel::Squarem,
++                ..Default::default()
++            },
++            None,
++        );
++        for t in 0..3 {
++            let rel = (sq.alphas[t] - plain.alphas[t]).abs() / plain.alphas[t].max(1.0);
++            assert!(
++                rel < 1e-3,
++                "txp {t}: squarem {} vs plain {} (rel {rel})",
++                sq.alphas[t],
++                plain.alphas[t]
++            );
++        }
++        let tp: f64 = plain.alphas.iter().sum();
++        let ts: f64 = sq.alphas.iter().sum();
++        assert!((tp - ts).abs() < 1e-6, "totals differ: {tp} vs {ts}");
++        // Same fixpoint, but reached in no more M-steps than plain (usually far fewer).
++        assert!(
++            sq.iters <= plain.iters,
++            "squarem used more M-steps ({}) than plain ({})",
++            sq.iters,
++            plain.iters
++        );
++    }
++
++    #[test]
++    fn squarem_matches_plain_vbem_fixpoint() {
++        let eq = ambiguous();
++        let base = EmOptions {
++            use_vbem: true,
++            ..Default::default()
++        };
++        let plain = optimize(&eq, 3, &base, None);
++        let sq = optimize(
++            &eq,
++            3,
++            &EmOptions {
++                accel: EmAccel::Squarem,
++                ..base.clone()
++            },
++            None,
++        );
++        for t in 0..3 {
++            let rel = (sq.alphas[t] - plain.alphas[t]).abs() / plain.alphas[t].max(1.0);
++            assert!(
++                rel < 1e-3,
++                "vbem txp {t}: {} vs {}",
++                sq.alphas[t],
++                plain.alphas[t]
++            );
++        }
++    }
++
++    #[test]
++    fn squarem_conserves_total_count() {
++        let eq = ambiguous();
++        let res = optimize(
++            &eq,
++            3,
++            &EmOptions {
++                accel: EmAccel::Squarem,
++                ..Default::default()
++            },
++            None,
++        );
++        let total: f64 = res.alphas.iter().sum();
++        // total input count = 40+35+25+300+260+180+500 = 1340
++        assert!((total - 1340.0).abs() < 1e-6, "total={total}");
++    }
++
++    #[test]
++    fn squarem_reduces_iters_on_large_ambiguous_case() {
++        // Two nearly-indistinguishable transcripts sharing a huge class, with tiny
++        // asymmetric unique evidence: the plain EM crawls from the 50/50 uniform
++        // start toward the ~25/75 unique ratio over many iterations. A tight
++        // tolerance makes that iteration count large, so SQUAREM's fewer-steps
++        // property is clearly exercised.
++        let ntxp = 2usize;
++        let eq = build(&[(vec![0], 1), (vec![1], 3), (vec![0, 1], 100_000)], ntxp);
++        let tight = EmOptions {
++            rel_diff_tol: 1e-5,
++            min_iter: 1,
++            alpha_check_cutoff: 1e-8,
++            ..Default::default()
++        };
++        let plain = optimize(&eq, ntxp, &tight, None);
++        let sq = optimize(
++            &eq,
++            ntxp,
++            &EmOptions {
++                accel: EmAccel::Squarem,
++                ..tight.clone()
++            },
++            None,
++        );
++        println!(
++            "squarem_reduces_iters: plain M-steps={} (converged={}) squarem M-steps={} (converged={})",
++            plain.iters, plain.converged, sq.iters, sq.converged
++        );
++        // Analytic fixpoint: the shared class splits proportionally to abundance, so
++        // f = a0/(a0+a1) solves f·100004 = 1 + 100000·f ⇒ f = 1/4, giving
++        // a0 = 25001, a1 = 75003. SQUAREM must land there.
++        assert!(sq.converged, "squarem did not converge");
++        assert!((sq.alphas[0] - 25001.0).abs() < 1.0, "a0={}", sq.alphas[0]);
++        assert!((sq.alphas[1] - 75003.0).abs() < 1.0, "a1={}", sq.alphas[1]);
++        // On this deliberately slow mixer the plain iteration has not converged even
++        // at the 10 000-step cap, while SQUAREM needs only a handful of M-steps.
++        assert!(
++            sq.iters * 20 < plain.iters,
++            "expected SQUAREM ({}) to need far fewer M-steps than plain ({})",
++            sq.iters,
++            plain.iters
++        );
++    }
++
+     #[test]
+     fn effective_length_shifts_allocation() {
+         // One shared class, equal weights, but t0 is 3x longer -> more of the
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index 0369c66f3..dd7d35c36 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -26,6 +26,7 @@ use piscem_rs::mapping::hit_searcher::SkippingStrategy;
+ use salmon_core::{LibraryFormat, ReadType};
+ use salmon_eqclass::EquivalenceClassBuilder;
+ use salmon_index::SalmonIndex;
++pub use salmon_infer::EmAccel;
+ use salmon_infer::{optimize, optimize_with_init, EmOptions};
+ use salmon_map::MapConfig;
+ use salmon_model::dumps::{dump_bias_models_to_file, BiasDump};
+@@ -306,9 +307,35 @@ pub struct QuantResult {
+ }
+ 
+ /// Run quantification end-to-end, writing outputs and returning the results.
++/// Coarse per-phase wall-clock timing for profiling. Each [`mark`](PhaseTimer::mark)
++/// logs the elapsed time since the previous mark on the dedicated `salmon::timing`
++/// target, so a breakdown (mapping vs. inference vs. posterior) is available inline
++/// at the default `info` level, or in isolation via `RUST_LOG=salmon::timing=info`.
++/// This is pure instrumentation: a handful of `Instant::now()` calls around
++/// second-scale phases, emitting logs — it never touches quant output or determinism.
++struct PhaseTimer {
++    last: std::time::Instant,
++}
++
++impl PhaseTimer {
++    fn new() -> Self {
++        Self {
++            last: std::time::Instant::now(),
++        }
++    }
++
++    fn mark(&mut self, phase: &str) {
++        let now = std::time::Instant::now();
++        let elapsed_s = now.duration_since(self.last).as_secs_f64();
++        tracing::info!(target: "salmon::timing", phase, elapsed_s, "phase complete");
++        self.last = now;
++    }
++}
++
+ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let start_time = asctime_now();
+     let run_timer = std::time::Instant::now();
++    let mut timer = PhaseTimer::new();
+     // The raw reference nucleotides are only needed for selective-alignment
+     // extension (non-sketch mapping) and for sequence-dependent bias correction
+     // (seq/GC; positional bias is sequence-free). In sketch mode without seq/GC
+@@ -318,6 +345,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let salmon = SalmonIndex::load_with_opts(&opts.index_dir, need_refseq)
+         .with_context(|| format!("loading index {}", opts.index_dir.display()))?;
+     let num_refs = salmon.num_refs();
++    timer.mark("index_load");
+ 
+     let eq_builder = EquivalenceClassBuilder::new();
+     // Gaussian-prior fragment length distribution (mean 250, sd 25); empirical
+@@ -582,6 +610,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         };
+         tracing::info!("mapped {m} / {p} fragments ({pct:.2}%)");
+     }
++    timer.mark("mapping");
+     if let Some(sw) = &sam_writer {
+         sw.flush().context("flushing SAM output")?;
+     }
+@@ -646,6 +675,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let mut collapsed = eq_builder.finish();
+     collapsed.update_eff_lengths(&eff_lengths);
+     let num_eq_classes = collapsed.len();
++    timer.mark("eff_length_collapse");
+ 
+     if opts.dump_eq || opts.dump_eq_weights {
+         dump_eq_classes(&opts.output_dir, &salmon, &collapsed, opts.dump_eq_weights)
+@@ -932,6 +962,8 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         rw.finalize().context("finalizing RAD output")?;
+     }
+ 
++    timer.mark("em_bias");
++
+     // ---- posterior uncertainty (bootstrap / Gibbs) + ambiguity --------------
+     // The packed CSR layout (piscem-infer style) makes these parallel-friendly.
+     let packed = salmon_infer::PackedEqClasses::from_collapsed(&collapsed, num_refs);
+@@ -959,6 +991,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     } else {
+         Vec::new()
+     };
++    timer.mark("posterior");
+ 
+     // ---- TPM ----------------------------------------------------------------
+     let rates: Vec<f64> = (0..num_refs)
+@@ -1062,6 +1095,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+ 
+     tracing::info!("writing results to {}", opts.output_dir.display());
+     write_outputs(opts, &result)?;
++    timer.mark("output");
+     Ok(result)
+ }
+ 
+diff --git a/scripts/profile.sh b/scripts/profile.sh
+new file mode 100755
+index 000000000..c23839f02
+--- /dev/null
++++ b/scripts/profile.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++#
++# profile.sh — reproducible salmon quant profiling harness (Phase 1).
++#
++# Builds the `profiling` cargo profile (release + line-table debug info, unstripped
++# — see [profile.profiling] in the root Cargo.toml; the shipped release/dist binary
++# is unaffected) and runs `salmon quant` under a sampling profiler on two workloads:
++#   1. mapping-dominated : plain quant
++#   2. inference-dominated: quant --numBootstraps 100
++# Per-phase wall-clock (index_load / mapping / eff_length_collapse / em_bias /
++# posterior / output) is emitted on the `salmon::timing` tracing target and shown
++# inline; isolate it with RUST_LOG=salmon::timing=info.
++#
++# Two data tiers:
++#   - smoke (default): the repo's sample_data.tgz — tiny, good for *relative* phase
++#     attribution and correctness, too small for stable wall-clock deltas.
++#   - giab           : a realistic human RNA-seq sample + full transcriptome index.
++#     See "GIAB tier" below to fetch the inputs, then pass them in.
++#
++# Usage:
++#   scripts/profile.sh                              # smoke tier, both workloads
++#   scripts/profile.sh -p 8                         # pin thread count
++#   scripts/profile.sh -i <index_dir> -1 R1.fq.gz -2 R2.fq.gz   # giab tier
++#   PROFILER=none scripts/profile.sh               # just time it, no profiler
++#
++# Profiler: samply (default; `cargo install samply`) — no sudo, opens the Firefox
++# profiler UI. On Linux you can set PROFILER=flamegraph (needs perf). PROFILER=none
++# skips sampling and only reports the per-phase timings.
++#
++# ── GIAB tier: fetching realistic inputs ─────────────────────────────────────────
++# Reads: a GIAB reference individual's RNA-seq. NA12878 (= HG001) LCL RNA-seq from
++#   the GEUVADIS project is the most canonical/downloadable. Resolve a paired-end
++#   run on the ENA browser (https://www.ebi.ac.uk/ena/browser) under study PRJEB3366
++#   / ArrayExpress E-GEUV-1, filtering sample = NA12878, library_strategy = RNA-Seq,
++#   then download the run's *_1.fastq.gz / *_2.fastq.gz (typically 2x75 bp, tens of
++#   millions of pairs). VERIFY the exact ERR run accession on ENA at download time —
++#   do not hard-code one. (Alternative: HG002/NA24385 RNA-seq via an SRA search.)
++# Transcriptome: GENCODE human transcripts, e.g.
++#   https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/  ->  gencode.vXX.transcripts.fa.gz
++#   (or Ensembl cDNA, ~194k transcripts). Build the index once:
++#     salmon index -t gencode.vXX.transcripts.fa.gz -i target/gencode_index -p 8
++#
++set -euo pipefail
++
++REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$REPO_ROOT"
++
++THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
++INDEX_DIR=""
++R1=""
++R2=""
++BOOTSTRAPS=100
++PROFILER="${PROFILER:-samply}"
++
++while [[ $# -gt 0 ]]; do
++  case "$1" in
++    -p) THREADS="$2"; shift 2 ;;
++    -i) INDEX_DIR="$2"; shift 2 ;;
++    -1) R1="$2"; shift 2 ;;
++    -2) R2="$2"; shift 2 ;;
++    --bootstraps) BOOTSTRAPS="$2"; shift 2 ;;
++    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
++    *) echo "unknown arg: $1" >&2; exit 2 ;;
++  esac
++done
++
++echo "==> building profiling profile (release + debug symbols)"
++cargo build --profile profiling -p salmon-cli
++SALMON="$REPO_ROOT/target/profiling/salmon"
++
++OUT="$REPO_ROOT/target/profile-run"
++mkdir -p "$OUT"
++
++# Resolve the data tier: explicit -i/-1/-2 => GIAB tier; otherwise unpack sample_data.
++if [[ -z "$INDEX_DIR" ]]; then
++  echo "==> smoke tier: unpacking sample_data.tgz and building index"
++  tar -xzf sample_data.tgz -C "$OUT"
++  INDEX_DIR="$OUT/sample_index"
++  R1="$OUT/sample_data/reads_1.fastq"
++  R2="$OUT/sample_data/reads_2.fastq"
++  "$SALMON" index -t "$OUT/sample_data/transcripts.fasta" -i "$INDEX_DIR" >/dev/null
++fi
++
++# Wrap the quant invocation in the chosen profiler.
++run() {
++  local tag="$1"; shift
++  echo "==> [$tag] threads=$THREADS  profiler=$PROFILER"
++  case "$PROFILER" in
++    samply)     samply record -o "$OUT/$tag.profile.json" -- "$@" ;;
++    flamegraph) cargo flamegraph --profile profiling -o "$OUT/$tag.svg" -- "${@:2}" ;;
++    none)       "$@" ;;
++    *) echo "unknown PROFILER: $PROFILER" >&2; exit 2 ;;
++  esac
++}
++
++COMMON=(-l A -i "$INDEX_DIR" -1 "$R1" -2 "$R2" -p "$THREADS")
++
++echo "### workload 1: mapping-dominated"
++run map "$SALMON" quant "${COMMON[@]}" -o "$OUT/out_map"
++
++echo "### workload 2: inference-dominated (--numBootstraps $BOOTSTRAPS)"
++run boot "$SALMON" quant "${COMMON[@]}" --numBootstraps "$BOOTSTRAPS" -o "$OUT/out_boot"
++
++echo "==> done. Profiles + quant outputs under $OUT"
++echo "    Per-phase timings above are on the 'salmon::timing' target"
++echo "    (RUST_LOG=salmon::timing=info to isolate them)."

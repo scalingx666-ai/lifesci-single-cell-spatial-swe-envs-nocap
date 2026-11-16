@@ -1,0 +1,1012 @@
+diff --git a/omicverse/pl/_cnv.py b/omicverse/pl/_cnv.py
+index 3f1bfd657..7ce456bd7 100644
+--- a/omicverse/pl/_cnv.py
++++ b/omicverse/pl/_cnv.py
+@@ -13,7 +13,9 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ from collections.abc import Sequence
++from pathlib import Path
+ from typing import Optional, Union
+ 
+ import matplotlib.pyplot as plt
+@@ -77,55 +79,144 @@ def _build_chr_segments(
+     n_bins: int,
+     *,
+     standard_only: bool = True,
+-) -> tuple[list[tuple[str, int, int]], slice]:
+-    """Sorted [(chrom, start_bin, end_bin), ...] covering the plotted bin range.
++) -> tuple[list[tuple[str, int, int]], "slice | np.ndarray"]:
++    """Sorted [(chrom, start_bin, end_bin), ...] plus the column selector to render.
++
++    The returned segments ALWAYS tile [0, number-of-selected-columns) with no
++    holes: segment coordinates are rebased onto the compacted axis of exactly
++    the columns picked by the second return value. This holds even when
++    non-standard scaffolds / alt contigs are interleaved *between* standard
++    chromosomes — previously such interleaving left an uncovered hole in the
++    middle of the rendered range, so a chromosome past the gap rendered only
++    partially / shifted to one side.
+ 
+     When ``standard_only`` is True (default), unplaced scaffolds / alt contigs
+-    are dropped from the ideogram — they otherwise crowd the right edge of the
+-    plot with thin segments labelled e.g. ``GL000220.1``. The second return
+-    is the slice over X_cnv columns to render, aligned with the kept
+-    chromosomes (contiguous if the kept set is contiguous in chr_pos, else a
+-    boolean mask is used instead by the caller).
++    are dropped from BOTH the ideogram and the rendered columns. The second
++    return is a selector applied to the ``X_cnv`` columns: a ``slice`` when
++    nothing is dropped, else an integer index array of the kept columns.
+     """
+     pairs = sorted(chr_pos.items(), key=lambda kv: kv[1])
+-    raw: list[tuple[str, int, int]] = []
++    spans: list[tuple[str, int, int]] = []
+     for i, (chrom, start) in enumerate(pairs):
+         end = pairs[i + 1][1] if i + 1 < len(pairs) else n_bins
+-        raw.append((str(chrom), int(start), int(end)))
++        spans.append((str(chrom), int(start), int(end)))
+ 
+     if not standard_only:
+-        return raw, slice(0, n_bins)
++        return spans, slice(0, n_bins)
+ 
+-    kept = [seg for seg in raw if _is_standard_chromosome(seg[0])]
++    kept = [sp for sp in spans if _is_standard_chromosome(sp[0])]
+     if not kept:
+-        return raw, slice(0, n_bins)
+-
+-    # If the kept chromosomes are a contiguous prefix/run in raw (typical case
+-    # — scaffolds come last), we can render the heatmap with a clean slice.
+-    starts = [s for _, s, _ in kept]
+-    ends = [e for _, _, e in kept]
+-    contig_lo = min(starts)
+-    contig_hi = max(ends)
+-    contiguous = all(
+-        seg[1] >= contig_lo and seg[2] <= contig_hi for seg in kept
+-    )
+-    if contiguous:
+-        # Re-base segment positions to 0 so the heatmap axes start at 0.
+-        rebased = [(c, s - contig_lo, e - contig_lo) for c, s, e in kept]
+-        return rebased, slice(contig_lo, contig_hi)
+-    # Non-contiguous (rare): caller will need to build a mask externally.
+-    return kept, slice(0, n_bins)
++        return spans, slice(0, n_bins)
++
++    # Compact to exactly the kept chromosomes' columns; rebase segment
++    # coordinates onto that compacted axis so segments tile [0, kept_width)
++    # with no holes (robust to interleaved non-standard scaffolds). The old
++    # min/max-envelope "contiguous" check was tautological and returned
++    # segments that did not tile the rendered columns when a scaffold sat
++    # between two standard chromosomes.
++    mask = np.zeros(int(n_bins), dtype=bool)
++    for _, s, e in kept:
++        mask[s:e] = True
++    col_index = np.flatnonzero(mask)
++
++    rebased: list[tuple[str, int, int]] = []
++    run = 0
++    for c, s, e in kept:
++        w = int(e - s)
++        rebased.append((c, run, run + w))
++        run += w
++    # Common case (nothing dropped): return a slice so the caller keeps a view
++    # of X_cnv instead of triggering a full-matrix copy via fancy indexing.
++    if col_index.size == n_bins:
++        return rebased, slice(0, n_bins)
++    return rebased, col_index
++
++
++_CENTROMERE_DIR = Path(__file__).parent / "_data"
++
++
++_GENOME_ALIASES = {
++    "hg38": "hg38", "grch38": "hg38", "hg20": "hg38",
++    "hg19": "hg19", "grch37": "hg19",
++    "mm10": "mm10", "grcm38": "mm10",
++}
++
++
++@functools.lru_cache(maxsize=8)
++def _load_centromeres(genome: str) -> dict[str, int]:
++    """Per-chromosome centromere bp for p/q arm splitting (empty if unknown).
++
++    Data vendored under ``_data/`` (see its README + ``generate_centromeres.py``).
++    Bundled: hg38/GRCh38, hg19/GRCh37, mm10/GRCm38. Any other genome returns an
++    empty mapping so the caller falls back to whole-chromosome blocks.
++    """
++    key = _GENOME_ALIASES.get(str(genome).strip().lower())
++    if key is None:
++        return {}
++    path = _CENTROMERE_DIR / f"centromere_{key}.csv"
++    if not path.exists():
++        return {}
++    df = pd.read_csv(path)
++    return {str(c): int(v) for c, v in zip(df["chromosome"], df["centromere"])}
++
++
++def _centromere_for(chrom: str, centromeres: dict[str, int]):
++    """Look up a chromosome's centromere, tolerating 'chr'-prefixed/bare names."""
++    c = str(chrom)
++    if c in centromeres:
++        return centromeres[c]
++    alt = c[3:] if c.startswith("chr") else f"chr{c}"
++    return centromeres.get(alt)
++
++
++def _split_segments_by_arm(
++    segments: Sequence[tuple[str, int, int]],
++    bin_starts: np.ndarray,
++    centromeres: dict[str, int],
++) -> list[tuple[str, int, int]]:
++    """Split each chromosome segment at its centromere into p/q arm segments.
++
++    ``segments`` are ``(chrom, start, end)`` in the *rendered* (compacted) column
++    space; ``bin_starts`` is the per-rendered-bin genomic start (same length /
++    order as the rendered columns). Segments whose chromosome has no known
++    centromere — or that fall entirely on one arm (e.g. acrocentric q-only) —
++    are returned as a single arm-labelled segment. The result still tiles
++    ``[0, width)`` with no holes.
++    """
++    out: list[tuple[str, int, int]] = []
++    for chrom, s, e in segments:
++        cen = _centromere_for(chrom, centromeres)
++        if cen is None:
++            out.append((chrom, s, e))
++            continue
++        starts = np.asarray(bin_starts[s:e])
++        n_p = int((starts < cen).sum())
++        if n_p <= 0:
++            out.append((f"{chrom}q", s, e))
++        elif n_p >= (e - s):
++            out.append((f"{chrom}p", s, e))
++        else:
++            out.append((f"{chrom}p", s, s + n_p))
++            out.append((f"{chrom}q", s + n_p, e))
++    return out
+ 
+ 
+ def _draw_ideogram(
+     ax: Axes,
+     segments: Sequence[tuple[str, int, int]],
+     *,
++    arm_segments: Sequence[tuple[str, int, int]] | None = None,
+     height: float = 1.0,
+     fontsize: int = 8,
+     label_short: bool = True,
+ ) -> None:
+-    """Render an ideogram-style chromosome bar onto ``ax``."""
++    """Render an ideogram-style chromosome bar onto ``ax``.
++
++    ``segments`` are chromosome-level blocks (one rectangle + label each). When
++    ``arm_segments`` is given, a faint centromere tick is drawn at each p/q
++    boundary inside a chromosome and tiny ``p`` / ``q`` labels are placed,
++    without splitting the chromosome rectangle.
++    """
+     total_width = segments[-1][2] - segments[0][1]
+     ax.set_xlim(segments[0][1], segments[-1][2])
+     ax.set_ylim(0, height)
+@@ -160,6 +251,22 @@ def _draw_ideogram(
+             color="white" if i % 2 else "black",
+         )
+ 
++    # Centromere ticks + tiny p/q labels inside each chromosome (no split).
++    if arm_segments is not None:
++        chrom_ends = {e for _, _, e in segments}
++        for chrom, start, end in arm_segments:
++            if (end - start) / max(total_width, 1) < min_label_frac / 1.5:
++                continue
++            arm = chrom[-1] if chrom[-1:] in ("p", "q") else ""
++            if arm:
++                ax.text(
++                    (start + end) / 2, height * 0.5, arm,
++                    ha="center", va="center", fontsize=max(fontsize - 3, 4),
++                    color="0.25",
++                )
++            if end not in chrom_ends:  # internal centromere boundary
++                ax.axvline(end, color="0.2", linewidth=0.5, alpha=0.7)
++
+ 
+ def _order_rows_by_group(
+     adata: AnnData, groupby: Optional[str]
+@@ -259,6 +366,8 @@ def cnv_heatmap(
+     figsize: tuple[float, float] = (8.0, 4.5),
+     cmap=_CNV_CMAP,
+     standard_chromosomes_only: bool = True,
++    split_arms: bool = False,
++    genome: str = "hg38",
+     backend: str = "auto",
+     title: Optional[str] = None,
+     show: bool = True,
+@@ -293,6 +402,20 @@ def cnv_heatmap(
+         Diverging colormap. Default is a blue/white/red palette.
+     standard_chromosomes_only : bool, default True
+         Drop unplaced scaffolds / alt contigs from the plot.
++    split_arms : bool, default False
++        Split each chromosome at its centromere into separate ``p`` / ``q`` arm
++        segments (labelled e.g. ``8p`` / ``8q``), so arm-level CNAs are
++        distinguishable. Requires per-bin genomic coordinates in
++        ``adata.uns['cnv']['bin_meta']`` (written by ``ov.single.CNV``) and a
++        centromere table for ``genome``; falls back to whole-chromosome blocks
++        if either is missing.
++    genome : str, default 'hg38'
++        Genome build for centromere coordinates when ``split_arms=True``.
++        Bundled: ``'hg38'``/``'GRCh38'``, ``'hg19'``/``'GRCh37'``,
++        ``'mm10'``/``'GRCm38'`` (add more via ``_data/generate_centromeres.py``).
++        **Must match your data** — a mismatched build mis-places arm boundaries,
++        and an unknown build is silently skipped (whole chromosomes drawn). Note
++        mouse (mm10) is telocentric, so its p arm is negligible.
+     backend : {'auto', 'marsilea', 'matplotlib'}
+         ``'auto'`` picks marsilea when installed (recommended for clean
+         categorical legends), else falls back to the matplotlib renderer.
+@@ -316,14 +439,34 @@ def cnv_heatmap(
+     >>> ov.pl.cnv_heatmap(adata, groupby='cnv_prediction',
+     ...                   annotations=['cell_type'])
+     """
+-    X, chr_pos, _ = _get_cnv_data(adata)
++    X, chr_pos, uns = _get_cnv_data(adata)
+     n_cells, n_bins_total = X.shape
+-    segments, col_slice = _build_chr_segments(
++    chrom_segments, col_slice = _build_chr_segments(
+         chr_pos, n_bins_total, standard_only=standard_chromosomes_only
+     )
+     X = X[:, col_slice]
+     n_bins = X.shape[1]
+ 
++    # Optionally compute p/q arm sub-segments (centromere split) for an arm
++    # annotation strip. Column GROUPING stays at the chromosome level, so the
++    # two arms of one chromosome render contiguously (no gap) and only different
++    # chromosomes are separated — the arm boundary is shown as a thin line /
++    # colour band inside each chromosome.
++    arm_segments = None
++    if split_arms:
++        bin_meta = uns.get("bin_meta")
++        centromeres = _load_centromeres(genome)
++        if (
++            bin_meta is not None
++            and centromeres
++            and len(bin_meta) == n_bins_total
++            and "start" in getattr(bin_meta, "columns", [])
++        ):
++            bm = bin_meta.iloc[col_slice]
++            arm_segments = _split_segments_by_arm(
++                chrom_segments, bm["start"].to_numpy(), centromeres
++            )
++
+     # Annotation strip order: groupby first (so it visually anchors the row
+     # ordering), then the rest of `annotations` (any duplicate removed).
+     ann_list = _to_list(annotations)
+@@ -353,7 +496,8 @@ def cnv_heatmap(
+         return _cnv_heatmap_marsilea(
+             adata,
+             X_ord=X_ord,
+-            segments=segments,
++            chrom_segments=chrom_segments,
++            arm_segments=arm_segments,
+             row_order=row_order,
+             strips=strips,
+             max_value=max_value,
+@@ -371,7 +515,7 @@ def cnv_heatmap(
+     ideo_ax = fig.add_subplot(gs[0, 0])
+     hm_ax = fig.add_subplot(gs[1, 0], sharex=ideo_ax)
+ 
+-    _draw_ideogram(ideo_ax, segments)
++    _draw_ideogram(ideo_ax, chrom_segments, arm_segments=arm_segments)
+ 
+     norm = Normalize(vmin=-max_value, vmax=max_value)
+     hm_ax.imshow(
+@@ -383,12 +527,19 @@ def cnv_heatmap(
+         extent=(0, n_bins, n_cells, 0),
+     )
+ 
+-    # Chromosome dividers — thin grey vertical lines at each segment break.
+-    for _, _, end in segments[:-1]:
+-        hm_ax.axvline(end, color="white", linewidth=0.4, alpha=0.7)
++    # Chromosome dividers — thin white lines between different chromosomes only.
++    for _, _, end in chrom_segments[:-1]:
++        hm_ax.axvline(end, color="white", linewidth=0.6, alpha=0.8)
++    # Centromere dividers — faint dotted lines at the p/q boundary inside a
++    # chromosome (arm-split mode); the two arms stay contiguous (no gap).
++    if arm_segments is not None:
++        chrom_ends = {e for _, _, e in chrom_segments}
++        for _, _, end in arm_segments[:-1]:
++            if end not in chrom_ends:
++                hm_ax.axvline(end, color="0.45", linewidth=0.4, alpha=0.6, linestyle=(0, (1, 1)))
+ 
+     # Group dividers — horizontal black lines + left-side labels.
+-    if primary is not None and len(group_segs) > 1:
++    if groupby is not None and len(group_segs) > 1:
+         for _, _, row_end in group_segs[:-1]:
+             hm_ax.axhline(row_end, color="black", linewidth=0.8)
+         for label, row_start, row_end in group_segs:
+@@ -429,7 +580,8 @@ def _cnv_heatmap_marsilea(
+     adata: AnnData,
+     *,
+     X_ord: np.ndarray,
+-    segments: list[tuple[str, int, int]],
++    chrom_segments: list[tuple[str, int, int]],
++    arm_segments: list[tuple[str, int, int]] | None,
+     row_order: np.ndarray,
+     strips: list[str],
+     max_value: float,
+@@ -438,7 +590,13 @@ def _cnv_heatmap_marsilea(
+     title: Optional[str],
+     show: bool,
+ ):
+-    """Marsilea-backed heatmap with chromosome ideogram + multi-strip row annotations."""
++    """Marsilea-backed heatmap with chromosome ideogram + multi-strip row annotations.
++
++    Columns are grouped by CHROMOSOME (a thin separator between different
++    chromosomes, original-API style). When ``arm_segments`` is given, a p/q
++    colour band is drawn inside each chromosome so the two arms stay contiguous
++    (no inter-arm gap) while the centromere boundary remains visible.
++    """
+     import marsilea as ma
+     import marsilea.plotter as mp
+ 
+@@ -446,14 +604,12 @@ def _cnv_heatmap_marsilea(
+ 
+     n_cells, n_bins = X_ord.shape
+ 
+-    # Build a per-bin "which chromosome" array for the top strip.
++    # Per-bin chromosome (drives grouping, alternating colour strip, labels).
+     chrom_per_bin = np.empty(n_bins, dtype=object)
+-    for chrom, start, end in segments:
++    for chrom, start, end in chrom_segments:
+         chrom_per_bin[start:end] = chrom.replace("chr", "")
+-    # Stable, perceptually-uniform alternation that matches the matplotlib
+-    # ideogram: even-indexed chromosomes light grey, odd-indexed dark.
+     ideo_palette: dict[str, str] = {}
+-    for i, (chrom, _, _) in enumerate(segments):
++    for i, (chrom, _, _) in enumerate(chrom_segments):
+         ideo_palette[chrom.replace("chr", "")] = "#d8d8d8" if i % 2 == 0 else "#444444"
+ 
+     h = ma.Heatmap(
+@@ -466,15 +622,30 @@ def _cnv_heatmap_marsilea(
+         label="CN (log ratio)",
+     )
+ 
+-    # Top: chromosome ideogram as a colour strip + chunk labels for each chrom.
++    # Arm band (closest to the heatmap): p/q two-tone inside each chromosome.
++    if arm_segments is not None:
++        arm_per_bin = np.empty(n_bins, dtype=object)
++        for chrom, start, end in arm_segments:
++            arm_per_bin[start:end] = chrom[-1] if chrom[-1:] in ("p", "q") else "·"
++        h.add_top(
++            mp.Colors(arm_per_bin, palette={"p": "#c9c9c9", "q": "#7a7a7a", "·": "#ffffff"},
++                      label="arm"),
++            size=0.10,
++            pad=0.0,
++            legend=True,
++        )
++
++    # Chromosome alternating colour strip + chunk labels.
+     h.add_top(
+         mp.Colors(chrom_per_bin, palette=ideo_palette),
+-        size=0.18,
++        size=0.16,
+         pad=0.0,
+         legend=False,
+     )
+-    chunk_labels = [c.replace("chr", "") for c, _, _ in segments]
+-    h.group_cols(chrom_per_bin, order=chunk_labels)
++    chunk_labels = [c.replace("chr", "") for c, _, _ in chrom_segments]
++    # Group by chromosome with a thin separator (original-API style): arms of
++    # the same chromosome stay together; only different chromosomes are split.
++    h.group_cols(chrom_per_bin, order=chunk_labels, spacing=0.006)
+     h.add_top(
+         mp.Chunk(chunk_labels, fill_colors=None, fontsize=8, rotation=0),
+         size=0.12,
+diff --git a/omicverse/pl/_data/README.md b/omicverse/pl/_data/README.md
+new file mode 100644
+index 000000000..2b7af11c7
+--- /dev/null
++++ b/omicverse/pl/_data/README.md
+@@ -0,0 +1,29 @@
++# Vendored centromere positions
++
++`centromere_<genome>.csv` — per-chromosome centromere coordinate (1-based bp)
++used by `ov.pl.cnv_heatmap(split_arms=True)` to draw the p/q arm boundary.
++Bundled: `hg38`, `hg19`, `mm10`.
++
++A gene/bin with `start < centromere` is assigned to the **p** arm, otherwise the
++**q** arm. Standard autosomes + chrX/chrY only.
++
++## Regenerate / add a genome
++Use the bundled generator — input a genome name, it retrieves UCSC and writes
++the CSV (no manual hardcoding for human builds):
++
++```bash
++python generate_centromeres.py hg38 hg19 mm10 mm39
++```
++
++It downloads the UCSC `cytoBand` table (`goldenPath/<genome>/database/cytoBand.txt.gz`,
++falling back to `cytoBandIdeo`) and takes the boundary between the two
++`acen`-stained cytobands per chromosome (p-arm `acen` end == q-arm `acen` start).
++
++## Caveats
++- **Source**: UCSC cytoBand, fetched 2026-06-06 (hg38/hg19 acen-derived).
++- **mm10 is hardcoded** in the generator (`_HARDCODED`): mouse chromosomes are
++  telocentric/acrocentric and UCSC mm10 `cytoBand` carries **no `acen` bands**,
++  so there is effectively no p arm — centromere is set to the proximal ~3 Mb as
++  an approximation. Arm-splitting mouse data is therefore of limited value
++  (most genes fall on the q arm). Newer mouse assembly `mm39` *does* have `acen`
++  in `cytoBandIdeo` and can be generated normally.
+diff --git a/omicverse/pl/_data/centromere_hg19.csv b/omicverse/pl/_data/centromere_hg19.csv
+new file mode 100644
+index 000000000..c94c3c2a3
+--- /dev/null
++++ b/omicverse/pl/_data/centromere_hg19.csv
+@@ -0,0 +1,25 @@
++chromosome,centromere
++chr1,125000000
++chr2,93300000
++chr3,91000000
++chr4,50400000
++chr5,48400000
++chr6,61000000
++chr7,59900000
++chr8,45600000
++chr9,49000000
++chr10,40200000
++chr11,53700000
++chr12,35800000
++chr13,17900000
++chr14,17600000
++chr15,19000000
++chr16,36600000
++chr17,24000000
++chr18,17200000
++chr19,26500000
++chr20,27500000
++chr21,13200000
++chr22,14700000
++chrX,60600000
++chrY,12500000
+diff --git a/omicverse/pl/_data/centromere_hg38.csv b/omicverse/pl/_data/centromere_hg38.csv
+new file mode 100644
+index 000000000..6b485a918
+--- /dev/null
++++ b/omicverse/pl/_data/centromere_hg38.csv
+@@ -0,0 +1,25 @@
++chromosome,centromere
++chr1,123400000
++chr2,93900000
++chr3,90900000
++chr4,50000000
++chr5,48800000
++chr6,59800000
++chr7,60100000
++chr8,45200000
++chr9,43000000
++chr10,39800000
++chr11,53400000
++chr12,35500000
++chr13,17700000
++chr14,17200000
++chr15,19000000
++chr16,36800000
++chr17,25100000
++chr18,18500000
++chr19,26200000
++chr20,28100000
++chr21,12000000
++chr22,15000000
++chrX,61000000
++chrY,10400000
+diff --git a/omicverse/pl/_data/centromere_mm10.csv b/omicverse/pl/_data/centromere_mm10.csv
+new file mode 100644
+index 000000000..2cc88f029
+--- /dev/null
++++ b/omicverse/pl/_data/centromere_mm10.csv
+@@ -0,0 +1,22 @@
++chromosome,centromere
++chr1,3000000
++chr2,3000000
++chr3,3000000
++chr4,3000000
++chr5,3000000
++chr6,3000000
++chr7,3000000
++chr8,3000000
++chr9,3000000
++chr10,3000000
++chr11,3000000
++chr12,3000000
++chr13,3000000
++chr14,3000000
++chr15,3000000
++chr16,3000000
++chr17,3000000
++chr18,3000000
++chr19,3000000
++chrX,3000000
++chrY,3000000
+diff --git a/omicverse/pl/_data/generate_centromeres.py b/omicverse/pl/_data/generate_centromeres.py
+new file mode 100644
+index 000000000..ed8dd75f3
+--- /dev/null
++++ b/omicverse/pl/_data/generate_centromeres.py
+@@ -0,0 +1,104 @@
++"""Generate ``centromere_<genome>.csv`` for ``ov.pl.cnv_heatmap(split_arms=True)``.
++
++General fetch-and-derive utility (not imported at runtime — the plot code only
++reads the produced CSVs). Run manually to (re)generate or add a genome::
++
++    python generate_centromeres.py hg38 hg19 mm10 mm39
++
++For each genome it downloads the UCSC ``cytoBand`` table (falling back to
++``cytoBandIdeo``), takes the boundary between the two ``acen`` (centromere)
++cytobands per chromosome, and writes ``chromosome,centromere`` rows for the
++standard autosomes + X/Y.
++
++Genomes whose UCSC cytoBand carries **no** ``acen`` bands (telocentric mouse
++assemblies such as mm10) are covered by ``_HARDCODED`` instead — mouse
++chromosomes are acrocentric/telocentric, so the centromere sits at the proximal
++~3 Mb and there is effectively no p arm.
++"""
++from __future__ import annotations
++
++import csv
++import gzip
++import io
++import re
++import sys
++import urllib.request
++from pathlib import Path
++
++_UCSC = "http://hgdownload.cse.ucsc.edu/goldenPath/{g}/database/{f}.txt.gz"
++_STD = re.compile(r"^chr(\d+|X|Y)$")
++
++# Genomes UCSC cytoBand cannot supply an acen-derived centromere for.
++# mm10: mouse chromosomes are telocentric — centromere at the proximal end;
++# UCSC mm10 cytoBand has no acen bands. ~3 Mb pericentromeric boundary
++# (approximate; mouse has essentially no p arm). Override if you have exact
++# values.
++_HARDCODED: dict[str, dict[str, int]] = {
++    "mm10": {f"chr{c}": 3_000_000 for c in [*range(1, 20), "X", "Y"]},
++}
++
++
++def fetch_cytoband(genome: str):
++    """Return list of (chrom, start, end, name, stain); prefer a table with acen."""
++    last = None
++    for fname in ("cytoBand", "cytoBandIdeo"):
++        try:
++            raw = urllib.request.urlopen(_UCSC.format(g=genome, f=fname), timeout=60).read()
++            rows = []
++            with gzip.open(io.BytesIO(raw), "rt") as fh:
++                for line in fh:
++                    chrom, start, end, name, stain = line.rstrip("\n").split("\t")
++                    rows.append((chrom, int(start), int(end), name, stain))
++            if any(r[4] == "acen" for r in rows):
++                return rows
++            last = rows
++        except Exception as exc:  # noqa: BLE001
++            last = exc
++    return last
++
++
++def derive_centromeres(rows) -> dict[str, int]:
++    """Centromere bp per chromosome = p-arm acen end (== q-arm acen start)."""
++    by_chrom: dict[str, list] = {}
++    for chrom, start, end, name, stain in rows:
++        if stain == "acen" and _STD.match(chrom):
++            by_chrom.setdefault(chrom, []).append((start, end, name))
++    out: dict[str, int] = {}
++    for chrom, bands in by_chrom.items():
++        p_ends = [e for _s, e, n in bands if n.startswith("p")]
++        q_starts = [s for s, _e, n in bands if n.startswith("q")]
++        out[chrom] = max(p_ends) if p_ends else min(q_starts)
++    return out
++
++
++def _chrom_key(chrom: str):
++    s = chrom[3:]
++    return (0, int(s)) if s.isdigit() else (1, s)
++
++
++def generate(genome: str, out_dir: str | Path) -> Path:
++    """Fetch/derive and write centromere_<genome>.csv; return the path."""
++    if genome in _HARDCODED:
++        cen = dict(_HARDCODED[genome])
++    else:
++        rows = fetch_cytoband(genome)
++        if not isinstance(rows, list):
++            raise RuntimeError(f"could not fetch UCSC cytoBand for {genome!r}: {rows}")
++        cen = derive_centromeres(rows)
++        if not cen:
++            raise RuntimeError(
++                f"{genome!r}: UCSC cytoBand has no 'acen' bands — add it to _HARDCODED."
++            )
++    path = Path(out_dir) / f"centromere_{genome}.csv"
++    with open(path, "w", newline="") as fh:
++        writer = csv.writer(fh)
++        writer.writerow(["chromosome", "centromere"])
++        for chrom, pos in sorted(cen.items(), key=lambda kv: _chrom_key(kv[0])):
++            writer.writerow([chrom, int(pos)])
++    return path
++
++
++if __name__ == "__main__":
++    here = Path(__file__).parent
++    for g in sys.argv[1:] or ["hg38", "hg19", "mm10"]:
++        print("wrote", generate(g, here))
+diff --git a/omicverse/single/_cnv.py b/omicverse/single/_cnv.py
+index 34fd8305f..a251f1a70 100644
+--- a/omicverse/single/_cnv.py
++++ b/omicverse/single/_cnv.py
+@@ -77,10 +77,15 @@ def _check_dep(backend: str) -> None:
+         "cnv.run()",
+         "ov.pl.cnv_heatmap(adata)",
+         "",
+-        "# inferCNV — reference-anchored CN matrix (uses non-tumour cells)",
++        "# inferCNV — reference-anchored CN matrix (platform sets gene cutoff)",
+         "cnv = ov.single.CNV(adata, method='infercnv')",
+-        "cnv.run(reference_key='cell_type', reference_cat=['T cell CD4', 'Macrophage'])",
+-        "ov.pl.cnv_heatmap(adata, groupby='cnv_prediction')",
++        "cnv.run(reference_key='cell_type', reference_cat=['T cell CD4', 'Macrophage'], platform='10x')",
++        "ov.pl.cnv_heatmap(adata, groupby='cell_type', split_arms=True)  # p/q arms",
++        "",
++        "# inferCNV phase2/3 — HMM state calls + CNV regions + subclusters",
++        "cnv = ov.single.CNV(adata, method='infercnv')",
++        "cnv.run(reference_key='cell_type', reference_cat=['T cell CD4'], platform='10x', HMM=True)",
++        "ov.pl.cnv_heatmap(adata, groupby='cnv_subcluster', split_arms=True)",
+     ],
+     related=["pl.cnv_heatmap", "pl.cnv_summary", "pl.cnv_umap"],
+ )
+@@ -138,6 +143,7 @@ def run(
+         reference_key: Optional[str] = None,
+         reference_cat: Union[str, Sequence[str], None] = None,
+         exclude_chromosomes: Optional[Sequence[str]] = ("chrX", "chrY", "chrM"),
++        platform: Optional[str] = None,
+         n_jobs: int = 1,
+         verbose: bool = False,
+         **kwargs: Any,
+@@ -157,12 +163,33 @@ def run(
+             Chromosomes to drop before CNV inference. Default skips sex +
+             mitochondrial chromosomes, which carry biological signal that
+             confounds the deviation from the genome-wide diploid baseline.
++        platform : {'10x', 'smartseq2'} or None
++            Sequencing platform for ``method='infercnv'``. Sets the gene-filter
++            ``cutoff`` (minimum mean expression) the way R inferCNV recommends:
++            ``'10x'`` → ``cutoff=0.1`` (sparse UMI), ``'smartseq2'`` →
++            ``cutoff=1.0`` (full-length). **Required for inferCNV** unless you
++            pass an explicit ``cutoff=`` — otherwise a ``ValueError`` is raised,
++            because the wrong cutoff silently over-/under-filters genes (e.g.
++            the SmartSeq2 default 1.0 drops ~3/4 of bins on 10x data, giving an
++            over-smoothed heatmap). Ignored by CopyKAT.
+         n_jobs : int
+             Parallel workers (CopyKAT only).
+         verbose : bool
+             Stream progress logs from the underlying backend.
+         **kwargs
+             Forwarded to the backend (``CopykatConfig`` or ``InferCNVConfig``).
++            For ``method='infercnv'`` these reach ``InferCNVConfig`` verbatim
++            (R kwarg names preserved: ``HMM``, ``HMM_type``, ``mask_nonDE_genes``,
++            ``denoise``, ``analysis_mode``). Passing ``HMM=True`` (optionally
++            ``HMM_type='i6'|'i3'``) runs inferCNV phase 2/3 and additionally
++            writes ``obs['cnv_subcluster']``, ``obsm['X_cnv_hmm_states']``
++            (or ``'X_cnv_hmm_states_i3'``) and ``uns['cnv']['cnv_regions']``,
++            so ``ov.pl.cnv_heatmap(adata, groupby='cnv_subcluster')`` works.
++            Note: phase-3-only results (denoised matrix, Bayes posterior) are
++            NOT written back to AnnData — they stay on the returned
++            ``InferCNVResult`` (``cnv.result``). ``obs['cnv_prediction']``
++            remains NaN for inferCNV (it has no per-cell tumour/normal call;
++            threshold ``obs['cnv_score']`` yourself if you need one).
+ 
+         Returns
+         -------
+@@ -182,6 +209,7 @@ def run(
+             reference_key=reference_key,
+             reference_cat=reference_cat,
+             exclude_chromosomes=exclude_chromosomes,
++            platform=platform,
+             verbose=verbose,
+             **kwargs,
+         )
+@@ -253,6 +281,7 @@ def _run_infercnv(
+         reference_key: Optional[str],
+         reference_cat: Union[str, Sequence[str], None],
+         exclude_chromosomes: Optional[Sequence[str]],
++        platform: Optional[str],
+         verbose: bool,
+         **kwargs: Any,
+     ) -> "CNV":
+@@ -262,6 +291,33 @@ def _run_infercnv(
+         if verbose:
+             logging.getLogger("pyinfercnv").setLevel(logging.INFO)
+ 
++        # Resolve the gene-filter cutoff from `platform` (R inferCNV convention:
++        # 10x -> 0.1, SmartSeq2 -> 1.0). Require an explicit choice so the wrong
++        # default cannot silently over-/under-filter genes.
++        if "cutoff" not in kwargs:
++            if platform is None:
++                raise ValueError(
++                    "method='infercnv' requires platform='10x' or "
++                    "platform='smartseq2' (sets the gene-filter cutoff: "
++                    "10x->0.1, smartseq2->1.0), or an explicit cutoff=<float>. "
++                    "Pass one, e.g. cnv.run(..., platform='10x')."
++                )
++            _p = platform.lower().replace("-", "").replace("_", "").replace(" ", "")
++            _platform_cutoff = {
++                "10x": 0.1, "tenx": 0.1,
++                "smartseq2": 1.0, "smartseq": 1.0, "ss2": 1.0,
++            }
++            if _p not in _platform_cutoff:
++                raise ValueError(
++                    f"unknown platform {platform!r}; use '10x' or 'smartseq2', "
++                    "or pass an explicit cutoff=<float>."
++                )
++            kwargs["cutoff"] = _platform_cutoff[_p]
++        elif platform is not None:
++            raise ValueError(
++                "pass either platform= or an explicit cutoff=, not both."
++            )
++
+         # inferCNV needs chromosome / start / end in adata.var.
+         for col in ("chromosome", "start", "end"):
+             if col not in self.adata.var.columns:
+diff --git a/pyproject.toml b/pyproject.toml
+index fd1ad5f6a..6d398eaab 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -377,6 +377,9 @@ exclude = [
+   "Skill_Seekers*",
+ ]
+ 
++[tool.setuptools.package-data]
++"omicverse.pl" = ["_data/*.csv"]
++
+ [tool.pytest.ini_options]
+ asyncio_mode = "auto"
+ asyncio_default_fixture_loop_scope = "function"
+diff --git a/tests/pl/test_cnv_heatmap.py b/tests/pl/test_cnv_heatmap.py
+new file mode 100644
+index 000000000..bd4e15c65
+--- /dev/null
++++ b/tests/pl/test_cnv_heatmap.py
+@@ -0,0 +1,186 @@
++"""Tests for ov.pl.cnv_heatmap chromosome-segment tiling.
++
++Regression coverage for the bug where a non-standard scaffold/alt-contig
++interleaved between two standard chromosomes left an uncovered hole in the
++rendered range, so a chromosome past the gap rendered only partially / on one
++side. The invariant under test: the segments returned by ``_build_chr_segments``
++ALWAYS tile ``[0, width)`` of the selected columns with no holes.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++import pytest
++
++matplotlib = pytest.importorskip("matplotlib")
++matplotlib.use("Agg")
++
++_cnv = pytest.importorskip("omicverse.pl._cnv")
++_build_chr_segments = _cnv._build_chr_segments
++
++
++def _width(selector, n_bins: int) -> int:
++    """Number of columns a slice / fancy-index selector picks out of n_bins."""
++    return int(np.zeros((2, n_bins))[:, selector].shape[1])
++
++
++def _assert_tiles(segments, selector, n_bins):
++    """Segments must tile [0, width) with no holes and start at 0."""
++    width = _width(selector, n_bins)
++    assert segments, "expected non-empty segments"
++    assert segments[0][1] == 0
++    assert segments[-1][2] == width
++    assert sum(e - s for _, s, e in segments) == width
++    # contiguity: each segment starts where the previous ended
++    for (_, _, prev_end), (_, cur_start, _) in zip(segments, segments[1:]):
++        assert cur_start == prev_end
++    return width
++
++
++def test_scaffold_interleaved_between_standard_chromosomes():
++    # GL000220.1 sits between chr1 and chr2 -> must be dropped from BOTH the
++    # ideogram and the rendered columns, leaving no hole.
++    chr_pos = {"chr1": 0, "GL000220.1": 500, "chr2": 1000}
++    segments, selector = _build_chr_segments(chr_pos, 1500, standard_only=True)
++
++    assert [c for c, _, _ in segments] == ["chr1", "chr2"]
++    width = _assert_tiles(segments, selector, 1500)
++    assert width == 1000  # 500 (chr1) + 500 (chr2); scaffold's 500 dropped
++
++    # selector must pick exactly chr1[0:500] + chr2[1000:1500] — guards against
++    # a "right width, wrong columns" implementation.
++    picked = np.arange(1500)[selector]
++    np.testing.assert_array_equal(picked, np.r_[0:500, 1000:1500])
++
++    # chrom_per_bin (as the marsilea branch builds it) must be fully covered.
++    chrom_per_bin = np.empty(width, dtype=object)
++    for c, s, e in segments:
++        chrom_per_bin[s:e] = c.replace("chr", "")
++    assert None not in set(chrom_per_bin.tolist())
++
++
++def test_normal_contiguous_chromosomes_tile_full_width():
++    chr_pos = {"1": 0, "2": 300, "3": 700}
++    segments, selector = _build_chr_segments(chr_pos, 1000, standard_only=True)
++    assert [c for c, _, _ in segments] == ["1", "2", "3"]
++    width = _assert_tiles(segments, selector, 1000)
++    assert width == 1000
++
++
++def test_standard_only_false_keeps_everything():
++    chr_pos = {"chr1": 0, "GL000220.1": 500, "chr2": 1000}
++    segments, selector = _build_chr_segments(chr_pos, 1500, standard_only=False)
++    assert selector == slice(0, 1500)
++    assert [c for c, _, _ in segments] == ["chr1", "GL000220.1", "chr2"]
++    assert _width(selector, 1500) == 1500
++
++
++def test_trailing_scaffolds_dropped():
++    # Common real case: scaffolds come last -> still tiles with no hole.
++    chr_pos = {"chr1": 0, "chr2": 400, "KI270728.1": 900}
++    segments, selector = _build_chr_segments(chr_pos, 1000, standard_only=True)
++    assert [c for c, _, _ in segments] == ["chr1", "chr2"]
++    width = _assert_tiles(segments, selector, 1000)
++    assert width == 900
++
++
++def test_all_standard_returns_view_slice():
++    # Nothing dropped -> selector is a slice (a view), not a fancy index (copy).
++    chr_pos = {"chr1": 0, "chr2": 400, "chr3": 700}
++    _, selector = _build_chr_segments(chr_pos, 1000, standard_only=True)
++    assert selector == slice(0, 1000)
++
++
++def test_load_centromeres_bundled():
++    cen38 = _cnv._load_centromeres("hg38")
++    cen19 = _cnv._load_centromeres("hg19")
++    assert cen38 and cen19
++    # chr8 centromere is ~45 Mb in both builds (sanity, from UCSC cytoBand)
++    assert 40_000_000 < cen38["chr8"] < 50_000_000
++    assert _cnv._load_centromeres("nonexistent_build") == {}
++
++
++def test_split_segments_by_arm_splits_and_tiles():
++    cen = _cnv._load_centromeres("hg38")
++    # one chr8 segment over rendered cols [0,200), bins uniformly spanning 0..90Mb
++    bin_starts = np.linspace(0, 90_000_000, 200)
++    out = _cnv._split_segments_by_arm([("chr8", 0, 200)], bin_starts, cen)
++    k = int((bin_starts < cen["chr8"]).sum())
++    assert out == [("chr8p", 0, k), ("chr8q", k, 200)]
++    # tiling preserved
++    assert out[0][1] == 0 and out[-1][2] == 200
++    assert sum(e - s for _, s, e in out) == 200
++
++
++def test_split_segments_by_arm_q_only_chromosome():
++    cen = _cnv._load_centromeres("hg38")
++    # all bins past the centromere -> single q-arm segment (acrocentric-like)
++    bin_starts = np.linspace(cen["chr14"] + 1, cen["chr14"] + 10_000_000, 50)
++    out = _cnv._split_segments_by_arm([("chr14", 0, 50)], bin_starts, cen)
++    assert out == [("chr14q", 0, 50)]
++
++
++def test_split_segments_by_arm_unknown_chrom_passthrough():
++    out = _cnv._split_segments_by_arm([("scaffoldX", 0, 10)], np.arange(10), {"chr1": 5})
++    assert out == [("scaffoldX", 0, 10)]
++
++
++def test_cnv_heatmap_split_arms_renders():
++    ad = pytest.importorskip("anndata")
++    matplotlib = pytest.importorskip("matplotlib")
++    matplotlib.use("Agg")
++    cnv_heatmap = _cnv.cnv_heatmap
++
++    # two chromosomes, 200 bins each; bin_meta gives genomic positions so the
++    # centromere split can land inside each chromosome.
++    n_cells = 10
++    per = 200
++    starts1 = np.linspace(0, 145_000_000, per)   # chr1 spans the centromere
++    starts8 = np.linspace(0, 145_000_000, per)   # chr8 spans the centromere
++    bin_meta = pd.DataFrame(
++        {
++            "chromosome": ["chr1"] * per + ["chr8"] * per,
++            "start": np.r_[starts1, starts8].astype(int),
++            "end": np.r_[starts1, starts8].astype(int) + 1,
++        }
++    )
++    X = np.zeros((n_cells, 2 * per), dtype="float32")
++    adata = ad.AnnData(X=np.zeros((n_cells, 5), dtype="float32"))
++    adata.obsm["X_cnv"] = X
++    adata.uns["cnv"] = {
++        "chr_pos": {"chr1": 0, "chr8": per},
++        "bin_meta": bin_meta,
++        "method": "infercnv",
++    }
++    fig, axes = cnv_heatmap(adata, backend="matplotlib", show=False,
++                            split_arms=True, genome="hg38")
++    assert set(axes) >= {"heatmap", "ideogram"}
++    # without arm split there would be 2 segments; with it, 4 (1p,1q,8p,8q)
++    fig2, _ = cnv_heatmap(adata, backend="matplotlib", show=False, split_arms=False)
++    assert fig is not None and fig2 is not None
++
++
++def test_matplotlib_backend_with_groupby_renders():
++    # Regression for the `primary`->`groupby` NameError + scaffold tiling in the
++    # real render path. Skips cleanly if heavy deps are unavailable.
++    ad = pytest.importorskip("anndata")
++    matplotlib = pytest.importorskip("matplotlib")
++    matplotlib.use("Agg")
++    cnv_heatmap = _cnv.cnv_heatmap
++
++    n_cells, n_bins = 12, 30
++    X = np.zeros((n_cells, n_bins), dtype="float32")
++    obs = pd.DataFrame(
++        {"grp": pd.Categorical(["A"] * 6 + ["B"] * 6)},
++        index=[f"c{i}" for i in range(n_cells)],
++    )
++    adata = ad.AnnData(X=np.zeros((n_cells, 5), dtype="float32"), obs=obs)
++    adata.obsm["X_cnv"] = X
++    # scaffold interleaved between chr1 and chr2 exercises the tiling fix too
++    adata.uns["cnv"] = {
++        "chr_pos": {"chr1": 0, "GL000220.1": 10, "chr2": 20},
++        "method": "infercnv",
++    }
++
++    fig, axes = cnv_heatmap(adata, groupby="grp", backend="matplotlib", show=False)
++    assert set(axes) >= {"heatmap", "ideogram"}
+diff --git a/tests/single/test_cnv_platform.py b/tests/single/test_cnv_platform.py
+new file mode 100644
+index 000000000..45ce5aa41
+--- /dev/null
++++ b/tests/single/test_cnv_platform.py
+@@ -0,0 +1,51 @@
++"""ov.single.CNV(method='infercnv') platform / cutoff guard.
++
++The gene-filter cutoff is platform-dependent (R inferCNV: 10x->0.1,
++SmartSeq2->1.0). The wrong default silently over-/under-filters genes, so
++``run()`` requires an explicit ``platform`` or ``cutoff``. These guards fire
++before any heavy computation.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++import pytest
++
++pytest.importorskip("pyinfercnv")
++ad = pytest.importorskip("anndata")
++ov = pytest.importorskip("omicverse")
++
++
++def _tiny_adata():
++    rng = np.random.RandomState(0)
++    X = rng.poisson(1.0, size=(20, 12)).astype("float32")
++    var = pd.DataFrame(
++        {"chromosome": ["chr1"] * 12, "start": range(12), "end": range(1, 13)},
++        index=[f"g{i}" for i in range(12)],
++    )
++    obs = pd.DataFrame(
++        {"cell_type": ["Macrophage"] * 10 + ["Tumor"] * 10},
++        index=[f"c{i}" for i in range(20)],
++    )
++    return ad.AnnData(X=X, obs=obs, var=var)
++
++
++def test_infercnv_requires_platform_or_cutoff():
++    cnv = ov.single.CNV(_tiny_adata(), method="infercnv")
++    with pytest.raises(ValueError, match="platform"):
++        cnv.run(reference_key="cell_type", reference_cat=["Macrophage"])
++
++
++def test_infercnv_rejects_unknown_platform():
++    cnv = ov.single.CNV(_tiny_adata(), method="infercnv")
++    with pytest.raises(ValueError, match="unknown platform"):
++        cnv.run(reference_key="cell_type", reference_cat=["Macrophage"], platform="nanopore")
++
++
++def test_infercnv_rejects_platform_and_cutoff_together():
++    cnv = ov.single.CNV(_tiny_adata(), method="infercnv")
++    with pytest.raises(ValueError, match="not both"):
++        cnv.run(
++            reference_key="cell_type", reference_cat=["Macrophage"],
++            platform="10x", cutoff=0.1,
++        )

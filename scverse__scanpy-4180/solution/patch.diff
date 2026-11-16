@@ -1,0 +1,310 @@
+diff --git a/benchmarks/asv.conf.json b/benchmarks/asv.conf.json
+index d19b822178..777d2bb980 100644
+--- a/benchmarks/asv.conf.json
++++ b/benchmarks/asv.conf.json
+@@ -58,7 +58,7 @@
+ 
+     // The list of conda channel names to be searched for benchmark
+     // dependency packages in the specified order
+-    "conda_channels": ["conda-forge", "defaults"],
++    "conda_channels": ["conda-forge"],
+ 
+     // The matrix of dependencies to test.  Each key is the name of a
+     // package (in PyPI) and the values are version numbers.  An empty
+@@ -84,6 +84,7 @@
+         "pooch": [""],
+         "scikit-image": [""], // https://github.com/conda-forge/scikit-misc-feedstock/pull/29
+         // "scikit-misc": [""],
++        "dask": [""],
+     },
+ 
+     // Combinations of libraries/python versions can be excluded/included
+diff --git a/benchmarks/benchmarks/preprocessing_counts.py b/benchmarks/benchmarks/preprocessing_counts.py
+index f8edb15045..a74cf20e50 100644
+--- a/benchmarks/benchmarks/preprocessing_counts.py
++++ b/benchmarks/benchmarks/preprocessing_counts.py
+@@ -9,6 +9,7 @@
+ from typing import TYPE_CHECKING
+ 
+ import anndata as ad
++import zarr
+ 
+ import scanpy as sc
+ from scanpy._utils import get_literal_vals
+@@ -114,22 +115,42 @@ def peakmem_log1p(self, *_) -> None:
+ 
+ 
+ class Agg:  # noqa: D101
+-    params: tuple[list[AggType], list[bool]] = (
++    params: tuple[list[AggType], list[bool], list[bool]] = (
+         list(get_literal_vals(AggType)),
+         [True, False],
++        [True, False],
+     )
+-    param_names = ("agg_name", "use_csc")
++    param_names = ("agg_name", "use_csc", "use_dask")
+ 
+     def setup_cache(self) -> None:
+         """Without this caching, asv was running several processes which meant the data was repeatedly downloaded."""
+         adata, _ = get_dataset("lung93k")
+-        adata.write_h5ad("lung93k.h5ad")
+-
+-    def setup(self, agg_name: AggType, use_csc: bool) -> None:  # noqa: FBT001
+-        self.adata = ad.read_h5ad("lung93k.h5ad")
+-        if use_csc:
+-            self.adata.layers["counts"] = self.adata.layers["counts"].tocsc()
+-        self.agg_name = agg_name
++        adata.layers["counts_csc"] = adata.layers["counts"].tocsc()
++        adata.write_zarr("lung93k.zarr")
++
++    def setup(self, agg_name: AggType, use_csc: bool, use_dask: bool) -> None:  # noqa: FBT001
++        counts_src_key = "counts_csc" if use_csc else "counts"
++        if use_dask:
++            if agg_name == "median":
++                # Skip this one: https://asv.readthedocs.io/en/stable/writing_benchmarks.html#setup-and-teardown-functions
++                raise NotImplementedError()
++            z = zarr.open("lung93k.zarr")
++            self.adata = ad.AnnData(
++                obs=ad.io.read_elem(z["obs"]),
++                var=ad.io.read_elem(z["var"]),
++                layers={
++                    "counts": ad.experimental.read_elem_lazy(
++                        z["layers"][counts_src_key]
++                    )
++                },
++                X=ad.experimental.read_elem_lazy(z["X"]),
++            )
++        else:
++            self.adata = ad.read_zarr("lung93k.zarr")
++            if counts_src_key != "counts":
++                self.adata.layers["counts"] = self.adata.layers[counts_src_key]
++                del self.adata.layers[counts_src_key]
++        self.agg_name: AggType = agg_name
+ 
+     def time_agg(self, *_) -> None:
+         sc.get.aggregate(
+diff --git a/docs/release-notes/4143.perf.md b/docs/release-notes/4143.perf.md
+new file mode 100644
+index 0000000000..e5644ca038
+--- /dev/null
++++ b/docs/release-notes/4143.perf.md
+@@ -0,0 +1,3 @@
++Use [Chan's mean-var][] algorithm for acceleration of dask-backed {func}`scanpy.get.aggregate` {smaller}`I Gold`
++
++[Chan's mean-var]: https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
+diff --git a/src/scanpy/get/_aggregated.py b/src/scanpy/get/_aggregated.py
+index a21ec7f806..03dfa9c0f7 100644
+--- a/src/scanpy/get/_aggregated.py
++++ b/src/scanpy/get/_aggregated.py
+@@ -3,10 +3,11 @@
+ from functools import partial, singledispatch
+ from typing import TYPE_CHECKING, Literal, TypedDict, get_args
+ 
++import numba
+ import numpy as np
+ import pandas as pd
+ from anndata import AnnData
+-from fast_array_utils.stats._power import power as fau_power  # TODO: upstream
++from fast_array_utils.numba import njit
+ from scipy import sparse
+ from sklearn.utils.sparsefuncs import csc_median_axis_0
+ 
+@@ -147,7 +148,7 @@ def mean_var(self, dof: int = 1) -> tuple[np.ndarray, np.ndarray]:
+                 mean_var_csr if isinstance(self.data, CSRBase) else mean_var_csc
+             )(self.indicator_matrix, self.data)
+         if dof != 0:
+-            var_ *= (group_counts / (group_counts - dof))[:, np.newaxis]
++            var_ *= (group_counts / np.maximum(group_counts - dof, 1))[:, np.newaxis]
+         return mean_, var_
+ 
+     def median(self) -> Array:
+@@ -365,16 +366,149 @@ def aggregate_dask_mean_var(
+     mask: NDArray[np.bool] | None = None,
+     dof: int = 1,
+ ) -> MeanVarDict:
+-    mean = aggregate_dask(data, by, "mean", mask=mask, dof=dof)["mean"]
+-    sq_mean = aggregate_dask(fau_power(data, 2), by, "mean", mask=mask, dof=dof)["mean"]
+-    # TODO: If we don't compute here, the results are not deterministic under the process cluster for sparse.
+-    if isinstance(data._meta, CSRBase):
+-        sq_mean = sq_mean.compute()
+-    var = sq_mean - fau_power(mean, 2)
+-    if dof != 0:
+-        group_counts = np.bincount(by.codes)
+-        var *= (group_counts / (group_counts - dof))[:, np.newaxis]
+-    return MeanVarDict(mean=mean, var=var)
++    """Compute group-wise mean and variance for a dask array.
++
++    Per chunk we compute ``(count, mean, M2)`` (where ``M2 = sum((x - mean)**2)``),
++    then combine across chunks with the pairwise parallel algorithm from
++    Chan et al. (https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm)
++    so the across-chunk reduction avoids the catastrophic cancellation of
++    ``E[X**2] - E[X]**2``.
++    """
++    import dask.array as da
++
++    n_categories = len(by.categories)
++    n_features = data.shape[1]
++    chunked_axis = 0 if isinstance(data._meta, CSRBase | np.ndarray) else 1
++
++    if chunked_axis == 1:
++        # Each block already sees every observation, so mean/var per chunk is final.
++        def per_block_col(chunk: Array) -> NDArray[np.float64]:
++            mean_, var_ = Aggregate(groupby=by, data=chunk, mask=mask).mean_var(dof=dof)
++            return np.concatenate([mean_, var_], axis=0)
++
++        combined = data.map_blocks(
++            per_block_col,
++            chunks=((2 * n_categories,), data.chunks[1]),
++            meta=np.array([], dtype=np.float64),
++        )
++        return MeanVarDict(mean=combined[:n_categories], var=combined[n_categories:])
++
++    n_blocks = data.numblocks[0]
++
++    def per_block_row(
++        chunk: Array, block_info: dict | None = None
++    ) -> NDArray[np.float64]:
++        row_subset = slice(*block_info[0]["array-location"][0])
++        by_sub = by[row_subset]
++        mask_sub = mask[row_subset] if mask is not None else None
++        return _block_moments(chunk, by_sub, mask=mask_sub, n_categories=n_categories)[
++            None
++        ]
++
++    per_block_stats = data.map_blocks(
++        per_block_row,
++        chunks=((1,) * n_blocks, (3,), (n_categories,), (n_features,)),
++        new_axis=(1, 2),
++        meta=np.array([], dtype=np.float64),
++    )
++
++    combined = da.reduction(
++        per_block_stats,
++        chunk=lambda x, axis=None, keepdims=False: x,
++        aggregate=_chan_reduce_axis_0,
++        axis=0,
++        keepdims=False,
++        concatenate=True,
++        dtype=np.float64,
++        meta=np.array([], dtype=np.float64),
++    )
++    counts = combined[0]
++    mean_ = combined[1]
++    m2 = combined[2]
++    denom = counts - dof if dof > 0 else counts
++    return MeanVarDict(mean=mean_, var=m2 / denom)
++
++
++def _block_moments(
++    data: np.ndarray | CSBase,
++    by: pd.Categorical,
++    *,
++    mask: NDArray[np.bool] | None,
++    n_categories: int,
++) -> NDArray[np.float64]:
++    """Per-chunk ``(count, mean, M2)`` array of shape ``(3, n_categories, n_features)``.
++
++    Groups with no observations in the chunk get zeros for mean and M2 so
++    they combine cleanly under ``_chan_combine``.
++    """
++    codes = by.codes
++    valid = codes >= 0
++    if mask is not None:
++        valid = valid & mask
++    counts = np.bincount(codes[valid], minlength=n_categories).astype(np.float64)
++
++    out = np.zeros((3, n_categories, data.shape[1]), dtype=np.float64)
++    out[0] = counts[:, None]
++    nonempty = counts > 0
++    if not nonempty.any():
++        return out
++
++    agg = Aggregate(groupby=by, data=data, mask=mask)
++    mean_, var_ = agg.mean_var()
++    # M2 is the variance times the counts directly minus correction.
++    m2 = var_ * (counts - 1)[:, np.newaxis]
++    out[1, :] = mean_
++    out[2, :] = m2
++    return out
++
++
++@numba.njit(inline="always")  # noqa: TID251
++def _chan_combine(  # noqa: PLR0917
++    n_a: float, mean_a: float, m2_a: float, n_b: float, mean_b: float, m2_b: float
++) -> tuple[float, float, float]:
++    """Combine two ``(count, mean, M2)`` groups pairwise."""
++    if n_a == 0.0:
++        return n_b, mean_b, m2_b
++    if n_b == 0.0:
++        return n_a, mean_a, m2_a
++    n = n_a + n_b
++    delta = mean_b - mean_a
++    return (
++        n,
++        (n_a * mean_a + n_b * mean_b) / n,
++        m2_a + m2_b + delta * delta * n_a * n_b / n,
++    )
++
++
++@njit
++def _chan_combine_blocks(
++    a: NDArray[np.float64], b: NDArray[np.float64]
++) -> NDArray[np.float64]:
++    """Combine two ``(3, K, F)`` ``(count, mean, M2)`` stat blocks pairwise."""
++    out = np.empty_like(a)
++    for i in numba.prange(a.shape[1]):
++        for j in range(a.shape[2]):
++            out[0, i, j], out[1, i, j], out[2, i, j] = _chan_combine(
++                a[0, i, j],
++                a[1, i, j],
++                a[2, i, j],
++                b[0, i, j],
++                b[1, i, j],
++                b[2, i, j],
++            )
++    return out
++
++
++def _chan_reduce_axis_0(
++    stats: NDArray[np.float64],
++    axis: int | None,
++    keepdims: bool,  # noqa: FBT001
++) -> NDArray[np.float64]:
++    """Aggregate per-block stats along axis 0 with the parallel variance algorithm."""
++    result = stats[0]
++    for i in range(1, stats.shape[0]):
++        result = _chan_combine_blocks(result, stats[i])
++    return result[None] if keepdims else result
+ 
+ 
+ @_aggregate.register(DaskArray)
+diff --git a/tests/test_aggregated.py b/tests/test_aggregated.py
+index 9d5db64e08..6b3ebf409f 100644
+--- a/tests/test_aggregated.py
++++ b/tests/test_aggregated.py
+@@ -16,7 +16,6 @@
+ from testing.scanpy._helpers.data import pbmc3k_processed
+ from testing.scanpy._pytest.marks import needs
+ from testing.scanpy._pytest.params import ARRAY_TYPES as ARRAY_TYPES_ALL
+-from testing.scanpy._pytest.params import ARRAY_TYPES_MEM
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable
+@@ -547,13 +546,15 @@ def test_nan() -> None:
+     assert adata_agg.obs["n_obs_aggregated"].tolist() == [1, 2, 1]
+ 
+ 
+-@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++@pytest.mark.parametrize("array_type", VALID_ARRAY_TYPES)
+ def test_var_no_catastrophic_cancellation(array_type) -> None:
+     # Values of the form `offset + tiny_noise` make the textbook two-pass
+     # formula sum(x**2)/n - (sum(x)/n)**2 lose ~all precision: both terms are
+     # ~n*offset**2 ≈ 1e19 in float64 (precision ~1e3) but their difference is
+     # the variance ~1e-3, far below the rounding noise. Welford's online
+-    # algorithm avoids the subtraction entirely.
++    # algorithm and Chan's parallel combine (per chunk in dask, and for the
++    # zero-block merge in sparse paths) avoid the subtraction entirely.
++
+     n_per_group, n_features = 1000, 4
+     offset, std = 1e8, 1e-3
+     groups = ["a", "b"]

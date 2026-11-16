@@ -1,0 +1,212 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 48d37fd8..887736b7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -70,6 +70,7 @@ Initial release of nf-core/scdownstream, created with the [nf-core](https://nf-c
+ 
+ ### `Fixed`
+ 
++- Reject colliding and unsafe subset filenames before writing split AnnData outputs, by @nictru and GPT-6.1 Sol [[#360](https://github.com/nf-core/scdownstream/pull/360)].
+ - Retain the trained SCVI model across SOLO batch predictions, by @nictru and GPT-6.1 Sol [[#370](https://github.com/nf-core/scdownstream/pull/370)].
+ - Preserve full integration and subset identities in QC report UMAP sections, by @nictru and GPT-6.1 Sol [[#369](https://github.com/nf-core/scdownstream/pull/369)].
+ - Include full grouping identity in every CyteType annotation column to preserve overlapping global and subset annotations, by @nictru and GPT-6.1 Sol [[#367](https://github.com/nf-core/scdownstream/pull/367)].
+diff --git a/modules/local/adata/splitcol/templates/split_column.py b/modules/local/adata/splitcol/templates/split_column.py
+index e7eadf6c..6081ebe8 100644
+--- a/modules/local/adata/splitcol/templates/split_column.py
++++ b/modules/local/adata/splitcol/templates/split_column.py
+@@ -2,6 +2,8 @@
+ 
+ import importlib.metadata
+ import platform
++import unicodedata
++from pathlib import Path
+ 
+ import anndata as ad
+ import yaml
+@@ -11,10 +13,28 @@
+ 
+ assert column in adata.obs.columns, f"Column {column} not found in adata."
+ 
++names = {}
+ for value in adata.obs[column].unique():
++    if not isinstance(value, str):
++        raise ValueError(f"{value!r}: subset labels must be non-missing strings")
++    name = value.replace(" ", "_")
++    if (
++        name in ("", ".", "..")
++        or "/" in name
++        or chr(92) in name  # Backslash
++        or any(unicodedata.category(char) == "Cc" for char in name)  # Control characters, e.g. tabs, newlines and NUL
++    ):
++        raise ValueError(f"{value!r} -> {name!r}: unsafe subset basename")
++    if name in names:
++        raise ValueError(f"{[names[name], value]!r} -> {name!r}: subset basename collision")
++    destination = Path(f"{name}.h5ad")
++    if destination.exists() or destination.is_symlink():
++        raise ValueError(f"{value!r} -> {destination.name!r}: subset output path already exists")
++    names[name] = value
++
++for name, value in names.items():
+     adata_subset = adata[adata.obs[column] == value].copy()
+-    value = value.replace(" ", "_")
+-    adata_subset.write_h5ad(f"{value}.h5ad", compression="gzip")
++    adata_subset.write_h5ad(f"{name}.h5ad", compression="gzip")
+ 
+ # Versions
+ 
+diff --git a/modules/local/adata/splitcol/tests/labels.nf.test b/modules/local/adata/splitcol/tests/labels.nf.test
+new file mode 100644
+index 00000000..13ab9101
+--- /dev/null
++++ b/modules/local/adata/splitcol/tests/labels.nf.test
+@@ -0,0 +1,150 @@
++nextflow_process {
++
++    name "Test ADATA_SPLITCOL label validation"
++    script "modules/local/adata/splitcol/main.nf"
++    process "ADATA_SPLITCOL"
++
++    tag "modules"
++    tag "modules_local"
++
++    setup {
++        run("ADATA_EXTEND") {
++            script "modules/local/adata/extend/main.nf"
++            process {
++                """
++                rows = (0..<128).collect { i ->
++                    def cell = String.format('cell_%03d', i)
++                    def safe = ['A B', 'a_b', 'T:CD4+', 'B-cell.(naive)'][i % 4]
++                    def collision = i == 0 ? 'safe' : (i % 2 ? 'A B' : 'A_B')
++                    def unsafe = i == 0 ? 'safe' : 'bad/name'
++                    def traversal = i == 0 ? 'safe' : '..'
++                    def staged_input = i % 2 ? 'labels' : 'safe'
++                    "\${cell},\${safe},\${collision},\${unsafe},\${traversal},\${staged_input}"
++                }
++                input[0] = channel.of('cell,safe,collision,path,traversal,staged_input\\n' + rows.join('\\n') + '\\n')
++                    .collectFile(name: 'labels.csv')
++                    .map { obs -> [
++                        [id: 'labels'],
++                        file(params.pipelines_testdata_base_path + '/anndata-variations/counts_in_X.h5ad', checkIfExists: true),
++                        [obs], [], [], [], [], []
++                    ] }
++                """
++            }
++        }
++    }
++
++    test("Should preserve safe punctuation, case and space normalisation") {
++        when {
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad
++                input[1] = 'safe'
++                """
++            }
++        }
++        then {
++            assert process.success
++            def outputs = process.out.h5ad[0][1]
++            assert outputs.collect { path(it).fileName.toString() }.sort() == ['A_B.h5ad', 'B-cell.(naive).h5ad', 'T:CD4+.h5ad', 'a_b.h5ad'].sort()
++            def originalLabels = ['A_B.h5ad': 'A B', 'a_b.h5ad': 'a_b', 'T:CD4+.h5ad': 'T:CD4+', 'B-cell.(naive).h5ad': 'B-cell.(naive)']
++            outputs.each { output ->
++                def adata = anndata(output)
++                assert adata.n_obs == 32
++                assert adata.obs.get('safe').data.every { it == originalLabels[path(output).fileName.toString()] }
++            }
++        }
++    }
++
++    test("Should reject normalised collisions before writing any subsets") {
++        tag "subset_collision"
++
++        when {
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad
++                input[1] = 'collision'
++                """
++            }
++        }
++        then {
++            assert process.failed
++            assert process.errorReport.contains('subset basename collision')
++            assert process.errorReport.contains("['A B', 'A_B'] -> 'A_B'")
++            def work = process.errorReport =~ /Work dir:\s+([^\n]+)/
++            assert work.find()
++            assert new File(work.group(1).trim()).listFiles().findAll {
++                it.name.endsWith('.h5ad') && !java.nio.file.Files.isSymbolicLink(it.toPath())
++            }.isEmpty()
++        }
++    }
++
++    test("Should reject directory separators before writing any subsets") {
++        when {
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad
++                input[1] = 'path'
++                """
++            }
++        }
++        then {
++            assert process.failed
++            assert process.errorReport.contains("'bad/name' -> 'bad/name': unsafe subset basename")
++            def work = process.errorReport =~ /Work dir:\s+([^\n]+)/
++            assert work.find()
++            assert new File(work.group(1).trim()).listFiles().findAll {
++                it.name.endsWith('.h5ad') && !java.nio.file.Files.isSymbolicLink(it.toPath())
++            }.isEmpty()
++        }
++    }
++
++    test("Should reject a staged input destination before writing subsets or changing the source") {
++        tag "subset_existing_destination"
++
++        when {
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad
++                input[1] = 'staged_input'
++                """
++            }
++        }
++        then {
++            assert process.failed
++            assert process.errorReport.contains("'labels' -> 'labels.h5ad': subset output path already exists")
++            def work = process.errorReport =~ /Work dir:\s+([^\n]+)/
++            assert work.find()
++            def workdir = new File(work.group(1).trim())
++            assert workdir.listFiles().findAll {
++                it.name.endsWith('.h5ad') && !java.nio.file.Files.isSymbolicLink(it.toPath())
++            }.isEmpty()
++            def input = new File(workdir, 'labels.h5ad').toPath()
++            assert java.nio.file.Files.isSymbolicLink(input)
++            def source = anndata(input.toRealPath().toString())
++            assert source.n_obs == 128
++            assert source.n_vars == 128
++            assert source.obs.index.values == (0..<128).collect { String.format('cell_%03d', it) }
++            assert source.obs.get('staged_input').data == (0..<128).collect { it % 2 ? 'labels' : 'safe' }
++        }
++    }
++
++    test("Should reject traversal basenames before writing any subsets") {
++        when {
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad
++                input[1] = 'traversal'
++                """
++            }
++        }
++        then {
++            assert process.failed
++            assert process.errorReport.contains("'..' -> '..': unsafe subset basename")
++            def work = process.errorReport =~ /Work dir:\s+([^\n]+)/
++            assert work.find()
++            assert new File(work.group(1).trim()).listFiles().findAll {
++                it.name.endsWith('.h5ad') && !java.nio.file.Files.isSymbolicLink(it.toPath())
++            }.isEmpty()
++        }
++    }
++}

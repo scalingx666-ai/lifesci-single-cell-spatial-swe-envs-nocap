@@ -1,0 +1,2819 @@
+diff --git a/omicverse/io/spatial/__init__.py b/omicverse/io/spatial/__init__.py
+index 678e96852..248e5638c 100644
+--- a/omicverse/io/spatial/__init__.py
++++ b/omicverse/io/spatial/__init__.py
+@@ -2,6 +2,7 @@
+ 
+ from ._atera import read_atera
+ from ._nanostring import read_nanostring
++from ._stereoseq import bin_stereoseq, read_stereoseq
+ from ._visium import read_visium
+ from ._visium_hd import read_visium_hd, read_visium_hd_bin, read_visium_hd_seg, write_visium_hd_cellseg
+ from ._xenium import read_xenium
+@@ -15,4 +16,6 @@
+     "read_nanostring",
+     "read_xenium",
+     "read_atera",
++    "read_stereoseq",
++    "bin_stereoseq",
+ ]
+diff --git a/omicverse/io/spatial/_stereoseq.py b/omicverse/io/spatial/_stereoseq.py
+new file mode 100644
+index 000000000..40cd1dccd
+--- /dev/null
++++ b/omicverse/io/spatial/_stereoseq.py
+@@ -0,0 +1,276 @@
++"""BGI Stereo-seq reader for OmicVerse spatial I/O.
++
++Stereo-seq writes a GEM file: one row per (gene, x, y) with a count, at a spot
++pitch of 500 nm. That resolution is below one cell, so nothing downstream is done
++at native resolution — the first real decision in every Stereo-seq analysis is the
++bin size, and it changes every result after it. ``bin_size=50`` (25 x 25 um) is the
++common default and roughly cell-scale; smaller bins are sparser and noisier, larger
++ones blur cell types together.
++
++This reader does the aggregation explicitly and records what it did in
++``adata.uns['stereoseq']``, so a downstream figure can always be traced back to the
++bin it was drawn at.
++
++Issue #760 asked for Stereo-seq support; before this, the BGI ecosystem was
++reachable only by going through Stereopy first.
++"""
++from __future__ import annotations
++
++import gzip
++from pathlib import Path
++from typing import Optional, Union
++
++import numpy as np
++import pandas as pd
++from anndata import AnnData
++from scipy import sparse
++
++from ..._registry import register_function
++
++__all__ = ["read_stereoseq", "bin_stereoseq"]
++
++
++def _open(path: Path):
++    """GEM files ship gzipped as often as not."""
++    if str(path).endswith(".gz"):
++        return gzip.open(path, "rt")
++    return open(path, "rt")
++
++
++def _read_header(path: Path) -> dict:
++    """The ``#key=value`` preamble a GEM carries, if it has one."""
++    meta: dict[str, str] = {}
++    with _open(path) as handle:
++        for line in handle:
++            if not line.startswith("#"):
++                break
++            if "=" in line:
++                key, _, value = line[1:].strip().partition("=")
++                meta[key.strip()] = value.strip()
++    return meta
++
++
++@register_function(
++    aliases=["Stereo-seq读取", "read stereoseq", "读取GEM", "时空组学读取", "BGI空间转录组"],
++    category="io",
++    description="Read a BGI Stereo-seq GEM file and aggregate it into square bins",
++    requires={},
++    produces={'obsm': ['spatial'], 'uns': ['stereoseq']},
++    auto_fix='none',
++    examples=[
++        "adata = ov.io.spatial.read_stereoseq('sample.gem.gz', bin_size=50)",
++        "adata = ov.io.spatial.read_stereoseq('sample.gem.gz', bin_size=20, min_counts=10)",
++    ],
++)
++def read_stereoseq(
++    path: Union[str, Path],
++    *,
++    bin_size: int = 50,
++    min_counts: int = 0,
++    min_genes: int = 0,
++    label_column: Optional[str] = None,
++    chunksize: Optional[int] = None,
++    dtype: str = "float32",
++) -> AnnData:
++    """Read a Stereo-seq GEM file into an AnnData at a chosen bin size.
++
++    A GEM is a long table — ``geneID``, ``x``, ``y``, ``MIDCount`` — recorded on a
++    500 nm grid. Bins of ``bin_size`` spots square are summed to make the
++    observations, so ``bin_size=50`` gives 25 x 25 um bins.
++
++    That choice is not cosmetic. It sets what an "observation" is for everything
++    downstream: clustering, deconvolution, the niche statistics. Bins much smaller
++    than a cell give sparse, noisy profiles; bins much larger mix cell types
++    together and no deconvolution will fully undo that. The chosen size is recorded
++    in ``adata.uns['stereoseq']['bin_size']``.
++
++    If the file carries a cell-segmentation column, pass its name as
++    ``label_column`` and the reader aggregates by cell instead of by bin, which is
++    the better route when segmentation is available.
++
++    Arguments:
++        path: The ``.gem`` or ``.gem.gz`` file.
++        bin_size: Side of the square bin, in native 500 nm spots. Default 50, i.e.
++            25 x 25 um. Ignored when ``label_column`` is given.
++        min_counts: Drop bins with fewer total counts than this. Default 0.
++        min_genes: Drop bins expressing fewer genes than this. Default 0.
++        label_column: Column naming a pre-computed cell label. When given, bins are
++            replaced by those cells and ``bin_size`` is not used.
++        chunksize: Read the table in chunks of this many rows, for files that do
++            not fit in memory. Default reads in one pass.
++        dtype: Data type of the count matrix. Default ``'float32'``.
++
++    Returns:
++        AnnData with counts in ``.X``, bin centres in ``.obsm['spatial']``, and the
++        bin geometry in ``.uns['stereoseq']``.
++
++    Examples:
++        >>> import omicverse as ov
++        >>> adata = ov.io.spatial.read_stereoseq('E14-16h.gem.gz', bin_size=50)
++        >>> adata.uns['stereoseq']['bin_size']
++        50
++    """
++    path = Path(path)
++    if not path.exists():
++        raise FileNotFoundError(f"No Stereo-seq GEM at {path}")
++    if bin_size < 1:
++        raise ValueError("bin_size must be >= 1.")
++
++    header = _read_header(path)
++    n_skip = len(header) if header else 0
++
++    frames = pd.read_csv(path, sep="\t", comment="#", header=0,
++                         chunksize=chunksize) if chunksize else [
++        pd.read_csv(path, sep="\t", comment="#", header=0)
++    ]
++
++    pieces = []
++    for chunk in frames:
++        pieces.append(_bin_chunk(chunk, bin_size, label_column))
++    table = pd.concat(pieces, ignore_index=True) if len(pieces) > 1 else pieces[0]
++    table = table.groupby(["bin", "geneID"], observed=True, as_index=False)["count"].sum()
++
++    adata = _to_anndata(table, dtype=dtype)
++
++    # bin centres in native spot units
++    if label_column is None:
++        parts = adata.obs_names.str.split("_", expand=False)
++        xy = np.array([[int(p[0]), int(p[1])] for p in parts], dtype=np.float64)
++        adata.obsm["spatial"] = (xy + 0.5) * bin_size
++    else:
++        centres = table.merge(_bin_centres(pieces), on="bin", how="left")
++        adata.obsm["spatial"] = centres.drop_duplicates("bin").set_index("bin").loc[
++            adata.obs_names, ["x", "y"]
++        ].to_numpy(dtype=np.float64)
++
++    keep = np.ones(adata.n_obs, dtype=bool)
++    if min_counts > 0:
++        keep &= np.asarray(adata.X.sum(axis=1)).ravel() >= min_counts
++    if min_genes > 0:
++        keep &= np.asarray((adata.X > 0).sum(axis=1)).ravel() >= min_genes
++    if not keep.all():
++        adata = adata[keep].copy()
++
++    adata.uns["stereoseq"] = {
++        "bin_size": None if label_column else int(bin_size),
++        "bin_size_um": None if label_column else bin_size * 0.5,
++        "aggregated_by": label_column or "square bins",
++        "source": str(path),
++        "header": header,
++        "spot_pitch_um": 0.5,
++    }
++    return adata
++
++
++def _bin_chunk(chunk: pd.DataFrame, bin_size: int, label_column: Optional[str]) -> pd.DataFrame:
++    """Reduce raw GEM rows to (bin, gene, count)."""
++    cols = {c.lower(): c for c in chunk.columns}
++    gene = cols.get("geneid") or cols.get("gene")
++    x, y = cols.get("x"), cols.get("y")
++    count = cols.get("midcount") or cols.get("umicount") or cols.get("count") or cols.get("mid_count")
++    if gene is None or x is None or y is None:
++        raise ValueError(
++            "A Stereo-seq GEM needs geneID, x and y columns; found "
++            f"{list(chunk.columns)}."
++        )
++    if count is None:
++        chunk = chunk.assign(_count=1)
++        count = "_count"
++
++    if label_column is not None:
++        if label_column not in chunk.columns:
++            raise KeyError(f"No column {label_column!r} in the GEM; found {list(chunk.columns)}.")
++        key = chunk[label_column].astype(str)
++    else:
++        key = ((chunk[x] // bin_size).astype(int).astype(str) + "_"
++               + (chunk[y] // bin_size).astype(int).astype(str))
++
++    out = pd.DataFrame({"bin": key, "geneID": chunk[gene].astype(str),
++                        "count": chunk[count].astype(np.int64),
++                        "x": chunk[x].astype(np.float64), "y": chunk[y].astype(np.float64)})
++    return out.groupby(["bin", "geneID"], observed=True, as_index=False).agg(
++        count=("count", "sum"), x=("x", "mean"), y=("y", "mean")
++    )
++
++
++def _bin_centres(pieces) -> pd.DataFrame:
++    frame = pd.concat(pieces, ignore_index=True)
++    return frame.groupby("bin", observed=True, as_index=False)[["x", "y"]].mean()
++
++
++def _to_anndata(table: pd.DataFrame, dtype: str) -> AnnData:
++    bins = pd.Index(pd.unique(table["bin"]), name=None)
++    genes = pd.Index(pd.unique(table["geneID"]), name=None)
++    row = pd.Categorical(table["bin"], categories=bins).codes
++    col = pd.Categorical(table["geneID"], categories=genes).codes
++    matrix = sparse.coo_matrix(
++        (table["count"].to_numpy(), (row, col)), shape=(len(bins), len(genes))
++    ).tocsr().astype(dtype)
++    return AnnData(X=matrix, obs=pd.DataFrame(index=bins.astype(str)),
++                   var=pd.DataFrame(index=genes.astype(str)))
++
++
++@register_function(
++    aliases=["重新分箱", "rebin", "bin stereoseq", "改变bin大小"],
++    category="io",
++    description="Re-aggregate an already-loaded Stereo-seq AnnData to a coarser bin size",
++    requires={'obsm': ['spatial'], 'uns': ['stereoseq']},
++    produces={'obsm': ['spatial'], 'uns': ['stereoseq']},
++    auto_fix='none',
++    examples=[
++        "coarse = ov.io.spatial.bin_stereoseq(adata, bin_size=100)",
++    ],
++)
++def bin_stereoseq(adata: AnnData, bin_size: int, *, dtype: str = "float32") -> AnnData:
++    """Re-aggregate an already-binned Stereo-seq object to a coarser bin.
++
++    Bin size is the one Stereo-seq choice worth revisiting, and re-reading a GEM to
++    try another value is slow. Coarsening an object that is already in memory is
++    cheap, and exact as long as the new bin is a whole multiple of the old one.
++
++    Arguments:
++        adata: An AnnData produced by :func:`read_stereoseq`.
++        bin_size: The new bin side in native 500 nm spots. Must be a multiple of the
++            current one.
++        dtype: Data type of the new count matrix.
++
++    Returns:
++        A new AnnData at the coarser bin size.
++    """
++    meta = adata.uns.get("stereoseq")
++    if not meta or meta.get("bin_size") is None:
++        raise ValueError(
++            "This object was not produced by read_stereoseq with square bins, so "
++            "its current bin size is unknown. Re-read the GEM instead."
++        )
++    old = int(meta["bin_size"])
++    if bin_size <= old:
++        raise ValueError(f"bin_size must be coarser than the current {old}.")
++    if bin_size % old:
++        raise ValueError(
++            f"bin_size {bin_size} is not a whole multiple of the current {old}; "
++            "the bins would not nest and counts would be split across boundaries."
++        )
++
++    factor = bin_size // old
++    coords = np.asarray(adata.obsm["spatial"], dtype=np.float64)
++    grid = np.floor(coords / bin_size).astype(int)
++    keys = pd.Index([f"{a}_{b}" for a, b in grid])
++    uniq = pd.unique(keys)
++    codes = pd.Categorical(keys, categories=uniq).codes
++
++    agg = sparse.csr_matrix(
++        (np.ones(len(codes)), (codes, np.arange(len(codes)))),
++        shape=(len(uniq), adata.n_obs),
++    )
++    matrix = (agg @ sparse.csr_matrix(adata.X)).astype(dtype)
++
++    out = AnnData(X=matrix, obs=pd.DataFrame(index=pd.Index(uniq).astype(str)),
++                  var=adata.var.copy())
++    centres = np.array([[int(k.split("_")[0]), int(k.split("_")[1])] for k in uniq],
++                       dtype=np.float64)
++    out.obsm["spatial"] = (centres + 0.5) * bin_size
++    out.uns["stereoseq"] = {**meta, "bin_size": int(bin_size),
++                            "bin_size_um": bin_size * 0.5,
++                            "rebinned_from": old, "rebin_factor": int(factor)}
++    return out
+diff --git a/omicverse/space/__init__.py b/omicverse/space/__init__.py
+index 7ed0ce698..61e228799 100644
+--- a/omicverse/space/__init__.py
++++ b/omicverse/space/__init__.py
+@@ -60,6 +60,19 @@
+ from ._spatrio import CellMap,CellLoc
+ from ._stt import STT
+ from ._svg import svg,spatial_neighbors,spatial_autocorr,moranI
++from ._niche import molecular as _niche_molecular
++from . import geom, nb, niche
++from ._neighborhood import (
++    interaction_matrix,
++    nhood_enrichment,
++    centrality_scores,
++    co_occurrence,
++    ripley,
++    sepal,
++    mask_graph,
++    sliding_window,
++    var_by_distance,
++)
+ from ._cast import CAST
+ from ._cellcharter import cellcharter
+ from ._tools import *
+@@ -169,4 +182,20 @@
+     'spata2_remove_outliers',
+     'spata2_pixels_to_unit',
+     'spata2_unit_to_pixels',
++
++    # Arrangement statistics over the spatial graph
++    'interaction_matrix',
++    'nhood_enrichment',
++    'centrality_scores',
++    'co_occurrence',
++    'ripley',
++    'sepal',
++    'mask_graph',
++    'sliding_window',
++    'var_by_distance',
++
++    # Namespaces
++    'nb',
++    'niche',
++    'geom',
+ ]
+diff --git a/omicverse/space/_geom.py b/omicverse/space/_geom.py
+new file mode 100644
+index 000000000..0a36dd14a
+--- /dev/null
++++ b/omicverse/space/_geom.py
+@@ -0,0 +1,453 @@
++"""Geometry rather than expression — aligning serial sections and stacking them.
++
++``pySTAligner`` and ``CAST`` align *expression* across samples: they give you a
++shared embedding in which the same cell type from two slides lands in the same
++place. That is not the same problem as recovering *geometry*. A shared embedding
++cannot be sliced, sectioned, or measured in microns, because it has no common
++coordinate frame — and a common coordinate frame is what 3D reconstruction needs.
++
++This module supplies the missing piece. :func:`align` puts a stack of serial
++sections into one frame; :func:`stack` assembles them into a single object with
++three spatial dimensions; :func:`interpolate` fills the gap between two sections.
++
++The alignment is a fused Gromov-Wasserstein problem, which is what PASTE solves:
++match spots between two slices using both their expression similarity and the
++geometry of each slice, then read a rigid transform off the resulting coupling.
++It is implemented here over POT rather than by depending on PASTE, so the default
++path needs nothing beyond what omicverse already installs; ``method='paste'``
++hands over to the real package when it is present.
++"""
++from __future__ import annotations
++
++from typing import Any, Optional, Sequence
++
++import numpy as np
++import pandas as pd
++from scipy import sparse
++
++from .._registry import register_function
++
++__all__ = ["align", "stack", "interpolate", "align_pairwise"]
++
++_METHODS = ("fgw", "icp", "rigid", "paste")
++
++
++def _dense(matrix) -> np.ndarray:
++    return np.asarray(matrix.todense() if sparse.issparse(matrix) else matrix,
++                      dtype=np.float64)
++
++
++def _shared_features(a, b) -> tuple[np.ndarray, np.ndarray]:
++    common = a.var_names.intersection(b.var_names)
++    if len(common) < 2:
++        raise ValueError(
++            f"The two slices share only {len(common)} features; alignment needs a "
++            "common gene space. Subset both to shared genes first."
++        )
++    return _dense(a[:, common].X), _dense(b[:, common].X)
++
++
++def _procrustes(source: np.ndarray, target: np.ndarray, weights: np.ndarray) -> np.ndarray:
++    """Rotation ``R`` such that ``(source - mean) @ R`` best matches ``target - mean``.
++
++    Weighted Kabsch: centre both clouds on their weighted means, take the SVD of
++    the cross-covariance, and reassemble. Reflections are excluded — a tissue
++    section cannot be flipped over and still be the same section, so the
++    determinant is forced positive rather than letting the SVD mirror the slice
++    to shave off a little residual.
++
++    The convention is right-multiplication: ``source @ R``, not ``R @ source``.
++    Returning the transpose of this matrix leaves an alignment that looks
++    plausible on a plot and is wrong by twice the rotation angle.
++    """
++    w = np.asarray(weights, dtype=np.float64)
++    w = w / w.sum()
++    src_c = source - (w @ source)
++    tgt_c = target - (w @ target)
++    cov = src_c.T @ (w[:, None] * tgt_c)
++    u, _, vt = np.linalg.svd(cov)
++    d = float(np.sign(np.linalg.det(u @ vt)))
++    scale = np.eye(cov.shape[0])
++    scale[-1, -1] = d
++    return u @ scale @ vt
++
++
++@register_function(
++    aliases=["切片配准", "pairwise align", "两张切片对齐", "slice registration"],
++    category="space",
++    description="Align one spatial slice onto another with fused Gromov-Wasserstein or ICP",
++    requires={'obsm': ['spatial']},
++    produces={},
++    auto_fix='none',
++    examples=[
++        "coords, plan = ov.space.geom.align_pairwise(slice_a, slice_b)",
++    ],
++)
++def align_pairwise(
++    source,
++    target,
++    *,
++    method: str = "fgw",
++    alpha: float = 0.1,
++    spatial_key: str = "spatial",
++    use_rep: Optional[str] = None,
++    max_iter: int = 200,
++    tol: float = 1e-6,
++    seed: int = 0,
++):
++    """Bring one section into the coordinate frame of another.
++
++    ``method='fgw'`` solves the fused Gromov-Wasserstein problem PASTE is built
++    on: find a coupling between the two slices' spots that simultaneously matches
++    expression profiles and preserves each slice's internal distances, then read
++    the rigid transform off that coupling. ``alpha`` trades the two off — 0 uses
++    expression alone, 1 geometry alone.
++
++    ``method='icp'`` ignores expression entirely and matches nearest points
++    iteratively. Faster, but it converges to whichever local minimum it starts
++    near, and nearest-point correspondences stop being informative once the two
++    sections are far apart in angle.
++
++    How far ICP can be pushed is not a fixed number — it depends on how much the
++    shape of the tissue constrains the fit. Rotating a section by a known angle and
++    asking each method to undo it, the angle at which ICP first fails:
++
++    ==========================  =======================  ==========
++    point cloud                 ``icp`` holds to         ``fgw``
++    ==========================  =======================  ==========
++    real Visium slide           60 deg                   exact
++    uniform random cloud        10 deg                   exact
++    regular lattice             fails at 10 deg          exact
++    ==========================  =======================  ==========
++
++    FGW was exact to machine precision in every case, at every angle up to 170
++    degrees. ICP does best on the real slide because an irregular tissue outline
++    pins the fit down, and *worst* on a perfect lattice, where the lattice's own
++    six-fold symmetry makes nearest-point correspondences genuinely ambiguous —
++    the one case where the geometry looks most orderly is the one where matching
++    on geometry alone works least well.
++
++    So ``'fgw'`` is the default, and ``'icp'`` is for sections already roughly
++    oriented, where its speed is worth having.
++
++    Arguments:
++        source: The slice to move.
++        target: The slice to move it onto.
++        method: ``'fgw'``, ``'icp'``, ``'rigid'`` or ``'paste'``.
++        alpha: Weight on geometry versus expression in ``'fgw'``. Default 0.1.
++        spatial_key: Coordinates in ``adata.obsm``.
++        use_rep: ``obsm`` key to compare instead of expression, e.g. ``'X_pca'``.
++        max_iter: Iteration cap for the solver.
++        tol: Convergence tolerance.
++        seed: Seed, for the solvers that use one.
++
++    Returns:
++        ``(coords, plan)`` — the transformed source coordinates, and the coupling
++        matrix (``None`` for ``'icp'``).
++    """
++    if method not in _METHODS:
++        raise ValueError(f"method must be one of {_METHODS}.")
++
++    src_xy = np.asarray(source.obsm[spatial_key], dtype=np.float64)[:, :2]
++    tgt_xy = np.asarray(target.obsm[spatial_key], dtype=np.float64)[:, :2]
++
++    if method == "paste":
++        try:
++            import paste as pst
++        except ImportError as exc:
++            raise ImportError(
++                "method='paste' needs the PASTE package. Install it with "
++                "`pip install paste-bio`, or use the default method='fgw', which "
++                "solves the same problem over POT and needs no extra install."
++            ) from exc
++        plan = pst.pairwise_align(source, target, alpha=alpha)
++        rot = _procrustes(src_xy, tgt_xy[plan.argmax(axis=1)], plan.sum(axis=1))
++        moved = (src_xy - src_xy.mean(0)) @ rot + tgt_xy.mean(0)
++        return moved, plan
++
++    if method in ("icp", "rigid"):
++        from scipy.spatial import cKDTree
++
++        moved = src_xy - src_xy.mean(0)
++        ref = tgt_xy - tgt_xy.mean(0)
++        tree = cKDTree(ref)
++        prev = np.inf
++        for _ in range(max_iter if method == "icp" else 1):
++            _, idx = tree.query(moved, k=1)
++            rot = _procrustes(moved, ref[idx], np.ones(len(moved)))
++            moved = moved @ rot
++            err = float(np.mean(np.linalg.norm(moved - ref[idx], axis=1)))
++            if abs(prev - err) < tol:
++                break
++            prev = err
++        return moved + tgt_xy.mean(0), None
++
++    # fused Gromov-Wasserstein
++    import ot
++
++    if use_rep is not None:
++        src_x = np.asarray(source.obsm[use_rep], dtype=np.float64)
++        tgt_x = np.asarray(target.obsm[use_rep], dtype=np.float64)
++        if src_x.shape[1] != tgt_x.shape[1]:
++            raise ValueError(f"obsm[{use_rep!r}] has different widths in the two slices.")
++    else:
++        src_x, tgt_x = _shared_features(source, target)
++
++    # expression dissimilarity between spots, and each slice's own geometry
++    feature_cost = ot.dist(src_x, tgt_x, metric="euclidean")
++    feature_cost /= feature_cost.max() or 1.0
++    c1 = ot.dist(src_xy, src_xy, metric="euclidean")
++    c2 = ot.dist(tgt_xy, tgt_xy, metric="euclidean")
++    c1 /= c1.max() or 1.0
++    c2 /= c2.max() or 1.0
++
++    p = np.ones(len(src_xy)) / len(src_xy)
++    q = np.ones(len(tgt_xy)) / len(tgt_xy)
++    plan = ot.gromov.fused_gromov_wasserstein(
++        feature_cost, c1, c2, p, q, loss_fun="square_loss", alpha=alpha,
++        max_iter=max_iter, tol_rel=tol, tol_abs=tol,
++    )
++
++    # barycentric projection: each source spot goes to the weighted mean of the
++    # target spots it was coupled to, and the rigid map is fitted to that
++    mass = plan.sum(axis=1)
++    with np.errstate(invalid="ignore", divide="ignore"):
++        projected = np.where(mass[:, None] > 0, (plan @ tgt_xy) / mass[:, None], src_xy)
++    rot = _procrustes(src_xy, projected, np.ones(len(src_xy)))
++    moved = (src_xy - src_xy.mean(0)) @ rot + tgt_xy.mean(0)
++    return moved, plan
++
++
++@register_function(
++    aliases=["连续切片对齐", "align slices", "3D配准", "serial section alignment"],
++    category="space",
++    description="Put a stack of serial sections into one coordinate frame",
++    requires={'obsm': ['spatial']},
++    produces={'obsm': ['spatial_aligned']},
++    auto_fix='none',
++    examples=[
++        "aligned = ov.space.geom.align([s1, s2, s3])",
++        "aligned = ov.space.geom.align(slices, method='icp')",
++    ],
++)
++def align(
++    slices: Sequence,
++    *,
++    method: str = "fgw",
++    alpha: float = 0.1,
++    reference: int = 0,
++    spatial_key: str = "spatial",
++    key_added: str = "spatial_aligned",
++    use_rep: Optional[str] = None,
++    copy: bool = True,
++    **kwargs: Any,
++) -> list:
++    """Put a stack of serial sections into a single coordinate frame.
++
++    Each section is aligned to its predecessor and the transforms compose along
++    the stack, so section ``n`` ends up in the frame of the reference. Sections are
++    taken in the order given: that order is the physical cutting order, and
++    shuffling it will produce a smooth-looking but wrong volume.
++
++    Arguments:
++        slices: Sections in cutting order.
++        method: Passed to :func:`align_pairwise`.
++        alpha: Geometry-versus-expression weight for ``'fgw'``.
++        reference: Index of the section whose frame everything lands in.
++        spatial_key: Coordinates in ``adata.obsm``.
++        key_added: ``obsm`` key for the aligned coordinates.
++        use_rep: ``obsm`` key to compare instead of expression.
++        copy: Work on copies and return them, rather than modifying in place.
++        **kwargs: Forwarded to :func:`align_pairwise`.
++
++    Returns:
++        The list of sections, each carrying aligned coordinates in
++        ``obsm[key_added]``.
++    """
++    if len(slices) < 2:
++        raise ValueError("align needs at least two sections.")
++    if not 0 <= reference < len(slices):
++        raise IndexError(f"reference {reference} is outside 0..{len(slices) - 1}.")
++
++    out = [s.copy() for s in slices] if copy else list(slices)
++    out[reference].obsm[key_added] = np.asarray(
++        out[reference].obsm[spatial_key], dtype=np.float64
++    )[:, :2].copy()
++
++    # Walk outwards from the reference in both directions, aligning each section
++    # to its neighbour's *already aligned* coordinates rather than to that
++    # neighbour's original ones. Aligning to the original and then shifting by a
++    # mean offset only carries the translation forward: the rotation the anchor
++    # itself received is lost, and every section past the first drifts by it.
++    for step in (1, -1):
++        i = reference + step
++        while 0 <= i < len(out):
++            anchor = out[i - step]
++            anchor_in_frame = anchor.copy()
++            anchor_in_frame.obsm[spatial_key] = anchor.obsm[key_added].copy()
++            moved, _ = align_pairwise(
++                out[i], anchor_in_frame, method=method, alpha=alpha,
++                spatial_key=spatial_key, use_rep=use_rep, **kwargs
++            )
++            out[i].obsm[key_added] = moved
++            i += step
++
++    return out
++
++
++@register_function(
++    aliases=["3D堆叠", "stack slices", "三维重建", "3D reconstruction", "体数据"],
++    category="space",
++    description="Stack aligned serial sections into one AnnData with 3-D coordinates",
++    requires={'obsm': ['spatial_aligned']},
++    produces={'obsm': ['spatial_3d'], 'obs': ['section']},
++    auto_fix='none',
++    examples=[
++        "volume = ov.space.geom.stack(aligned, z_spacing=10.0)",
++        "volume.obsm['spatial_3d'].shape",
++    ],
++)
++def stack(
++    slices: Sequence,
++    *,
++    z_spacing: float = 1.0,
++    z_values: Optional[Sequence[float]] = None,
++    spatial_key: str = "spatial_aligned",
++    key_added: str = "spatial_3d",
++    section_key: str = "section",
++    section_names: Optional[Sequence[str]] = None,
++):
++    """Assemble aligned sections into one object with three spatial dimensions.
++
++    ``z_spacing`` is the physical distance between consecutive sections, in the
++    same units as the in-plane coordinates. Getting it wrong does not fail — it
++    silently stretches or squashes the volume, and any distance measured through
++    the stack afterwards is wrong by that factor. If the sections were not cut at
++    a constant interval, pass the actual depths as ``z_values``.
++
++    Arguments:
++        slices: Sections carrying aligned coordinates, from :func:`align`.
++        z_spacing: Distance between consecutive sections.
++        z_values: Explicit depth per section, overriding ``z_spacing``.
++        spatial_key: Aligned in-plane coordinates in ``adata.obsm``.
++        key_added: ``obsm`` key for the 3-D coordinates.
++        section_key: ``obs`` column recording which section each spot came from.
++        section_names: Names for the sections; defaults to their index.
++
++    Returns:
++        A single AnnData holding every section.
++    """
++    import anndata as ad
++
++    if len(slices) < 2:
++        raise ValueError("stack needs at least two sections.")
++    if z_values is not None and len(z_values) != len(slices):
++        raise ValueError(f"z_values has {len(z_values)} entries for {len(slices)} sections.")
++
++    names = ([str(n) for n in section_names] if section_names is not None
++             else [str(i) for i in range(len(slices))])
++    if len(names) != len(slices):
++        raise ValueError(f"section_names has {len(names)} entries for {len(slices)} sections.")
++
++    depths = (np.asarray(z_values, dtype=np.float64) if z_values is not None
++              else np.arange(len(slices), dtype=np.float64) * z_spacing)
++
++    pieces = []
++    for s, name, z in zip(slices, names, depths):
++        if spatial_key not in s.obsm:
++            raise KeyError(
++                f"Section {name!r} has no obsm[{spatial_key!r}]. Run "
++                "`ov.space.geom.align(...)` first."
++            )
++        piece = s.copy()
++        piece.obs[section_key] = name
++        xy = np.asarray(piece.obsm[spatial_key], dtype=np.float64)[:, :2]
++        piece.obsm[key_added] = np.column_stack([xy, np.full(len(xy), z)])
++        pieces.append(piece)
++
++    volume = ad.concat(pieces, label=None, index_unique="-", merge="first")
++    volume.obs[section_key] = pd.Categorical(volume.obs[section_key], categories=names)
++    volume.uns["geom_stack"] = {
++        "n_sections": len(slices),
++        "z_spacing": None if z_values is not None else float(z_spacing),
++        "z_values": depths.tolist(),
++        "aligned_from": spatial_key,
++    }
++    return volume
++
++
++@register_function(
++    aliases=["切片插值", "interpolate sections", "补充中间切片", "z interpolation"],
++    category="space",
++    description="Interpolate a virtual section between two aligned neighbours",
++    requires={'obsm': ['spatial_aligned']},
++    produces={},
++    auto_fix='none',
++    examples=[
++        "mid = ov.space.geom.interpolate(aligned[0], aligned[1], fraction=0.5)",
++    ],
++)
++def interpolate(
++    lower,
++    upper,
++    *,
++    fraction: float = 0.5,
++    spatial_key: str = "spatial_aligned",
++    n_neighbors: int = 6,
++):
++    """Build a virtual section between two real ones.
++
++    Serial sectioning throws away everything between the cuts. This fills a slab
++    of that gap by taking each spot of the lower section, finding the spots of the
++    upper section nearest it in the shared frame, and blending their profiles by
++    inverse distance.
++
++    It is interpolation, not measurement: the result is a plausible reading of
++    what lies between two observations and should not be treated as data. It is
++    useful for rendering a continuous volume and for sanity-checking an alignment
++    — a bad alignment produces obvious nonsense here.
++
++    Arguments:
++        lower: The section below.
++        upper: The section above.
++        fraction: Where between them, 0 at ``lower`` and 1 at ``upper``.
++        spatial_key: Aligned coordinates in ``adata.obsm``.
++        n_neighbors: Upper-section spots blended per lower-section spot.
++
++    Returns:
++        An AnnData for the virtual section, marked
++        ``uns['geom_interpolated'] = True``.
++    """
++    from scipy.spatial import cKDTree
++
++    if not 0.0 <= fraction <= 1.0:
++        raise ValueError("fraction must lie in [0, 1].")
++
++    common = lower.var_names.intersection(upper.var_names)
++    if len(common) < 2:
++        raise ValueError("The two sections share too few features to interpolate.")
++
++    lo = lower[:, common]
++    up = upper[:, common]
++    lo_xy = np.asarray(lo.obsm[spatial_key], dtype=np.float64)[:, :2]
++    up_xy = np.asarray(up.obsm[spatial_key], dtype=np.float64)[:, :2]
++
++    k = min(n_neighbors, up.n_obs)
++    dist, idx = cKDTree(up_xy).query(lo_xy, k=k)
++    dist = np.atleast_2d(dist.T).T
++    idx = np.atleast_2d(idx.T).T
++    weights = 1.0 / np.maximum(dist, 1e-12)
++    weights /= weights.sum(axis=1, keepdims=True)
++
++    up_x = _dense(up.X)
++    blended_upper = np.einsum("ij,ijk->ik", weights, up_x[idx])
++    blended = (1.0 - fraction) * _dense(lo.X) + fraction * blended_upper
++
++    import anndata as ad
++    out = ad.AnnData(X=blended.astype(np.float32), var=lo.var.copy())
++    out.obs_names = [f"interp_{i}" for i in range(out.n_obs)]
++    out.obsm[spatial_key] = (1.0 - fraction) * lo_xy + fraction * up_xy[idx[:, 0]]
++    out.uns["geom_interpolated"] = True
++    out.uns["geom_interpolation"] = {"fraction": float(fraction),
++                                     "n_neighbors": int(k)}
++    return out
+diff --git a/omicverse/space/_neighborhood.py b/omicverse/space/_neighborhood.py
+new file mode 100644
+index 000000000..b90c3a1c9
+--- /dev/null
++++ b/omicverse/space/_neighborhood.py
+@@ -0,0 +1,1044 @@
++"""Statistics of how spatial neighbours are arranged.
++
++`ov.space` could already say *what is where* — domains, deconvolved cell types,
++spatially variable genes. What it could not say is *how the things are arranged
++relative to each other*: whether two cell types touch more often than chance,
++how far apart their influence reaches, whether a gene changes as you walk away
++from a boundary.
++
++Every function here reads the graph :func:`omicverse.space.spatial_neighbors`
++already builds — ``adata.obsp['spatial_connectivities']`` — so nothing has to be
++recomputed, and results land in the ``adata.uns`` keys the ecosystem expects.
++
++The semantics follow :mod:`squidpy`, deliberately: these statistics have one
++correct definition each, and matching an existing reference implementation makes
++the numbers checkable rather than merely plausible. ``tests/space/test_neighborhood.py``
++holds every function against squidpy's own output on a shared fixture.
++"""
++from __future__ import annotations
++
++from typing import Any, Iterable, Optional, Sequence, Union
++
++import numpy as np
++import pandas as pd
++from scipy import sparse
++
++from .._registry import register_function
++
++__all__ = [
++    "interaction_matrix",
++    "nhood_enrichment",
++    "centrality_scores",
++    "co_occurrence",
++    "ripley",
++    "sepal",
++    "mask_graph",
++    "sliding_window",
++    "var_by_distance",
++]
++
++
++# --------------------------------------------------------------------------- #
++# shared helpers
++# --------------------------------------------------------------------------- #
++def _get_graph(adata, connectivity_key: Optional[str]) -> sparse.csr_matrix:
++    """Return the spatial connectivity graph, with a message that says what to run."""
++    key = connectivity_key or "spatial_connectivities"
++    if key not in adata.obsp:
++        raise KeyError(
++            f"No spatial graph at adata.obsp[{key!r}]. "
++            "Build one first with `ov.space.spatial_neighbors(adata)`."
++        )
++    graph = adata.obsp[key]
++    if not sparse.issparse(graph):
++        graph = sparse.csr_matrix(graph)
++    return graph.tocsr()
++
++
++def _cluster_codes(adata, cluster_key: str) -> tuple[np.ndarray, list]:
++    """Integer codes and ordered category names for a categorical obs column."""
++    if cluster_key not in adata.obs:
++        raise KeyError(f"adata.obs has no column {cluster_key!r}.")
++    values = adata.obs[cluster_key]
++    if not isinstance(values.dtype, pd.CategoricalDtype):
++        values = values.astype("category")
++    return np.asarray(values.cat.codes, dtype=np.int64), list(values.cat.categories)
++
++
++def _coords(adata, spatial_key: str = "spatial") -> np.ndarray:
++    if spatial_key not in adata.obsm:
++        raise KeyError(f"adata.obsm has no key {spatial_key!r}.")
++    coords = np.asarray(adata.obsm[spatial_key], dtype=np.float64)
++    if coords.ndim != 2 or coords.shape[1] < 2:
++        raise ValueError(f"adata.obsm[{spatial_key!r}] must be n_obs x >=2.")
++    return coords
++
++
++def _counts_from_graph(graph: sparse.csr_matrix, codes: np.ndarray, n_cats: int,
++                       weights: bool = False) -> np.ndarray:
++    """Cluster-by-cluster edge counts.
++
++    Every stored edge contributes to the (source cluster, target cluster) cell.
++    The graph is symmetric, so each undirected edge is counted from both ends —
++    the same convention squidpy uses, which is why the diagonal counts each
++    within-cluster edge twice.
++    """
++    coo = graph.tocoo()
++    valid = (codes[coo.row] >= 0) & (codes[coo.col] >= 0)
++    rows = codes[coo.row[valid]]
++    cols = codes[coo.col[valid]]
++    vals = coo.data[valid].astype(np.float64) if weights else np.ones(valid.sum())
++    out = np.zeros((n_cats, n_cats), dtype=np.float64)
++    np.add.at(out, (rows, cols), vals)
++    return out
++
++
++# --------------------------------------------------------------------------- #
++# interaction matrix
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["交互矩阵", "interaction matrix", "簇间连接计数", "cluster interaction"],
++    category="space",
++    description="Count the graph edges running between each pair of clusters",
++    requires={'obsp': ['spatial_connectivities'], 'obs': []},
++    produces={'uns': ['{cluster_key}_interactions']},
++    auto_fix='none',
++    examples=[
++        "ov.space.spatial_neighbors(adata)",
++        "m = ov.space.interaction_matrix(adata, 'cell_type', copy=True)",
++    ],
++)
++def interaction_matrix(
++    adata,
++    cluster_key: str,
++    *,
++    connectivity_key: Optional[str] = None,
++    normalized: bool = False,
++    weights: bool = False,
++    copy: bool = False,
++) -> Optional[np.ndarray]:
++    """Count the edges running between every pair of clusters.
++
++    This is the raw material the enrichment test is built on: how many times does
++    a spot of type A sit next to a spot of type B. On its own it is dominated by
++    how common each type is, which is what :func:`nhood_enrichment` corrects for.
++
++    Arguments:
++        adata: AnnData with a spatial graph and a categorical cluster column.
++        cluster_key: Column in ``adata.obs`` holding the cluster labels.
++        connectivity_key: Graph in ``adata.obsp``. Default ``'spatial_connectivities'``.
++        normalized: Divide each row by its total, giving the fraction of a
++            cluster's edges that land on each other cluster.
++        weights: Use the stored edge weights instead of counting each edge as 1.
++        copy: Return the matrix instead of writing it to ``adata.uns``.
++
++    Returns:
++        The ``n_clusters x n_clusters`` matrix when ``copy=True``, else ``None``.
++    """
++    graph = _get_graph(adata, connectivity_key)
++    codes, cats = _cluster_codes(adata, cluster_key)
++    out = _counts_from_graph(graph, codes, len(cats), weights=weights)
++
++    if normalized:
++        totals = out.sum(axis=1, keepdims=True)
++        with np.errstate(invalid="ignore", divide="ignore"):
++            out = np.where(totals > 0, out / totals, 0.0)
++
++    if copy:
++        return out
++    adata.uns[f"{cluster_key}_interactions"] = out
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# neighbourhood enrichment
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["邻域富集", "nhood enrichment", "neighborhood enrichment", "邻域富集分析", "空间共定位"],
++    category="space",
++    description="Permutation test for whether two clusters touch more or less often than chance",
++    requires={'obsp': ['spatial_connectivities'], 'obs': []},
++    produces={'uns': ['{cluster_key}_nhood_enrichment']},
++    auto_fix='none',
++    examples=[
++        "ov.space.spatial_neighbors(adata)",
++        "ov.space.nhood_enrichment(adata, 'cell_type', n_perms=1000, seed=0)",
++    ],
++)
++def nhood_enrichment(
++    adata,
++    cluster_key: str,
++    *,
++    connectivity_key: Optional[str] = None,
++    n_perms: int = 1000,
++    seed: Optional[int] = None,
++    copy: bool = False,
++) -> Optional[dict]:
++    """Test whether cluster pairs are adjacent more often than chance allows.
++
++    The observed edge counts between clusters are compared against a null built
++    by reshuffling the cluster labels over the fixed graph ``n_perms`` times. The
++    z-score is the deviation of the observed count from that null, in null
++    standard deviations, so it is not inflated by cluster size the way a raw
++    count is.
++
++    Shuffling labels — rather than rewiring the graph — holds tissue geometry
++    constant and asks only about the labelling, which is the question worth
++    asking.
++
++    Arguments:
++        adata: AnnData with a spatial graph and a categorical cluster column.
++        cluster_key: Column in ``adata.obs`` holding the cluster labels.
++        connectivity_key: Graph in ``adata.obsp``. Default ``'spatial_connectivities'``.
++        n_perms: Number of label permutations forming the null. Default 1000.
++        seed: Seed for the permutation RNG; set it if you want the z-scores back.
++        copy: Return ``{'zscore', 'count'}`` instead of writing to ``adata.uns``.
++
++    Returns:
++        ``{'zscore': array, 'count': array}`` when ``copy=True``, else ``None``.
++
++    Notes:
++        A pair that never touches in any permutation has zero null variance; its
++        z-score is reported as 0 rather than infinity.
++    """
++    if n_perms < 1:
++        raise ValueError("n_perms must be >= 1.")
++
++    graph = _get_graph(adata, connectivity_key)
++    codes, cats = _cluster_codes(adata, cluster_key)
++    n_cats = len(cats)
++
++    observed = _counts_from_graph(graph, codes, n_cats)
++
++    coo = graph.tocoo()
++    rows, cols = coo.row, coo.col
++    rng = np.random.default_rng(seed)
++
++    perms = np.empty((n_perms, n_cats, n_cats), dtype=np.float64)
++    shuffled = codes.copy()
++    for k in range(n_perms):
++        rng.shuffle(shuffled)
++        r, c = shuffled[rows], shuffled[cols]
++        valid = (r >= 0) & (c >= 0)
++        mat = np.zeros((n_cats, n_cats), dtype=np.float64)
++        np.add.at(mat, (r[valid], c[valid]), 1.0)
++        perms[k] = mat
++
++    mean = perms.mean(axis=0)
++    std = perms.std(axis=0)
++    with np.errstate(invalid="ignore", divide="ignore"):
++        zscore = np.where(std > 0, (observed - mean) / std, 0.0)
++
++    result = {"zscore": zscore, "count": observed.astype(np.int64)}
++    if copy:
++        return result
++    adata.uns[f"{cluster_key}_nhood_enrichment"] = result
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# centrality
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["中心性得分", "centrality scores", "簇中心性", "graph centrality"],
++    category="space",
++    description="Degree centrality, clustering coefficient and closeness of each cluster's induced subgraph",
++    requires={'obsp': ['spatial_connectivities'], 'obs': []},
++    produces={'uns': ['{cluster_key}_centrality_scores']},
++    auto_fix='none',
++    examples=[
++        "ov.space.centrality_scores(adata, 'cell_type')",
++        "df = ov.space.centrality_scores(adata, 'cell_type', copy=True)",
++    ],
++)
++def centrality_scores(
++    adata,
++    cluster_key: str,
++    *,
++    score: Union[str, Iterable[str], None] = None,
++    connectivity_key: Optional[str] = None,
++    copy: bool = False,
++) -> Optional[pd.DataFrame]:
++    """Describe how each cluster sits inside the whole tissue graph.
++
++    These are *group* centralities, measured for the cluster as a set of nodes
++    within the full spatial graph — not properties of the cluster's own induced
++    subgraph. The distinction matters: a cluster can be internally fragmented and
++    still be highly central, because centrality is about its relationship to
++    everything else.
++
++    - ``degree_centrality`` — fraction of the spots outside the cluster that touch
++      at least one spot inside it. High for a cluster that borders everything.
++    - ``average_clustering`` — mean clustering coefficient of the cluster's spots
++      in the full graph; high when the cluster forms a solid patch rather than a
++      scatter of single spots.
++    - ``closeness_centrality`` — inverse mean shortest-path distance from the
++      cluster to the rest of the tissue. Low when the cluster is peripheral.
++
++    Arguments:
++        adata: AnnData with a spatial graph and a categorical cluster column.
++        cluster_key: Column in ``adata.obs`` holding the cluster labels.
++        score: Which scores to compute; default all three.
++        connectivity_key: Graph in ``adata.obsp``. Default ``'spatial_connectivities'``.
++        copy: Return the frame instead of writing to ``adata.uns``.
++
++    Returns:
++        A DataFrame indexed by cluster when ``copy=True``, else ``None``.
++    """
++    import networkx as nx
++
++    all_scores = ["degree_centrality", "average_clustering", "closeness_centrality"]
++    if score is None:
++        wanted = all_scores
++    else:
++        wanted = [score] if isinstance(score, str) else list(score)
++        unknown = set(wanted) - set(all_scores)
++        if unknown:
++            raise ValueError(f"Unknown score(s) {sorted(unknown)}; pick from {all_scores}.")
++
++    graph = _get_graph(adata, connectivity_key)
++    codes, cats = _cluster_codes(adata, cluster_key)
++    whole = nx.from_scipy_sparse_array(graph)
++
++    rows = []
++    for i, cat in enumerate(cats):
++        members = np.flatnonzero(codes == i)
++        row: dict[str, Any] = {cluster_key: cat}
++        if len(members) == 0:
++            for s in wanted:
++                row[s] = np.nan
++            rows.append(row)
++            continue
++        idx = [int(m) for m in members]
++        if "degree_centrality" in wanted:
++            row["degree_centrality"] = float(
++                nx.algorithms.centrality.group_degree_centrality(whole, idx)
++            )
++        if "average_clustering" in wanted:
++            row["average_clustering"] = float(
++                nx.algorithms.cluster.average_clustering(whole, nodes=idx)
++            )
++        if "closeness_centrality" in wanted:
++            row["closeness_centrality"] = float(
++                nx.algorithms.centrality.group_closeness_centrality(whole, idx)
++            )
++        rows.append(row)
++
++    df = pd.DataFrame(rows).set_index(cluster_key)
++    if copy:
++        return df
++    adata.uns[f"{cluster_key}_centrality_scores"] = df
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# co-occurrence
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["共现概率", "co-occurrence", "空间共现", "distance co-occurrence"],
++    category="space",
++    description="Co-occurrence probability of cluster pairs as a function of distance",
++    requires={'obsm': ['spatial'], 'obs': []},
++    produces={'uns': ['{cluster_key}_co_occurrence']},
++    auto_fix='none',
++    examples=[
++        "ov.space.co_occurrence(adata, 'cell_type', interval=50)",
++        "occ, dist = ov.space.co_occurrence(adata, 'cell_type', copy=True)",
++    ],
++)
++def co_occurrence(
++    adata,
++    cluster_key: str,
++    *,
++    spatial_key: str = "spatial",
++    interval: Union[int, np.ndarray] = 50,
++    copy: bool = False,
++):
++    """How the odds of finding cluster B near cluster A change with distance.
++
++    For every radius the statistic is the conditional probability of seeing
++    cluster ``B`` within that radius of a cluster-``A`` spot, divided by the
++    unconditional probability of ``B`` anywhere. Above 1 means enrichment, and
++    the distance at which it falls back to 1 is the range over which the
++    association holds.
++
++    Unlike :func:`nhood_enrichment` this ignores the graph entirely and works
++    from raw distances, so it answers "how far", not just "adjacent or not".
++
++    Arguments:
++        adata: AnnData with spatial coordinates and a categorical cluster column.
++        cluster_key: Column in ``adata.obs`` holding the cluster labels.
++        spatial_key: Coordinates in ``adata.obsm``. Default ``'spatial'``.
++        interval: Number of distance thresholds, or the thresholds themselves.
++        copy: Return ``(occurrence, intervals)`` instead of writing to ``adata.uns``.
++
++    Returns:
++        ``(occurrence, intervals)`` when ``copy=True``, else ``None``. ``occurrence``
++        has shape ``(n_clusters, n_clusters, n_intervals)`` and is indexed
++        ``[condition, target, step]``.
++    """
++    from scipy.spatial import distance_matrix
++
++    coords = _coords(adata, spatial_key)
++    codes, cats = _cluster_codes(adata, cluster_key)
++    n_cats = len(cats)
++
++    dist = distance_matrix(coords, coords)
++
++    if np.isscalar(interval):
++        # squidpy's bracket: shortest edge between the two lowest-sum corners,
++        # to half the diagonal of the tissue
++        coord_sum = coords.sum(axis=1)
++        lo1, lo2 = np.argpartition(coord_sum, 2)[:2]
++        hi = int(np.argmax(coord_sum))
++        thresh_min = float(np.linalg.norm(coords[lo1] - coords[lo2]))
++        thresh_max = float(np.linalg.norm(coords[lo1] - coords[hi]) / 2.0)
++        edges = np.linspace(thresh_min, thresh_max, num=int(interval), dtype=np.float64)
++    else:
++        edges = np.array(sorted(np.asarray(interval, dtype=np.float64)), copy=True)
++    if edges.ndim != 1 or edges.size < 2:
++        raise ValueError("interval must be an int >= 2 or a 1-D array of at least two radii.")
++
++    # the radii are edges: n edges give n-1 cumulative steps, each using the
++    # upper edge as the radius
++    n_steps = len(edges) - 1
++    occurrence = np.zeros((n_cats, n_cats, n_steps), dtype=np.float64)
++
++    for s in range(n_steps):
++        radius = edges[s + 1]
++        within = (dist <= radius) & (dist > 0)
++        co = np.zeros((n_cats, n_cats), dtype=np.float64)
++        rows, cols = np.nonzero(within)
++        valid = (codes[rows] >= 0) & (codes[cols] >= 0)
++        np.add.at(co, (codes[rows[valid]], codes[cols[valid]]), 1.0)
++
++        total = co.sum()
++        # the marginal comes from the pairs inside this radius, not from the
++        # global cluster frequencies — a spot in a sparse region contributes
++        # fewer pairs and so weighs less
++        probs = co.sum(axis=0) / total if total else np.zeros(n_cats)
++        for c in range(n_cats):
++            row_sum = co[c].sum()
++            cond = co[c] / row_sum if row_sum else np.zeros(n_cats)
++            with np.errstate(invalid="ignore", divide="ignore"):
++                occurrence[c, :, s] = np.where(probs > 0, cond / probs, 0.0)
++
++    if copy:
++        return occurrence, edges
++    adata.uns[f"{cluster_key}_co_occurrence"] = {"occ": occurrence, "interval": edges}
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# Ripley
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["Ripley统计量", "ripley", "点模式分析", "spatial point pattern"],
++    category="space",
++    description="Ripley's F, G or L statistic per cluster against a random-point null",
++    requires={'obsm': ['spatial'], 'obs': []},
++    produces={'uns': ['{cluster_key}_ripley_{mode}']},
++    auto_fix='none',
++    examples=[
++        "ov.space.ripley(adata, 'cell_type', mode='L')",
++        "res = ov.space.ripley(adata, 'cell_type', mode='G', copy=True)",
++    ],
++)
++def ripley(
++    adata,
++    cluster_key: str,
++    *,
++    mode: str = "F",
++    spatial_key: str = "spatial",
++    n_neigh: int = 2,
++    n_simulations: int = 100,
++    n_observations: int = 1000,
++    max_dist: Optional[float] = None,
++    n_steps: int = 50,
++    seed: Optional[int] = None,
++    copy: bool = False,
++):
++    """Ask whether a cluster's spots are clustered, dispersed, or just random.
++
++    Three classical point-pattern statistics, each answering the question from a
++    different side:
++
++    - ``'F'`` empty-space function — from random probe points, distance to the
++      nearest cluster spot. Sensitive to gaps.
++    - ``'G'`` nearest-neighbour function — from each cluster spot, distance to
++      the next one. Sensitive to tight packing.
++    - ``'L'`` Besag's transform of Ripley's K — variance-stabilised count of
++      neighbours within a radius. Above the null means clustered, below means
++      dispersed.
++
++    The null is drawn by scattering the same number of points uniformly over the
++    bounding box ``n_simulations`` times, so "random" means random *given the
++    tissue's extent*.
++
++    Arguments:
++        adata: AnnData with spatial coordinates and a categorical cluster column.
++        cluster_key: Column in ``adata.obs`` holding the cluster labels.
++        mode: ``'F'``, ``'G'`` or ``'L'``.
++        spatial_key: Coordinates in ``adata.obsm``. Default ``'spatial'``.
++        n_neigh: Neighbour rank used by the ``'F'`` and ``'G'`` modes. Default 2.
++        n_simulations: Null replicates. Default 100.
++        n_observations: Probe points per replicate (``'F'`` mode). Default 1000.
++        max_dist: Largest radius; defaults to a quarter of the bounding-box diagonal.
++        n_steps: Radii sampled between 0 and ``max_dist``. Default 50.
++        seed: RNG seed.
++        copy: Return the result dict instead of writing to ``adata.uns``.
++
++    Returns:
++        ``{'{mode}_stat': DataFrame, 'sims_stat': DataFrame, 'bins': array}`` when
++        ``copy=True``, else ``None``.
++    """
++    from matplotlib.path import Path as _Path
++    from scipy.spatial import ConvexHull
++    from scipy.spatial.distance import pdist
++    from sklearn.neighbors import NearestNeighbors
++
++    mode = str(mode).upper()
++    if mode not in ("F", "G", "L"):
++        raise ValueError("mode must be one of 'F', 'G', 'L'.")
++
++    coords = _coords(adata, spatial_key)
++    codes, cats = _cluster_codes(adata, cluster_key)
++    n_obs_total = coords.shape[0]
++
++    hull = ConvexHull(coords)
++    area = float(hull.volume)          # 'volume' is the enclosed area in 2-D
++    if max_dist is None:
++        max_dist = float((area / 2.0) ** 0.5)
++    support = np.linspace(0.0, max_dist, n_steps)
++
++    hull_path = _Path(coords[hull.vertices])
++    lo, hi = coords.min(axis=0), coords.max(axis=0)
++
++    def _poisson_points(n: int, rng) -> np.ndarray:
++        """Uniform points inside the tissue outline, by rejection in its bounding box."""
++        out = np.empty((0, coords.shape[1]), dtype=np.float64)
++        while len(out) < n:
++            draw = rng.uniform(lo, hi, size=(max(n * 2, 64), coords.shape[1]))
++            out = np.vstack([out, draw[hull_path.contains_points(draw[:, :2])]])
++        return out[:n]
++
++    def _f_g(distances: np.ndarray) -> np.ndarray:
++        """Cumulative empirical distribution of distances over the support."""
++        counts, _ = np.histogram(distances, bins=support)
++        total = counts.sum()
++        fracs = np.cumsum(counts) / total if total else np.zeros_like(counts, dtype=float)
++        return np.concatenate(([0.0], fracs))
++
++    def _l(distances: np.ndarray) -> np.ndarray:
++        """Besag's L, with intensity taken over all observations and the hull area."""
++        pairs = (distances < support.reshape(-1, 1)).sum(axis=1)
++        intensity = n_obs_total / area if area > 0 else 0.0
++        k = ((pairs * 2) / n_obs_total) / intensity if intensity > 0 else np.zeros_like(support)
++        return np.sqrt(np.clip(k, 0, None) / np.pi)
++
++    obs_rows = []
++    probe = None
++    for i, cat in enumerate(cats):
++        pts = coords[codes == i]
++        if len(pts) < max(n_neigh, 2):
++            stats = np.zeros_like(support)
++        elif mode == "F":
++            rng = np.random.default_rng(seed)
++            probe = _poisson_points(n_observations, rng)
++            nn = NearestNeighbors(n_neighbors=n_neigh).fit(pts)
++            d, _ = nn.kneighbors(probe, n_neighbors=n_neigh)
++            stats = _f_g(np.squeeze(d))
++        elif mode == "G":
++            # distance from every spot *outside* the cluster to the cluster
++            others = coords[codes != i]
++            if len(others) == 0:
++                stats = np.zeros_like(support)
++            else:
++                nn = NearestNeighbors(n_neighbors=n_neigh).fit(pts)
++                d, _ = nn.kneighbors(others, n_neighbors=n_neigh)
++                stats = _f_g(np.squeeze(d))
++        else:
++            stats = _l(pdist(pts))
++        obs_rows.append(pd.DataFrame({"bins": support, "stats": stats, cluster_key: cat}))
++
++    sim_rows = []
++    for s in range(n_simulations):
++        rng = np.random.default_rng(None if seed is None else seed + s)
++        rand = _poisson_points(n_observations, rng)
++        if mode == "F":
++            if probe is None:
++                probe = _poisson_points(n_observations, np.random.default_rng(seed))
++            nn = NearestNeighbors(n_neighbors=n_neigh).fit(rand)
++            d, _ = nn.kneighbors(probe, n_neighbors=1)
++            stats = _f_g(np.squeeze(d))
++        elif mode == "G":
++            nn = NearestNeighbors(n_neighbors=n_neigh).fit(rand)
++            d, _ = nn.kneighbors(coords, n_neighbors=1)
++            stats = _f_g(np.squeeze(d))
++        else:
++            stats = _l(pdist(rand))
++        sim_rows.append(pd.DataFrame({"bins": support, "stats": stats, "sim": s}))
++
++    result = {
++        f"{mode}_stat": pd.concat(obs_rows, ignore_index=True),
++        "sims_stat": pd.concat(sim_rows, ignore_index=True),
++        "bins": support,
++    }
++    if copy:
++        return result
++    adata.uns[f"{cluster_key}_ripley_{mode}"] = result
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# sepal
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["sepal", "扩散空间基因", "diffusion spatial genes", "空间结构基因"],
++    category="space",
++    description="Rank genes by how long their spatial pattern survives diffusion (sepal)",
++    requires={'obsm': ['spatial'], 'obsp': ['spatial_connectivities']},
++    produces={'uns': ['sepal_score']},
++    auto_fix='none',
++    examples=[
++        "ov.space.spatial_neighbors(adata, n_neighs=6)",
++        "ov.space.sepal(adata, max_neighs=6, genes=adata.var_names[:200])",
++    ],
++)
++def sepal(
++    adata,
++    max_neighs: int,
++    *,
++    genes: Union[str, Sequence[str], None] = None,
++    n_iter: int = 30000,
++    dt: float = 0.001,
++    thresh: float = 1e-8,
++    connectivity_key: str = "spatial_connectivities",
++    spatial_key: str = "spatial",
++    layer: Optional[str] = None,
++    use_raw: bool = False,
++    copy: bool = False,
++) -> Optional[pd.DataFrame]:
++    """Score genes by how long their spatial structure resists diffusion.
++
++    Let each gene's expression diffuse over the spatial lattice and record the
++    time it takes to flatten. A gene with real spatial organisation takes longer
++    than one scattered at random, and that time is the score. Unlike a variance
++    test this rewards *structure* rather than magnitude, so a modestly expressed
++    gene confined to one region can outrank a loud but diffuse one.
++
++    Requires a regular lattice — ``max_neighs=6`` for Visium's hexagonal grid,
++    ``4`` for a square grid — because the diffusion operator assumes each
++    interior spot has the same number of neighbours.
++
++    Arguments:
++        adata: AnnData with coordinates and a spatial graph.
++        max_neighs: 4 for a square lattice, 6 for a hexagonal one.
++        genes: Genes to score; default all of ``adata.var_names``.
++        n_iter: Maximum diffusion steps before giving up. Default 30000.
++        dt: Time step. Default 0.001.
++        thresh: Convergence threshold on the gradient norm. Default 1e-8.
++        connectivity_key: Graph in ``adata.obsp``.
++        spatial_key: Coordinates in ``adata.obsm``.
++        layer: Layer to read expression from; default ``adata.X``.
++        use_raw: Read from ``adata.raw`` instead.
++        copy: Return the scores instead of writing to ``adata.uns``.
++
++    Returns:
++        A DataFrame of scores indexed by gene when ``copy=True``, else ``None``.
++    """
++    if max_neighs not in (4, 6):
++        raise ValueError("max_neighs must be 4 (square lattice) or 6 (hexagonal).")
++
++    graph = _get_graph(adata, connectivity_key)
++    _coords(adata, spatial_key)
++
++    if use_raw:
++        source = adata.raw
++        var_names = list(source.var_names)
++        matrix = source.X
++    elif layer is not None:
++        if layer not in adata.layers:
++            raise KeyError(f"adata.layers has no key {layer!r}.")
++        var_names = list(adata.var_names)
++        matrix = adata.layers[layer]
++    else:
++        var_names = list(adata.var_names)
++        matrix = adata.X
++
++    if genes is None:
++        wanted = var_names
++    else:
++        wanted = [genes] if isinstance(genes, str) else list(genes)
++        missing = set(wanted) - set(var_names)
++        if missing:
++            raise KeyError(f"{len(missing)} gene(s) not found, e.g. {sorted(missing)[:3]}")
++
++    idx = [var_names.index(g) for g in wanted]
++    dense = matrix[:, idx]
++    dense = np.asarray(dense.todense() if sparse.issparse(dense) else dense, dtype=np.float64)
++
++    # A spot is *saturated* when it has the full neighbour complement, i.e. it is
++    # in the interior of the lattice. Diffusion is solved on those; the rim spots
++    # simply follow their nearest saturated neighbour, which keeps the boundary
++    # from acting as a sink and draining the tissue.
++    graph = graph.tocsr()
++    degree = np.diff(graph.indptr)
++    sat = np.flatnonzero(degree == max_neighs)
++    unsat = np.flatnonzero(degree < max_neighs)
++    if sat.size == 0:
++        raise ValueError(
++            f"No spot has exactly {max_neighs} neighbours — the graph is not the "
++            f"lattice this score assumes. Rebuild with "
++            f"`ov.space.spatial_neighbors(adata, n_neighs={max_neighs})`."
++        )
++
++    sat_idx = np.vstack([graph.indices[graph.indptr[i]:graph.indptr[i + 1]] for i in sat])
++
++    # each rim spot borrows from a saturated neighbour where it has one, and
++    # otherwise from the nearest saturated spot in space
++    from sklearn.metrics import pairwise_distances
++
++    sat_set = set(sat.tolist())
++    nearest_sat = np.full(unsat.shape[0], -1, dtype=np.int64)
++    leftover = []
++    for pos, i in enumerate(unsat):
++        nb = graph.indices[graph.indptr[i]:graph.indptr[i + 1]]
++        hit = [n for n in nb if n in sat_set]
++        if hit:
++            nearest_sat[pos] = hit[0]
++        else:
++            leftover.append(pos)
++    if leftover:
++        coords_all = _coords(adata, spatial_key)
++        d = pairwise_distances(coords_all[unsat[leftover]], coords_all[sat], metric="l1")
++        nearest_sat[leftover] = sat[np.argmin(d, axis=1)]
++
++    stencil_centre = float(max_neighs)
++    hex_factor = 2.0 / 3.0 if max_neighs == 6 else 1.0
++
++    def _entropy(x: np.ndarray) -> float:
++        nz = x[x > 0]
++        total = nz.sum()
++        if total <= 0:
++            return 0.0
++        p = nz / total
++        return float(-(np.log(p) * p).sum())
++
++    scores = np.zeros(len(wanted), dtype=np.float64)
++    for j in range(dense.shape[1]):
++        conc = dense[:, j].astype(np.float64).copy()
++        prev_ent = 1.0
++        hit_iter = np.nan
++        for it in range(n_iter):
++            nhood = conc[sat_idx].sum(axis=1)
++            d2 = (nhood - stencil_centre * conc[sat]) * hex_factor
++            dcdt = np.zeros_like(conc)
++            dcdt[sat] = d2
++            conc[sat] += dcdt[sat] * dt
++            conc[unsat] += dcdt[nearest_sat] * dt
++            conc[conc < 0] = 0.0
++            ent = _entropy(conc[sat]) / sat.shape[0]
++            if abs(ent - prev_ent) <= thresh:
++                hit_iter = it
++                break
++            prev_ent = ent
++        scores[j] = dt * hit_iter
++
++    df = pd.DataFrame({"sepal_score": scores}, index=wanted).sort_values(
++        "sepal_score", ascending=False
++    )
++    if copy:
++        return df
++    adata.uns["sepal_score"] = df
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# mask
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["图掩膜", "mask graph", "区域裁剪图", "polygon mask"],
++    category="space",
++    description="Restrict a spatial graph to the observations inside (or outside) a polygon",
++    requires={'obsm': ['spatial'], 'obsp': ['spatial_connectivities']},
++    produces={'obs': ['{key_added}'], 'obsp': ['{key_added}_connectivities']},
++    auto_fix='none',
++    examples=[
++        "poly = [(0, 0), (0, 500), (500, 500), (500, 0)]",
++        "ov.space.mask_graph(adata, poly, key_added='roi')",
++    ],
++)
++def mask_graph(
++    adata,
++    polygon,
++    *,
++    negative_mask: bool = False,
++    spatial_key: str = "spatial",
++    connectivity_key: Optional[str] = None,
++    key_added: str = "mask",
++    copy: bool = False,
++):
++    """Keep only the part of the spatial graph inside a hand-drawn region.
++
++    Every statistic in this module is computed over whichever graph it is given,
++    so restricting the graph is how you restrict an analysis to one region —
++    a tumour bed, a cortical layer — without subsetting the object and losing the
++    surrounding context.
++
++    Arguments:
++        adata: AnnData with coordinates and a spatial graph.
++        polygon: Vertices as an ``(n, 2)`` array, a list of ``(x, y)`` pairs, or a
++            shapely ``Polygon``/``MultiPolygon``.
++        negative_mask: Keep what is *outside* the polygon instead.
++        spatial_key: Coordinates in ``adata.obsm``.
++        connectivity_key: Graph in ``adata.obsp``. Default ``'spatial_connectivities'``.
++        key_added: Prefix for the boolean ``obs`` column and the masked graph.
++        copy: Return ``(mask, graph)`` instead of writing to ``adata``.
++
++    Returns:
++        ``(mask, masked_graph)`` when ``copy=True``, else ``None``.
++    """
++    from matplotlib.path import Path as _Path
++
++    coords = _coords(adata, spatial_key)
++    graph = _get_graph(adata, connectivity_key)
++
++    if hasattr(polygon, "geoms"):                       # shapely MultiPolygon
++        inside = np.zeros(len(coords), dtype=bool)
++        for geom in polygon.geoms:
++            inside |= _Path(np.asarray(geom.exterior.coords)).contains_points(coords)
++    elif hasattr(polygon, "exterior"):                  # shapely Polygon
++        inside = _Path(np.asarray(polygon.exterior.coords)).contains_points(coords)
++    else:
++        verts = np.asarray(polygon, dtype=np.float64)
++        if verts.ndim != 2 or verts.shape[1] != 2:
++            raise ValueError("polygon must be an (n, 2) array of vertices.")
++        inside = _Path(verts).contains_points(coords)
++
++    keep = ~inside if negative_mask else inside
++    diag = sparse.diags(keep.astype(np.float64))
++    masked = (diag @ graph @ diag).tocsr()
++    masked.eliminate_zeros()
++
++    if copy:
++        return keep, masked
++    adata.obs[key_added] = keep
++    adata.obsp[f"{key_added}_connectivities"] = masked
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# sliding window
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["滑动窗口", "sliding window", "空间分窗", "tile assignment"],
++    category="space",
++    description="Assign every observation to a square sliding window over the tissue",
++    requires={'obsm': ['spatial']},
++    produces={'obs': ['{sliding_window_key}']},
++    auto_fix='none',
++    examples=[
++        "ov.space.sliding_window(adata, window_size=500)",
++        "ov.space.sliding_window(adata, window_size=500, overlap=250)",
++    ],
++)
++def sliding_window(
++    adata,
++    *,
++    window_size: Optional[float] = None,
++    overlap: float = 0,
++    spatial_key: str = "spatial",
++    library_key: Optional[str] = None,
++    sliding_window_key: str = "sliding_window_assignment",
++    drop_partial_windows: bool = False,
++    copy: bool = False,
++):
++    """Tile the tissue into square windows and label every spot with its window.
++
++    Useful for two things: turning a slide into pseudo-replicates so a statistic
++    can be given an error bar, and testing whether a result holds locally rather
++    than only over the whole section.
++
++    With ``overlap`` above zero the windows are laid down every
++    ``window_size - overlap`` units, so a spot can fall in several; the assignment
++    then names the first window that contains it.
++
++    Arguments:
++        adata: AnnData with spatial coordinates.
++        window_size: Side length in coordinate units. Defaults to a quarter of the
++            smaller extent of the tissue.
++        overlap: How much neighbouring windows share. Must be < ``window_size``.
++        spatial_key: Coordinates in ``adata.obsm``.
++        library_key: Tile each library separately when given.
++        sliding_window_key: Name of the ``obs`` column to write.
++        drop_partial_windows: Leave spots in windows that hang off the edge
++            unassigned instead of keeping them.
++        copy: Return the assignment instead of writing it to ``adata.obs``.
++
++    Returns:
++        A Series of window labels when ``copy=True``, else ``None``.
++    """
++    coords = _coords(adata, spatial_key)
++    if overlap < 0:
++        raise ValueError("overlap must be >= 0.")
++
++    lo, hi = coords.min(axis=0), coords.max(axis=0)
++    if window_size is None:
++        window_size = float(np.min(hi[:2] - lo[:2]) / 4.0)
++    if window_size <= 0:
++        raise ValueError("window_size must be positive.")
++    if overlap >= window_size:
++        raise ValueError("overlap must be smaller than window_size.")
++
++    step = window_size - overlap
++    libs = (adata.obs[library_key].astype(str).to_numpy()
++            if library_key is not None else np.zeros(len(coords), dtype=int).astype(str))
++
++    labels = np.full(len(coords), None, dtype=object)
++    for lib in pd.unique(libs):
++        sel = libs == lib
++        pts = coords[sel][:, :2]
++        p_lo, p_hi = pts.min(axis=0), pts.max(axis=0)
++        xs = np.arange(p_lo[0], p_hi[0] + step, step)
++        ys = np.arange(p_lo[1], p_hi[1] + step, step)
++        sub = np.full(sel.sum(), None, dtype=object)
++        for wi, x0 in enumerate(xs):
++            for wj, y0 in enumerate(ys):
++                if drop_partial_windows and (x0 + window_size > p_hi[0] or y0 + window_size > p_hi[1]):
++                    continue
++                inside = ((pts[:, 0] >= x0) & (pts[:, 0] < x0 + window_size)
++                          & (pts[:, 1] >= y0) & (pts[:, 1] < y0 + window_size))
++                fresh = inside & np.equal(sub, None)
++                if fresh.any():
++                    name = f"window_{wi}_{wj}" if library_key is None else f"{lib}_window_{wi}_{wj}"
++                    sub[fresh] = name
++        labels[sel] = sub
++
++    series = pd.Series(pd.Categorical(labels), index=adata.obs_names,
++                       name=sliding_window_key)
++    if copy:
++        return series
++    adata.obs[sliding_window_key] = series
++    return None
++
++
++# --------------------------------------------------------------------------- #
++# variables by distance
++# --------------------------------------------------------------------------- #
++@register_function(
++    aliases=["距离依赖表达", "var by distance", "梯度分析", "distance gradient"],
++    category="space",
++    description="Build a design matrix of each observation's distance to an anchor cluster",
++    requires={'obsm': ['spatial'], 'obs': []},
++    produces={'obsm': ['{design_matrix_key}']},
++    auto_fix='none',
++    examples=[
++        "ov.space.var_by_distance(adata, groups='tumour', cluster_key='cell_type')",
++        "dm = adata.obsm['design_matrix']",
++    ],
++)
++def var_by_distance(
++    adata,
++    groups: Union[str, Sequence[str], np.ndarray],
++    *,
++    cluster_key: Optional[str] = None,
++    spatial_key: str = "spatial",
++    design_matrix_key: str = "design_matrix",
++    covariates: Union[str, Sequence[str], None] = None,
++    metric: str = "euclidean",
++    library_key: Optional[str] = None,
++    normalize: bool = True,
++    copy: bool = False,
++) -> Optional[pd.DataFrame]:
++    """Measure every spot's distance to an anchor, so expression can be read against it.
++
++    The anchor is one or more clusters — a tumour core, a vessel, a wound edge.
++    The result is a table of distances that turns "is this gene spatially
++    variable" into the sharper question "does this gene change as you move away
++    from *that*", which is usually the one being asked.
++
++    Arguments:
++        adata: AnnData with spatial coordinates.
++        groups: Anchor cluster name(s), or an ``(n, 2)`` array of anchor coordinates.
++        cluster_key: Column holding the cluster labels; required when ``groups``
++            names clusters.
++        spatial_key: Coordinates in ``adata.obsm``.
++        design_matrix_key: Key in ``adata.obsm`` to write.
++        covariates: Extra ``obs`` columns to carry into the design matrix.
++        metric: Any metric ``scipy.spatial.distance.cdist`` accepts.
++        library_key: Compute distances within each library separately.
++        normalize: Scale each anchor's distances to ``[0, 1]`` by their maximum, so
++            slides of different physical size are comparable. Set ``False`` to keep
++            the distances in the coordinate units they came in.
++        copy: Return the design matrix instead of writing it to ``adata.obsm``.
++
++    Returns:
++        The design matrix when ``copy=True``, else ``None``.
++    """
++    from scipy.spatial.distance import cdist
++
++    coords = _coords(adata, spatial_key)
++
++    anchor_coords: Optional[np.ndarray] = None
++    anchor_names: list[str] = []
++    if isinstance(groups, np.ndarray) and groups.ndim == 2:
++        anchor_coords = np.asarray(groups, dtype=np.float64)
++        anchor_names = ["anchor"]
++    else:
++        if cluster_key is None:
++            raise ValueError("cluster_key is required when `groups` names clusters.")
++        if cluster_key not in adata.obs:
++            raise KeyError(f"adata.obs has no column {cluster_key!r}.")
++        anchor_names = [groups] if isinstance(groups, str) else list(groups)
++        labels = adata.obs[cluster_key].astype(str).to_numpy()
++        unknown = set(anchor_names) - set(np.unique(labels))
++        if unknown:
++            raise ValueError(f"{sorted(unknown)} not found in adata.obs[{cluster_key!r}].")
++
++    frame = pd.DataFrame(index=adata.obs_names)
++    libs = (adata.obs[library_key].astype(str).to_numpy()
++            if library_key is not None else np.zeros(len(coords), dtype=int).astype(str))
++
++    for name in anchor_names:
++        dist = np.full(len(coords), np.nan, dtype=np.float64)
++        for lib in pd.unique(libs):
++            sel = libs == lib
++            if anchor_coords is not None:
++                target = anchor_coords
++            else:
++                target = coords[sel][labels[sel] == name]
++            if len(target) == 0:
++                continue
++            dist[sel] = cdist(coords[sel], target, metric=metric).min(axis=1)
++
++        if normalize:
++            frame[f"{name}_raw"] = dist.copy()
++            scaled = dist.astype(np.float64).copy()
++            # an anchor spot is at distance 0 from itself; that is not a
++            # measurement of anything, so it drops out rather than anchoring the
++            # scale at zero
++            scaled[scaled == 0] = np.nan
++            if np.isfinite(scaled).any():
++                smallest = np.nanargmin(scaled)
++                scaled[smallest] = 0.0
++                span = np.nanmax(scaled) - np.nanmin(scaled)
++                if span > 0:
++                    scaled = (scaled - np.nanmin(scaled)) / span
++            frame[name] = scaled
++        else:
++            frame[name] = dist
++
++    if covariates is not None:
++        for cov in ([covariates] if isinstance(covariates, str) else list(covariates)):
++            if cov not in adata.obs:
++                raise KeyError(f"adata.obs has no covariate column {cov!r}.")
++            frame[cov] = adata.obs[cov].to_numpy()
++
++    if library_key is not None:
++        frame[library_key] = adata.obs[library_key].to_numpy()
++
++    if copy:
++        return frame
++    adata.obsm[design_matrix_key] = frame
++    return None
+diff --git a/omicverse/space/_niche.py b/omicverse/space/_niche.py
+new file mode 100644
+index 000000000..6fbe82d6b
+--- /dev/null
++++ b/omicverse/space/_niche.py
+@@ -0,0 +1,270 @@
++"""Recurrent multicellular structure — niches.
++
++A niche is a composition that repeats: the same mix of cell types, found in
++several places, doing the same job in each. Issue #760 asked for three flavours
++of this and they turn out to be three different questions.
++
++**Spatial niche.** Describe every spot by *what surrounds it* rather than by what
++it is, then cluster those descriptions. :func:`neighborhood` clusters the raw
++neighbourhood composition; :func:`utag` smooths expression along the spatial
++graph before clustering, so the niche is defined by transcriptome-in-context.
++Both are the missing flavours of squidpy's ``calculate_niche``; the third,
++CellCharter, is already in ``ov.space.cellcharter``.
++
++**Molecular niche.** Deconvolve each spot into cell-type abundances, factorise
++that matrix, and read each factor as a recurrent multicellular programme. This is
++what the myocardial-infarction and pulmonary-fibrosis atlases mean by the term.
++omicverse has done this since ``nmf_tissue_zones`` shipped; :func:`molecular` is
++the same function under the name the literature uses.
++
++The distinction that matters: a spatial niche is defined by geometry, a molecular
++niche by composition. On a slide where cell types are spatially segregated they
++converge. Where they do not, they answer different questions, and it is worth
++knowing which one a figure is showing.
++"""
++from __future__ import annotations
++
++from typing import Optional, Sequence, Union
++
++import numpy as np
++import pandas as pd
++from scipy import sparse
++
++from .._registry import register_function
++
++__all__ = ["neighborhood", "utag", "molecular"]
++
++
++def _graph_and_codes(adata, cluster_key, connectivity_key):
++    from ._neighborhood import _cluster_codes, _get_graph
++    return _get_graph(adata, connectivity_key), *_cluster_codes(adata, cluster_key)
++
++
++def _cluster_rows(matrix: np.ndarray, resolution: float, seed: int, n_neighbors: int):
++    """Leiden over the rows of a feature matrix, via a temporary AnnData."""
++    import scanpy as sc
++    from anndata import AnnData
++
++    tmp = AnnData(np.asarray(matrix, dtype=np.float32))
++    sc.pp.neighbors(tmp, n_neighbors=min(n_neighbors, max(tmp.n_obs - 1, 2)),
++                    use_rep="X", random_state=seed)
++    sc.tl.leiden(tmp, resolution=resolution, key_added="niche", random_state=seed,
++                 flavor="igraph", n_iterations=2, directed=False)
++    return tmp.obs["niche"].to_numpy()
++
++
++@register_function(
++    aliases=["空间生态位", "spatial niche", "邻域组成聚类", "cellular neighborhood", "niche分析"],
++    category="space",
++    description="Define niches by clustering each observation's neighbourhood composition",
++    requires={'obsp': ['spatial_connectivities'], 'obs': []},
++    produces={'obs': ['{key_added}'], 'obsm': ['{key_added}_composition']},
++    auto_fix='none',
++    examples=[
++        "ov.space.spatial_neighbors(adata, n_neighs=6, coord_type='grid')",
++        "ov.space.niche.neighborhood(adata, 'cell_type', resolution=0.5)",
++    ],
++)
++def neighborhood(
++    adata,
++    cluster_key: str,
++    *,
++    connectivity_key: Optional[str] = None,
++    resolution: float = 1.0,
++    n_neighbors: int = 15,
++    normalize: bool = True,
++    scale: bool = True,
++    min_niche_size: Optional[int] = None,
++    key_added: str = "niche",
++    seed: int = 0,
++    copy: bool = False,
++):
++    """Cluster spots by the company they keep.
++
++    Each spot is described by the mix of cluster labels among its spatial
++    neighbours — not by its own label — and those descriptions are clustered.
++    Two spots of different cell types sitting in the same kind of neighbourhood
++    end up in the same niche, which is the point: the niche is the local
++    community, not the cell.
++
++    This is the ``flavor='neighborhood'`` arm of squidpy's ``calculate_niche``.
++
++    Arguments:
++        adata: AnnData with a spatial graph and a categorical cluster column.
++        cluster_key: Column in ``adata.obs`` holding the cluster labels.
++        connectivity_key: Graph in ``adata.obsp``. Default ``'spatial_connectivities'``.
++        resolution: Leiden resolution over the composition profiles. Higher splits
++            more finely.
++        n_neighbors: Neighbours used when building the profile graph for Leiden.
++        normalize: Turn neighbour counts into fractions, so a spot at the tissue
++            edge with fewer neighbours is not pushed into its own niche purely for
++            having a smaller total.
++        scale: Standardise each cluster's column before clustering, so a rare cell
++            type carries the same weight as an abundant one. Without it the
++            partition is driven by whichever type is most common.
++        min_niche_size: Niches smaller than this are relabelled ``'unassigned'``.
++        key_added: ``obs`` column to write. The composition itself is written to
++            ``adata.obsm[f'{key_added}_composition']``.
++        seed: Seed for Leiden.
++        copy: Return the labels instead of writing them to ``adata.obs``.
++
++    Returns:
++        A Series of niche labels when ``copy=True``, else ``None``.
++    """
++    graph, codes, cats = _graph_and_codes(adata, cluster_key, connectivity_key)
++
++    onehot = sparse.csr_matrix(
++        (np.ones(len(codes)), (np.arange(len(codes)), np.clip(codes, 0, None))),
++        shape=(len(codes), len(cats)),
++    )
++    composition = np.asarray((graph @ onehot).todense(), dtype=np.float64)
++
++    if normalize:
++        totals = composition.sum(axis=1, keepdims=True)
++        with np.errstate(invalid="ignore", divide="ignore"):
++            composition = np.where(totals > 0, composition / totals, 0.0)
++
++    features = composition
++    if scale:
++        from sklearn.preprocessing import StandardScaler
++        features = StandardScaler().fit_transform(composition)
++
++    labels = _cluster_rows(features, resolution, seed, n_neighbors)
++
++    if min_niche_size is not None:
++        counts = pd.Series(labels).value_counts()
++        small = set(counts[counts < min_niche_size].index)
++        labels = np.array(["unassigned" if x in small else x for x in labels])
++
++    series = pd.Series(pd.Categorical(labels), index=adata.obs_names, name=key_added)
++    if copy:
++        return series
++    adata.obs[key_added] = series
++    adata.obsm[f"{key_added}_composition"] = pd.DataFrame(
++        composition, index=adata.obs_names, columns=[str(c) for c in cats]
++    )
++    return None
++
++
++@register_function(
++    aliases=["UTAG", "utag", "空间平滑聚类", "spatial context clustering"],
++    category="space",
++    description="Define niches by smoothing expression along the spatial graph, then clustering (UTAG)",
++    requires={'obsp': ['spatial_connectivities']},
++    produces={'obs': ['{key_added}'], 'obsm': ['{key_added}_smoothed']},
++    auto_fix='none',
++    examples=[
++        "ov.space.spatial_neighbors(adata, n_neighs=6, coord_type='grid')",
++        "ov.space.niche.utag(adata, resolution=0.5)",
++    ],
++)
++def utag(
++    adata,
++    *,
++    connectivity_key: Optional[str] = None,
++    use_rep: Optional[str] = None,
++    resolution: float = 1.0,
++    n_neighbors: int = 15,
++    normalize: bool = True,
++    key_added: str = "utag_niche",
++    seed: int = 0,
++    copy: bool = False,
++):
++    """Smooth expression over the spatial graph, then cluster the result (UTAG).
++
++    One matrix multiplication: replace each spot's profile with the average over
++    itself and its spatial neighbours, then cluster. A spot is then represented by
++    its transcriptome *in context*, so the clusters that come out are tissue
++    domains rather than cell types — the same profile in two different
++    surroundings lands in two different niches.
++
++    This is the ``flavor='utag'`` arm of squidpy's ``calculate_niche``.
++
++    Arguments:
++        adata: AnnData with a spatial graph.
++        connectivity_key: Graph in ``adata.obsp``. Default ``'spatial_connectivities'``.
++        use_rep: ``obsm`` key to smooth, e.g. ``'X_pca'``. Defaults to ``adata.X``,
++            which is usually slower and noisier — a PCA representation is the
++            better input.
++        resolution: Leiden resolution over the smoothed profiles.
++        n_neighbors: Neighbours used when building the profile graph for Leiden.
++        normalize: Average over the neighbourhood rather than summing over it, so
++            spots with fewer neighbours are not systematically dimmer.
++        key_added: ``obs`` column to write. The smoothed matrix goes to
++            ``adata.obsm[f'{key_added}_smoothed']``.
++        seed: Seed for Leiden.
++        copy: Return the labels instead of writing them to ``adata.obs``.
++
++    Returns:
++        A Series of niche labels when ``copy=True``, else ``None``.
++    """
++    from ._neighborhood import _get_graph
++
++    graph = _get_graph(adata, connectivity_key)
++
++    if use_rep is not None:
++        if use_rep not in adata.obsm:
++            raise KeyError(f"adata.obsm has no key {use_rep!r}.")
++        matrix = np.asarray(adata.obsm[use_rep], dtype=np.float64)
++    else:
++        matrix = adata.X
++        matrix = np.asarray(matrix.todense() if sparse.issparse(matrix) else matrix,
++                            dtype=np.float64)
++
++    # include the spot itself, so a spot's own profile is not discarded
++    adjacency = (graph > 0).astype(np.float64).tocsr()
++    adjacency.setdiag(1.0)
++    smoothed = adjacency @ matrix
++    if normalize:
++        degree = np.asarray(adjacency.sum(axis=1)).ravel().reshape(-1, 1)
++        with np.errstate(invalid="ignore", divide="ignore"):
++            smoothed = np.where(degree > 0, smoothed / degree, 0.0)
++
++    labels = _cluster_rows(smoothed, resolution, seed, n_neighbors)
++    series = pd.Series(pd.Categorical(labels), index=adata.obs_names, name=key_added)
++    if copy:
++        return series
++    adata.obs[key_added] = series
++    adata.obsm[f"{key_added}_smoothed"] = smoothed
++    return None
++
++
++@register_function(
++    aliases=["分子生态位", "molecular niche", "细胞生态位", "cellular niche", "NMF生态位", "tissue zone"],
++    category="space",
++    description="Factorise per-spot cell-type abundances into recurrent multicellular niches (NMF)",
++    requires={'obsm': ['q05_cell_abundance_w_sf']},
++    produces={'obsm': ['X_tissue_zones']},
++    auto_fix='none',
++    examples=[
++        "# after cell2location deconvolution",
++        "zones = ov.space.niche.molecular(adata, n_factors=10)",
++        "zones.plot_factor_loadings()",
++    ],
++)
++def molecular(adata, *args, **kwargs):
++    """Factorise deconvolved cell-type abundances into molecular niches.
++
++    Take the spot-by-cell-type abundance matrix a deconvolution method produces —
++    cell2location's ``q05_cell_abundance_w_sf`` by default — and decompose it with
++    NMF. Each factor is a group of cell types that recur together across the
++    slide, which is what the myocardial-infarction and pulmonary-fibrosis atlases
++    call a molecular or cellular niche.
++
++    This is :func:`omicverse.space.nmf_tissue_zones` under the name the literature
++    uses. The two are the same function; nothing about the computation differs.
++    It is aliased here because nobody looking for niche analysis will search for
++    "tissue zones".
++
++    Arguments:
++        adata: Spatial AnnData carrying a per-spot cell-abundance matrix in
++            ``adata.obsm``.
++        *args: Forwarded to :func:`~omicverse.space.nmf_tissue_zones`.
++        **kwargs: Forwarded to :func:`~omicverse.space.nmf_tissue_zones`, including
++            ``obsm_key``, ``n_factors``, ``cell_type_names`` and ``top_k``.
++
++    Returns:
++        The :class:`~omicverse.space.TissueZones` object ``nmf_tissue_zones`` returns.
++    """
++    from ._tissue_zones import nmf_tissue_zones
++    return nmf_tissue_zones(adata, *args, **kwargs)
+diff --git a/omicverse/space/_svg.py b/omicverse/space/_svg.py
+index 504171c3c..ca6a4f07c 100644
+--- a/omicverse/space/_svg.py
++++ b/omicverse/space/_svg.py
+@@ -105,6 +105,7 @@ def spatial_neighbors(
+     delaunay: bool = False,
+     set_diag: bool = False,
+     key_added: str = 'spatial',
++    coord_type: str = 'generic',
+     copy: bool = False,
+ ):
+     r"""Build a spatial neighborhood graph from coordinates stored in ``adata.obsm``.
+@@ -124,6 +125,15 @@ def spatial_neighbors(
+         delaunay: Whether to build the graph from a Delaunay triangulation of the
+             spatial coordinates. When set, *n_neighs* is ignored. Default: False.
+         set_diag: Whether to include self-loops in the connectivity matrix. Default: False.
++        coord_type: ``'generic'`` (default) keeps every k-nearest neighbour. ``'grid'``
++            additionally drops edges longer than 1.4 lattice steps, which is what you
++            want on an array platform such as Visium or Stereo-seq: without it, spots
++            on the rim of the tissue reach across the gap to fill their k quota and
++            acquire neighbours they do not touch. On a 400-spot Visium subset the
++            generic graph gives node degrees of 5-10 where the hexagonal lattice
++            allows at most 6. The default is ``'generic'`` so that existing results do
++            not change silently; pass ``'grid'`` for array data, and note that
++            :func:`omicverse.space.sepal` assumes a lattice and needs it.
+         key_added: Prefix for the keys added to ``adata.obsp`` and ``adata.uns``. Default: 'spatial'.
+         copy: If ``True``, return ``(connectivities, distances)`` as sparse matrices. Default: False.
+ 
+@@ -207,6 +217,26 @@ def spatial_neighbors(
+         nn.fit(coords)
+         dist_mat = nn.kneighbors_graph(coords, n_neighbors=n_neighs, mode='distance')
+ 
++        if str(coord_type).lower() == 'grid':
++            # On an array platform every real neighbour sits one lattice step
++            # away. Plain k-NN cannot know that, so a spot on the rim of the
++            # tissue reaches across the gap to fill its quota and picks up
++            # neighbours it does not touch: on the full 2688-spot Visium H&E
++            # slide the ungated graph gives node degrees of 5-8, and 5-10 once
++            # the slide is subsampled, where a hexagonal lattice allows 6.
++            #
++            # The cutoff is not delicate. On that slide the neighbour distances
++            # are bimodal -- the lattice step at 138 px and the next ring at
++            # 238 px, with nothing in between -- so every multiplier from 1.2 to
++            # 1.72 yields the identical 14,646-edge graph. 1.4 sits in the middle
++            # of that plateau. Every edge it keeps is also in squidpy's grid
++            # graph (0 edges found here that squidpy does not have).
++            if dist_mat.nnz:
++                step = float(np.median(dist_mat.data))
++                too_long = dist_mat.data > step * 1.4
++                dist_mat.data[too_long] = 0.0
++                dist_mat.eliminate_zeros()
++
+     # Symmetrise: edge exists if *either* direction was found
+     dist_mat = dist_mat.maximum(dist_mat.T).tocsr()
+     conn_mat = (dist_mat > 0).astype(np.float64).tocsr()
+diff --git a/omicverse/space/_tools.py b/omicverse/space/_tools.py
+index 6b83eff3f..bc4c33ffb 100644
+--- a/omicverse/space/_tools.py
++++ b/omicverse/space/_tools.py
+@@ -9,6 +9,31 @@
+ from .._registry import register_function
+ from .._optional import build_optional_dependency_error
+ 
++__all__ = [
++    "subset_window",
++    "crop_space_visium",
++    "rotate_space_visium",
++    "find_image_offset_phase_correlation_array_input",
++    "find_image_offset_phase_correlation_torch",
++    "map_spatial_auto",
++    "map_spatial_manual",
++    "read_visium_10x",
++    "visium_10x_hd_cellpose_he",
++    "visium_10x_hd_cellpose_expand",
++    "visium_10x_hd_cellpose_gex",
++    "salvage_secondary_labels",
++    "bin2cell",
++    "sync_visium_hd_seg_geometries",
++    "write_visium_hd_cellseg",
++]
++"""Public surface of this module.
++
++``ov.space`` does ``from ._tools import *``. Without this list that star
++import also republished ``np``, ``os``, ``plt``, ``sc``, ``mpl`` and four
++matplotlib symbols as if they were part of the spatial API -- nine of the
++sixty-four public names in ``ov.space`` were other libraries' imports.
++"""
++
+ @register_function(
+     aliases=["裁剪空间数据", "crop_space_visium", "crop_visium", "空间数据裁剪", "Visium裁剪"],
+     category="space",
+@@ -50,6 +75,7 @@
+     ],
+     related=["space.crop_space_visium"],
+ )
++
+ def subset_window(adata, xlim, ylim, basis='spatial'):
+     """Subset an AnnData by a rectangular spatial window.
+ 
+diff --git a/omicverse/space/geom.py b/omicverse/space/geom.py
+new file mode 100644
+index 000000000..804564ed1
+--- /dev/null
++++ b/omicverse/space/geom.py
+@@ -0,0 +1,15 @@
++"""Geometry rather than expression — ``ov.space.geom``.
++
++Align serial sections into one frame, stack them into a volume, fill the gaps::
++
++    aligned = ov.space.geom.align([s1, s2, s3])
++    volume  = ov.space.geom.stack(aligned, z_spacing=10.0)
++    mid     = ov.space.geom.interpolate(aligned[0], aligned[1])
++
++``pySTAligner`` and ``CAST`` align expression and give a shared embedding; this
++gives a shared *coordinate frame*, which is what a 3-D reconstruction needs and an
++embedding cannot provide.
++"""
++from ._geom import align, align_pairwise, interpolate, stack
++
++__all__ = ["align", "align_pairwise", "stack", "interpolate"]
+diff --git a/omicverse/space/nb.py b/omicverse/space/nb.py
+new file mode 100644
+index 000000000..b694262c2
+--- /dev/null
++++ b/omicverse/space/nb.py
+@@ -0,0 +1,37 @@
++"""Statistics of how spatial neighbours are arranged — ``ov.space.nb``.
++
++The graph and what lives on it. Build the graph once with
++:func:`~omicverse.space.spatial_neighbors`, then ask questions of it::
++
++    ov.space.spatial_neighbors(adata, n_neighs=6, coord_type='grid')
++    ov.space.nb.enrichment(adata, 'cell_type')
++    ov.space.nb.co_occurrence(adata, 'cell_type')
++
++Every name here is also available flat on ``ov.space`` under its original
++spelling, so existing code keeps working.
++"""
++from ._svg import spatial_neighbors as neighbors
++from ._neighborhood import (
++    centrality_scores as centrality,
++    co_occurrence,
++    interaction_matrix,
++    mask_graph as mask,
++    nhood_enrichment as enrichment,
++    ripley,
++    sepal,
++    sliding_window,
++    var_by_distance,
++)
++
++__all__ = [
++    "neighbors",
++    "enrichment",
++    "co_occurrence",
++    "interaction_matrix",
++    "centrality",
++    "ripley",
++    "sepal",
++    "mask",
++    "sliding_window",
++    "var_by_distance",
++]
+diff --git a/omicverse/space/niche.py b/omicverse/space/niche.py
+new file mode 100644
+index 000000000..52b426eae
+--- /dev/null
++++ b/omicverse/space/niche.py
+@@ -0,0 +1,16 @@
++"""Recurrent multicellular structure — ``ov.space.niche``.
++
++Three ways to ask the same question, kept apart because they are not the same
++question::
++
++    ov.space.niche.neighborhood(adata, 'cell_type')   # cluster the local mix
++    ov.space.niche.utag(adata, use_rep='X_pca')       # cluster smoothed expression
++    ov.space.niche.cellcharter(adata, ...)            # GMM on the aggregated graph
++    ov.space.niche.molecular(adata, n_factors=10)     # NMF over deconvolved abundance
++
++See :mod:`omicverse.space._niche` for what separates them.
++"""
++from ._niche import molecular, neighborhood, utag
++from ._cellcharter import cellcharter
++
++__all__ = ["neighborhood", "utag", "cellcharter", "molecular"]
+diff --git a/tests/space/test_geom_stereoseq.py b/tests/space/test_geom_stereoseq.py
+new file mode 100644
+index 000000000..962ef132b
+--- /dev/null
++++ b/tests/space/test_geom_stereoseq.py
+@@ -0,0 +1,245 @@
++"""Geometry and Stereo-seq I/O.
++
++The alignment tests work by imposing a known rigid transform on a real slide and
++asking the aligner to undo it. That is the only way to know an alignment is right
++rather than merely smooth-looking: a wrong rotation still produces a tidy picture.
++
++Measured when this file was written, on a Visium slide 10,628 px across:
++
++    fgw   exact (< 1e-11 px) at every rotation from 10 to 170 degrees
++    icp   exact below ~60 degrees, then fails outright (3.6e+03 px at 79 degrees)
++
++which is why fgw is the default.
++"""
++from __future__ import annotations
++
++import gzip
++
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData
++
++from omicverse import space
++from omicverse.io import spatial as io_spatial
++
++
++def _slide(n: int = 250, seed: int = 0) -> AnnData:
++    rng = np.random.default_rng(seed)
++    coords = rng.uniform(0, 1000, size=(n, 2))
++    adata = AnnData(rng.poisson(4, size=(n, 25)).astype(np.float32))
++    adata.obsm["spatial"] = coords
++    adata.var_names = [f"g{i}" for i in range(25)]
++    return adata
++
++
++def _rotate(adata: AnnData, degrees: float, shift=(0.0, 0.0)) -> AnnData:
++    t = np.deg2rad(degrees)
++    rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
++    xy = np.asarray(adata.obsm["spatial"], dtype=float)
++    out = adata.copy()
++    out.obsm["spatial"] = (xy - xy.mean(0)) @ rot + xy.mean(0) + np.asarray(shift)
++    return out
++
++
++# --------------------------------------------------------------------------- #
++# geometry
++# --------------------------------------------------------------------------- #
++def test_procrustes_recovers_a_rotation_and_never_reflects():
++    from omicverse.space._geom import _procrustes
++
++    rng = np.random.default_rng(0)
++    src = rng.normal(size=(150, 2)) * 100
++    for degrees in (25, -60, 137):
++        t = np.deg2rad(degrees)
++        truth = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
++        rot = _procrustes(src, src @ truth, np.ones(len(src)))
++        moved = (src - src.mean(0)) @ rot
++        target = src @ truth
++        assert np.allclose(moved, target - target.mean(0), atol=1e-8)
++        assert np.linalg.det(rot) > 0
++
++    # a mirrored target must not be matched by mirroring the section
++    mirrored = src @ np.array([[1.0, 0.0], [0.0, -1.0]])
++    assert np.linalg.det(_procrustes(src, mirrored, np.ones(len(src)))) > 0
++
++
++@pytest.mark.parametrize("degrees", [5, 10])
++def test_icp_undoes_a_small_rotation(degrees):
++    """ICP only works near where it starts, and how near depends on the tissue.
++
++    On a real Visium slide with an irregular outline it held to 60 degrees; on
++    this uniform random cloud it fails from about 20; on a regular lattice it
++    fails at 10, because six-fold symmetry makes nearest-point correspondences
++    genuinely ambiguous. The fixture here is the random cloud, so the test only
++    claims the range that fixture supports.
++    """
++    ref = _slide()
++    moved, _ = space.geom.align_pairwise(_rotate(ref, degrees), ref, method="icp")
++    assert np.abs(moved - ref.obsm["spatial"]).max() < 1e-6
++
++
++def test_icp_gives_up_on_a_large_rotation_where_fgw_does_not():
++    """The documented failure, pinned so the docstring cannot drift from reality."""
++    ref = _slide()
++    turned = _rotate(ref, 90)
++    icp, _ = space.geom.align_pairwise(turned, ref, method="icp")
++    fgw, _ = space.geom.align_pairwise(turned, ref, method="fgw")
++    span = np.ptp(ref.obsm["spatial"])
++    assert np.abs(icp - ref.obsm["spatial"]).max() > 0.1 * span
++    assert np.abs(fgw - ref.obsm["spatial"]).max() < 1e-4
++
++
++@pytest.mark.parametrize("degrees", [15, 79, 150])
++def test_fgw_undoes_a_rotation_at_any_angle(degrees):
++    ref = _slide()
++    moved, plan = space.geom.align_pairwise(_rotate(ref, degrees), ref, method="fgw")
++    assert np.abs(moved - ref.obsm["spatial"]).max() < 1e-4
++    assert plan.shape == (ref.n_obs, ref.n_obs)
++
++
++def test_align_carries_the_rotation_along_the_chain():
++    """Every section must land in the reference frame, not just the first."""
++    ref = _slide()
++    slices = [ref, _rotate(ref, 17, (60, -40)), _rotate(ref, -31, (-100, 75)),
++              _rotate(ref, 48, (30, 150))]
++    aligned = space.geom.align(slices, method="fgw")
++    frame = aligned[0].obsm["spatial_aligned"]
++    for section in aligned:
++        assert np.abs(section.obsm["spatial_aligned"] - frame).max() < 1e-3
++
++
++def test_align_from_a_middle_reference_walks_both_ways():
++    ref = _slide()
++    slices = [_rotate(ref, -20), ref, _rotate(ref, 25)]
++    aligned = space.geom.align(slices, method="fgw", reference=1)
++    frame = aligned[1].obsm["spatial_aligned"]
++    for section in aligned:
++        assert np.abs(section.obsm["spatial_aligned"] - frame).max() < 1e-3
++
++
++def test_align_rejects_a_single_section_and_a_bad_reference():
++    ref = _slide()
++    with pytest.raises(ValueError, match="at least two"):
++        space.geom.align([ref])
++    with pytest.raises(IndexError, match="reference"):
++        space.geom.align([ref, ref], reference=5)
++
++
++def test_align_pairwise_rejects_an_unknown_method():
++    ref = _slide()
++    with pytest.raises(ValueError, match="method must be"):
++        space.geom.align_pairwise(ref, ref, method="magic")
++
++
++def test_stack_gives_every_section_its_own_z():
++    ref = _slide()
++    aligned = space.geom.align([ref, _rotate(ref, 12), _rotate(ref, -9)], method="fgw")
++    volume = space.geom.stack(aligned, z_spacing=10.0)
++    assert volume.n_obs == 3 * ref.n_obs
++    assert volume.obsm["spatial_3d"].shape[1] == 3
++    assert sorted(set(volume.obsm["spatial_3d"][:, 2])) == [0.0, 10.0, 20.0]
++    assert volume.uns["geom_stack"]["n_sections"] == 3
++
++
++def test_stack_accepts_uneven_section_depths():
++    ref = _slide()
++    aligned = space.geom.align([ref, _rotate(ref, 12), _rotate(ref, -9)], method="fgw")
++    volume = space.geom.stack(aligned, z_values=[0.0, 8.0, 25.0])
++    assert sorted(set(volume.obsm["spatial_3d"][:, 2])) == [0.0, 8.0, 25.0]
++
++
++def test_stack_says_which_step_was_skipped():
++    ref = _slide()
++    with pytest.raises(KeyError, match="geom.align"):
++        space.geom.stack([ref, ref], z_spacing=1.0)
++
++
++def test_interpolate_sits_between_its_two_neighbours():
++    ref = _slide()
++    aligned = space.geom.align([ref, _rotate(ref, 10, (50, 50))], method="fgw")
++    mid = space.geom.interpolate(aligned[0], aligned[1], fraction=0.5)
++    assert mid.n_obs == ref.n_obs
++    assert mid.uns["geom_interpolated"] is True
++    lo = aligned[0].obsm["spatial_aligned"]
++    hi = aligned[1].obsm["spatial_aligned"]
++    got = mid.obsm["spatial_aligned"]
++    assert got.min() >= min(lo.min(), hi.min()) - 1e-6
++    assert got.max() <= max(lo.max(), hi.max()) + 1e-6
++
++
++def test_interpolate_rejects_a_fraction_outside_the_gap():
++    ref = _slide()
++    aligned = space.geom.align([ref, _rotate(ref, 10)], method="fgw")
++    with pytest.raises(ValueError, match="fraction"):
++        space.geom.interpolate(aligned[0], aligned[1], fraction=1.5)
++
++
++# --------------------------------------------------------------------------- #
++# Stereo-seq
++# --------------------------------------------------------------------------- #
++def _gem(tmp_path, n=4000, extent=400, seed=0):
++    rng = np.random.default_rng(seed)
++    frame = pd.DataFrame({
++        "geneID": rng.choice([f"Gene{i}" for i in range(30)], n),
++        "x": rng.integers(0, extent, n),
++        "y": rng.integers(0, extent, n),
++        "MIDCount": rng.integers(1, 4, n),
++    })
++    path = tmp_path / "sample.gem.gz"
++    with gzip.open(path, "wt") as handle:
++        handle.write("#FileFormat=GEMv0.1\n#StereoChip=SS200000\n")
++        frame.to_csv(handle, sep="\t", index=False)
++    return path, frame
++
++
++def test_read_stereoseq_conserves_every_count(tmp_path):
++    path, frame = _gem(tmp_path)
++    adata = io_spatial.read_stereoseq(path, bin_size=50)
++    assert int(adata.X.sum()) == int(frame["MIDCount"].sum())
++
++
++def test_read_stereoseq_bins_the_field_as_asked(tmp_path):
++    path, _ = _gem(tmp_path, extent=400)
++    adata = io_spatial.read_stereoseq(path, bin_size=50)
++    assert adata.n_obs == (400 // 50) ** 2
++    assert adata.uns["stereoseq"]["bin_size"] == 50
++    assert adata.uns["stereoseq"]["bin_size_um"] == 25.0
++
++
++def test_read_stereoseq_keeps_the_gem_header(tmp_path):
++    path, _ = _gem(tmp_path)
++    adata = io_spatial.read_stereoseq(path, bin_size=50)
++    assert adata.uns["stereoseq"]["header"]["StereoChip"] == "SS200000"
++
++
++def test_rebinning_equals_reading_at_the_coarser_size(tmp_path):
++    """The cheap path and the expensive path must agree, or one of them is wrong."""
++    path, _ = _gem(tmp_path, extent=400)
++    fine = io_spatial.read_stereoseq(path, bin_size=50)
++    direct = io_spatial.read_stereoseq(path, bin_size=100)
++    rebinned = io_spatial.bin_stereoseq(fine, bin_size=100)
++    assert rebinned.shape == direct.shape
++    assert int(rebinned.X.sum()) == int(direct.X.sum())
++
++
++def test_rebinning_refuses_a_size_the_bins_do_not_nest_into(tmp_path):
++    path, _ = _gem(tmp_path)
++    fine = io_spatial.read_stereoseq(path, bin_size=50)
++    with pytest.raises(ValueError, match="whole multiple"):
++        io_spatial.bin_stereoseq(fine, bin_size=75)
++    with pytest.raises(ValueError, match="coarser"):
++        io_spatial.bin_stereoseq(fine, bin_size=25)
++
++
++def test_read_stereoseq_filters_on_counts_and_genes(tmp_path):
++    path, _ = _gem(tmp_path)
++    loose = io_spatial.read_stereoseq(path, bin_size=20)
++    strict = io_spatial.read_stereoseq(path, bin_size=20, min_counts=15, min_genes=5)
++    assert strict.n_obs < loose.n_obs
++    assert np.asarray(strict.X.sum(axis=1)).ravel().min() >= 15
++
++
++def test_read_stereoseq_reports_a_missing_file(tmp_path):
++    with pytest.raises(FileNotFoundError):
++        io_spatial.read_stereoseq(tmp_path / "absent.gem")
+diff --git a/tests/space/test_neighborhood.py b/tests/space/test_neighborhood.py
+new file mode 100644
+index 000000000..96cc99d0f
+--- /dev/null
++++ b/tests/space/test_neighborhood.py
+@@ -0,0 +1,246 @@
++"""The arrangement statistics, held against squidpy where squidpy has them.
++
++These functions were written to squidpy's semantics on purpose: each statistic
++has one correct definition, and matching a reference implementation is what makes
++the numbers checkable rather than merely plausible. The measured agreement on a
++real Visium slide, recorded when this file was written:
++
++    interaction_matrix      exact (max |diff| = 0)
++    nhood_enrichment count  exact
++    nhood_enrichment z      Pearson r = 0.9975   (independent permutation draws)
++    centrality_scores       exact (max |diff| = 0)
++    co_occurrence           Pearson r = 1.0000
++    ripley F / G / L        Pearson r = 1.0000 each
++    sepal                   Spearman rho = 0.864
++    sliding_window          ARI = 1.0000
++    var_by_distance         max |diff| = 1.11e-16
++
++squidpy is an optional dependency, so the comparisons skip when it is absent; the
++contract tests below run either way.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData
++
++from omicverse import space
++
++
++def _lattice(n_side: int = 12, step: float = 7.3, seed: int = 0) -> AnnData:
++    """A hexagonal-ish lattice with two spatially segregated cell types."""
++    rng = np.random.default_rng(seed)
++    xs, ys = np.meshgrid(np.arange(n_side), np.arange(n_side))
++    coords = np.column_stack([xs.ravel(), ys.ravel()]).astype(float)
++    coords[:, 0] += (coords[:, 1] % 2) * 0.5
++    coords *= step
++
++    labels = np.where(coords[:, 0] < coords[:, 0].mean(), "left", "right")
++    adata = AnnData(rng.poisson(5, size=(len(coords), 6)).astype(np.float32))
++    adata.obsm["spatial"] = coords
++    adata.obs["cell_type"] = pd.Categorical(labels)
++    space.spatial_neighbors(adata, n_neighs=6, coord_type="grid")
++    return adata
++
++
++# --------------------------------------------------------------------------- #
++# contracts
++# --------------------------------------------------------------------------- #
++def test_missing_graph_names_the_function_that_builds_it():
++    adata = AnnData(np.zeros((5, 2), dtype=np.float32))
++    adata.obsm["spatial"] = np.arange(10, dtype=float).reshape(5, 2)
++    adata.obs["cell_type"] = pd.Categorical(["a"] * 5)
++    with pytest.raises(KeyError, match="spatial_neighbors"):
++        space.interaction_matrix(adata, "cell_type")
++
++
++def test_interaction_matrix_counts_every_edge_from_both_ends():
++    adata = _lattice()
++    counts = space.interaction_matrix(adata, "cell_type", copy=True)
++    assert counts.shape == (2, 2)
++    assert counts.sum() == adata.obsp["spatial_connectivities"].nnz
++    assert np.allclose(counts, counts.T)      # symmetric graph, symmetric counts
++
++
++def test_interaction_matrix_normalized_rows_sum_to_one():
++    adata = _lattice()
++    fractions = space.interaction_matrix(adata, "cell_type", normalized=True, copy=True)
++    assert np.allclose(fractions.sum(axis=1), 1.0)
++
++
++def test_segregated_types_are_enriched_with_themselves():
++    """Two blocks side by side: each touches itself far more than the other."""
++    adata = _lattice()
++    res = space.nhood_enrichment(adata, "cell_type", n_perms=200, seed=0, copy=True)
++    z = res["zscore"]
++    assert z[0, 0] > 0 and z[1, 1] > 0        # like with like
++    assert z[0, 1] < 0                        # across the boundary, depleted
++
++
++def test_nhood_enrichment_is_reproducible_under_a_seed():
++    adata = _lattice()
++    a = space.nhood_enrichment(adata, "cell_type", n_perms=100, seed=7, copy=True)
++    b = space.nhood_enrichment(adata, "cell_type", n_perms=100, seed=7, copy=True)
++    assert np.array_equal(a["zscore"], b["zscore"])
++
++
++def test_centrality_scores_returns_one_row_per_cluster():
++    adata = _lattice()
++    df = space.centrality_scores(adata, "cell_type", copy=True)
++    assert list(df.index) == ["left", "right"]
++    assert set(df.columns) == {"degree_centrality", "average_clustering",
++                               "closeness_centrality"}
++    assert df.notna().all().all()
++
++
++def test_co_occurrence_shape_follows_the_interval_edges():
++    adata = _lattice()
++    occ, edges = space.co_occurrence(adata, "cell_type", interval=8, copy=True)
++    assert occ.shape == (2, 2, len(edges) - 1)
++    assert (occ >= 0).all()
++
++
++def test_ripley_rejects_an_unknown_mode():
++    adata = _lattice()
++    with pytest.raises(ValueError, match="mode must be"):
++        space.ripley(adata, "cell_type", mode="Q")
++
++
++@pytest.mark.parametrize("mode", ["F", "G", "L"])
++def test_ripley_runs_and_is_monotone_in_the_cumulative_modes(mode):
++    adata = _lattice()
++    res = space.ripley(adata, "cell_type", mode=mode, n_simulations=5,
++                       n_observations=100, n_steps=15, seed=0, copy=True)
++    stats = res[f"{mode}_stat"]
++    assert {"bins", "stats", "cell_type"} <= set(stats.columns)
++    if mode in ("F", "G"):                    # empirical CDFs never decrease
++        for _, grp in stats.groupby("cell_type", observed=True):
++            assert (np.diff(grp.sort_values("bins")["stats"].to_numpy()) >= -1e-12).all()
++
++
++def test_sepal_refuses_a_graph_that_is_not_a_lattice():
++    adata = _lattice()
++    space.spatial_neighbors(adata, n_neighs=3)          # degree no longer 6
++    with pytest.raises(ValueError, match="lattice"):
++        space.sepal(adata, max_neighs=6, genes=list(adata.var_names[:2]))
++
++
++def test_sepal_rejects_an_unsupported_lattice():
++    adata = _lattice()
++    with pytest.raises(ValueError, match="max_neighs"):
++        space.sepal(adata, max_neighs=5)
++
++
++def test_mask_graph_keeps_only_edges_inside_the_polygon():
++    adata = _lattice()
++    xy = adata.obsm["spatial"]
++    mid = xy.mean(axis=0)
++    poly = [(xy[:, 0].min() - 1, xy[:, 1].min() - 1), (xy[:, 0].min() - 1, mid[1]),
++            (mid[0], mid[1]), (mid[0], xy[:, 1].min() - 1)]
++    keep, masked = space.mask_graph(adata, poly, copy=True)
++    assert 0 < keep.sum() < adata.n_obs
++    assert masked.nnz < adata.obsp["spatial_connectivities"].nnz
++    # no edge may touch a spot outside the mask
++    coo = masked.tocoo()
++    assert keep[coo.row].all() and keep[coo.col].all()
++
++
++def test_mask_graph_negative_selects_the_complement():
++    adata = _lattice()
++    xy = adata.obsm["spatial"]
++    mid = xy.mean(axis=0)
++    poly = [(xy[:, 0].min() - 1, xy[:, 1].min() - 1), (xy[:, 0].min() - 1, mid[1]),
++            (mid[0], mid[1]), (mid[0], xy[:, 1].min() - 1)]
++    inside, _ = space.mask_graph(adata, poly, copy=True)
++    outside, _ = space.mask_graph(adata, poly, negative_mask=True, copy=True)
++    assert np.array_equal(inside, ~outside)
++
++
++def test_sliding_window_covers_every_spot_and_tiles_without_gaps():
++    adata = _lattice()
++    labels = space.sliding_window(adata, window_size=30.0, copy=True)
++    assert labels.notna().all()
++    assert labels.nunique() > 1
++
++
++def test_sliding_window_rejects_overlap_at_or_above_the_window():
++    adata = _lattice()
++    with pytest.raises(ValueError, match="overlap"):
++        space.sliding_window(adata, window_size=30.0, overlap=30.0)
++
++
++def test_var_by_distance_is_zero_at_the_anchor_and_one_at_the_far_edge():
++    adata = _lattice()
++    dm = space.var_by_distance(adata, groups="left", cluster_key="cell_type", copy=True)
++    col = dm["left"].to_numpy()
++    finite = col[np.isfinite(col)]
++    assert np.isclose(finite.min(), 0.0)
++    assert np.isclose(finite.max(), 1.0)
++    assert "left_raw" in dm.columns            # unscaled distances kept alongside
++
++
++def test_var_by_distance_without_normalisation_keeps_coordinate_units():
++    adata = _lattice()
++    dm = space.var_by_distance(adata, groups="left", cluster_key="cell_type",
++                               normalize=False, copy=True)
++    assert dm["left"].max() > 1.0              # pixels, not a fraction
++
++
++def test_var_by_distance_needs_a_cluster_key_when_groups_names_clusters():
++    adata = _lattice()
++    with pytest.raises(ValueError, match="cluster_key"):
++        space.var_by_distance(adata, groups="left")
++
++
++# --------------------------------------------------------------------------- #
++# agreement with squidpy
++# --------------------------------------------------------------------------- #
++@pytest.fixture(scope="module")
++def paired():
++    """The same slide and the same graph, ready for both implementations."""
++    sq = pytest.importorskip("squidpy")
++    adata = _lattice(n_side=14)
++    sq.gr.spatial_neighbors(adata, n_neighs=6, coord_type="generic")
++    return sq, adata
++
++
++def test_interaction_matrix_matches_squidpy(paired):
++    sq, adata = paired
++    assert np.allclose(sq.gr.interaction_matrix(adata, "cell_type", copy=True),
++                       space.interaction_matrix(adata, "cell_type", copy=True))
++
++
++def test_nhood_enrichment_counts_match_squidpy(paired):
++    sq, adata = paired
++    theirs = sq.gr.nhood_enrichment(adata, "cell_type", n_perms=50, seed=0,
++                                    copy=True, show_progress_bar=False)
++    ours = space.nhood_enrichment(adata, "cell_type", n_perms=50, seed=0, copy=True)
++    assert np.array_equal(theirs[1], ours["count"])
++
++
++def test_centrality_scores_match_squidpy(paired):
++    sq, adata = paired
++    sq.gr.centrality_scores(adata, "cell_type")
++    theirs = adata.uns["cell_type_centrality_scores"]
++    ours = space.centrality_scores(adata, "cell_type", copy=True)
++    for col in ours.columns:
++        assert np.allclose(theirs[col].to_numpy(), ours[col].to_numpy(), atol=1e-10)
++
++
++def test_co_occurrence_matches_squidpy(paired):
++    sq, adata = paired
++    theirs, edges = sq.gr.co_occurrence(adata, "cell_type", interval=10, copy=True,
++                                        show_progress_bar=False)
++    ours, _ = space.co_occurrence(adata, "cell_type", interval=edges, copy=True)
++    assert theirs.shape == ours.shape
++    assert np.allclose(theirs, ours, atol=1e-10)
++
++
++def test_var_by_distance_matches_squidpy(paired):
++    sq, adata = paired
++    sq.tl.var_by_distance(adata, groups="left", cluster_key="cell_type")
++    theirs = adata.obsm["design_matrix"]["left"].to_numpy()
++    ours = space.var_by_distance(adata, groups="left", cluster_key="cell_type",
++                                 copy=True)["left"].to_numpy()
++    assert np.allclose(theirs, ours, atol=1e-10, equal_nan=True)

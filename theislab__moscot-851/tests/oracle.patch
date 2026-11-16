@@ -1,0 +1,161 @@
+diff --git a/src/moscot/backends/ott/output.py b/src/moscot/backends/ott/output.py
+index d583261d..01a357f9 100644
+--- a/src/moscot/backends/ott/output.py
++++ b/src/moscot/backends/ott/output.py
+@@ -1,8 +1,10 @@
++import functools
+ from typing import Any, Optional, Tuple, Union
+ 
+ import jax
+ import jax.numpy as jnp
+ import numpy as np
++import scipy.sparse as sp
+ from ott.geometry import geometry, low_rank, pointcloud
+ from ott.solvers.linear import sinkhorn, sinkhorn_lr
+ from ott.solvers.quadratic import gromov_wasserstein, gromov_wasserstein_lr
+@@ -84,6 +86,22 @@ def rows(ixs: np.ndarray) -> jnp.ndarray:
+     return None
+ 
+ 
++def _mass_select_row(row: jnp.ndarray, *, value: float, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
++    """Select ``mode = 'mass'`` entries of one row: its ``k`` largest entries and how many to keep."""
++    vals, idx = jax.lax.top_k(row, k)
++    total = row.sum()
++    target = jnp.inf if value >= 1.0 else value * total
++    n_keep = jnp.minimum((jnp.cumsum(vals) < target).sum() + 1, k)
++    return vals, idx, jnp.where(row.max() > 0.0, n_keep, 0)  # massless rows keep nothing
++
++
++@functools.partial(jax.jit, static_argnames=("value", "k"))
++def _mass_select_rows(rows: jnp.ndarray, *, value: float, k: int) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
++    # `top_k` over a whole block of long rows needs several times the block's memory; 256 rows at a
++    # time do not (and run ~3x faster on a 2048 x 92,507 block on an RTX 4090)
++    return jax.lax.map(functools.partial(_mass_select_row, value=value, k=k), rows, batch_size=256)
++
++
+ class OTTOutput(BaseDiscreteSolverOutput):
+     """Output of various :term:`OT` problems.
+ 
+@@ -263,6 +281,20 @@ def _row_materializer(self) -> RowMaterializer:  # noqa: D102
+         materialize = _ott_row_materializer(self._output)
+         return super()._row_materializer() if materialize is None else materialize
+ 
++    def _mass_select(self, rows: ArrayLike, *, value: float, max_k: Optional[int]) -> Tuple[sp.csr_matrix, int]:
++        # select on the device holding the rows; only `[b, max_k]` crosses to the host, not `[b, m]`
++        if max_k is None or not isinstance(rows, jax.Array):
++            return super()._mass_select(rows, value=value, max_k=max_k)
++        b, m = rows.shape
++        k = min(max_k, m)
++        vals, idx, n_keep = (np.asarray(x) for x in _mass_select_rows(rows, value=value, k=k))
++        keep = np.arange(k)[None, :] < n_keep[:, None]
++        row_ix = np.broadcast_to(np.arange(b)[:, None], keep.shape)
++        out = sp.csr_matrix((vals[keep], (row_ix[keep], idx[keep])), shape=(b, m))
++        out.eliminate_zeros()
++        out.sort_indices()
++        return out, int((n_keep == 0).sum())
++
+     @property
+     def is_linear(self) -> bool:  # noqa: D102
+         return isinstance(self._output, (sinkhorn.SinkhornOutput, sinkhorn_lr.LRSinkhornOutput))
+diff --git a/src/moscot/base/output.py b/src/moscot/base/output.py
+index fdd153e1..ff390b41 100644
+--- a/src/moscot/base/output.py
++++ b/src/moscot/base/output.py
+@@ -73,13 +73,8 @@ def _massless_rows(rows: np.ndarray) -> np.ndarray:
+     return ~(rows.max(axis=1) > 0.0)
+ 
+ 
+-def _sparsify_block(
+-    rows: np.ndarray, *, mode: str, thr: Optional[float], value: Optional[float], max_k: Optional[int]
+-) -> sp.csr_matrix:
+-    """Apply the sparsification criterion to a block of transport-matrix rows."""
+-    if mode == "mass":
+-        assert value is not None  # validated in `sparsify`
+-        return _mass_select_block(rows, value=value, max_k=max_k)
++def _threshold_block(rows: np.ndarray, *, thr: float) -> sp.csr_matrix:
++    """Set the entries of a block of transport-matrix rows below ``thr`` to :math:`0`."""
+     rows = np.array(rows)  # writable copy
+     rows[rows < thr] = 0.0
+     return sp.csr_matrix(rows)
+@@ -286,6 +281,15 @@ def materialize(ixs: np.ndarray) -> ArrayLike:
+ 
+         return materialize
+ 
++    def _mass_select(self, rows: ArrayLike, *, value: float, max_k: Optional[int]) -> tuple[sp.csr_matrix, int]:
++        """Apply ``mode = 'mass'`` to a block of rows from :meth:`_row_materializer`.
++
++        Returns the sparsified block and its number of rows carrying no mass. Outputs whose rows live
++        on an accelerator override this to select there and copy only the kept entries to the host.
++        """
++        rows = np.asarray(rows)
++        return _mass_select_block(rows, value=value, max_k=max_k), int(_massless_rows(rows).sum())
++
+     def sparsify(
+         self,
+         mode: Literal["threshold", "percentile", "min_row", "mass"],
+@@ -304,6 +308,8 @@ def sparsify(
+         :term:`Gromov-Wasserstein`/:term:`fused Gromov-Wasserstein`, their :term:`low-rank` counterparts,
+         and already materialized matrices - never hold more than ``[batch_size, m]`` at a time. Other
+         outputs fall back to pushing indicator columns, whose cost depends on the output's :meth:`push`.
++        For :mod:`ott` outputs, ``mode = 'mass'`` with ``max_k`` selects the entries on the device holding
++        the rows and copies only ``[batch_size, max_k]`` of each block to the host.
+ 
+         Rows carrying no mass keep no entries and take no part in choosing a threshold, whichever
+         ``mode`` is used - no threshold can make them non-empty, and letting them take part would
+@@ -388,9 +394,15 @@ def sparsify(
+         tmaps_sparse: list[sp.csr_matrix] = []
+         n_massless = 0
+         for ixs in row_blocks:
+-            block = np.asarray(materialize(ixs))
+-            n_massless += int(_massless_rows(block).sum())
+-            tmaps_sparse.append(_sparsify_block(block, mode=mode, thr=thr, value=value, max_k=max_k))
++            if mode == "mass":
++                assert value is not None  # validated above
++                block, n_empty = self._mass_select(materialize(ixs), value=value, max_k=max_k)
++            else:
++                assert thr is not None
++                rows = np.asarray(materialize(ixs))
++                block, n_empty = _threshold_block(rows, thr=thr), int(_massless_rows(rows).sum())
++            n_massless += n_empty
++            tmaps_sparse.append(block)
+         if n_massless:
+             logger.warning(
+                 f"`{n_massless}` row(s) of the transport matrix carry no mass and are left empty; "
+diff --git a/tests/backends/ott/test_backend.py b/tests/backends/ott/test_backend.py
+index 64e5ef8c..dfb5a917 100644
+--- a/tests/backends/ott/test_backend.py
++++ b/tests/backends/ott/test_backend.py
+@@ -22,7 +22,7 @@
+ from moscot.backends.ott import GWSolver, SinkhornSolver
+ from moscot.backends.ott._utils import InitializerResolver, alpha_to_fused_penalty
+ from moscot.backends.ott.output import OTTOutput
+-from moscot.base.output import BaseDiscreteSolverOutput
++from moscot.base.output import BaseDiscreteSolverOutput, _mass_select_block
+ from moscot.base.solver import O, OTSolver
+ from moscot.utils.tagged_array import Tag, TaggedArray
+ from tests._utils import ATOL, RTOL, Geom_t
+@@ -504,6 +504,24 @@ def test_sparsify_minrow_contract(self, flavour: str, batch_size: int) -> None:
+             res.toarray(), np.where(tmap >= tmap.max(axis=1).min(), tmap, 0.0), rtol=RTOL, atol=1e-6
+         )
+ 
++    @pytest.mark.parametrize("batch_size", [1, 8, 1024])
++    @pytest.mark.parametrize("value", [0.5, 0.9, 1.0])
++    @pytest.mark.parametrize("flavour", FLAVOURS)
++    def test_mass_on_device_matches_host(self, flavour: str, value: float, batch_size: int) -> None:
++        # with `max_k`, the entries are selected on the device; the host selection is the reference
++        out = self._output(flavour, "mean")
++        res = out.sparsify(mode="mass", value=value, max_k=7, batch_size=batch_size).transport_matrix
++        expected = _mass_select_block(np.asarray(out.transport_matrix), value=value, max_k=7)
++        np.testing.assert_array_equal(np.diff(res.indptr), np.diff(expected.indptr))
++        for i in range(res.shape[0]):  # tied entries (e.g. of low-rank rows) may be kept at other columns
++            np.testing.assert_allclose(np.sort(res[i].data), np.sort(expected[i].data), rtol=RTOL, atol=1e-6)
++
++    def test_mass_on_device_massless_rows(self) -> None:
++        rows = jnp.asarray(np.r_[np.zeros((1, 5)), np.arange(10.0).reshape(2, 5)], dtype=jnp.float32)
++        res, n_empty = self._output("sinkhorn")._mass_select(rows, value=0.9, max_k=2)
++        assert n_empty == 1
++        np.testing.assert_array_equal(np.diff(res.indptr), [0, 2, 2])
++
+     def test_rows_use_parent_scale_cost(self) -> None:
+         # a `geom.subset`-based materializer re-derives `inv_scale_cost` from the subset and drifts here
+         out = self._output("sinkhorn", "mean")

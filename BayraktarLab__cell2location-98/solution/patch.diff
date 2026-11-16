@@ -1,0 +1,2261 @@
+diff --git a/cell2location/cluster_averages/cluster_averages.py b/cell2location/cluster_averages/cluster_averages.py
+index 86f1f2bb..2f1e5dba 100644
+--- a/cell2location/cluster_averages/cluster_averages.py
++++ b/cell2location/cluster_averages/cluster_averages.py
+@@ -14,9 +14,9 @@ def compute_cluster_averages(adata, labels, use_raw=True, layer=None):
+     labels
+         Name of adata.obs column containing cluster labels
+     use_raw
+-        Use raw slow in adata?
++        Use raw slow in adata.
+     layer
+-        use layer in adata? provide layer name
++        Use layer in adata, provide layer name.
+ 
+     Returns
+     -------
+@@ -38,7 +38,7 @@ def compute_cluster_averages(adata, labels, use_raw=True, layer=None):
+             var_names = adata.raw.var_names
+ 
+     if sum(adata.obs.columns == labels) != 1:
+-        raise ValueError("cluster_col is absent in adata_ref.obs or not unique")
++        raise ValueError("`labels` is absent in adata_ref.obs or not unique")
+ 
+     all_clusters = np.unique(adata.obs[labels])
+     averages_mat = np.zeros((1, x.shape[1]))
+@@ -53,29 +53,52 @@ def compute_cluster_averages(adata, labels, use_raw=True, layer=None):
+     return averages_df
+ 
+ 
+-def get_cluster_variances(adata_ref, cluster_col):
++def get_cluster_variances(adata, labels, use_raw=True, layer=None):
+     """
+-    :param adata_ref: AnnData object of reference single-cell dataset
+-    :param cluster_col: Name of adata_ref.obs column containing cluster labels
+-    :returns: pd.DataFrame of within cluster variance of each gene
++    Compute variance of each gene in each cluster
++
++    Parameters
++    ----------
++
++    labels
++        Name of adata.obs column containing cluster labels
++    use_raw
++        Use raw slow in adata.
++    layer
++        Use layer in adata, provide layer name.
++
++    Returns
++    -------
++    pd.DataFrame of within cluster variance of each gene
+     """
+-    if not adata_ref.raw:
+-        raise ValueError("AnnData object has no raw data")
+-    if sum(adata_ref.obs.columns == cluster_col) != 1:
+-        raise ValueError("cluster_col is absent in adata_ref.obs or not unique")
++    if layer is not None:
++        x = adata.layers[layer]
++        var_names = adata.var_names
++    else:
++        if not use_raw:
++            x = adata.X
++            var_names = adata.var_names
++        else:
++            if not adata.raw:
++                raise ValueError("AnnData object has no raw data, change `use_raw=True, layer=None` or fix your object")
++            x = adata.raw.X
++            var_names = adata.raw.var_names
++
++    if sum(adata.obs.columns == labels) != 1:
++        raise ValueError("`labels` is absent in adata_ref.obs or not unique")
+ 
+-    all_clusters = np.unique(adata_ref.obs[cluster_col])
+-    var_mat = np.zeros((1, adata_ref.raw.X.shape[1]))
++    all_clusters = np.unique(adata.obs[labels])
++    var_mat = np.zeros((1, x.shape[1]))
+ 
+     for c in all_clusters:
+-        sparse_subset = csr_matrix(adata_ref.raw.X[np.isin(adata_ref.obs[cluster_col], c), :])
++        sparse_subset = csr_matrix(x[np.isin(adata.obs[labels], c), :])
+         c = sparse_subset.copy()
+         c.data **= 2
+         var = c.mean(0) - (np.array(sparse_subset.mean(0)) ** 2)
+         del c
+         var_mat = np.concatenate((var_mat, var))
+     var_mat = var_mat[1:, :].T
+-    var_df = pd.DataFrame(data=var_mat, index=adata_ref.raw.var_names, columns=all_clusters)
++    var_df = pd.DataFrame(data=var_mat, index=var_names, columns=all_clusters)
+ 
+     return var_df
+ 
+diff --git a/cell2location/distributions/AutoAmortisedNormalMessenger.py b/cell2location/distributions/AutoAmortisedNormalMessenger.py
+new file mode 100755
+index 00000000..e9a0f2da
+--- /dev/null
++++ b/cell2location/distributions/AutoAmortisedNormalMessenger.py
+@@ -0,0 +1,485 @@
++from copy import deepcopy
++from typing import Callable, Optional, Union
++
++import numpy as np
++import pyro.distributions as dist
++import torch
++from pyro.distributions.distribution import Distribution
++from pyro.distributions.transforms import SoftplusTransform
++from pyro.infer.autoguide import AutoHierarchicalNormalMessenger
++from pyro.infer.autoguide.utils import (
++    deep_getattr,
++    deep_setattr,
++    helpful_support_errors,
++)
++from pyro.nn.module import PyroModule, PyroParam, to_pyro_module_
++from scvi._compat import Literal
++from torch.distributions import biject_to, constraints
++
++from cell2location.nn import FCLayers
++
++
++def log_sum_exp(value, dim=None, keepdim=False):
++    """Numerically stable implementation of the operation
++    value.exp().sum(dim, keepdim).log()
++    """
++    if dim is not None:
++        m, _ = torch.max(value, dim=dim, keepdim=True)
++        value0 = value - m
++        if keepdim is False:
++            m = m.squeeze(dim)
++        return m + torch.log(torch.sum(torch.exp(value0), dim=dim, keepdim=keepdim))
++    else:
++        m = torch.max(value)
++        sum_exp = torch.sum(torch.exp(value - m))
++        return m + torch.log(sum_exp)
++
++
++class FCLayersPyro(FCLayers, PyroModule):
++    pass
++
++
++class AutoAmortisedHierarchicalNormalMessenger(AutoHierarchicalNormalMessenger):
++    """
++    EXPERIMENTAL Automatic :class:`~pyro.infer.effect_elbo.GuideMessenger` ,
++    intended for use with :class:`~pyro.infer.effect_elbo.Effect_ELBO` or
++    similar. Amortise specific sites
++
++    The mean-field posterior at any site is a transformed normal distribution,
++    the mean of which depends on the value of that site given its dependencies in the model:
++
++        loc = loc + transform.inv(prior.mean) * weight
++
++    Where the value of `prior.mean` is conditional on upstream sites in the model.
++    This approach doesn't work for distributions that don't have the mean.
++
++    loc, scales and element-specific weight are amortised for each site specified in `amortised_plate_sites`.
++
++    Derived classes may override particular sites and use this simply as a
++    default, see AutoNormalMessenger documentation for example.
++
++    :param callable model: A Pyro model.
++    :param dict amortised_plate_sites: Dictionary with amortised plate details:
++        the name of observation/minibatch plate,
++        indexes of model args to provide to encoder,
++        variable names that belong to the observation plate
++        and the number of dimensions in non-plate axis of each variable - such as:
++        {
++            "name": "obs_plate",
++            "input": [0],  # expression data + (optional) batch index ([0, 2])
++            "input_transform": [torch.log1p], # how to transform input data before passing to NN
++            "sites": {
++                "n_s": 1,
++                "y_s": 1,
++                "z_sr": R,
++                "w_sf": F,
++            }
++        }
++    :param int n_in: Number of input dimensions (for encoder_class).
++    :param int n_hidden: Number of hidden nodes in each layer, one of 3 options:
++        1. Integer denoting the number of hidden nodes
++        2. Dictionary with {"single": 200, "multiple": 200} denoting the number of hidden nodes for each `encoder_mode` (See below)
++        3. Allowing different number of hidden nodes for each model site. Dictionary with the number of hidden nodes for single encode mode and each model site:
++        {
++            "single": 200
++            "n_s": 5,
++            "y_s": 5,
++            "z_sr": 128,
++            "w_sf": 200,
++        }
++    :param float init_param_scale: How to scale/normalise initial values for weights converting hidden layers to loc and scales.
++    :param float scales_offset: offset between the output of the NN and scales.
++    :param Callable encoder_class: Class that defines encoder network.
++    :param dict encoder_kwargs: Keyword arguments for encoder class.
++    :param dict multi_encoder_kwargs: Optional separate keyword arguments for encoder_class,
++        useful when encoder_mode == "single-multiple".
++    :param Callable encoder_instance: Encoder network instance, overrides class input and the input instance is copied with deepcopy.
++    :param str encoder_mode: Use single encoder for all variables ("single"), one encoder per variable ("multiple")
++        or a single encoder in the first step and multiple encoders in the second step ("single-multiple").
++    :param list hierarchical_sites: List of latent variables (model sites)
++        that have hierarchical dependencies.
++        If None, all sites are assumed to have hierarchical dependencies. If None, for the sites
++        that don't have upstream sites, the guide is representing/learning deviation from the prior.
++    """
++
++    # 'element-wise' or 'scalar'
++    weight_type = "element-wise"
++
++    def __init__(
++        self,
++        model: Callable,
++        *,
++        amortised_plate_sites: dict,
++        n_in: int,
++        n_hidden: dict = None,
++        init_param_scale: float = 1 / 50,
++        init_scale: float = 0.1,
++        init_weight: float = 1.0,
++        encoder_class=FCLayersPyro,
++        encoder_kwargs=None,
++        multi_encoder_kwargs=None,
++        encoder_instance: torch.nn.Module = None,
++        encoder_mode: Literal["single", "multiple", "single-multiple"] = "single",
++        hierarchical_sites: Optional[list] = None,
++    ):
++        if not isinstance(init_scale, float) or not (init_scale > 0):
++            raise ValueError("Expected init_scale > 0. but got {}".format(init_scale))
++        super().__init__(model)
++        self._init_scale = init_scale
++        self._init_weight = init_weight
++        self._hierarchical_sites = hierarchical_sites
++        self.amortised_plate_sites = amortised_plate_sites
++        self.encoder_mode = encoder_mode
++        self._computing_median = False
++        self._computing_quantiles = False
++        self._quantile_values = None
++        self._computing_mi = False
++        self.mi = dict()
++        self.samples_for_mi = None
++
++        self.softplus = SoftplusTransform()
++
++        # default n_hidden values and checking input
++        if n_hidden is None:
++            n_hidden = {"single": 200, "multiple": 200}
++        else:
++            if isinstance(n_hidden, int):
++                n_hidden = {"single": n_hidden, "multiple": n_hidden}
++            elif not isinstance(n_hidden, dict):
++                raise ValueError("n_hidden must be either int or dict")
++        # process encoder kwargs, add n_hidden, create argument for multiple encoders
++        encoder_kwargs = deepcopy(encoder_kwargs) if isinstance(encoder_kwargs, dict) else dict()
++        encoder_kwargs["n_hidden"] = n_hidden["single"]
++        if multi_encoder_kwargs is None:
++            multi_encoder_kwargs = deepcopy(encoder_kwargs)
++
++        # save encoder parameters
++        self.encoder_kwargs = encoder_kwargs
++        self.multi_encoder_kwargs = multi_encoder_kwargs
++        self.single_n_in = n_in
++        self.multiple_n_in = n_in
++        self.n_hidden = n_hidden
++        if ("single" in encoder_mode) and ("multiple" in encoder_mode):
++            # if single network precedes multiple networks
++            self.multiple_n_in = self.n_hidden["single"]
++        self.encoder_class = encoder_class
++        self.encoder_instance = encoder_instance
++        self.init_param_scale = init_param_scale
++
++    def get_posterior(
++        self,
++        name: str,
++        prior: Distribution,
++    ) -> Union[Distribution, torch.Tensor]:
++        if self._computing_median:
++            return self._get_posterior_median(name, prior)
++        if self._computing_quantiles:
++            return self._get_posterior_quantiles(name, prior)
++        if self._computing_mi:
++            # the messenger autoguide needs the output to fit certain dimensions
++            # this is hack which saves MI to self.mi but returns cheap to compute medians
++            self.mi[name] = self._get_mutual_information(name, prior)
++            return self._get_posterior_median(name, prior)
++
++        with helpful_support_errors({"name": name, "fn": prior}):
++            transform = biject_to(prior.support)
++        # If hierarchical_sites not specified all sites are assumed to be hierarchical
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            loc, scale, weight = self._get_params(name, prior)
++            loc = loc + transform.inv(prior.mean) * weight
++            posterior = dist.TransformedDistribution(
++                dist.Normal(loc, scale).to_event(transform.domain.event_dim),
++                transform.with_cache(),
++            )
++            return posterior
++        else:
++            # Fall back to mean field when hierarchical_sites list is not empty and site not in the list.
++            loc, scale = self._get_params(name, prior)
++            posterior = dist.TransformedDistribution(
++                dist.Normal(loc, scale).to_event(transform.domain.event_dim),
++                transform.with_cache(),
++            )
++            return posterior
++
++    def encode(self, name: str, prior: Distribution):
++        """
++        Apply encoder network to input data to obtain hidden layer encoding.
++        Parameters
++        ----------
++        args
++            Pyro model args
++        kwargs
++            Pyro model kwargs
++        -------
++
++        """
++        try:
++            args, kwargs = self.args_kwargs  # stored as a tuple of (tuple, dict)
++            # get the data for NN from
++            in_names = self.amortised_plate_sites["input"]
++            x_in = [kwargs[i] if i in kwargs.keys() else args[i] for i in in_names]
++            # apply data transform before passing to NN
++            in_transforms = self.amortised_plate_sites["input_transform"]
++            x_in = [in_transforms[i](x) for i, x in enumerate(x_in)]
++            # apply learnable normalisation before passing to NN:
++            input_normalisation = self.amortised_plate_sites.get("input_normalisation", None)
++            if input_normalisation is not None:
++                for i in range(len(self.amortised_plate_sites["input"])):
++                    if input_normalisation[i]:
++                        x_in[i] = x_in[i] * deep_getattr(self, f"input_normalisation_{i}")
++            if "single" in self.encoder_mode:
++                # encode with a single encoder
++                res = deep_getattr(self, "one_encoder")(*x_in)
++                if "multiple" in self.encoder_mode:
++                    # when there is a second layer of multiple encoders fetch encoders and encode data
++                    x_in[0] = res
++                    res = deep_getattr(self.multiple_encoders, name)(*x_in)
++            else:
++                # when there are multiple encoders fetch encoders and encode data
++                res = deep_getattr(self.multiple_encoders, name)(*x_in)
++            return res
++        except AttributeError:
++            pass
++
++        # Initialize.
++        # create normalisation parameters if necessary:
++        input_normalisation = self.amortised_plate_sites.get("input_normalisation", None)
++        if input_normalisation is not None:
++            for i in range(len(self.amortised_plate_sites["input"])):
++                if input_normalisation[i]:
++                    deep_setattr(
++                        self,
++                        f"input_normalisation_{i}",
++                        PyroParam(torch.ones((1, self.single_n_in)).to(prior.mean.device).requires_grad_(True)),
++                    )
++        # create encoder neural networks
++        if "single" in self.encoder_mode:
++            if self.encoder_instance is not None:
++                # copy provided encoder instance
++                one_encoder = deepcopy(self.encoder_instance).to(prior.mean.device)
++                # convert to pyro module
++                to_pyro_module_(one_encoder)
++                deep_setattr(self, "one_encoder", one_encoder)
++            else:
++                # create encoder instance from encoder class
++                deep_setattr(
++                    self,
++                    "one_encoder",
++                    self.encoder_class(n_in=self.single_n_in, n_out=self.n_hidden["single"], **self.encoder_kwargs).to(
++                        prior.mean.device
++                    ),
++                )
++        if "multiple" in self.encoder_mode:
++            # determine the number of hidden layers
++            if name in self.n_hidden.keys():
++                n_hidden = self.n_hidden[name]
++            else:
++                n_hidden = self.n_hidden["multiple"]
++            multi_encoder_kwargs = deepcopy(self.multi_encoder_kwargs)
++            multi_encoder_kwargs["n_hidden"] = n_hidden
++
++            # create multiple encoders
++            if self.encoder_instance is not None:
++                # copy instances
++                encoder_ = deepcopy(self.encoder_instance).to(prior.mean.device)
++                # convert to pyro module
++                to_pyro_module_(encoder_)
++                deep_setattr(
++                    self,
++                    "multiple_encoders." + name,
++                    encoder_,
++                )
++            else:
++                # create instances
++                deep_setattr(
++                    self,
++                    "multiple_encoders." + name,
++                    self.encoder_class(n_in=self.multiple_n_in, n_out=n_hidden, **multi_encoder_kwargs).to(
++                        prior.mean.device
++                    ),
++                )
++        return self.encode(name, prior)
++
++    def _get_params(self, name: str, prior: Distribution):
++        if name not in self.amortised_plate_sites["sites"].keys():
++            # don't use amortisation unless requested (site in the list)
++            return super()._get_params(name, prior)
++
++        args, kwargs = self.args_kwargs  # stored as a tuple of (tuple, dict)
++        hidden = self.encode(name, prior)
++        try:
++            linear_loc = deep_getattr(self.hidden2locs, name)
++            bias_loc = deep_getattr(self.bias4locs, name)
++            loc = hidden @ linear_loc + bias_loc
++            linear_scale = deep_getattr(self.hidden2scales, name)
++            bias_scale = deep_getattr(self.bias4scales, name)
++            scale = self.softplus((hidden @ linear_scale) + bias_scale - self._init_scale_unconstrained)
++            if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++                if self.weight_type == "element-wise":
++                    # weight is element-wise
++                    linear_weight = deep_getattr(self.hidden2weights, name)
++                    bias_weight = deep_getattr(self.bias4weights, name)
++                    weight = self.softplus((hidden @ linear_weight) + bias_weight - self._init_weight_unconstrained)
++                if self.weight_type == "scalar":
++                    # weight is a single value parameter
++                    weight = deep_getattr(self.weights, name)
++                return loc, scale, weight
++            else:
++                return loc, scale
++        except AttributeError:
++            pass
++
++        # Initialize.
++        with torch.no_grad():
++            init_scale = torch.full((), self._init_scale)
++            self._init_scale_unconstrained = self.softplus.inv(init_scale)
++            init_weight = torch.full((), self._init_weight)
++            self._init_weight_unconstrained = self.softplus.inv(init_weight)
++
++            # determine the number of hidden layers
++            if "multiple" in self.encoder_mode:
++                if name in self.n_hidden.keys():
++                    n_hidden = self.n_hidden[name]
++                else:
++                    n_hidden = self.n_hidden["multiple"]
++            elif "single" in self.encoder_mode:
++                n_hidden = self.n_hidden["single"]
++            # determine parameter dimensions
++            param_dim = (n_hidden, self.amortised_plate_sites["sites"][name])
++            bias_dim = (1, self.amortised_plate_sites["sites"][name])
++            # generate initial value for linear parameters
++            init_param = torch.normal(
++                torch.full(size=param_dim, fill_value=0.0, device=prior.mean.device),
++                torch.full(
++                    size=param_dim, fill_value=(1 * self.init_param_scale) / np.sqrt(n_hidden), device=prior.mean.device
++                ),
++            )
++        deep_setattr(self, "hidden2locs." + name, PyroParam(init_param.clone().detach().requires_grad_(True)))
++        deep_setattr(self, "hidden2scales." + name, PyroParam(init_param.clone().detach().requires_grad_(True)))
++        deep_setattr(
++            self, "bias4locs." + name, PyroParam(torch.full(size=bias_dim, fill_value=0.0, device=prior.mean.device))
++        )
++        deep_setattr(
++            self, "bias4scales." + name, PyroParam(torch.full(size=bias_dim, fill_value=0.0, device=prior.mean.device))
++        )
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            if self.weight_type == "scalar":
++                # weight is a single value parameter
++                deep_setattr(self, "weights." + name, PyroParam(init_weight, constraint=constraints.positive))
++            if self.weight_type == "element-wise":
++                # weight is element-wise
++                deep_setattr(
++                    self, "hidden2weights." + name, PyroParam(init_param.clone().detach().requires_grad_(True))
++                )
++                deep_setattr(
++                    self,
++                    "bias4weights." + name,
++                    PyroParam(torch.full(size=bias_dim, fill_value=0.0, device=prior.mean.device)),
++                )
++        return self._get_params(name, prior)
++
++    def median(self, *args, **kwargs):
++        self._computing_median = True
++        try:
++            return self(*args, **kwargs)
++        finally:
++            self._computing_median = False
++
++    @torch.no_grad()
++    def _get_posterior_median(self, name, prior):
++        transform = biject_to(prior.support)
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            loc, scale, weight = self._get_params(name, prior)
++            loc = loc + transform.inv(prior.mean) * weight
++        else:
++            loc, scale = self._get_params(name, prior)
++        return transform(loc)
++
++    def quantiles(self, quantiles, *args, **kwargs):
++        self._computing_quantiles = True
++        self._quantile_values = quantiles
++        try:
++            return self(*args, **kwargs)
++        finally:
++            self._computing_quantiles = False
++
++    @torch.no_grad()
++    def _get_posterior_quantiles(self, name, prior):
++        transform = biject_to(prior.support)
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            loc, scale, weight = self._get_params(name, prior)
++            loc = loc + transform.inv(prior.mean) * weight
++        else:
++            loc, scale = self._get_params(name, prior)
++
++        site_quantiles = torch.tensor(self._quantile_values, dtype=loc.dtype, device=loc.device)
++        site_quantiles_values = dist.Normal(loc, scale).icdf(site_quantiles)
++        return transform(site_quantiles_values)
++
++    def mutual_information(self, *args, **kwargs):
++        # compute samples necessary to compute MI
++        self.samples_for_mi = self(*args, **kwargs)
++        self._computing_mi = True
++        try:
++            # compute mi (saved to self.mi)
++            self(*args, **kwargs)
++            return self.mi
++        finally:
++            self._computing_mi = False
++
++    @torch.no_grad()
++    def _get_mutual_information(self, name, prior):
++        """Approximate the mutual information between data x and latent variable z
++
++            I(x, z) = E_xE_{q(z|x)}log(q(z|x)) - E_xE_{q(z|x)}log(q(z))
++
++        Returns: Float
++
++        """
++
++        #### get posterior mean and variance ####
++        transform = biject_to(prior.support)
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            loc, scale, weight = self._get_params(name, prior)
++            loc = loc + transform.inv(prior.mean) * weight
++        else:
++            loc, scale = self._get_params(name, prior)
++
++        if name not in self.amortised_plate_sites["sites"].keys():
++            # if amortisation is not used for a particular site return MI=0
++            return 0
++
++        #### create tensors with useful numbers ####
++        one = torch.ones((), dtype=loc.dtype, device=loc.device)
++        two = torch.tensor(2, dtype=loc.dtype, device=loc.device)
++        pi = torch.tensor(3.14159265359, dtype=loc.dtype, device=loc.device)
++        #### get sample from posterior ####
++        z_samples = self.samples_for_mi[name]
++
++        #### compute mi ####
++        x_batch, nz = loc.size()
++        x_batch = torch.tensor(x_batch, dtype=loc.dtype, device=loc.device)
++        nz = torch.tensor(nz, dtype=loc.dtype, device=loc.device)
++
++        # E_{q(z|x)}log(q(z|x)) = -0.5*nz*log(2*\pi) - 0.5*(1+scale.loc()).sum(-1)
++        neg_entropy = (
++            -nz * torch.log(pi * two) * (one / two) - ((scale**two).log() + one).sum(-1) * (one / two)
++        ).mean()
++
++        # [1, x_batch, nz]
++        loc, scale = loc.unsqueeze(0), scale.unsqueeze(0)
++        var = scale**two
++
++        # (z_batch, x_batch, nz)
++        dev = z_samples - loc
++
++        # (z_batch, x_batch)
++        log_density = -((dev**two) / var).sum(dim=-1) * (one / two) - (
++            nz * torch.log(pi * two) + (scale**two).log().sum(-1)
++        ) * (one / two)
++
++        # log q(z): aggregate posterior
++        # [z_batch]
++        log_qz = log_sum_exp(log_density, dim=1) - torch.log(x_batch)
++
++        return (neg_entropy - log_qz.mean(-1)).item()
+diff --git a/cell2location/models/_cell2location_model.py b/cell2location/models/_cell2location_model.py
+index 71d546ba..68320d38 100755
+--- a/cell2location/models/_cell2location_model.py
++++ b/cell2location/models/_cell2location_model.py
+@@ -1,4 +1,4 @@
+-from typing import List, Optional
++from typing import List, Optional, Union
+ 
+ import matplotlib.pyplot as plt
+ import numpy as np
+@@ -6,6 +6,7 @@
+ import scanpy
+ from anndata import AnnData
+ from pyro import clear_param_store
++from pyro.infer import Trace_ELBO, TraceEnum_ELBO
+ from pyro.nn import PyroModule
+ from scvi import REGISTRY_KEYS
+ from scvi.data import AnnDataManager
+@@ -16,14 +17,22 @@
+     NumericalJointObsField,
+     NumericalObsField,
+ )
++from scvi.dataloaders import DataSplitter, DeviceBackedDataSplitter
+ from scvi.model.base import BaseModelClass, PyroSampleMixin, PyroSviTrainMixin
++from scvi.model.base._pyromixin import PyroJitGuideWarmup
++from scvi.train import TrainRunner
+ from scvi.utils import setup_anndata_dsp
+ 
+ from cell2location.models._cell2location_module import (
+     LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel,
+ )
+ from cell2location.models.base._pyro_base_loc_module import Cell2locationBaseModule
+-from cell2location.models.base._pyro_mixin import PltExportMixin, QuantileMixin
++from cell2location.models.base._pyro_mixin import (
++    PltExportMixin,
++    PyroAggressiveConvergence,
++    PyroAggressiveTrainingPlan,
++    QuantileMixin,
++)
+ from cell2location.utils import select_slide
+ 
+ 
+@@ -65,6 +74,8 @@ def __init__(
+ 
+         super().__init__(adata)
+ 
++        self.mi_ = []
++
+         if model_class is None:
+             model_class = LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel
+ 
+@@ -150,7 +161,14 @@ def setup_anndata(
+         cls.register_manager(adata_manager)
+ 
+     def train(
+-        self, max_epochs: int = 30000, batch_size: int = None, train_size: float = 1, lr: float = 0.002, **kwargs
++        self,
++        max_epochs: int = 30000,
++        batch_size: int = None,
++        train_size: float = 1,
++        lr: float = 0.002,
++        num_particles: int = 1,
++        scale_elbo: float = 1.0,
++        **kwargs,
+     ):
+         """Train the model with useful defaults
+ 
+@@ -177,8 +195,108 @@ def train(
+         kwargs["train_size"] = train_size
+         kwargs["lr"] = lr
+ 
++        if "plan_kwargs" not in kwargs.keys():
++            kwargs["plan_kwargs"] = dict()
++        if getattr(self.module.model, "discrete_variables", None) and (len(self.module.model.discrete_variables) > 0):
++            kwargs["plan_kwargs"]["loss_fn"] = TraceEnum_ELBO(num_particles=num_particles)
++        else:
++            kwargs["plan_kwargs"]["loss_fn"] = Trace_ELBO(num_particles=num_particles)
++        if scale_elbo != 1.0:
++            if scale_elbo is None:
++                scale_elbo = 1.0 / (self.summary_stats["n_cells"] * self.summary_stats["n_genes"])
++            kwargs["plan_kwargs"]["scale_elbo"] = scale_elbo
++
+         super().train(**kwargs)
+ 
++    def train_aggressive(
++        self,
++        max_epochs: Optional[int] = 1000,
++        use_gpu: Optional[Union[str, int, bool]] = None,
++        train_size: float = 1,
++        validation_size: Optional[float] = None,
++        batch_size: int = None,
++        early_stopping: bool = False,
++        lr: Optional[float] = None,
++        plan_kwargs: Optional[dict] = None,
++        **trainer_kwargs,
++    ):
++        """
++        Train the model.
++        Parameters
++        ----------
++        max_epochs
++            Number of passes through the dataset. If `None`, defaults to
++            `np.min([round((20000 / n_cells) * 400), 400])`
++        use_gpu
++            Use default GPU if available (if None or True), or index of GPU to use (if int),
++            or name of GPU (if str, e.g., `'cuda:0'`), or use CPU (if False).
++        train_size
++            Size of training set in the range [0.0, 1.0].
++        validation_size
++            Size of the test set. If `None`, defaults to 1 - `train_size`. If
++            `train_size + validation_size < 1`, the remaining cells belong to a test set.
++        batch_size
++            Minibatch size to use during training. If `None`, no minibatching occurs and all
++            data is copied to device (e.g., GPU).
++        early_stopping
++            Perform early stopping. Additional arguments can be passed in `**kwargs`.
++            See :class:`~scvi.train.Trainer` for further options.
++        lr
++            Optimiser learning rate (default optimiser is :class:`~pyro.optim.ClippedAdam`).
++            Specifying optimiser via plan_kwargs overrides this choice of lr.
++        plan_kwargs
++            Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
++            `train()` will overwrite values present in `plan_kwargs`, when appropriate.
++        **trainer_kwargs
++            Other keyword args for :class:`~scvi.train.Trainer`.
++        """
++        if max_epochs is None:
++            n_obs = self.adata_manager.adata.n_obs
++            max_epochs = np.min([round((20000 / n_obs) * 1000), 1000])
++
++        plan_kwargs = plan_kwargs if isinstance(plan_kwargs, dict) else dict()
++        if lr is not None and "optim" not in plan_kwargs.keys():
++            plan_kwargs.update({"optim_kwargs": {"lr": lr}})
++
++        if batch_size is None:
++            # use data splitter which moves data to GPU once
++            data_splitter = DeviceBackedDataSplitter(
++                self.adata_manager,
++                train_size=train_size,
++                validation_size=validation_size,
++                batch_size=batch_size,
++                use_gpu=use_gpu,
++            )
++        else:
++            data_splitter = DataSplitter(
++                self.adata_manager,
++                train_size=train_size,
++                validation_size=validation_size,
++                batch_size=batch_size,
++                use_gpu=use_gpu,
++            )
++        training_plan = PyroAggressiveTrainingPlan(pyro_module=self.module, **plan_kwargs)
++
++        es = "early_stopping"
++        trainer_kwargs[es] = early_stopping if es not in trainer_kwargs.keys() else trainer_kwargs[es]
++
++        if "callbacks" not in trainer_kwargs.keys():
++            trainer_kwargs["callbacks"] = []
++        trainer_kwargs["callbacks"].append(PyroJitGuideWarmup())
++        trainer_kwargs["callbacks"].append(PyroAggressiveConvergence())
++
++        runner = TrainRunner(
++            self,
++            training_plan=training_plan,
++            data_splitter=data_splitter,
++            max_epochs=max_epochs,
++            use_gpu=use_gpu,
++            **trainer_kwargs,
++        )
++        res = runner()
++        self.mi_ = self.mi_ + training_plan.mi
++        return res
++
+     def export_posterior(
+         self,
+         adata,
+diff --git a/cell2location/models/_cell2location_module.py b/cell2location/models/_cell2location_module.py
+index 19d474cf..5268be37 100755
+--- a/cell2location/models/_cell2location_module.py
++++ b/cell2location/models/_cell2location_module.py
+@@ -96,7 +96,8 @@ def __init__(
+         detection_hyp_prior={"mean_alpha": 10.0},
+         w_sf_mean_var_ratio=5.0,
+         init_vals: Optional[dict] = None,
+-        init_alpha=3.0,
++        init_alpha=20.0,
++        dropout_p=0.0,
+     ):
+ 
+         super().__init__()
+@@ -117,6 +118,10 @@ def __init__(
+         detection_hyp_prior["alpha"] = detection_alpha
+         self.detection_hyp_prior = detection_hyp_prior
+ 
++        self.dropout_p = dropout_p
++        if self.dropout_p is not None:
++            self.dropout = torch.nn.Dropout(p=self.dropout_p)
++
+         if (init_vals is not None) & (type(init_vals) is dict):
+             self.np_init_vals = init_vals
+             for k in init_vals.keys():
+@@ -222,6 +227,10 @@ def list_obs_plate_vars(self):
+                 torch.log1p,
+                 lambda x: x,
+             ],  # how to transform input data before passing to NN
++            "input_normalisation": [
++                False,
++                False,
++            ],  # whether to normalise input data before passing to NN
+             "sites": {
+                 "n_s_cells_per_location": 1,
+                 "b_s_groups_per_location": 1,
+@@ -263,29 +272,75 @@ def forward(self, x_data, idx, batch_index):
+         # =====================Cell abundances w_sf======================= #
+         # factorisation prior on w_sf models similarity in locations
+         # across cell types f and reflects the absolute scale of w_sf
+-        with obs_plate:
++        with obs_plate as ind:
++            k = "n_s_cells_per_location"
+             n_s_cells_per_location = pyro.sample(
+-                "n_s_cells_per_location",
++                k,
+                 dist.Gamma(
+                     self.N_cells_per_location * self.N_cells_mean_var_ratio,
+                     self.N_cells_mean_var_ratio,
+                 ),
+             )
++            if (
++                self.training_wo_observed
++                and not self.training_wo_initial
++                and getattr(self, f"init_val_{k}", None) is not None
++            ):
++                # pre-training Variational distribution to initial values
++                pyro.sample(
++                    k + "_initial",
++                    dist.Gamma(
++                        self.init_alpha_tt,
++                        self.init_alpha_tt / getattr(self, f"init_val_{k}")[ind],
++                    ),
++                    obs=n_s_cells_per_location,
++                )  # (self.n_obs, self.n_groups)
+ 
++            k = "b_s_groups_per_location"
+             b_s_groups_per_location = pyro.sample(
+-                "b_s_groups_per_location",
++                k,
+                 dist.Gamma(self.B_groups_per_location, self.ones),
+             )
++            if (
++                self.training_wo_observed
++                and not self.training_wo_initial
++                and getattr(self, f"init_val_{k}", None) is not None
++            ):
++                # pre-training Variational distribution to initial values
++                pyro.sample(
++                    k + "_initial",
++                    dist.Gamma(
++                        self.init_alpha_tt,
++                        self.init_alpha_tt / getattr(self, f"init_val_{k}")[ind],
++                    ),
++                    obs=b_s_groups_per_location,
++                )  # (self.n_obs, self.n_groups)
+ 
+         # cell group loadings
+         shape = self.ones_1_n_groups * b_s_groups_per_location / self.n_groups_tensor
+         rate = self.ones_1_n_groups / (n_s_cells_per_location / b_s_groups_per_location)
+-        with obs_plate:
++        with obs_plate as ind:
++            k = "z_sr_groups_factors"
+             z_sr_groups_factors = pyro.sample(
+-                "z_sr_groups_factors",
++                k,
+                 dist.Gamma(shape, rate),  # .to_event(1)#.expand([self.n_groups]).to_event(1)
+             )  # (n_obs, n_groups)
+ 
++            if (
++                self.training_wo_observed
++                and not self.training_wo_initial
++                and getattr(self, f"init_val_{k}", None) is not None
++            ):
++                # pre-training Variational distribution to initial values
++                pyro.sample(
++                    k + "_initial",
++                    dist.Gamma(
++                        self.init_alpha_tt,
++                        self.init_alpha_tt / getattr(self, f"init_val_{k}")[ind],
++                    ),
++                    obs=z_sr_groups_factors,
++                )  # (self.n_obs, self.n_groups)
++
+         k_r_factors_per_groups = pyro.sample(
+             "k_r_factors_per_groups",
+             dist.Gamma(self.factors_per_groups, self.ones).expand([self.n_groups, 1]).to_event(2),
+@@ -302,26 +357,26 @@ def forward(self, x_data, idx, batch_index):
+             w_sf_mu = z_sr_groups_factors @ x_fr_group2fact
+ 
+             k = "w_sf"
++            w_sf = pyro.sample(
++                k,
++                dist.Gamma(
++                    w_sf_mu * self.w_sf_mean_var_ratio_tensor,
++                    self.w_sf_mean_var_ratio_tensor,
++                ),
++            )  # (self.n_obs, self.n_factors)
+             if (
+                 self.training_wo_observed
+                 and not self.training_wo_initial
+                 and getattr(self, f"init_val_{k}", None) is not None
+             ):
+                 # pre-training Variational distribution to initial values
+-                w_sf = pyro.sample(
+-                    k,
++                pyro.sample(
++                    k + "_initial",
+                     dist.Gamma(
+                         self.init_alpha_tt,
+                         self.init_alpha_tt / getattr(self, f"init_val_{k}")[ind],
+                     ),
+-                )  # (self.n_obs, self.n_factors)
+-            else:
+-                w_sf = pyro.sample(
+-                    "w_sf",
+-                    dist.Gamma(
+-                        w_sf_mu * self.w_sf_mean_var_ratio_tensor,
+-                        self.w_sf_mean_var_ratio_tensor,
+-                    ),
++                    obs=w_sf,
+                 )  # (self.n_obs, self.n_factors)
+ 
+         # =====================Location-specific detection efficiency ======================= #
+@@ -342,17 +397,33 @@ def forward(self, x_data, idx, batch_index):
+ 
+         beta = (obs2sample @ detection_hyp_prior_alpha) / (obs2sample @ detection_mean_y_e)
+         with obs_plate:
++            k = "detection_y_s"
+             detection_y_s = pyro.sample(
+-                "detection_y_s",
++                k,
+                 dist.Gamma(obs2sample @ detection_hyp_prior_alpha, beta),
+             )  # (self.n_obs, 1)
+ 
++            if (
++                self.training_wo_observed
++                and not self.training_wo_initial
++                and getattr(self, f"init_val_{k}", None) is not None
++            ):
++                # pre-training Variational distribution to initial values
++                pyro.sample(
++                    k + "_initial",
++                    dist.Gamma(
++                        self.init_alpha_tt,
++                        self.init_alpha_tt / getattr(self, f"init_val_{k}")[ind],
++                    ),
++                    obs=detection_y_s,
++                )  # (self.n_obs, 1)
++
+         # =====================Gene-specific additive component ======================= #
+         # per gene molecule contribution that cannot be explained by
+         # cell state signatures (e.g. background, free-floating RNA)
+         s_g_gene_add_alpha_hyp = pyro.sample(
+             "s_g_gene_add_alpha_hyp",
+-            dist.Gamma(self.gene_add_alpha_hyp_prior_alpha, self.gene_add_alpha_hyp_prior_beta),
++            dist.Gamma(self.ones * self.gene_add_alpha_hyp_prior_alpha, self.ones * self.gene_add_alpha_hyp_prior_beta),
+         )
+         s_g_gene_add_mean = pyro.sample(
+             "s_g_gene_add_mean",
+@@ -379,7 +450,7 @@ def forward(self, x_data, idx, batch_index):
+         # =====================Gene-specific overdispersion ======================= #
+         alpha_g_phi_hyp = pyro.sample(
+             "alpha_g_phi_hyp",
+-            dist.Gamma(self.alpha_g_phi_hyp_prior_alpha, self.alpha_g_phi_hyp_prior_beta),
++            dist.Gamma(self.ones * self.alpha_g_phi_hyp_prior_alpha, self.ones * self.alpha_g_phi_hyp_prior_beta),
+         )
+         alpha_g_inverse = pyro.sample(
+             "alpha_g_inverse",
+@@ -398,6 +469,8 @@ def forward(self, x_data, idx, batch_index):
+ 
+             # =====================DATA likelihood ======================= #
+             # Likelihood (sampling distribution) of data_target & add overdispersion via NegativeBinomial
++            if self.dropout_p != 0:
++                x_data = self.dropout(x_data)
+             with obs_plate:
+                 pyro.sample(
+                     "data_target",
+diff --git a/cell2location/models/base/_pyro_base_loc_module.py b/cell2location/models/base/_pyro_base_loc_module.py
+index 978e3605..1f70e17e 100755
+--- a/cell2location/models/base/_pyro_base_loc_module.py
++++ b/cell2location/models/base/_pyro_base_loc_module.py
+@@ -1,3 +1,5 @@
++from typing import Optional
++
+ from scvi._compat import Literal
+ from scvi.module.base import PyroBaseModuleClass
+ 
+@@ -26,8 +28,9 @@ def __init__(
+         model,
+         amortised: bool = False,
+         encoder_mode: Literal["single", "multiple", "single-multiple"] = "single",
+-        encoder_kwargs=None,
++        encoder_kwargs: Optional[dict] = None,
+         data_transform="log1p",
++        create_autoguide_kwargs: Optional[dict] = None,
+         **kwargs,
+     ):
+         super().__init__()
+@@ -35,6 +38,8 @@ def __init__(
+ 
+         self._model = model(**kwargs)
+         self._amortised = amortised
++        if create_autoguide_kwargs is None:
++            create_autoguide_kwargs = dict()
+ 
+         self._guide = self._create_autoguide(
+             model=self.model,
+@@ -44,6 +49,7 @@ def __init__(
+             encoder_mode=encoder_mode,
+             init_loc_fn=self.init_to_value,
+             n_cat_list=[kwargs["n_batch"]],
++            **create_autoguide_kwargs,
+         )
+ 
+         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
+diff --git a/cell2location/models/base/_pyro_mixin.py b/cell2location/models/base/_pyro_mixin.py
+index 6166f639..603459c5 100755
+--- a/cell2location/models/base/_pyro_mixin.py
++++ b/cell2location/models/base/_pyro_mixin.py
+@@ -1,20 +1,30 @@
++import logging
+ from datetime import date
+ from functools import partial
++from typing import Optional, Union
+ 
+ import matplotlib
+ import matplotlib.pyplot as plt
+ import numpy as np
+ import pandas as pd
+ import pyro
++import pytorch_lightning as pl
+ import torch
+ from pyro import poutine
+-from pyro.infer.autoguide import AutoNormal, init_to_mean
++from pyro.infer.autoguide import AutoNormal, init_to_feasible, init_to_mean
++from pytorch_lightning.callbacks import Callback
+ from scipy.sparse import issparse
+ from scvi import REGISTRY_KEYS
+ from scvi.dataloaders import AnnDataLoader
+ from scvi.model._utils import parse_use_gpu_arg
++from scvi.module.base import PyroBaseModuleClass
++from scvi.train import PyroTrainingPlan
+ 
+-from ...distributions.AutoNormalEncoder import AutoGuideList, AutoNormalEncoder
++from ...distributions.AutoAmortisedNormalMessenger import (
++    AutoAmortisedHierarchicalNormalMessenger,
++)
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def init_to_value(site=None, values={}):
+@@ -23,7 +33,7 @@ def init_to_value(site=None, values={}):
+     if site["name"] in values:
+         return values[site["name"]]
+     else:
+-        return init_to_mean(site)
++        return init_to_mean(site, fallback=init_to_feasible)
+ 
+ 
+ class AutoGuideMixinModule:
+@@ -43,38 +53,41 @@ def _create_autoguide(
+         encoder_kwargs,
+         data_transform,
+         encoder_mode,
+-        init_loc_fn=init_to_mean,
++        init_loc_fn=init_to_mean(fallback=init_to_feasible),
+         n_cat_list: list = [],
+         encoder_instance=None,
++        guide_class=AutoNormal,
++        guide_kwargs: Optional[dict] = None,
+     ):
+ 
++        if guide_kwargs is None:
++            guide_kwargs = dict()
++
+         if not amortised:
+-            _guide = AutoNormal(
+-                model,
+-                init_loc_fn=init_loc_fn,
+-                create_plates=model.create_plates,
+-            )
++            if getattr(model, "discrete_variables", None) is not None:
++                model = poutine.block(model, hide=model.discrete_variables)
++            if issubclass(guide_class, poutine.messenger.Messenger):
++                # messenger guides don't need create_plates function
++                _guide = guide_class(
++                    model,
++                    init_loc_fn=init_loc_fn,
++                    **guide_kwargs,
++                )
++            else:
++                _guide = guide_class(
++                    model,
++                    init_loc_fn=init_loc_fn,
++                    **guide_kwargs,
++                    create_plates=self.model.create_plates,
++                )
+         else:
+             encoder_kwargs = encoder_kwargs if isinstance(encoder_kwargs, dict) else dict()
+             n_hidden = encoder_kwargs["n_hidden"] if "n_hidden" in encoder_kwargs.keys() else 200
+-            init_param_scale = (
+-                encoder_kwargs["init_param_scale"] if "init_param_scale" in encoder_kwargs.keys() else 1 / 50
+-            )
+-            if "init_param_scale" in encoder_kwargs.keys():
+-                del encoder_kwargs["init_param_scale"]
+-            amortised_vars = self.list_obs_plate_vars
+-            _guide = AutoGuideList(model, create_plates=model.create_plates)
+-            _guide.append(
+-                AutoNormal(
+-                    pyro.poutine.block(model, hide=list(amortised_vars["sites"].keys())),
+-                    init_loc_fn=init_loc_fn,
+-                )
+-            )
+             if isinstance(data_transform, np.ndarray):
+-                # add extra info about gene clusters to the network
++                # add extra info about gene clusters as input to NN
+                 self.register_buffer("gene_clusters", torch.tensor(data_transform.astype("float32")))
+                 n_in = model.n_vars + data_transform.shape[1]
+-                data_transform = self.data_transform_clusters()
++                data_transform = self._data_transform_clusters()
+             elif data_transform == "log1p":
+                 # use simple log1p transform
+                 data_transform = torch.log1p
+@@ -94,26 +107,26 @@ def _create_autoguide(
+                     "var_std",
+                     torch.tensor(data_transform["var_std"].astype("float32").reshape((1, n_in))),
+                 )
+-                data_transform = self.data_transform_scale()
++                data_transform = self._data_transform_scale()
+             else:
+                 # use custom data transform
+                 data_transform = data_transform
+                 n_in = model.n_vars
+-
++            amortised_vars = model.list_obs_plate_vars()
+             if len(amortised_vars["input"]) >= 2:
+                 encoder_kwargs["n_cat_list"] = n_cat_list
+             amortised_vars["input_transform"][0] = data_transform
+-            _guide.append(
+-                AutoNormalEncoder(
+-                    pyro.poutine.block(model, expose=list(amortised_vars["sites"].keys())),
+-                    amortised_plate_sites=amortised_vars,
+-                    n_in=n_in,
+-                    n_hidden=n_hidden,
+-                    init_param_scale=init_param_scale,
+-                    encoder_kwargs=encoder_kwargs,
+-                    encoder_mode=encoder_mode,
+-                    encoder_instance=encoder_instance,
+-                )
++            if getattr(model, "discrete_variables", None) is not None:
++                model = poutine.block(model, hide=model.discrete_variables)
++            _guide = AutoAmortisedHierarchicalNormalMessenger(
++                model,
++                amortised_plate_sites=amortised_vars,
++                n_in=n_in,
++                n_hidden=n_hidden,
++                encoder_kwargs=encoder_kwargs,
++                encoder_mode=encoder_mode,
++                encoder_instance=encoder_instance,
++                **guide_kwargs,
+             )
+         return _guide
+ 
+@@ -166,7 +179,9 @@ def optim_param(module_name, param_name):
+         return optim_param
+ 
+     @torch.no_grad()
+-    def _posterior_quantile_amortised(self, q: float = 0.5, batch_size: int = 2048, use_gpu: bool = None):
++    def _posterior_quantile_minibatch(
++        self, q: float = 0.5, batch_size: int = 2048, use_gpu: bool = None, use_median: bool = False
++    ):
+         """
+         Compute median of the posterior distribution of each parameter, separating local (minibatch) variable
+         and global variables, which is necessary when performing amortised inference.
+@@ -182,10 +197,12 @@ def _posterior_quantile_amortised(self, q: float = 0.5, batch_size: int = 2048,
+             number of observations per batch
+         use_gpu
+             Bool, use gpu?
++        use_median
++            Bool, when q=0.5 use median rather than quantile method of the guide
+ 
+         Returns
+         -------
+-        dictionary {variable_name: posterior median}
++        dictionary {variable_name: posterior quantile}
+ 
+         """
+ 
+@@ -205,35 +222,27 @@ def _posterior_quantile_amortised(self, q: float = 0.5, batch_size: int = 2048,
+             self.to_device(device)
+ 
+             if i == 0:
+-
+-                means = self.module.guide.quantiles([q], *args, **kwargs)
+-                means = {
+-                    k: means[k].cpu().numpy()
+-                    for k in means.keys()
+-                    if k in self.module.model.list_obs_plate_vars()["sites"]
+-                }
+-
++                # find plate sites
++                obs_plate_sites = self._get_obs_plate_sites(args, kwargs, return_observed=True)
++                if len(obs_plate_sites) == 0:
++                    # if no local variables - don't sample
++                    break
+                 # find plate dimension
+-                trace = poutine.trace(self.module.model).get_trace(*args, **kwargs)
+-                # print(trace.nodes[self.module.model.list_obs_plate_vars()['name']])
+-                obs_plate = {
+-                    name: site["cond_indep_stack"][0].dim
+-                    for name, site in trace.nodes.items()
+-                    if site["type"] == "sample"
+-                    if any(f.name == self.module.model.list_obs_plate_vars()["name"] for f in site["cond_indep_stack"])
+-                }
++                obs_plate_dim = list(obs_plate_sites.values())[0]
++                if use_median and q == 0.5:
++                    means = self.module.guide.median(*args, **kwargs)
++                else:
++                    means = self.module.guide.quantiles([q], *args, **kwargs)
++                means = {k: means[k].cpu().numpy() for k in means.keys() if k in obs_plate_sites}
+ 
+             else:
++                if use_median and q == 0.5:
++                    means_ = self.module.guide.median(*args, **kwargs)
++                else:
++                    means_ = self.module.guide.quantiles([q], *args, **kwargs)
+ 
+-                means_ = self.module.guide.quantiles([q], *args, **kwargs)
+-                means_ = {
+-                    k: means_[k].cpu().numpy()
+-                    for k in means_.keys()
+-                    if k in list(self.module.model.list_obs_plate_vars()["sites"].keys())
+-                }
+-                means = {
+-                    k: np.concatenate([means[k], means_[k]], axis=list(obs_plate.values())[0]) for k in means.keys()
+-                }
++                means_ = {k: means_[k].cpu().numpy() for k in means_.keys() if k in obs_plate_sites}
++                means = {k: np.concatenate([means[k], means_[k]], axis=obs_plate_dim) for k in means.keys()}
+             i += 1
+ 
+         # sample global parameters
+@@ -243,12 +252,11 @@ def _posterior_quantile_amortised(self, q: float = 0.5, batch_size: int = 2048,
+         kwargs = {k: v.to(device) for k, v in kwargs.items()}
+         self.to_device(device)
+ 
+-        global_means = self.module.guide.quantiles([q], *args, **kwargs)
+-        global_means = {
+-            k: global_means[k].cpu().numpy()
+-            for k in global_means.keys()
+-            if k not in list(self.module.model.list_obs_plate_vars()["sites"].keys())
+-        }
++        if use_median and q == 0.5:
++            global_means = self.module.guide.median(*args, **kwargs)
++        else:
++            global_means = self.module.guide.quantiles([q], *args, **kwargs)
++        global_means = {k: global_means[k].cpu().numpy() for k in global_means.keys() if k not in obs_plate_sites}
+ 
+         for k in global_means.keys():
+             means[k] = global_means[k]
+@@ -258,26 +266,31 @@ def _posterior_quantile_amortised(self, q: float = 0.5, batch_size: int = 2048,
+         return means
+ 
+     @torch.no_grad()
+-    def _posterior_quantile(self, q: float = 0.5, batch_size: int = 2048, use_gpu: bool = None):
++    def _posterior_quantile(
++        self, q: float = 0.5, batch_size: int = None, use_gpu: bool = None, use_median: bool = False
++    ):
+         """
+         Compute median of the posterior distribution of each parameter pyro models trained without amortised inference.
+ 
+         Parameters
+         ----------
+         q
+-            quantile to compute
++            Quantile to compute
+         use_gpu
+             Bool, use gpu?
++        use_median
++            Bool, when q=0.5 use median rather than quantile method of the guide
+ 
+         Returns
+         -------
+-        dictionary {variable_name: posterior median}
++        dictionary {variable_name: posterior quantile}
+ 
+         """
+ 
+         self.module.eval()
+         gpus, device = parse_use_gpu_arg(use_gpu)
+-
++        if batch_size is None:
++            batch_size = self.adata_manager.adata.n_obs
+         train_dl = AnnDataLoader(self.adata_manager, shuffle=False, batch_size=batch_size)
+         # sample global parameters
+         tensor_dict = next(iter(train_dl))
+@@ -286,30 +299,40 @@ def _posterior_quantile(self, q: float = 0.5, batch_size: int = 2048, use_gpu: b
+         kwargs = {k: v.to(device) for k, v in kwargs.items()}
+         self.to_device(device)
+ 
+-        means = self.module.guide.quantiles([q], *args, **kwargs)
++        if use_median and q == 0.5:
++            means = self.module.guide.median(*args, **kwargs)
++        else:
++            means = self.module.guide.quantiles([q], *args, **kwargs)
+         means = {k: means[k].cpu().detach().numpy() for k in means.keys()}
+ 
+         return means
+ 
+-    def posterior_quantile(self, q: float = 0.5, batch_size: int = 2048, use_gpu: bool = None):
++    def posterior_quantile(
++        self, q: float = 0.5, batch_size: int = 2048, use_gpu: bool = None, use_median: bool = False
++    ):
+         """
+         Compute median of the posterior distribution of each parameter.
+ 
+         Parameters
+         ----------
+         q
+-            quantile to compute
++            Quantile to compute
+         use_gpu
++            Bool, use gpu?
++        use_median
++            Bool, when q=0.5 use median rather than quantile method of the guide
+ 
+         Returns
+         -------
+ 
+         """
+ 
+-        if self.module.is_amortised:
+-            return self._posterior_quantile_amortised(q=q, batch_size=batch_size, use_gpu=use_gpu)
++        if batch_size is not None:
++            return self._posterior_quantile_minibatch(
++                q=q, batch_size=batch_size, use_gpu=use_gpu, use_median=use_median
++            )
+         else:
+-            return self._posterior_quantile(q=q, batch_size=batch_size, use_gpu=use_gpu)
++            return self._posterior_quantile(q=q, batch_size=batch_size, use_gpu=use_gpu, use_median=use_median)
+ 
+ 
+ class PltExportMixin:
+@@ -394,6 +417,8 @@ def _export2adata(self, samples):
+             "post_sample_q05": samples["post_sample_q05"],
+             "post_sample_q95": samples["post_sample_q95"],
+         }
++        if type(self.factor_names_) is dict:
++            results["factor_names"] = self.factor_names_
+ 
+         return results
+ 
+@@ -403,6 +428,7 @@ def sample2df_obs(
+         site_name: str = "w_sf",
+         summary_name: str = "means",
+         name_prefix: str = "cell_abundance",
++        factor_names_key: str = "",
+     ):
+         """Export posterior distribution summary for observation-specific parameters
+         (e.g. spatial cell abundance) as Pandas data frame
+@@ -424,11 +450,15 @@ def sample2df_obs(
+         Pandas data frame corresponding to either means, 5%/95% quantiles or sd of the posterior distribution
+ 
+         """
++        if type(self.factor_names_) is dict:
++            factor_names_ = self.factor_names_[factor_names_key]
++        else:
++            factor_names_ = self.factor_names_
+ 
+         return pd.DataFrame(
+             samples[f"post_sample_{summary_name}"].get(site_name, None),
+             index=self.adata.obs_names,
+-            columns=[f"{summary_name}{name_prefix}_{site_name}_{i}" for i in self.factor_names_],
++            columns=[f"{summary_name}{name_prefix}_{site_name}_{i}" for i in factor_names_],
+         )
+ 
+     def sample2df_vars(
+@@ -437,6 +467,7 @@ def sample2df_vars(
+         site_name: str = "gene_factors",
+         summary_name: str = "means",
+         name_prefix: str = "",
++        factor_names_key: str = "",
+     ):
+         r"""Export posterior distribution summary for variable-specific parameters as Pandas data frame
+         (means, 5%/95% quantiles or sd of posterior distribution).
+@@ -457,11 +488,15 @@ def sample2df_vars(
+         Pandas data frame corresponding to either means, 5%/95% quantiles or sd of the posterior distribution
+ 
+         """
++        if type(self.factor_names_) is dict:
++            factor_names_ = self.factor_names_[factor_names_key]
++        else:
++            factor_names_ = self.factor_names_
+ 
+         return pd.DataFrame(
+             samples[f"post_sample_{summary_name}"].get(site_name, None),
+             columns=self.adata.var_names,
+-            index=[f"{summary_name}{name_prefix}_{site_name}_{i}" for i in self.factor_names_],
++            index=[f"{summary_name}{name_prefix}_{site_name}_{i}" for i in factor_names_],
+         ).T
+ 
+     def plot_QC(self, summary_name: str = "means", use_n_obs: int = 1000):
+@@ -486,7 +521,9 @@ def plot_QC(self, summary_name: str = "means", use_n_obs: int = 1000):
+         if getattr(self, "samples", False) is False:
+             raise RuntimeError("self.samples is missing, please run self.export_posterior() first")
+         if use_n_obs is not None:
+-            ind_x = np.random.choice(self.adata.n_obs, np.min((use_n_obs, self.adata.n_obs)), replace=False)
++            ind_x = np.random.choice(
++                self.adata_manager.adata.n_obs, np.min((use_n_obs, self.adata.n_obs)), replace=False
++            )
+         else:
+             ind_x = None
+ 
+@@ -497,3 +534,243 @@ def plot_QC(self, summary_name: str = "means", use_n_obs: int = 1000):
+         if issparse(x_data):
+             x_data = np.asarray(x_data.toarray())
+         self.plot_posterior_mu_vs_data(self.expected_nb_param["mu"], x_data)
++
++
++class PyroAggressiveConvergence(Callback):
++    """
++    A callback to compute/apply aggressive training convergence criteria for amortised inference.
++    Motivated by this paper: https://arxiv.org/pdf/1901.05534.pdf
++    """
++
++    def __init__(self, dataloader: AnnDataLoader = None, patience: int = 10, tolerance: float = 1e-4) -> None:
++        super().__init__()
++        self.dataloader = dataloader
++        self.patience = patience
++        self.tolerance = tolerance
++
++    def on_train_epoch_end(
++        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", unused: Optional = None
++    ) -> None:
++        """
++        Compute aggressive training convergence criteria for amortised inference.
++        """
++        pyro_guide = pl_module.module.guide
++        if self.dataloader is None:
++            dl = trainer.datamodule.train_dataloader()
++        else:
++            dl = self.dataloader
++        for tensors in dl:
++            tens = {k: t.to(pl_module.device) for k, t in tensors.items()}
++            args, kwargs = pl_module.module._get_fn_args_from_batch(tens)
++            break
++        mi_ = pyro_guide.mutual_information(*args, **kwargs)
++        mi_ = np.array([v for v in mi_.values()]).sum()
++        pl_module.log("MI", mi_, prog_bar=True)
++        if len(pl_module.mi) > 1:
++            if pl_module.mi[-1] >= (mi_ - self.tolerance):
++                pl_module.n_epochs_patience += 1
++        else:
++            pl_module.n_epochs_patience = 0
++        if pl_module.n_epochs_patience > self.patience:
++            # stop aggressive training by setting epoch counter to max epochs
++            # pl_module.aggressive_epochs_counter = pl_module.n_aggressive_epochs + 1
++            logger.info('Stopped aggressive training after "{}" epochs'.format(pl_module.aggressive_epochs_counter))
++        pl_module.mi.append(mi_)
++
++
++class PyroAggressiveTrainingPlan1(PyroTrainingPlan):
++    """
++    Lightning module task to train Pyro scvi-tools modules.
++    Parameters
++    ----------
++    pyro_module
++        An instance of :class:`~scvi.module.base.PyroBaseModuleClass`. This object
++        should have callable `model` and `guide` attributes or methods.
++    loss_fn
++        A Pyro loss. Should be a subclass of :class:`~pyro.infer.ELBO`.
++        If `None`, defaults to :class:`~pyro.infer.Trace_ELBO`.
++    optim
++        A Pyro optimizer instance, e.g., :class:`~pyro.optim.Adam`. If `None`,
++        defaults to :class:`pyro.optim.Adam` optimizer with a learning rate of `1e-3`.
++    optim_kwargs
++        Keyword arguments for **default** optimiser :class:`pyro.optim.Adam`.
++    n_aggressive_epochs
++        Number of epochs in aggressive optimisation of amortised variables.
++    n_aggressive_steps
++        Number of steps to spend optimising amortised variables before one step optimising global variables.
++    n_steps_kl_warmup
++        Number of training steps (minibatches) to scale weight on KL divergences from 0 to 1.
++        Only activated when `n_epochs_kl_warmup` is set to None.
++    n_epochs_kl_warmup
++        Number of epochs to scale weight on KL divergences from 0 to 1.
++        Overrides `n_steps_kl_warmup` when both are not `None`.
++    """
++
++    def __init__(
++        self,
++        pyro_module: PyroBaseModuleClass,
++        loss_fn: Optional[pyro.infer.ELBO] = None,
++        optim: Optional[pyro.optim.PyroOptim] = None,
++        optim_kwargs: Optional[dict] = None,
++        n_aggressive_epochs: int = 1000,
++        n_aggressive_steps: int = 20,
++        n_steps_kl_warmup: Union[int, None] = None,
++        n_epochs_kl_warmup: Union[int, None] = 400,
++        aggressive_vars: Union[list, None] = None,
++        invert_aggressive_selection: bool = False,
++    ):
++        super().__init__(
++            pyro_module=pyro_module,
++            loss_fn=loss_fn,
++            optim=optim,
++            optim_kwargs=optim_kwargs,
++            n_steps_kl_warmup=n_steps_kl_warmup,
++            n_epochs_kl_warmup=n_epochs_kl_warmup,
++        )
++
++        self.n_aggressive_epochs = n_aggressive_epochs
++        self.n_aggressive_steps = n_aggressive_steps
++        self.aggressive_steps_counter = 0
++        self.aggressive_epochs_counter = 0
++        self.mi = []
++        self.n_epochs_patience = 0
++
++        # in list not provided use amortised variables for aggressive training
++        if aggressive_vars is None:
++            aggressive_vars = list(self.module.list_obs_plate_vars["sites"].keys())
++            aggressive_vars = aggressive_vars + [f"{i}_initial" for i in aggressive_vars]
++            aggressive_vars = aggressive_vars + [f"{i}_unconstrained" for i in aggressive_vars]
++
++        self.aggressive_vars = aggressive_vars
++        self.invert_aggressive_selection = invert_aggressive_selection
++
++        self.svi = pyro.infer.SVI(
++            model=pyro_module.model,
++            guide=pyro_module.guide,
++            optim=self.optim,
++            loss=self.loss_fn,
++        )
++
++    def change_requires_grad(self, aggressive_vars_status, non_aggressive_vars_status):
++
++        for k, v in self.module.guide.named_parameters():
++            k_in_vars = np.any([i in k for i in self.aggressive_vars])
++            # hide variables on the list if they are not hidden
++            if k_in_vars and v.requires_grad and (aggressive_vars_status == "hide"):
++                v.requires_grad = False
++            # expose variables on the list if they are hidden
++            if k_in_vars and (not v.requires_grad) and (aggressive_vars_status == "expose"):
++                v.requires_grad = True
++
++            # hide variables not on the list if they are not hidden
++            if (not k_in_vars) and v.requires_grad and (non_aggressive_vars_status == "hide"):
++                v.requires_grad = False
++            # expose variables not on the list if they are hidden
++            if (not k_in_vars) and (not v.requires_grad) and (non_aggressive_vars_status == "expose"):
++                v.requires_grad = True
++
++    def training_epoch_end(self, outputs):
++
++        self.aggressive_epochs_counter += 1
++
++        elbo = 0
++        n = 0
++        for out in outputs:
++            elbo += out["loss"]
++            n += 1
++        elbo /= n
++        self.log("elbo_train", elbo, prog_bar=True)
++
++    def training_step(self, batch, batch_idx):
++
++        args, kwargs = self.module._get_fn_args_from_batch(batch)
++        # Set KL weight if necessary.
++        # Note: if applied, ELBO loss in progress bar is the effective KL annealed loss, not the true ELBO.
++        if self.use_kl_weight:
++            kwargs.update({"kl_weight": self.kl_weight})
++
++        if self.aggressive_epochs_counter < self.n_aggressive_epochs:
++            if self.aggressive_steps_counter < self.n_aggressive_steps:
++                self.aggressive_steps_counter += 1
++                # Do parameter update exclusively for amortised variables
++                if self.invert_aggressive_selection:
++                    self.change_requires_grad(
++                        aggressive_vars_status="hide",
++                        non_aggressive_vars_status="expose",
++                    )
++                else:
++                    self.change_requires_grad(
++                        aggressive_vars_status="expose",
++                        non_aggressive_vars_status="hide",
++                    )
++                loss = torch.Tensor([self.svi.step(*args, **kwargs)])
++            else:
++                self.aggressive_steps_counter = 0
++                # Do parameter update exclusively for non-amortised variables
++                if self.invert_aggressive_selection:
++                    self.change_requires_grad(
++                        aggressive_vars_status="expose",
++                        non_aggressive_vars_status="hide",
++                    )
++                else:
++                    self.change_requires_grad(
++                        aggressive_vars_status="hide",
++                        non_aggressive_vars_status="expose",
++                    )
++                loss = torch.Tensor([self.svi.step(*args, **kwargs)])
++        else:
++            # Do parameter update for both types of variables
++            self.change_requires_grad(
++                aggressive_vars_status="expose",
++                non_aggressive_vars_status="expose",
++            )
++            loss = torch.Tensor([self.svi.step(*args, **kwargs)])
++
++        return {"loss": loss}
++
++
++class PyroAggressiveTrainingPlan(PyroAggressiveTrainingPlan1):
++    """
++    Lightning module task to train Pyro scvi-tools modules.
++    Parameters
++    ----------
++    pyro_module
++        An instance of :class:`~scvi.module.base.PyroBaseModuleClass`. This object
++        should have callable `model` and `guide` attributes or methods.
++    loss_fn
++        A Pyro loss. Should be a subclass of :class:`~pyro.infer.ELBO`.
++        If `None`, defaults to :class:`~pyro.infer.Trace_ELBO`.
++    optim
++        A Pyro optimizer instance, e.g., :class:`~pyro.optim.Adam`. If `None`,
++        defaults to :class:`pyro.optim.Adam` optimizer with a learning rate of `1e-3`.
++    optim_kwargs
++        Keyword arguments for **default** optimiser :class:`pyro.optim.Adam`.
++    n_steps_kl_warmup
++        Number of training steps (minibatches) to scale weight on KL divergences from 0 to 1.
++        Only activated when `n_epochs_kl_warmup` is set to None.
++    n_epochs_kl_warmup
++        Number of epochs to scale weight on KL divergences from 0 to 1.
++        Overrides `n_steps_kl_warmup` when both are not `None`.
++    """
++
++    def __init__(
++        self,
++        scale_elbo: Union[float, None] = 1.0,
++        **kwargs,
++    ):
++        super().__init__(**kwargs)
++
++        if scale_elbo != 1.0:
++            self.svi = pyro.infer.SVI(
++                model=poutine.scale(self.module.model, scale_elbo),
++                guide=poutine.scale(self.module.guide, scale_elbo),
++                optim=self.optim,
++                loss=self.loss_fn,
++            )
++        else:
++            self.svi = pyro.infer.SVI(
++                model=self.module.model,
++                guide=self.module.guide,
++                optim=self.optim,
++                loss=self.loss_fn,
++            )
+diff --git a/cell2location/models/reference/_reference_module.py b/cell2location/models/reference/_reference_module.py
+index 4c766355..8467b877 100755
+--- a/cell2location/models/reference/_reference_module.py
++++ b/cell2location/models/reference/_reference_module.py
+@@ -231,7 +231,7 @@ def forward(self, x_data, idx, batch_index, label_index, extra_categoricals):
+         # s_{e,g} accounting for background, free-floating RNA
+         s_g_gene_add_alpha_hyp = pyro.sample(
+             "s_g_gene_add_alpha_hyp",
+-            dist.Gamma(self.gene_add_alpha_hyp_prior_alpha, self.gene_add_alpha_hyp_prior_beta),
++            dist.Gamma(self.ones * self.gene_add_alpha_hyp_prior_alpha, self.ones * self.gene_add_alpha_hyp_prior_beta),
+         )
+         s_g_gene_add_mean = pyro.sample(
+             "s_g_gene_add_mean",
+@@ -258,7 +258,7 @@ def forward(self, x_data, idx, batch_index, label_index, extra_categoricals):
+         # =====================Gene-specific overdispersion ======================= #
+         alpha_g_phi_hyp = pyro.sample(
+             "alpha_g_phi_hyp",
+-            dist.Gamma(self.alpha_g_phi_hyp_prior_alpha, self.alpha_g_phi_hyp_prior_beta),
++            dist.Gamma(self.ones * self.alpha_g_phi_hyp_prior_alpha, self.ones * self.alpha_g_phi_hyp_prior_beta),
+         )
+         alpha_g_inverse = pyro.sample(
+             "alpha_g_inverse",
+diff --git a/cell2location/models/simplified/_cell2location_v3_no_factorisation_module.py b/cell2location/models/simplified/_cell2location_v3_no_factorisation_module.py
+index e10ba338..032ce624 100755
+--- a/cell2location/models/simplified/_cell2location_v3_no_factorisation_module.py
++++ b/cell2location/models/simplified/_cell2location_v3_no_factorisation_module.py
+@@ -301,7 +301,7 @@ def forward(self, x_data, idx, batch_index):
+         # cell state signatures (e.g. background, free-floating RNA)
+         s_g_gene_add_alpha_hyp = pyro.sample(
+             "s_g_gene_add_alpha_hyp",
+-            dist.Gamma(self.gene_add_alpha_hyp_prior_alpha, self.gene_add_alpha_hyp_prior_beta),
++            dist.Gamma(self.ones * self.gene_add_alpha_hyp_prior_alpha, self.ones * self.gene_add_alpha_hyp_prior_beta),
+         )
+         s_g_gene_add_mean = pyro.sample(
+             "s_g_gene_add_mean",
+@@ -328,7 +328,7 @@ def forward(self, x_data, idx, batch_index):
+         # =====================Gene-specific overdispersion ======================= #
+         alpha_g_phi_hyp = pyro.sample(
+             "alpha_g_phi_hyp",
+-            dist.Gamma(self.alpha_g_phi_hyp_prior_alpha, self.alpha_g_phi_hyp_prior_beta),
++            dist.Gamma(self.ones * self.alpha_g_phi_hyp_prior_alpha, self.ones * self.alpha_g_phi_hyp_prior_beta),
+         )
+         alpha_g_inverse = pyro.sample(
+             "alpha_g_inverse",
+diff --git a/cell2location/models/simplified/_cell2location_v3_no_mg_module.py b/cell2location/models/simplified/_cell2location_v3_no_mg_module.py
+index e12d2b18..78d576bd 100755
+--- a/cell2location/models/simplified/_cell2location_v3_no_mg_module.py
++++ b/cell2location/models/simplified/_cell2location_v3_no_mg_module.py
+@@ -290,7 +290,7 @@ def forward(self, x_data, idx, batch_index):
+         # cell state signatures (e.g. background, free-floating RNA)
+         s_g_gene_add_alpha_hyp = pyro.sample(
+             "s_g_gene_add_alpha_hyp",
+-            dist.Gamma(self.gene_add_alpha_hyp_prior_alpha, self.gene_add_alpha_hyp_prior_beta),
++            dist.Gamma(self.ones * self.gene_add_alpha_hyp_prior_alpha, self.ones * self.gene_add_alpha_hyp_prior_beta),
+         )
+         s_g_gene_add_mean = pyro.sample(
+             "s_g_gene_add_mean",
+@@ -317,7 +317,7 @@ def forward(self, x_data, idx, batch_index):
+         # =====================Gene-specific overdispersion ======================= #
+         alpha_g_phi_hyp = pyro.sample(
+             "alpha_g_phi_hyp",
+-            dist.Gamma(self.alpha_g_phi_hyp_prior_alpha, self.alpha_g_phi_hyp_prior_beta),
++            dist.Gamma(self.ones * self.alpha_g_phi_hyp_prior_alpha, self.ones * self.alpha_g_phi_hyp_prior_beta),
+         )
+         alpha_g_inverse = pyro.sample(
+             "alpha_g_inverse",
+diff --git a/cell2location/nn/__init__.py b/cell2location/nn/__init__.py
+new file mode 100755
+index 00000000..52899267
+--- /dev/null
++++ b/cell2location/nn/__init__.py
+@@ -0,0 +1,3 @@
++from .fclayers import FCLayers
++
++__all__ = ["FCLayers"]
+diff --git a/cell2location/nn/fclayers.py b/cell2location/nn/fclayers.py
+new file mode 100755
+index 00000000..0c2e6290
+--- /dev/null
++++ b/cell2location/nn/fclayers.py
+@@ -0,0 +1,174 @@
++import collections
++from typing import Iterable
++
++import torch
++from scvi.nn._utils import one_hot
++from torch import nn as nn
++
++
++class FCLayers(nn.Module):
++    """
++    A helper class to build fully-connected layers for a neural network.
++    Dropout is performed on input rather than on output.
++
++    Adapted with modifications from scvi-tools:
++    Copyright (c) 2020 Romain Lopez, Adam Gayoso, Galen Xing, Yosef Lab
++    All rights reserved.
++
++    Parameters
++    ----------
++    n_in
++        The dimensionality of the input
++    n_out
++        The dimensionality of the output
++    n_cat_list
++        A list containing, for each category of interest,
++        the number of categories. Each category will be
++        included using a one-hot encoding.
++    n_layers
++        The number of fully-connected hidden layers
++    n_hidden
++        The number of nodes per hidden layer
++    dropout_rate
++        Dropout rate to apply to each of the hidden layers
++    use_batch_norm
++        Whether to have `BatchNorm` layers or not
++    use_layer_norm
++        Whether to have `LayerNorm` layers or not
++    use_activation
++        Whether to have layer activation or not
++    bias
++        Whether to learn bias in linear layers or not
++    inject_covariates
++        Whether to inject covariates in each layer, or just the first (default).
++    activation_fn
++        Which activation function to use
++    """
++
++    def __init__(
++        self,
++        n_in: int,
++        n_out: int,
++        n_cat_list: Iterable[int] = None,
++        n_layers: int = 1,
++        n_hidden: int = 128,
++        dropout_rate: float = 0.1,
++        use_batch_norm: bool = True,
++        use_layer_norm: bool = False,
++        use_activation: bool = True,
++        bias: bool = True,
++        inject_covariates: bool = True,
++        activation_fn: nn.Module = nn.ReLU,
++    ):
++        super().__init__()
++        self.inject_covariates = inject_covariates
++        layers_dim = [n_in] + (n_layers - 1) * [n_hidden] + [n_out]
++
++        if n_cat_list is not None:
++            # n_cat = 1 will be ignored
++            self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in n_cat_list]
++        else:
++            self.n_cat_list = []
++
++        cat_dim = sum(self.n_cat_list)
++        self.fc_layers = nn.Sequential(
++            collections.OrderedDict(
++                [
++                    (
++                        "Layer {}".format(i),
++                        nn.Sequential(
++                            nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
++                            nn.Linear(
++                                n_in + cat_dim * self.inject_into_layer(i),
++                                n_out,
++                                bias=bias,
++                            ),
++                            # non-default params come from defaults in original Tensorflow implementation
++                            nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001) if use_batch_norm else None,
++                            nn.LayerNorm(n_out, elementwise_affine=False) if use_layer_norm else None,
++                            activation_fn() if use_activation else None,
++                        ),
++                    )
++                    for i, (n_in, n_out) in enumerate(zip(layers_dim[:-1], layers_dim[1:]))
++                ]
++            )
++        )
++
++    def inject_into_layer(self, layer_num) -> bool:
++        """Helper to determine if covariates should be injected."""
++        user_cond = layer_num == 0 or (layer_num > 0 and self.inject_covariates)
++        return user_cond
++
++    def set_online_update_hooks(self, hook_first_layer=True):
++        self.hooks = []
++
++        def _hook_fn_weight(grad):
++            categorical_dims = sum(self.n_cat_list)
++            new_grad = torch.zeros_like(grad)
++            if categorical_dims > 0:
++                new_grad[:, -categorical_dims:] = grad[:, -categorical_dims:]
++            return new_grad
++
++        def _hook_fn_zero_out(grad):
++            return grad * 0
++
++        for i, layers in enumerate(self.fc_layers):
++            for layer in layers:
++                if i == 0 and not hook_first_layer:
++                    continue
++                if isinstance(layer, nn.Linear):
++                    if self.inject_into_layer(i):
++                        w = layer.weight.register_hook(_hook_fn_weight)
++                    else:
++                        w = layer.weight.register_hook(_hook_fn_zero_out)
++                    self.hooks.append(w)
++                    b = layer.bias.register_hook(_hook_fn_zero_out)
++                    self.hooks.append(b)
++
++    def forward(self, x: torch.Tensor, *cat_list: int):
++        """
++        Forward computation on ``x``.
++        Parameters
++        ----------
++        x
++            tensor of values with shape ``(n_in,)``
++        cat_list
++            list of category membership(s) for this sample
++        x: torch.Tensor
++        Returns
++        -------
++        py:class:`torch.Tensor`
++            tensor of shape ``(n_out,)``
++        """
++        one_hot_cat_list = []  # for generality in this list many indices useless.
++
++        if len(self.n_cat_list) > len(cat_list):
++            raise ValueError("nb. categorical args provided doesn't match init. params.")
++        for n_cat, cat in zip(self.n_cat_list, cat_list):
++            if n_cat and cat is None:
++                raise ValueError("cat not provided while n_cat != 0 in init. params.")
++            if n_cat > 1:  # n_cat = 1 will be ignored - no additional information
++                if cat.size(1) != n_cat:
++                    one_hot_cat = one_hot(cat, n_cat)
++                else:
++                    one_hot_cat = cat  # cat has already been one_hot encoded
++                one_hot_cat_list += [one_hot_cat]
++        for i, layers in enumerate(self.fc_layers):
++            for layer in layers:
++                if layer is not None:
++                    if isinstance(layer, nn.BatchNorm1d):
++                        if x.dim() == 3:
++                            x = torch.cat([(layer(slice_x)).unsqueeze(0) for slice_x in x], dim=0)
++                        else:
++                            x = layer(x)
++                    else:
++                        if isinstance(layer, nn.Linear) and self.inject_into_layer(i):
++                            if x.dim() == 3:
++                                one_hot_cat_list_layer = [
++                                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1))) for o in one_hot_cat_list
++                                ]
++                            else:
++                                one_hot_cat_list_layer = one_hot_cat_list
++                            x = torch.cat((x, *one_hot_cat_list_layer), dim=-1)
++                        x = layer(x)
++        return x
+diff --git a/cell2location/nn/fclayers_context.py b/cell2location/nn/fclayers_context.py
+new file mode 100755
+index 00000000..11e4771c
+--- /dev/null
++++ b/cell2location/nn/fclayers_context.py
+@@ -0,0 +1,224 @@
++import collections
++from typing import Iterable
++
++import torch
++from scvi.nn._utils import one_hot
++from torch import nn as nn
++
++
++class FCLayers(nn.Module):
++    """
++    A helper class to build fully-connected layers for a neural network.
++    Dropout is performed on input rather than on output.
++
++    Adapted with modifications from scvi-tools:
++    Copyright (c) 2020 Romain Lopez, Adam Gayoso, Galen Xing, Yosef Lab
++    All rights reserved.
++
++    Parameters
++    ----------
++    n_in
++        The dimensionality of the input
++    n_out
++        The dimensionality of the output
++    n_cat_list
++        A list containing, for each category of interest,
++        the number of categories. Each category will be
++        included using a one-hot encoding.
++    n_layers
++        The number of fully-connected hidden layers
++    n_hidden
++        The number of nodes per hidden layer
++    dropout_rate
++        Dropout rate to apply to each of the hidden layers
++    use_batch_norm
++        Whether to have `BatchNorm` layers or not
++    use_layer_norm
++        Whether to have `LayerNorm` layers or not
++    use_activation
++        Whether to have layer activation or not
++    bias
++        Whether to learn bias in linear layers or not
++    inject_covariates
++        Whether to inject covariates in each layer, or just the first (default).
++    activation_fn
++        Which activation function to use
++    """
++
++    def __init__(
++        self,
++        n_in: int,
++        n_out: int,
++        n_cat_list: Iterable[int] = None,
++        n_layers: int = 1,
++        n_hidden: int = 128,
++        dropout_rate: float = 0.1,
++        use_batch_norm: bool = True,
++        use_layer_norm: bool = False,
++        use_activation: bool = True,
++        bias: bool = True,
++        inject_covariates: bool = True,
++        activation_fn: nn.Module = nn.ReLU,
++        use_context_network: bool = False,
++        context_n_hidden: int = 128,
++    ):
++        super().__init__()
++        self.inject_covariates = inject_covariates
++        layers_dim = [n_in] + (n_layers - 1) * [n_hidden] + [n_out]
++
++        if n_cat_list is not None:
++            # n_cat = 1 will be ignored
++            self.n_cat_list = [n_cat if n_cat > 1 else 0 for n_cat in n_cat_list]
++        else:
++            self.n_cat_list = []
++
++        cat_dim = sum(self.n_cat_list)
++        self.fc_layers = nn.Sequential(
++            collections.OrderedDict(
++                [
++                    (
++                        "Layer_{}".format(i),
++                        nn.Sequential(
++                            nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
++                            nn.Linear(
++                                n_in + cat_dim * self.inject_into_layer(i),
++                                n_out,
++                                bias=bias,
++                            ),
++                            # non-default params come from defaults in original Tensorflow implementation
++                            nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001) if use_batch_norm else None,
++                            nn.LayerNorm(n_out, elementwise_affine=False) if use_layer_norm else None,
++                            activation_fn() if use_activation else None,
++                        ),
++                    )
++                    for i, (n_in, n_out) in enumerate(zip(layers_dim[:-1], layers_dim[1:]))
++                ]
++            )
++        )
++        self.use_context_network = use_context_network
++        if use_context_network:
++            layers_dim = [n_in] + (n_layers - 1) * [context_n_hidden] + [n_out]
++            self.fc_layers_context = nn.Sequential(
++                collections.OrderedDict(
++                    [
++                        (
++                            "Context_Layer_{}".format(i),
++                            nn.Sequential(
++                                nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
++                                nn.Linear(
++                                    n_in + cat_dim * self.inject_into_layer(i),
++                                    n_out,
++                                    bias=bias,
++                                ),
++                                # non-default params come from defaults in original Tensorflow implementation
++                                nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001) if use_batch_norm else None,
++                                nn.LayerNorm(n_out, elementwise_affine=False) if use_layer_norm else None,
++                                activation_fn() if use_activation else None,
++                            ),
++                        )
++                        for i, (n_in, n_out) in enumerate(zip(layers_dim[:-1], layers_dim[1:]))
++                    ]
++                )
++            )
++
++    def inject_into_layer(self, layer_num) -> bool:
++        """Helper to determine if covariates should be injected."""
++        user_cond = layer_num == 0 or (layer_num > 0 and self.inject_covariates)
++        return user_cond
++
++    def set_online_update_hooks(self, hook_first_layer=True):
++        self.hooks = []
++
++        def _hook_fn_weight(grad):
++            categorical_dims = sum(self.n_cat_list)
++            new_grad = torch.zeros_like(grad)
++            if categorical_dims > 0:
++                new_grad[:, -categorical_dims:] = grad[:, -categorical_dims:]
++            return new_grad
++
++        def _hook_fn_zero_out(grad):
++            return grad * 0
++
++        for i, layers in enumerate(self.fc_layers):
++            for layer in layers:
++                if i == 0 and not hook_first_layer:
++                    continue
++                if isinstance(layer, nn.Linear):
++                    if self.inject_into_layer(i):
++                        w = layer.weight.register_hook(_hook_fn_weight)
++                    else:
++                        w = layer.weight.register_hook(_hook_fn_zero_out)
++                    self.hooks.append(w)
++                    b = layer.bias.register_hook(_hook_fn_zero_out)
++                    self.hooks.append(b)
++
++    def forward(self, x: torch.Tensor, *cat_list: int):
++        """
++        Forward computation on ``x``.
++        Parameters
++        ----------
++        x
++            tensor of values with shape ``(n_in,)``
++        cat_list
++            list of category membership(s) for this sample
++        x: torch.Tensor
++        Returns
++        -------
++        py:class:`torch.Tensor`
++            tensor of shape ``(n_out,)``
++        """
++        one_hot_cat_list = []  # for generality in this list many indices useless.
++
++        if len(self.n_cat_list) > len(cat_list):
++            raise ValueError("nb. categorical args provided doesn't match init. params.")
++        for n_cat, cat in zip(self.n_cat_list, cat_list):
++            if n_cat and cat is None:
++                raise ValueError("cat not provided while n_cat != 0 in init. params.")
++            if n_cat > 1:  # n_cat = 1 will be ignored - no additional information
++                if cat.size(1) != n_cat:
++                    one_hot_cat = one_hot(cat, n_cat)
++                else:
++                    one_hot_cat = cat  # cat has already been one_hot encoded
++                one_hot_cat_list += [one_hot_cat]
++        if self.use_context_network:
++            x_context = x
++            for i, layers in enumerate(self.fc_layers_context):
++                for layer in layers:
++                    if layer is not None:
++                        if isinstance(layer, nn.BatchNorm1d):
++                            if x_context.dim() == 3:
++                                x_context = torch.cat([(layer(slice_x)).unsqueeze(0) for slice_x in x_context], dim=0)
++                            else:
++                                x_context = layer(x_context)
++                        else:
++                            if isinstance(layer, nn.Linear) and self.inject_into_layer(i):
++                                if x_context.dim() == 3:
++                                    one_hot_cat_list_layer = [
++                                        o.unsqueeze(0).expand((x_context.size(0), o.size(0), o.size(1)))
++                                        for o in one_hot_cat_list
++                                    ]
++                                else:
++                                    one_hot_cat_list_layer = one_hot_cat_list
++                                x_context = torch.cat((x_context, *one_hot_cat_list_layer), dim=-1)
++                            x_context = layer(x_context)
++        for i, layers in enumerate(self.fc_layers):
++            for layer in layers:
++                if layer is not None:
++                    if isinstance(layer, nn.BatchNorm1d):
++                        if x.dim() == 3:
++                            x = torch.cat([(layer(slice_x)).unsqueeze(0) for slice_x in x], dim=0)
++                        else:
++                            x = layer(x)
++                    else:
++                        if isinstance(layer, nn.Linear) and self.inject_into_layer(i):
++                            if x.dim() == 3:
++                                one_hot_cat_list_layer = [
++                                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1))) for o in one_hot_cat_list
++                                ]
++                            else:
++                                one_hot_cat_list_layer = one_hot_cat_list
++                            x = torch.cat((x, *one_hot_cat_list_layer), dim=-1)
++                        x = layer(x)
++        if self.use_context_network:
++            x = x * torch.nn.functional.softmax(x_context, dim=1)
++        return x
+diff --git a/setup.cfg b/setup.cfg
+index 7f58c58d..4101ef6e 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -25,7 +25,6 @@ install_requires =
+     plotnine
+     opencv-python
+ 
+-
+ [options.extras_require]
+ dev =
+     black==22.3
+diff --git a/tests/test_cell2location.py b/tests/test_cell2location.py
+index 8d33f0de..0c53476f 100644
+--- a/tests/test_cell2location.py
++++ b/tests/test_cell2location.py
+@@ -1,5 +1,8 @@
+ import numpy as np
++import torch
++from pyro import poutine
+ from scvi.data import synthetic_iid
++from scvi.dataloaders import AnnDataLoader
+ 
+ from cell2location import run_colocation
+ from cell2location.models import Cell2location, RegressionModel
+@@ -13,15 +16,19 @@
+ 
+ def test_cell2location():
+     save_path = "./cell2location_model_test"
++    if torch.cuda.is_available():
++        use_gpu = int(torch.cuda.is_available())
++    else:
++        use_gpu = False
+     dataset = synthetic_iid(n_labels=5)
+     RegressionModel.setup_anndata(dataset, labels_key="labels", batch_key="batch")
+ 
+     # train regression model to get signatures of cell types
+     sc_model = RegressionModel(dataset)
+     # test full data training
+-    sc_model.train(max_epochs=1)
++    sc_model.train(max_epochs=1, use_gpu=use_gpu)
+     # test minibatch training
+-    sc_model.train(max_epochs=1, batch_size=1000)
++    sc_model.train(max_epochs=1, batch_size=1000, use_gpu=use_gpu)
+     # export the estimated cell abundance (summary of the posterior distribution)
+     dataset = sc_model.export_posterior(dataset, sample_kwargs={"num_samples": 10})
+     # test plot_QC
+@@ -43,7 +50,7 @@ def test_cell2location():
+     ##  full data  ##
+     st_model = Cell2location(dataset, cell_state_df=inf_aver, N_cells_per_location=30, detection_alpha=200)
+     # test full data training
+-    st_model.train(max_epochs=1)
++    st_model.train(max_epochs=1, use_gpu=use_gpu)
+     # export the estimated cell abundance (summary of the posterior distribution)
+     # full data
+     dataset = st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": st_model.adata.n_obs})
+@@ -51,7 +58,7 @@ def test_cell2location():
+     Cell2location.setup_anndata(dataset, batch_key="batch")
+     st_model = Cell2location(dataset, cell_state_df=inf_aver, N_cells_per_location=30, detection_alpha=200)
+     # test minibatch training
+-    st_model.train(max_epochs=1, batch_size=50)
++    st_model.train(max_epochs=1, batch_size=50, use_gpu=use_gpu)
+     # export the estimated cell abundance (summary of the posterior distribution)
+     # minibatches of locations
+     dataset = st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": 50})
+@@ -64,7 +71,20 @@ def test_cell2location():
+     # minibatches of locations
+     dataset = st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": 50})
+     # test computing any quantile of the posterior distribution
+-    st_model.posterior_quantile(q=0.5)
++    if not isinstance(st_model.module.guide, poutine.messenger.Messenger):
++        st_model.posterior_quantile(q=0.5, use_gpu=use_gpu)
++    # test computing median
++    if True:
++        if use_gpu:
++            device = f"cuda:{use_gpu}"
++        else:
++            device = "cpu"
++        train_dl = AnnDataLoader(st_model.adata_manager, shuffle=False, batch_size=50)
++        for batch in train_dl:
++            batch = {k: v.to(device) for k, v in batch.items()}
++            args, kwargs = st_model.module._get_fn_args_from_batch(batch)
++            break
++        st_model.module.guide.median(*args, **kwargs)
+     # test computing expected expression per cell type
+     st_model.module.model.compute_expected_per_cell_type(st_model.samples["post_sample_q05"], st_model.adata_manager)
+     ### test amortised inference with default cell2location model ###
+@@ -79,7 +99,24 @@ def test_cell2location():
+         encoder_mode="multiple",
+     )
+     # test minibatch training
+-    st_model.train(max_epochs=1, batch_size=50)
++    st_model.train(max_epochs=1, batch_size=20, use_gpu=use_gpu)
++    st_model.train_aggressive(
++        max_epochs=3, batch_size=20, plan_kwargs={"n_aggressive_epochs": 1, "n_aggressive_steps": 5}, use_gpu=use_gpu
++    )
++    # test computing median
++    if True:
++        if use_gpu:
++            device = f"cuda:{use_gpu}"
++        else:
++            device = "cpu"
++        train_dl = AnnDataLoader(st_model.adata_manager, shuffle=False, batch_size=50)
++        for batch in train_dl:
++            batch = {k: v.to(device) for k, v in batch.items()}
++            args, kwargs = st_model.module._get_fn_args_from_batch(batch)
++            break
++        st_model.module.guide.median(*args, **kwargs)
++        st_model.module.guide.quantiles([0.5], *args, **kwargs)
++        st_model.module.guide.mutual_information(*args, **kwargs)
+     # export the estimated cell abundance (summary of the posterior distribution)
+     # minibatches of locations
+     dataset = st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": 50})
+@@ -107,7 +144,7 @@ def test_cell2location():
+         model_class=LocationModelMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel,
+     )
+     # test full data training
+-    st_model.train(max_epochs=1)
++    st_model.train(max_epochs=1, use_gpu=use_gpu)
+     # export the estimated cell abundance (summary of the posterior distribution)
+     # full data
+     dataset = st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": st_model.adata.n_obs})
+@@ -121,7 +158,7 @@ def test_cell2location():
+         model_class=LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelNoMGPyroModel,
+     )
+     # test full data training
+-    st_model.train(max_epochs=1)
++    st_model.train(max_epochs=1, use_gpu=use_gpu)
+     # export the estimated cell abundance (summary of the posterior distribution)
+     # full data
+     st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": st_model.adata.n_obs})

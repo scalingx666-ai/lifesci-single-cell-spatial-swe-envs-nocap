@@ -1,0 +1,404 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f8adffc..176a60a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -29,12 +29,17 @@
+   ambiguous. A run that passes no `--library` trims exactly as before and its text report is
+   unchanged; the only difference anywhere is the new `"library": null` key in the JSON report.
+ 
+-- **`--clumpify` keeps peak memory inside the `--memory` budget it prints**
+-  ([#439](https://github.com/FelixKrueger/TrimGalore/issues/439)) — peak drops 13–17% from
+-  holding fewer bins in flight and the sizing model is refitted against measured peak RSS
+-  (paired 10 M-read runs, 2–16 cores, macOS and Linux), so budgets above ~2 GiB and
++- **`--clumpify` keeps peak memory inside the `--memory` budget it prints, on reads of ~50 bp
++  and longer** ([#439](https://github.com/FelixKrueger/TrimGalore/issues/439)) — peak drops
++  13–17% from holding fewer bins in flight and the sizing model is refitted against measured
++  peak RSS (paired 10 M-read runs, 2–16 cores, macOS and Linux), so budgets above ~2 GiB and
+   `--fastqc` runs now get smaller bins, and `.fq.gz` output differs from earlier releases on
+-  identical input (same records, different gzip member boundaries).
++  identical input (same records, different gzip member boundaries). The startup banner now
++  names the budget alongside the prediction (`predicted peak ≈ 930 of 1024 MiB budget`) so the
++  ~9% headroom is visible. Very short reads are not yet covered: the per-bin coefficient is
++  fitted per byte rather than per record, so a 25 bp library packs more records into the same
++  bin bytes and can exceed the budget at `--cores 2`
++  ([#457](https://github.com/FelixKrueger/TrimGalore/issues/457)).
+ 
+ - **An output file is now published only if every byte it owes was written, including the
+   gzip trailer** ([#434](https://github.com/FelixKrueger/TrimGalore/issues/434)). #428 made the
+diff --git a/src/clump.rs b/src/clump.rs
+index 3d1f5be..c0fd61c 100644
+--- a/src/clump.rs
++++ b/src/clump.rs
+@@ -147,7 +147,12 @@ pub struct ClumpLayout {
+ impl ClumpLayout {
+     /// Layout with an explicit bin count and budget, for callers that bypass
+     /// `resolve_layout`. The reservation is the trim-phase constant.
+-    pub fn new(n_bins: usize, bin_byte_budget: usize, workers: usize) -> Self {
++    ///
++    /// Test-only: a budget below `MIN_BIN_BYTES` makes `predicted_peak_bytes`
++    /// meaningless, so production layouts come from `resolve_layout` alone.
++    #[cfg(test)]
++    pub(crate) fn new(n_bins: usize, bin_byte_budget: usize, workers: usize) -> Self {
++        debug_assert!(n_bins > 0 && bin_byte_budget as u64 >= MIN_BIN_BYTES);
+         Self {
+             n_bins,
+             bin_byte_budget,
+@@ -170,6 +175,29 @@ fn dyn_denominator(n_bins: usize, cores: usize) -> u64 {
+     23 * n_bins as u64 + 64 * cores as u64
+ }
+ 
++/// Per-worker channel depths. `k` above charges for `work + 1 in hand +
++/// result_per_core`, so their sum is the constant and neither may move alone.
++#[derive(Debug, Clone, Copy)]
++pub struct ChannelDepths {
++    pub work: usize,
++    pub result_per_core: usize,
++}
++
++/// A clumpy batch is a whole bin, so a shallower work queue caps resident bins.
++pub fn channel_depths(clumpy: bool) -> ChannelDepths {
++    if clumpy {
++        ChannelDepths {
++            work: 1,
++            result_per_core: 2,
++        }
++    } else {
++        ChannelDepths {
++            work: 2,
++            result_per_core: 2,
++        }
++    }
++}
++
+ /// The three thread counts the memory model needs. They differ: `--clump_only`
+ /// is synchronous, and `--fastqc_args -t N` sets FastQC's threads independently.
+ #[derive(Debug, Clone, Copy)]
+@@ -551,6 +579,80 @@ mod tests {
+         assert_eq!(layout.bin_byte_budget, 19_006_356);
+     }
+ 
++    #[test]
++    fn sizing_constants_are_pinned_across_the_role_space() {
++        // Hand-computed bin budgets. A coefficient edit — σ, k, the static
++        // reservation, the FastQC per-thread charge, its cap, or the margin —
++        // moves at least one of these, which the swept test below cannot see.
++        // Do not trim this table: the 17-thread cell is the only one that
++        // observes FASTQC_CHARGED_THREAD_CAP.
++        let gib = 1024 * 1024 * 1024u64;
++        let cases: [(u64, LayoutInputs, usize); 6] = [
++            (gib, LayoutInputs::uniform(4, None), 19_006_356),
++            (
++                gib,
++                LayoutInputs {
++                    bin_cores: 4,
++                    workers: 1,
++                    fastqc_threads: None,
++                },
++                27_453_626,
++            ),
++            (
++                gib,
++                LayoutInputs {
++                    bin_cores: 4,
++                    workers: 4,
++                    fastqc_threads: Some(16),
++                },
++                8_681_915,
++            ),
++            (
++                gib,
++                LayoutInputs {
++                    bin_cores: 4,
++                    workers: 4,
++                    fastqc_threads: Some(17),
++                },
++                8_681_915,
++            ),
++            (gib, LayoutInputs::uniform(2, None), 23_911_222),
++            (4 * gib, LayoutInputs::uniform(32, None), 11_761_649),
++        ];
++        for (budget, inputs, expected) in cases {
++            let layout = resolve_layout(budget, &inputs).unwrap();
++            assert_eq!(
++                layout.bin_byte_budget, expected,
++                "pin moved for budget {budget} inputs {inputs:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn clumpify_floor_at_the_default_cell_is_pinned_absolutely() {
++        // Relative floor tests cannot see MIN_BIN_BYTES being lowered, because
++        // both sides move together. This pins the constant and the figure the
++        // docs publish for --cores 2 in one assertion.
++        let floor = clumpify_min_memory_bytes(&ins(2, false));
++        assert_eq!(floor.div_ceil(1024 * 1024), 281);
++    }
++
++    #[test]
++    fn channel_depths_sum_to_the_per_worker_coefficient() {
++        // k = 4 in dyn_denominator charges for the queued batch, the batch in
++        // hand, and the result slots. Raising either depth invalidates the fit.
++        let clumpy = channel_depths(true);
++        assert_eq!(clumpy.work, 1);
++        assert_eq!(clumpy.result_per_core, 2);
++        assert_eq!(
++            clumpy.work + 1 + clumpy.result_per_core,
++            4,
++            "channel depths must sum to k = 4 (64/16 in dyn_denominator); see \
++             plans/08162026_clumpify-memory-accounting/phase2/CALIBRATION.md"
++        );
++        assert_eq!(channel_depths(false).work, 2);
++    }
++
+     #[test]
+     fn resolve_layout_fastqc_reserves_more_and_shrinks_bins() {
+         // FastQC's histograms are charged on top of the trim-phase reservation,
+@@ -599,6 +701,40 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn floor_and_sizing_round_consistently_without_overflow() {
++        // Not a coefficient guard — `predicted ≤ budget` holds for any σ, k or
++        // static, because the sizing and the prediction read the same helpers.
++        // What this pins: the floor is the *least* resolvable budget across the
++        // input space (a rounding direction that disagrees between the two makes
++        // advertised budgets unusable), and the unchecked multiplies in
++        // `predicted_peak_bytes` and `clumpify_min_memory_bytes` stay inside u64.
++        for cores in [1usize, 2, 3, 4, 8, 16, 17, 32, 1024, 65536] {
++            for fastqc in [false, true] {
++                let inputs = ins(cores, fastqc);
++                let floor = clumpify_min_memory_bytes(&inputs);
++
++                let at = resolve_layout(floor, &inputs);
++                assert!(at.is_ok(), "floor {floor} must resolve for {inputs:?}");
++                assert!(at.unwrap().bin_byte_budget as u64 >= MIN_BIN_BYTES);
++                assert!(
++                    resolve_layout(floor - 1, &inputs).is_err(),
++                    "one byte under {floor} must bail for {inputs:?}"
++                );
++
++                for budget in [floor, floor + 1, u64::MAX / 2, u64::MAX] {
++                    if let Ok(layout) = resolve_layout(budget, &inputs) {
++                        let predicted = layout.predicted_peak_bytes();
++                        assert!(
++                            predicted <= budget,
++                            "predicted {predicted} > budget {budget} for {inputs:?}"
++                        );
++                    }
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn resolve_layout_bails_just_below_the_floor() {
+         // One byte under the floor must bail, and the message must name the
+diff --git a/src/clump_only.rs b/src/clump_only.rs
+index 98d2fba..db2ea3f 100644
+--- a/src/clump_only.rs
++++ b/src/clump_only.rs
+@@ -280,13 +280,14 @@ pub fn clump_only_single(
+             fastqc_threads: fastqc_requested
+                 .then(|| crate::fastqc::resolved_threads(fastqc_args, cores.max(1))),
+         },
+-    )?;
++    )
++    .context("--clump_only cannot run within the given --memory")?;
+ 
+     let input_compressed = naming::is_gzipped(input);
+     let output_path = naming::clumped_output_name(input, output_dir, basename, gzip_output);
+ 
+     eprintln!(
+-        "clump-only: reordering '{}' -> '{}' ({} bins × {} MiB budget, gzip level {}{})",
++        "clump-only: reordering '{}' -> '{}' ({} bins × {} MiB each, gzip level {}{})",
+         input.display(),
+         output_path.display(),
+         layout.n_bins,
+@@ -426,14 +427,15 @@ pub fn clump_only_paired(
+             fastqc_threads: fastqc_requested
+                 .then(|| crate::fastqc::resolved_threads(fastqc_args, cores.max(1))),
+         },
+-    )?;
++    )
++    .context("--clump_only cannot run within the given --memory")?;
+ 
+     let input_compressed = naming::is_gzipped(input_r1) || naming::is_gzipped(input_r2);
+     let (out_r1_path, out_r2_path) =
+         naming::clumped_paired_output_names(input_r1, input_r2, output_dir, basename, gzip_output);
+ 
+     eprintln!(
+-        "clump-only (paired): '{}' + '{}' -> '{}' + '{}' ({} bins × {} MiB, gzip level {}{})",
++        "clump-only (paired): '{}' + '{}' -> '{}' + '{}' ({} bins × {} MiB each, gzip level {}{})",
+         input_r1.display(),
+         input_r2.display(),
+         out_r1_path.display(),
+@@ -769,7 +771,8 @@ pub fn clump_only_single_to_bam(
+             fastqc_threads: fastqc_requested
+                 .then(|| crate::fastqc::resolved_threads(fastqc_args, cores.max(1))),
+         },
+-    )?;
++    )
++    .context("--clump_only cannot run within the given --memory")?;
+ 
+     let input_fmt = detect_input_format(input)?;
+     let source_header = if matches!(input_fmt, InputFormat::UnalignedBam) {
+@@ -781,7 +784,7 @@ pub fn clump_only_single_to_bam(
+     let output_path = naming::clumped_bam_output_name(input, output_dir, basename);
+ 
+     eprintln!(
+-        "clump-only (uBAM out): reordering '{}' -> '{}' ({} bins × {} MiB budget, BGZF)",
++        "clump-only (uBAM out): reordering '{}' -> '{}' ({} bins × {} MiB each, BGZF)",
+         input.display(),
+         output_path.display(),
+         layout.n_bins,
+@@ -934,7 +937,8 @@ pub fn clump_only_paired_to_bam_one_pair(
+             fastqc_threads: fastqc_requested
+                 .then(|| crate::fastqc::resolved_threads(fastqc_args, cores.max(1))),
+         },
+-    )?;
++    )
++    .context("--clump_only cannot run within the given --memory")?;
+ 
+     // Open readers + peek header + compute output path + input-format label
+     // according to the input shape. Returns via `PairedInputSetup` to avoid
+@@ -1028,7 +1032,7 @@ pub fn clump_only_paired_to_bam_one_pair(
+         format!("{} + {}", inputs[0].display(), inputs[1].display())
+     };
+     eprintln!(
+-        "clump-only (uBAM out, paired): '{}' -> '{}' ({} bins × {} MiB budget, BGZF)",
++        "clump-only (uBAM out, paired): '{}' -> '{}' ({} bins × {} MiB each, BGZF)",
+         input_display,
+         output_path.display(),
+         layout.n_bins,
+diff --git a/src/fastqc.rs b/src/fastqc.rs
+index 7b02655..392b4cd 100644
+--- a/src/fastqc.rs
++++ b/src/fastqc.rs
+@@ -190,4 +190,37 @@ mod tests {
+         let config = parse("-t abc");
+         assert_eq!(config.threads, FastQCConfig::default().threads);
+     }
++
++    // `resolved_threads` feeds the clumpify memory model's FastQC reservation,
++    // so a wrong answer makes the printed prediction stop being a bound (#439).
++
++    #[test]
++    fn resolved_threads_defaults_to_cores() {
++        assert_eq!(resolved_threads(None, 4), 4);
++        assert_eq!(resolved_threads(Some("--nogroup"), 8), 8);
++    }
++
++    #[test]
++    fn resolved_threads_takes_an_explicit_count_over_cores() {
++        assert_eq!(resolved_threads(Some("-t 16"), 2), 16);
++        assert_eq!(resolved_threads(Some("--threads 16"), 2), 16);
++        assert_eq!(resolved_threads(Some("--nogroup -t 6 --quiet"), 2), 6);
++    }
++
++    #[test]
++    fn resolved_threads_is_never_zero() {
++        assert_eq!(resolved_threads(None, 0), 1);
++        assert_eq!(resolved_threads(Some("-t 0"), 4), 1);
++    }
++
++    #[test]
++    fn resolved_threads_ignores_an_unparsable_count() {
++        assert_eq!(resolved_threads(Some("-t abc"), 4), 4);
++        assert_eq!(resolved_threads(Some("-t"), 4), 4);
++    }
++
++    #[test]
++    fn resolved_threads_takes_the_last_explicit_count() {
++        assert_eq!(resolved_threads(Some("-t 2 -t 9"), 4), 9);
++    }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index f52315d..ed308af 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -204,11 +204,13 @@ fn resolve_clump_layout(cli: &Cli) -> Result<Option<clump::ClumpLayout>> {
+         return Ok(None);
+     }
+     let layout = clump::resolve_layout(memory_bytes, &layout_inputs)?;
++    // Naming the budget makes the ~9% margin visible arithmetic.
+     eprintln!(
+-        "clumpify: {} bins × {} MiB; predicted peak ≈ {} MiB (gzip level {})",
++        "clumpify: {} bins × {} MiB; predicted peak ≈ {} of {} MiB budget (gzip level {})",
+         layout.n_bins,
+         layout.bin_byte_budget / (1024 * 1024),
+         layout.predicted_peak_bytes() / (1024 * 1024),
++        memory_bytes / (1024 * 1024),
+         cli.compression,
+     );
+     Ok(Some(layout))
+diff --git a/src/parallel.rs b/src/parallel.rs
+index 816273a..2edce49 100644
+--- a/src/parallel.rs
++++ b/src/parallel.rs
+@@ -113,8 +113,8 @@ pub fn run_paired_end_parallel(
+     );
+ 
+     // Per-worker channels (round-robin distribution — no MPMC dependency needed)
+-    // A clumpy batch is a whole bin, so a shallower queue caps resident bins.
+-    let queue_depth = if clump_layout.is_some() { 1 } else { 2 };
++    let depths = clump::channel_depths(clump_layout.is_some());
++    let queue_depth = depths.work;
+     let mut work_txs: Vec<mpsc::SyncSender<PairedWork>> = Vec::with_capacity(cores);
+     let mut work_rxs: Vec<mpsc::Receiver<PairedWork>> = Vec::with_capacity(cores);
+     for _ in 0..cores {
+@@ -127,7 +127,8 @@ pub fn run_paired_end_parallel(
+     // so reader-side errors surface to the main thread without waiting on the
+     // reader_handle.join() that happens after the result loop drains. *(Plan v2
+     // Step 6a; B-Crit-1.)*
+-    let (result_tx, result_rx) = mpsc::sync_channel::<Result<PairedBatchResult>>(cores * 2);
++    let (result_tx, result_rx) =
++        mpsc::sync_channel::<Result<PairedBatchResult>>(cores * depths.result_per_core);
+ 
+     std::thread::scope(|s| -> Result<(TrimStats, TrimStats, PairValidationStats)> {
+         // ── Worker threads ──────────────────────────────────────────────
+@@ -940,7 +941,8 @@ pub fn run_single_end_parallel(
+     clump_layout: Option<ClumpLayout>,
+ ) -> Result<TrimStats> {
+     // A clumpy batch is a whole bin, so a shallower queue caps resident bins.
+-    let queue_depth = if clump_layout.is_some() { 1 } else { 2 };
++    let depths = clump::channel_depths(clump_layout.is_some());
++    let queue_depth = depths.work;
+     let mut work_txs: Vec<mpsc::SyncSender<SingleWork>> = Vec::with_capacity(cores);
+     let mut work_rxs: Vec<mpsc::Receiver<SingleWork>> = Vec::with_capacity(cores);
+     for _ in 0..cores {
+@@ -956,7 +958,8 @@ pub fn run_single_end_parallel(
+     // printed "Worker error" and broke, and the main loop then ended on a
+     // closed channel with nothing to distinguish it from a clean EOF — so a
+     // short output was committed with exit 0 (#434).
+-    let (result_tx, result_rx) = mpsc::sync_channel::<Result<SingleBatchResult>>(cores * 2);
++    let (result_tx, result_rx) =
++        mpsc::sync_channel::<Result<SingleBatchResult>>(cores * depths.result_per_core);
+ 
+     std::thread::scope(|s| -> Result<TrimStats> {
+         // ── Worker threads ──────────────────────────────────────────────
+diff --git a/tests/integration_preflight_tripwire.rs b/tests/integration_preflight_tripwire.rs
+index 20f2225..8fe097e 100644
+--- a/tests/integration_preflight_tripwire.rs
++++ b/tests/integration_preflight_tripwire.rs
+@@ -594,10 +594,16 @@ fn se_trim_clumpify() {
+         out.stderr
+     );
+ 
+-    // Both banner figures are MiB: bins before the semicolon, peak before "(gzip".
++    // The bins figure is MiB, and the peak/budget pair is pinned by value: this case
++    // runs at the default --memory 1G, where 1024 × 10/11 truncates to 930. Asserting
++    // the arithmetic catches a divisor change that a unit label alone would not, since
++    // the peak no longer carries a unit of its own.
+     assert!(
+-        out.stderr.contains("MiB; predicted peak ≈") && out.stderr.contains("MiB (gzip level"),
+-        "clumpify banner must label both figures MiB:\n{}",
++        out.stderr.contains("MiB; predicted peak ≈")
++            && out
++                .stderr
++                .contains("predicted peak ≈ 930 of 1024 MiB budget"),
++        "clumpify banner must pin both figures and their divisors:\n{}",
+         out.stderr
+     );
+ }

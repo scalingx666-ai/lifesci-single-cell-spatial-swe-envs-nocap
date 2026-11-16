@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** add _utils.py
+
+## Description
+
+Sorry, I forgot to add the _utils.py file from the last PR
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `7164fda2bbea`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

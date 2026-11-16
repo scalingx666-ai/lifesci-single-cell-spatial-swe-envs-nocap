@@ -1,0 +1,116 @@
+diff --git a/dynamo/preprocessing/gene_selection.py b/dynamo/preprocessing/gene_selection.py
+index d5fbbcc7d..9758dd0b4 100644
+--- a/dynamo/preprocessing/gene_selection.py
++++ b/dynamo/preprocessing/gene_selection.py
+@@ -233,7 +233,16 @@ def calc_dispersion_by_svr(
+ 
+     for layer in layers:
+         valid_CM, detected_bool = get_vaild_CM(adata, layer, **SVRs_kwargs)
+-        if valid_CM is None:
++        if valid_CM is None or valid_CM.shape[1] == 0:
++            # No gene passes the validity filter for this layer (e.g. a very small adata). `valid_CM` can
++            # be an empty (0-column) sparse matrix rather than None, which the SVR fit would divide-by-zero
++            # on. Create the score columns as all-invalid so downstream feature selection skips gracefully
++            # (a missing "score" column would otherwise raise a KeyError during preprocessing).
++            main_warning(f"No valid genes for SVR gene selection on layer '{layer}'.")
++            _prefix = "" if layer == "X" else layer + "_"
++            adata.var[_prefix + "log_m"] = np.nan
++            adata.var[_prefix + "log_cv"] = np.nan
++            adata.var[_prefix + "score"] = -np.inf
+             continue
+ 
+         mean, cv = get_mean_cv(adata, valid_CM, algorithm, winsorize, winsor_perc)
+diff --git a/dynamo/preprocessing/pca.py b/dynamo/preprocessing/pca.py
+index 51c374bd0..e7482e3ff 100644
+--- a/dynamo/preprocessing/pca.py
++++ b/dynamo/preprocessing/pca.py
+@@ -16,7 +16,7 @@
+ from sklearn.utils.sparsefuncs import mean_variance_axis
+ 
+ from ..configuration import DKM
+-from ..dynamo_logger import main_info_insert_adata_obsm, main_info_insert_adata_var
++from ..dynamo_logger import main_info_insert_adata_obsm, main_info_insert_adata_var, main_warning
+ 
+ 
+ def _truncatedSVD_with_center(
+@@ -45,7 +45,9 @@ def _truncatedSVD_with_center(
+     """
+     random_state = check_random_state(random_state)
+     v0 = random_state.uniform(-1, 1, np.min(X.shape))
+-    n_components = min(n_components, X.shape[1] - 1)
++    # svds requires 0 < k < min(X.shape); with few cells the row dimension is the limit,
++    # not the number of features.
++    n_components = min(n_components, min(X.shape) - 1)
+ 
+     mean = np.asarray(X.mean(0))  # Convert from np.matrix to ndarray, shape (1, n_features)
+     X_H = X.T.conj()
+@@ -240,6 +242,10 @@ def pca(
+         adata.var.iloc[bad_genes, adata.var.columns.tolist().index("use_for_pca")] = False
+         X_data = X_data[:, valid_ind]
+ 
++    if 0 in X_data.shape:
++        main_warning("No genes passed the filter for PCA; skipping dimensionality reduction.")
++        return (adata, None, None) if return_all else adata
++
+     if use_incremental_PCA:
+         from sklearn.decomposition import IncrementalPCA
+ 
+diff --git a/dynamo/preprocessing/utils.py b/dynamo/preprocessing/utils.py
+index 4a70b7d0a..22f939a7c 100755
+--- a/dynamo/preprocessing/utils.py
++++ b/dynamo/preprocessing/utils.py
+@@ -592,6 +592,13 @@ def get_svr_filter(
+     valid_idx = np.where(np.isfinite(adata.var.loc[:, score_name]))[0]
+ 
+     valid_table = adata.var.iloc[valid_idx, :]
++    if len(valid_table) == 0:
++        main_warning(f"No gene has a finite `{score_name}`; no feature genes selected.")
++        if return_adata:
++            adata.var.loc[:, "use_for_pca"] = False
++            return adata
++        return np.zeros(adata.n_vars, dtype=bool)
++
+     nth_score = np.sort(valid_table.loc[:, score_name])[::-1][np.min((n_top_genes - 1, valid_table.shape[0] - 1))]
+ 
+     feature_gene_idx = np.where(valid_table.loc[:, score_name] >= nth_score)[0][:n_top_genes]
+diff --git a/tests/test_preprocess.py b/tests/test_preprocess.py
+index 92d0ce7ee..2576b5cef 100644
+--- a/tests/test_preprocess.py
++++ b/tests/test_preprocess.py
+@@ -661,3 +661,36 @@ def test_regress_out():
+ 
+     dyn.pl.umap(adata, color=celltype_key, figsize=figsize)
+     print("The preprocess_adata() time difference is :", timeit.default_timer() - starttime)
++
++
++# Small-/degenerate-adata robustness (regression for PR #616, @AlexanderCaichen).
++def test_pca_small_adata():
++    """Preprocessing a few-cells adata must not crash in truncated SVD (needs k < min(X.shape))."""
++    rng = np.random.default_rng(0)
++    X = csr_matrix(rng.poisson(3.0, (10, 200)).astype(float))
++    adata = anndata.AnnData(X)
++    adata.layers["spliced"] = X.copy()
++    adata.layers["unspliced"] = csr_matrix(rng.poisson(1.0, (10, 200)).astype(float))
++    Preprocessor().preprocess_adata(adata, recipe="monocle")
++    assert "X_pca" in adata.obsm
++    assert adata.obsm["X_pca"].shape[1] <= min(adata.shape) - 1
++
++
++def test_get_svr_filter_no_finite_scores():
++    """get_svr_filter must not crash (np.sort on empty) when no gene has a finite score."""
++    from dynamo.preprocessing.utils import get_svr_filter
++
++    adata = anndata.AnnData(csr_matrix(np.ones((50, 10))))
++    adata.var["score"] = -np.inf
++    mask = get_svr_filter(adata, layer="X", n_top_genes=100)
++    assert int(mask.sum()) == 0
++
++
++def test_pca_no_genes_pass_filter():
++    """pca must skip gracefully (not crash with n_components=-1) when no gene passes the filter."""
++    from dynamo.preprocessing.pca import pca
++
++    adata = anndata.AnnData(np.random.default_rng(0).poisson(2.0, (50, 10)).astype(float))
++    adata.var["use_for_pca"] = False
++    result = pca(adata, n_pca_components=5)
++    assert "X_pca" not in result.obsm

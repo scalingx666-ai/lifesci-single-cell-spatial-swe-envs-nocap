@@ -1,0 +1,880 @@
+diff --git a/omicverse/io/__init__.py b/omicverse/io/__init__.py
+index c21d73378..821daa09e 100644
+--- a/omicverse/io/__init__.py
++++ b/omicverse/io/__init__.py
+@@ -6,6 +6,7 @@
+     bulk: I/O helpers for bulk omics resources.
+     single: I/O helpers for single-cell data.
+     spatial: I/O helpers for spatial omics data.
++    cytometry: I/O helpers for flow / mass cytometry (.fcs).
+ 
+ Compatibility shortcuts:
+     - ``ov.io.read(...)``
+@@ -13,10 +14,12 @@
+     - ``ov.io.read_10x_h5(...)``
+     - ``ov.io.read_10x_mtx(...)``
+     - ``ov.io.read_visium_hd(...)``
++    - ``ov.io.read_fcs(...)``
+     - ``ov.io.read_csv(...)``, ``ov.io.save(...)``, ``ov.io.load(...)``
+ """
+ 
+-from . import bulk, general, single, spatial
++from . import bulk, cytometry, general, single, spatial
++from .cytometry import parse_spillover, read_fcs
+ from .general import load, read_csv, read_table, save
+ from .single import read, read_10x_h5, read_10x_mtx, read_h5ad
+ from .spatial import read_nanostring, read_visium_hd, read_visium_hd_bin, read_visium_hd_seg, read_xenium
+@@ -26,6 +29,7 @@
+     "bulk",
+     "single",
+     "spatial",
++    "cytometry",
+     # top-level compatibility exports
+     "read",
+     "read_h5ad",
+@@ -36,6 +40,8 @@
+     "read_visium_hd_seg",
+     "read_nanostring",
+     "read_xenium",
++    "read_fcs",
++    "parse_spillover",
+     "read_csv",
+     "read_table",
+     "save",
+diff --git a/omicverse/io/cytometry/__init__.py b/omicverse/io/cytometry/__init__.py
+new file mode 100644
+index 000000000..ba250c201
+--- /dev/null
++++ b/omicverse/io/cytometry/__init__.py
+@@ -0,0 +1,11 @@
++r"""Cytometry I/O — Flow Cytometry Standard (``.fcs``) files.
++
++A peer of ``io.bulk`` / ``io.single`` / ``io.spatial`` rather than a member of
++one of them: an FCS event is a cell, but the file format, its metadata model
++($PnN/$PnS, $SPILLOVER) and the instruments that write it are their own world,
++shared by conventional flow, spectral flow and mass cytometry.
++"""
++
++from ._fcs import parse_spillover, read_fcs
++
++__all__ = ["read_fcs", "parse_spillover"]
+diff --git a/omicverse/io/cytometry/_fcs.py b/omicverse/io/cytometry/_fcs.py
+new file mode 100644
+index 000000000..98ce88e26
+--- /dev/null
++++ b/omicverse/io/cytometry/_fcs.py
+@@ -0,0 +1,321 @@
++r"""FCS (Flow Cytometry Standard) reader for OmicVerse I/O.
++
++WHY THIS LIVES IN ``ov.io``
++---------------------------
++Reading an FCS file is I/O, not an assay. The only FCS reader omicverse had was
++``ov.single.ev.read_fcs``, buried inside the single-extracellular-vesicle
++module, and it was shaped for that assay: it stamped ``uns['ev']``, named every
++row ``event000123``, and — the part that actually loses information — it took
++whatever DataFrame the backend handed back and threw the FCS metadata away.
++That means it dropped the two things a cytometry file exists to carry:
++
++* the ``$PnN`` / ``$PnS`` distinction — the DETECTOR name (``FITC-A``) versus
++  the MARKER on it (``CD3``). Confusing the two is the classic FCS mistake:
++  the same antibody sits on a different detector between panels, and the same
++  detector carries a different antibody between experiments.
++* ``$SPILLOVER`` — the acquisition-time spillover matrix. Without it,
++  compensation cannot be applied later, and uncompensated fluorescence data is
++  not wrong-looking, just wrong.
++
++INTEROPERABILITY
++----------------
++The ``var`` schema here is deliberately identical to `pytometry
++<https://github.com/scverse/pytometry>`_ (scverse, Apache-2.0): same index rule
++(marker when present, else channel) and the same ``n / channel / marker / PnB /
++PnE / PnG / PnR`` columns. An AnnData from this function is therefore a drop-in
++input to ``pytometry.pp.compensate`` and ``pytometry.tl.normalize_logicle``
++without a conversion step. The test suite pins this, though those tests skip
++when pytometry is absent — so it is checked, not merely asserted, wherever
++pytometry is installed.
++
++The parsing itself uses `flowio <https://github.com/whitews/FlowIO>`_ (BSD-3),
++which is the parser underneath both pytometry and FlowKit. Depending on it
++directly keeps the output contract stable no matter which higher-level
++cytometry package the user happens to have installed.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++from typing import Any, Dict, Optional, Sequence, Union
++
++import numpy as np
++import pandas as pd
++from anndata import AnnData
++
++from ..._registry import register_function
++
++__all__ = ["read_fcs", "parse_spillover"]
++
++_INSTALL_HINT = (
++    "Reading FCS files needs `flowio` (BSD-3, a few hundred KB):\n"
++    "    pip install flowio\n"
++    "or install the fuller cytometry stack:\n"
++    "    pip install pytometry"
++)
++
++
++def _flowio():
++    try:
++        import flowio  # noqa: F401
++        return flowio
++    except ImportError as exc:                                # pragma: no cover
++        raise ImportError(f"{exc}\n{_INSTALL_HINT}") from exc
++
++
++def parse_spillover(text: str, channels: Sequence[str]) -> Optional[pd.DataFrame]:
++    r"""Parse an FCS ``$SPILLOVER`` / ``$SPILL`` string into a square DataFrame.
++
++    The keyword is a flat, comma-delimited string: a channel count ``n``, then
++    ``n`` channel names, then ``n*n`` matrix values in row-major order. Both
++    pytometry and FlowKit hand this back as the raw string; parsing it here
++    means the matrix is usable immediately and a malformed one is caught at read
++    time rather than at compensation time.
++
++    Returns ``None`` when the keyword is absent or does not parse — a missing
++    spillover matrix is completely normal (unstained runs, mass cytometry) and
++    must not be an error.
++    """
++    if not text:
++        return None
++    parts = [p.strip() for p in str(text).split(",") if p.strip() != ""]
++    if not parts:
++        return None
++    try:
++        n = int(float(parts[0]))
++    except (TypeError, ValueError):
++        return None
++    if n <= 0 or len(parts) < 1 + n + n * n:
++        return None
++
++    names = parts[1: 1 + n]
++    try:
++        values = [float(v) for v in parts[1 + n: 1 + n + n * n]]
++    except (TypeError, ValueError):
++        return None
++
++    matrix = np.asarray(values, dtype=float).reshape(n, n)
++    # Some vendors write detector INDEXES rather than names. Map them back so
++    # the frame is labelled the same way as `var['channel']` either way.
++    if all(re.fullmatch(r"\d+", nm) for nm in names) and channels:
++        try:
++            names = [channels[int(nm) - 1] for nm in names]
++        except (IndexError, ValueError):                      # pragma: no cover
++            pass
++    return pd.DataFrame(matrix, index=names, columns=names)
++
++
++def _channel_frame(channels: Dict[int, Dict[str, Any]]) -> pd.DataFrame:
++    """Build the `var` frame from flowio's per-channel keyword dict."""
++    rows = []
++    for idx in sorted(channels, key=int):
++        c = channels[idx]
++        pnn = (c.get("pnn") or "").strip()
++        pns = (c.get("pns") or "").strip()
++        rows.append({
++            "n": int(idx),
++            "channel": pnn,
++            "marker": pns,
++            "PnB": c.get("pnb"),
++            "PnE": c.get("pne"),
++            "PnG": c.get("png"),
++            "PnR": c.get("pnr"),
++        })
++    var = pd.DataFrame(rows)
++    # Index by the MARKER when the file names one, else the detector. This is
++    # pytometry's rule and the one a biologist expects: you asked for CD3, not
++    # for whatever detector CD3 happened to sit on in this panel.
++    var.index = pd.Index(
++        [m if m else c for m, c in zip(var["marker"], var["channel"])],
++        name=None,
++    )
++    # A panel can legitimately put the same marker on two detectors; make the
++    # index unique by falling back to the detector name for the duplicates
++    # rather than silently returning an AnnData that cannot be sliced by name.
++    if var.index.duplicated().any():
++        seen: Dict[str, int] = {}
++        fixed = []
++        for name, chan in zip(var.index, var["channel"]):
++            if name in seen:
++                seen[name] += 1
++                fixed.append(f"{name} ({chan})" if chan else f"{name}.{seen[name]}")
++            else:
++                seen[name] = 0
++                fixed.append(name)
++        var.index = pd.Index(fixed)
++    return var
++
++
++@register_function(
++    aliases=["read_fcs", "read_flow", "读取fcs", "流式细胞术读取", "fcs", "flow_cytometry_read"],
++    category="io",
++    description=(
++        "Read a Flow Cytometry Standard (.fcs) file into an AnnData: events x "
++        "channels, with the detector name ($PnN) and the marker on it ($PnS) "
++        "kept as separate var columns, the full FCS keyword dictionary in "
++        "uns['fcs'], and the acquisition $SPILLOVER matrix parsed into a "
++        "labelled DataFrame ready for compensation. Works for conventional "
++        "flow, spectral flow and mass cytometry (CyTOF) files alike. The var "
++        "schema matches pytometry, so the result feeds pytometry.pp.compensate "
++        "and pytometry.tl.normalize_logicle unchanged."
++    ),
++    examples=[
++        "adata = ov.io.read_fcs('sample.fcs')",
++        "adata.var[['channel', 'marker']]           # FITC-A -> CD3",
++        "adata.uns['fcs']['spillover']              # parsed, square DataFrame",
++        "adata = ov.io.read_fcs('sample.fcs', markers_only=True)",
++    ],
++    related=["io.read", "single.ev.read_fcs"],
++)
++def read_fcs(
++    path: str,
++    *,
++    channels: Optional[Sequence[str]] = None,
++    markers_only: bool = False,
++    sample: Optional[str] = None,
++    compensated: bool = False,
++    preprocess: bool = True,
++    dtype: Union[str, np.dtype] = "float32",
++) -> AnnData:
++    r"""Read an ``.fcs`` file.
++
++    Arguments
++    ---------
++    path
++        Path to a Flow Cytometry Standard file. FCS **2.0 / 3.0 / 3.1** —
++        the versions the flowio parser supports; 3.2 is not claimed.
++    channels
++        Keep only these channels. Matched against BOTH the detector name
++        (``$PnN``, e.g. ``'FITC-A'``) and the marker (``$PnS``, e.g. ``'CD3'``),
++        so either vocabulary works.
++    markers_only
++        Keep only channels that carry a ``$PnS`` marker — i.e. drop scatter and
++        time. Convenient, but note that FSC/SSC are exactly what the first
++        gates need, so leave it ``False`` for a gating workflow.
++    sample
++        Value for ``obs['sample']``. Defaults to the filename stem, which makes
++        concatenating several files give a usable sample column for free.
++    preprocess
++        Convert the stored CHANNEL values into SCALE values — apply ``$PnG``
++        gain, decode ``$PnE`` log-amplified channels, and scale time by
++        ``$TIMESTEP``. On by default because scale values are what every
++        downstream step assumes; set ``False`` only if you specifically want the
++        raw ADC buffer.
++    compensated
++        Apply the file's own ``$SPILLOVER`` matrix on read. ``False`` by default
++        and deliberately so: the acquisition matrix is frequently wrong, most
++        labs recompute it from single-stain controls, and applying it silently
++        would leave no way to tell whether it had been applied. The matrix is
++        always available in ``uns['fcs']['spillover']``.
++    dtype
++        Storage dtype for ``X``. ``float32`` halves memory on a 10^7-event file
++        and is well past the precision of a 18-bit ADC.
++
++    Returns
++    -------
++    :class:`~anndata.AnnData`
++        ``X`` events x channels; ``var`` with ``n / channel / marker / PnB /
++        PnE / PnG / PnR``, indexed by marker where one exists; ``obs`` with
++        ``sample``; ``uns['fcs']`` with ``keywords``, ``spillover`` (a square
++        DataFrame or ``None``), ``version`` and ``compensated``.
++
++    Notes
++    -----
++    Nothing here is assay-specific. ``ov.single.ev.read_fcs`` wraps this for the
++    single-EV convention (it adds ``uns['ev']``).
++    """
++    if not os.path.exists(path):
++        raise FileNotFoundError(f"FCS file not found: {path}")
++
++    flowio = _flowio()
++    fd = flowio.FlowData(str(path))
++
++    var = _channel_frame(fd.channels)
++    # `as_array(preprocess=True)`, NOT the raw `fd.events` buffer. The DATA
++    # segment holds CHANNEL values; turning them into SCALE values means
++    # applying `$PnG` (amplifier gain), decoding `$PnE` log-amplified channels
++    # as ``10 ** (decades * x / range) * log0``, and scaling the time channel by
++    # `$TIMESTEP`. Reading the raw buffer silently returns a gain-2.0 channel at
++    # twice its true value and a log-amplified channel off by orders of
++    # magnitude — every downstream gate would then be drawn in the wrong place.
++    values = fd.as_array(preprocess=preprocess)
++
++    keywords = dict(fd.text)
++    spill = parse_spillover(
++        keywords.get("spillover") or keywords.get("spill") or "",
++        list(var["channel"]),
++    )
++
++    if compensated:
++        if spill is None:
++            raise ValueError(
++                "compensated=True but this file carries no $SPILLOVER matrix. "
++                "Pass the matrix explicitly to your compensation step instead."
++            )
++        values = _apply_spillover(values, list(var["channel"]), spill)
++
++    # Subset AFTER compensation: spillover is defined over the full detector
++    # set, so dropping channels first would silently compensate against a
++    # different matrix than the instrument recorded.
++    keep = np.ones(len(var), dtype=bool)
++    if markers_only:
++        keep &= var["marker"].astype(str).str.len().to_numpy() > 0
++    if channels is not None:
++        wanted = {str(c) for c in channels}
++        keep &= (var["channel"].isin(wanted) | var["marker"].isin(wanted)).to_numpy()
++        missing = wanted - set(var["channel"]) - set(var["marker"])
++        if missing:
++            raise KeyError(
++                f"channel(s) not in this file: {sorted(missing)}. "
++                f"Available detectors: {sorted(var['channel'])}"
++            )
++    if not keep.any():
++        raise ValueError("no channels left after filtering")
++    values = values[:, keep]
++    var = var.loc[keep].copy()
++
++    obs = pd.DataFrame(index=pd.RangeIndex(values.shape[0]).astype(str))
++    obs["sample"] = sample if sample is not None else os.path.splitext(os.path.basename(path))[0]
++
++    adata = AnnData(X=np.ascontiguousarray(values, dtype=dtype), obs=obs, var=var)
++    # `uns['meta']` is pytometry's contract and NOT decoration: `pp.compensate`
++    # does `adata.uns["meta"]["spill"]` and reads `.columns` off it, so the key
++    # must exist and hold the PARSED matrix (or None), not the raw keyword
++    # string. Matching the var schema alone was not enough to be a drop-in —
++    # this cost two failed interop runs to find, and the test suite pins it.
++    adata.uns["meta"] = dict(keywords)
++    adata.uns["meta"]["spill"] = spill
++    adata.uns["fcs"] = {
++        # Same object, not a copy: `uns['meta']` is the interop name and
++        # `uns['fcs']['keywords']` the discoverable one, for one dict.
++        "keywords": keywords,
++        "spillover": spill,
++        "version": getattr(fd, "version", None),
++        "compensated": bool(compensated),
++        "preprocessed": bool(preprocess),
++        "path": os.path.abspath(path),
++    }
++    return adata
++
++
++def _apply_spillover(values: np.ndarray, channels: Sequence[str],
++                     spill: pd.DataFrame) -> np.ndarray:
++    """Right-multiply the fluorescence block by the inverse spillover matrix.
++
++    Only the channels the matrix names are touched — scatter and time must pass
++    through untouched, and a matrix that names a channel the file does not have
++    is a genuine mismatch worth refusing.
++    """
++    idx = []
++    for name in spill.columns:
++        if name not in list(channels):
++            raise ValueError(
++                f"$SPILLOVER names channel {name!r}, which is not in this file. "
++                "The matrix does not belong to these events."
++            )
++        idx.append(list(channels).index(name))
++    block = values[:, idx]
++    values = values.copy()
++    values[:, idx] = block @ np.linalg.inv(spill.to_numpy())
++    return values
+diff --git a/omicverse/single/ev/io.py b/omicverse/single/ev/io.py
+index d91857a1c..99c7f0966 100644
+--- a/omicverse/single/ev/io.py
++++ b/omicverse/single/ev/io.py
+@@ -56,8 +56,10 @@ def _require(modname: str, feature: str):
+         return importlib.import_module(modname)
+     except ImportError as exc:  # pragma: no cover - exercised only without dep
+         raise ImportError(
++            # There is no `ev` extra — the old hint sent users to an install
++            # command that fails. Point at one that exists.
+             f"{feature} needs the optional '{modname}' backend. Install with: "
+-            f"pip install {modname}   (or pip install omicverse[ev])."
++            f"pip install {modname}   (or pip install omicverse[cytometry])."
+         ) from exc
+ 
+ 
+@@ -547,21 +549,22 @@ def read_nanofcm(
+ 
+ @register_function(
+     aliases=[
+-        "read_fcs", "load_fcs", "read_flow", "读取FCS", "流式文件读取",
++        "read_fcs_ev", "load_fcs_ev", "读取EV流式",
+     ],
+     category="ev",
+     description=(
+-        "Read a single-EV flow-cytometry FCS file into an intensity-type "
+-        "single-EV AnnData. Each FCS event is one EV and each fluorescence "
+-        "channel a protein marker. Uses the optional 'flowkit' or 'fcsparser' "
+-        "backend for FCS parsing; if neither is installed pass a CSV export "
+-        "instead (see read_nanofcm)."
++        "Read an FCS file as SINGLE-EV data: each event is one vesicle and each "
++        "fluorescence channel a protein marker, returned as an intensity-type "
++        "single-EV AnnData with uns['ev']. This is the EV-flavoured wrapper — "
++        "for a general flow / spectral / mass cytometry read that keeps the "
++        "$PnN/$PnS channel-vs-marker distinction and the $SPILLOVER matrix, use "
++        "ov.io.read_fcs instead."
+     ),
+     examples=[
+         "adata = ov.single.ev.read_fcs('ev_events.fcs')",
+         "adata = ov.single.ev.read_fcs('ev_events.fcs', marker_cols=['FITC-A'])",
+     ],
+-    related=["single.ev.read_nanofcm", "single.ev.read_ev_matrix"],
++    related=["io.read_fcs", "single.ev.read_nanofcm", "single.ev.read_ev_matrix"],
+ )
+ def read_fcs(
+     path: str,
+@@ -572,14 +575,21 @@ def read_fcs(
+ ):
+     """Read an FCS-format single-EV flow event file into an AnnData.
+ 
++    Thin EV-flavoured wrapper over :func:`omicverse.io.read_fcs`. The general
++    reader owns the format — it keeps the ``$PnN`` detector name and the
++    ``$PnS`` marker apart, and parses ``$SPILLOVER`` — and this adds the single-
++    EV conventions on top: ``event%06d`` row names, the intensity ``value_type``
++    and the ``uns['ev']`` stamp.
++
+     Parameters
+     ----------
+     path
+-        Path to a ``.fcs`` file. If it ends in ``.csv`` / ``.tsv`` the call is
+-        forwarded to :func:`read_nanofcm` (the documented CSV-export path).
++        Path to a ``.fcs`` file. If it ends in ``.csv`` / ``.tsv`` / ``.txt``
++        the call is forwarded to :func:`read_nanofcm` (the documented CSV-export
++        path), which is EV-specific and stays here.
+     marker_cols
+-        Channels to keep as protein markers. If ``None`` all channels are
+-        kept.
++        Channels to keep as protein markers; ``None`` keeps all. Matched against
++        the detector name AND the marker name, so either vocabulary works.
+     platform
+         Platform tag stored in ``uns['ev']``.
+     sample
+@@ -590,11 +600,12 @@ def read_fcs(
+     :class:`~anndata.AnnData`
+         Intensity-type single-EV AnnData.
+ 
+-    Notes
+-    -----
+-    FCS parsing requires the optional ``flowkit`` or ``fcsparser`` package
+-    (``pip install fcsparser``). When neither is available, export the events
+-    to CSV from the instrument software and use :func:`read_nanofcm`.
++    See Also
++    --------
++    omicverse.io.read_fcs
++        The general reader. Use it for conventional flow, spectral flow or mass
++        cytometry, or whenever you need the spillover matrix or the channel /
++        marker distinction — none of which survive the EV framing here.
+     """
+     if not os.path.exists(path):
+         raise FileNotFoundError(path)
+@@ -602,27 +613,26 @@ def read_fcs(
+     if low.endswith((".csv", ".tsv", ".txt")):
+         return read_nanofcm(path, marker_cols=marker_cols, platform=platform)
+ 
+-    events: Optional[pd.DataFrame] = None
+-    # try flowkit first, then fcsparser
+-    try:
+-        flowkit = _require("flowkit", "FCS parsing")
+-        fk_sample = flowkit.Sample(path)
+-        events = fk_sample.as_dataframe(source="raw")
+-        if hasattr(events.columns, "get_level_values"):
+-            events.columns = events.columns.get_level_values(-1)
+-    except ImportError:
+-        fcsparser = _require("fcsparser", "FCS parsing")
+-        _, events = fcsparser.parse(path, reformat_meta=True)
+-
+-    events = events.reset_index(drop=True)
+-    if marker_cols is not None:
+-        events = events[list(marker_cols)]
+-    events.index = [f"event{i:06d}" for i in range(len(events))]
++    from ...io.cytometry import read_fcs as _read_fcs
++
++    adata = _read_fcs(path, channels=marker_cols, sample=sample)
++    events = pd.DataFrame(
++        np.asarray(adata.X),
++        columns=[str(c) for c in adata.var.index],
++        index=[f"event{i:06d}" for i in range(adata.n_obs)],
++    )
+     obs = pd.DataFrame(index=events.index)
+     obs["sample"] = sample
+-    return _build_ev_anndata(
++    out = _build_ev_anndata(
+         events, value_type="intensity", platform=platform, obs=obs
+     )
++    # Carry the FCS metadata through rather than discarding it, which is what
++    # this function used to do — the spillover matrix in particular is not
++    # recoverable once the events have been reframed as an EV matrix.
++    out.uns["fcs"] = adata.uns["fcs"]
++    out.var["channel"] = adata.var["channel"].to_numpy()
++    out.var["marker"] = adata.var["marker"].to_numpy()
++    return out
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/pyproject.toml b/pyproject.toml
+index 7c2724bc3..00d53fa74 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -93,6 +93,22 @@ dependencies = [
+ rust = [
+     "anndataoom>=0.1.0,<1.0",
+ ]
++# Flow / spectral / mass cytometry. `flowio` (BSD-3, pure Python, numpy only) is
++# the FCS parser behind ov.io.read_fcs and behind both pytometry and FlowKit; it
++# was previously an UNDECLARED runtime dependency of a public function.
++#   pip install omicverse[cytometry]
++cytometry = [
++    "flowio>=1.3",
++]
++# Adds the scverse cytometry stack: compensation, logicle/biexponential
++# transforms and FlowSOM on top of the reader. Kept separate because flowutils
++# and flowkit require numpy>=2, which is a heavier constraint than the reader
++# itself needs.
++#   pip install omicverse[cytometry-full]
++cytometry-full = [
++    "flowio>=1.3",
++    "pytometry>=0.1.4",
++]
+ full = [
+   "dynamo-release<=1.5.3",
+   "squidpy",
+diff --git a/tests/test_io_fcs.py b/tests/test_io_fcs.py
+new file mode 100644
+index 000000000..449d7dad0
+--- /dev/null
++++ b/tests/test_io_fcs.py
+@@ -0,0 +1,326 @@
++"""Tests for ``ov.io.read_fcs`` — the general Flow Cytometry Standard reader.
++
++The FCS fixture is WRITTEN BY THE TEST (flowio can create files as well as read
++them), so these run in CI without shipping a binary and without depending on a
++vendor sample. That matters: the two things this reader exists to preserve —
++the $PnN/$PnS distinction and $SPILLOVER — only appear in a file that actually
++carries them, and a hand-waved fixture would test neither.
++"""
++from __future__ import annotations
++
++import importlib.util
++
++import numpy as np
++import pandas as pd
++import pytest
++
++HAS_FLOWIO = importlib.util.find_spec("flowio") is not None
++HAS_PYTOMETRY = importlib.util.find_spec("pytometry") is not None
++
++pytestmark = pytest.mark.skipif(not HAS_FLOWIO, reason="flowio not installed")
++
++from omicverse.io.cytometry import parse_spillover  # noqa: E402
++
++# 4 fluorescence detectors carrying named antibodies, plus scatter with none.
++CHANNELS = [
++    ("FSC-A", None), ("SSC-A", None),
++    ("FITC-A", "CD3"), ("PE-A", "CD4"), ("APC-A", "CD8"), ("PerCP-A", "CD19"),
++]
++SPILL_NAMES = ["FITC-A", "PE-A", "APC-A", "PerCP-A"]
++SPILL = np.array([
++    [1.00, 0.08, 0.01, 0.00],
++    [0.11, 1.00, 0.05, 0.01],
++    [0.02, 0.06, 1.00, 0.09],
++    [0.00, 0.01, 0.07, 1.00],
++])
++
++
++@pytest.fixture
++def fcs(tmp_path):
++    import flowio
++
++    rng = np.random.default_rng(0)
++    n = 2000
++    data = np.abs(rng.normal(5e4, 1e4, size=(n, len(CHANNELS)))).astype(np.float32)
++    opt = {f"$P{i + 1}S": s for i, (_, s) in enumerate(CHANNELS) if s}
++    opt["$SPILLOVER"] = ",".join(
++        [str(len(SPILL_NAMES))] + SPILL_NAMES + [f"{v:g}" for v in SPILL.flatten()]
++    )
++    path = tmp_path / "sample_a.fcs"
++    with open(path, "wb") as fh:
++        flowio.create_fcs(
++            fh, data.flatten().tolist(),
++            channel_names=[c for c, _ in CHANNELS],
++            opt_channel_names=[s for _, s in CHANNELS],
++            metadata_dict=opt,
++        )
++    return str(path)
++
++
++@pytest.fixture
++def fcs_no_spill(tmp_path):
++    """A file with no $SPILLOVER — completely normal (unstained, CyTOF)."""
++    import flowio
++
++    rng = np.random.default_rng(1)
++    data = np.abs(rng.normal(1e3, 2e2, size=(500, 3))).astype(np.float32)
++    path = tmp_path / "plain.fcs"
++    with open(path, "wb") as fh:
++        flowio.create_fcs(fh, data.flatten().tolist(),
++                          channel_names=["FSC-A", "SSC-A", "Time"])
++    return str(path)
++
++
++# ── the two things the EV reader threw away ─────────────────────────────────
++
++def test_detector_and_marker_are_kept_apart(fcs):
++    """$PnN vs $PnS is THE classic FCS mistake: the same antibody sits on a
++    different detector between panels. Both must survive."""
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs)
++    assert list(a.var["channel"]) == [c for c, _ in CHANNELS]
++    assert list(a.var["marker"]) == [s or "" for _, s in CHANNELS]
++    # Indexed by the marker where one exists, else the detector.
++    assert list(a.var.index) == ["FSC-A", "SSC-A", "CD3", "CD4", "CD8", "CD19"]
++
++
++def test_spillover_is_parsed_into_a_labelled_matrix(fcs):
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs)
++    spill = a.uns["fcs"]["spillover"]
++    assert isinstance(spill, pd.DataFrame)
++    assert list(spill.columns) == SPILL_NAMES
++    assert np.allclose(spill.to_numpy(), SPILL)
++
++
++def test_a_file_without_spillover_is_not_an_error(fcs_no_spill):
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs_no_spill)
++    assert a.uns["fcs"]["spillover"] is None
++    assert a.shape == (500, 3)
++
++
++# ── parse_spillover, directly ───────────────────────────────────────────────
++
++def test_parse_spillover_round_trips():
++    text = ",".join(["2", "A", "B", "1", "0.05", "0.02", "1"])
++    m = parse_spillover(text, ["A", "B"])
++    assert list(m.columns) == ["A", "B"]
++    assert np.allclose(m.to_numpy(), [[1, 0.05], [0.02, 1]])
++
++
++def test_parse_spillover_maps_detector_indexes_to_names():
++    """Some vendors write 1-based detector INDEXES instead of names."""
++    m = parse_spillover("2,1,2,1,0.05,0.02,1", ["FITC-A", "PE-A"])
++    assert list(m.columns) == ["FITC-A", "PE-A"]
++
++
++@pytest.mark.parametrize("bad", ["", "not,a,matrix", "3,A,B,1,0", "0", "abc"])
++def test_malformed_spillover_returns_None_rather_than_raising(bad):
++    # A missing or broken matrix must degrade to "no compensation available",
++    # never take down the read of an otherwise fine file.
++    assert parse_spillover(bad, ["A", "B"]) is None
++
++
++# ── selection ───────────────────────────────────────────────────────────────
++
++def test_channels_can_be_named_by_either_vocabulary(fcs):
++    from omicverse.io import read_fcs
++
++    by_marker = read_fcs(fcs, channels=["CD3", "CD4"])
++    by_detector = read_fcs(fcs, channels=["FITC-A", "PE-A"])
++    assert by_marker.shape == by_detector.shape == (2000, 2)
++    assert np.allclose(np.asarray(by_marker.X), np.asarray(by_detector.X))
++
++
++def test_markers_only_drops_scatter(fcs):
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs, markers_only=True)
++    assert list(a.var.index) == ["CD3", "CD4", "CD8", "CD19"]
++
++
++def test_an_unknown_channel_is_a_loud_error(fcs):
++    from omicverse.io import read_fcs
++
++    with pytest.raises(KeyError, match="not in this file"):
++        read_fcs(fcs, channels=["CD3", "CD400"])
++
++
++def test_sample_defaults_to_the_filename(fcs):
++    from omicverse.io import read_fcs
++
++    assert read_fcs(fcs).obs["sample"].unique().tolist() == ["sample_a"]
++    assert read_fcs(fcs, sample="donor7").obs["sample"].unique().tolist() == ["donor7"]
++
++
++# ── compensation ────────────────────────────────────────────────────────────
++
++def test_compensation_is_off_by_default_and_recorded_when_on(fcs):
++    from omicverse.io import read_fcs
++
++    raw = read_fcs(fcs)
++    comp = read_fcs(fcs, compensated=True)
++    assert raw.uns["fcs"]["compensated"] is False
++    assert comp.uns["fcs"]["compensated"] is True
++    assert not np.allclose(np.asarray(raw.X), np.asarray(comp.X))
++
++
++def test_compensation_leaves_scatter_untouched(fcs):
++    """The spillover matrix names only fluorescence detectors; FSC/SSC must not
++    be dragged through it."""
++    from omicverse.io import read_fcs
++
++    raw = read_fcs(fcs)
++    comp = read_fcs(fcs, compensated=True)
++    assert np.allclose(np.asarray(raw.X)[:, :2], np.asarray(comp.X)[:, :2])
++
++
++def test_compensation_without_a_matrix_refuses(fcs_no_spill):
++    from omicverse.io import read_fcs
++
++    with pytest.raises(ValueError, match="no \\$SPILLOVER"):
++        read_fcs(fcs_no_spill, compensated=True)
++
++
++def test_subsetting_does_not_change_the_compensation(fcs):
++    """Compensation is defined over the full detector set. Subsetting first
++    would silently compensate against a different matrix than was recorded."""
++    from omicverse.io import read_fcs
++
++    full = read_fcs(fcs, compensated=True)
++    subset = read_fcs(fcs, compensated=True, channels=["CD3"])
++    col = list(full.var.index).index("CD3")
++    assert np.allclose(np.asarray(full.X)[:, col], np.asarray(subset.X)[:, 0])
++
++
++# ── interop with pytometry (the reason the schema is what it is) ────────────
++
++@pytest.mark.skipif(not HAS_PYTOMETRY, reason="pytometry not installed")
++def test_the_result_is_a_drop_in_for_pytometry(fcs):
++    """Matching pytometry's `var` schema was NOT sufficient — `pp.compensate`
++    reads `uns['meta']['spill']` and wants the parsed matrix there. Both halves
++    are pinned here because the first two attempts at this shipped a var schema
++    that looked right and a uns that did not work."""
++    import pytometry as pm
++
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs)
++    pm.pp.compensate(a.copy())
++    pm.tl.normalize_logicle(a.copy())
++    pm.tl.normalize_arcsinh(a.copy(), cofactor=150)
++    pm.pp.split_signal(a.copy(), var_key="channel")
++
++
++@pytest.mark.skipif(not HAS_PYTOMETRY, reason="pytometry not installed")
++def test_our_compensation_agrees_with_pytometry_exactly(fcs):
++    import pytometry as pm
++
++    from omicverse.io import read_fcs
++
++    ours = read_fcs(fcs, compensated=True)
++    theirs = read_fcs(fcs)
++    pm.pp.compensate(theirs)
++    cols = [list(ours.var["channel"]).index(c) for c in SPILL_NAMES]
++    assert np.allclose(np.asarray(ours.X)[:, cols], np.asarray(theirs.X)[:, cols])
++
++
++@pytest.mark.skipif(not HAS_PYTOMETRY, reason="pytometry not installed")
++def test_var_schema_matches_pytometrys_own_reader(fcs):
++    import pytometry as pm
++
++    from omicverse.io import read_fcs
++
++    ours = read_fcs(fcs)
++    theirs = pm.io.read_fcs(fcs)
++    assert list(ours.var.columns) == list(theirs.var.columns)
++    assert list(ours.var.index) == list(theirs.var.index)
++    assert list(ours.var["channel"]) == list(theirs.var["channel"])
++
++
++# ── the EV wrapper still works ──────────────────────────────────────────────
++
++def test_ev_reader_keeps_its_contract_and_gains_the_metadata(fcs):
++    """`ov.single.ev.read_fcs` now delegates here. Its own conventions must be
++    unchanged for existing callers — and it should no longer THROW AWAY the
++    spillover matrix and the channel/marker split, which it used to."""
++    from omicverse.single.ev.io import read_fcs as ev_read_fcs
++
++    a = ev_read_fcs(fcs)
++    assert a.obs_names[0] == "event000000"
++    assert a.uns["ev"] == {"value_type": "intensity", "platform": "FCS"}
++    assert a.obs["sample"].unique().tolist() == ["sample1"]
++    # newly preserved
++    assert a.uns["fcs"]["spillover"].shape == (4, 4)
++    assert list(a.var["channel"]) == [c for c, _ in CHANNELS]
++
++
++def test_ev_reader_still_accepts_marker_cols(fcs):
++    from omicverse.single.ev.io import read_fcs as ev_read_fcs
++
++    assert ev_read_fcs(fcs, marker_cols=["CD3", "CD4"]).shape == (2000, 2)
++
++
++def test_missing_file_is_a_FileNotFoundError(tmp_path):
++    from omicverse.io import read_fcs
++
++    with pytest.raises(FileNotFoundError):
++        read_fcs(str(tmp_path / "nope.fcs"))
++
++
++# ── channel values vs scale values ──────────────────────────────────────────
++# Found by adversarial review AFTER the reader had been written and opened as a
++# PR. The original fixture used $PnE = "0,0" and $PnG = 1.0 throughout, so it
++# could not have caught this no matter what the reader did.
++
++@pytest.fixture
++def fcs_amplified(tmp_path):
++    """A file with a real amplifier gain on one channel."""
++    import flowio
++
++    raw = np.array([[100.0, 200.0, 1000.0, 5000.0]] * 50, dtype=np.float32)
++    path = tmp_path / "amplified.fcs"
++    with open(path, "wb") as fh:
++        flowio.create_fcs(
++            fh, raw.flatten().tolist(),
++            channel_names=["FSC-A", "SSC-A", "FITC-A", "PE-A"],
++            metadata_dict={"$P4G": "2.0", "$P3R": "1024", "$P4R": "1024"},
++        )
++    return str(path)
++
++
++def test_amplifier_gain_is_applied(fcs_amplified):
++    """The DATA segment holds CHANNEL values; $PnG turns them into SCALE values.
++
++    Reading the raw buffer returned a gain-2.0 channel at exactly twice its true
++    value — silently, and every gate drawn on it would sit in the wrong place.
++    """
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs_amplified)
++    assert np.isclose(np.asarray(a.X)[0, 3], 2500.0), "PE-A has $P4G=2.0: 5000 -> 2500"
++    assert np.isclose(np.asarray(a.X)[0, 2], 1000.0), "FITC-A has no gain: unchanged"
++    assert a.uns["fcs"]["preprocessed"] is True
++
++
++def test_preprocess_can_be_turned_off(fcs_amplified):
++    from omicverse.io import read_fcs
++
++    a = read_fcs(fcs_amplified, preprocess=False)
++    assert np.isclose(np.asarray(a.X)[0, 3], 5000.0)
++    assert a.uns["fcs"]["preprocessed"] is False
++
++
++def test_scaling_agrees_with_flowio_itself(fcs_amplified):
++    """Pin against the parser's own preprocessing rather than a hand-computed
++    number, so $PnE / $TIMESTEP handling stays correct too."""
++    import flowio
++
++    from omicverse.io import read_fcs
++
++    expected = flowio.FlowData(fcs_amplified).as_array(preprocess=True)
++    assert np.allclose(np.asarray(read_fcs(fcs_amplified).X), expected)

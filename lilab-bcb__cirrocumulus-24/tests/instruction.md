@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** find dataset by URL when no permissions
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `b1ec4d8a68ba`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,270 @@
+diff --git a/scarf/assay/rna.py b/scarf/assay/rna.py
+index b169458a..680984f1 100644
+--- a/scarf/assay/rna.py
++++ b/scarf/assay/rna.py
+@@ -4,7 +4,7 @@
+ import numpy as np
+ import pandas as pd
+ import zarr
+-from numba import njit, prange
++from numba import njit
+ 
+ from ..matrix import ChunkedArray
+ from ..metadata import MetaData
+@@ -33,7 +33,7 @@ def _read_facade_block(
+     return _read_block(zarr_arr, row_idx, col_idx)
+ 
+ 
+-@njit(parallel=True, cache=True)
++@njit(cache=True, nogil=True)
+ def _hvg_stats_gene_major_kernel(
+     values: np.ndarray,
+     inv: np.ndarray,
+@@ -47,7 +47,7 @@ def _hvg_stats_gene_major_kernel(
+     """Accumulate lib-size HVG stats over selected cells in a raw block."""
+     n_genes = values.shape[0]
+     n_selected = selected.shape[0]
+-    for g in prange(n_genes):
++    for g in range(n_genes):
+         target = dest[g]
+         if target < 0:
+             continue
+@@ -791,9 +791,6 @@ def _streaming_feature_stats(
+         """
+         import time
+ 
+-        import numba
+-        from numba import set_num_threads
+-
+         from ..storage.feature_stream import map_feature_cell_bands
+         from ..utils.process import process_rss_mb
+ 
+@@ -827,15 +824,9 @@ def _streaming_feature_stats(
+         n_feats = int(counts_t.shape[0])
+         dest_of = np.full(n_feats, -1, dtype=np.int64)
+         dest_of[feat_idx] = np.arange(n_features, dtype=np.int64)
+-        threads = min(
+-            max(1, int(self.resources.workers)),
+-            max(1, int(numba.config.NUMBA_NUM_THREADS)),
+-        )
+-        previous_threads = numba.get_num_threads()
+         logger.info(
+             f"({self.name}) feature stats consume "
+             f"workers={self.resources.workers} "
+-            f"numbaThreads={threads} "
+             f"memoryBytes={self.resources.memoryBytes}"
+         )
+ 
+@@ -893,7 +884,6 @@ def process_band(
+ 
+         consume_metrics: dict[str, object] = {}
+         try:
+-            set_num_threads(threads)
+             for item in map_feature_cell_bands(
+                 counts_t,
+                 process_band,
+@@ -923,7 +913,6 @@ def process_band(
+                 s1[destinations[keep]] = merged[1][keep]
+                 s2[destinations[keep]] = merged[2][keep]
+         finally:
+-            set_num_threads(previous_threads)
+             if consume_metrics:
+                 logger.info(
+                     f"({self.name}) feature stats execution "
+diff --git a/scarf/features/markers/rank.py b/scarf/features/markers/rank.py
+index 728c020a..7c5e135d 100644
+--- a/scarf/features/markers/rank.py
++++ b/scarf/features/markers/rank.py
+@@ -172,7 +172,7 @@ def _marker_stats_batch(
+     return out
+ 
+ 
+-@njit(parallel=True, cache=True)
++@njit(cache=True, nogil=True)
+ def _marker_stats_gene_major(
+     raw: np.ndarray,
+     scalar: np.ndarray,
+@@ -188,7 +188,7 @@ def _marker_stats_gene_major(
+     n_genes = raw.shape[0]
+     n_cells = raw.shape[1]
+     n_groups = group_counts.shape[0]
+-    for g in prange(n_genes):
++    for g in range(n_genes):
+         row = destination_rows[g]
+         if row < 0:
+             continue
+diff --git a/scarf/features/markers/search.py b/scarf/features/markers/search.py
+index 787927b9..9690b3eb 100644
+--- a/scarf/features/markers/search.py
++++ b/scarf/features/markers/search.py
+@@ -214,6 +214,7 @@ def find_markers_by_rank(
+         resources = getattr(assay, "resources", None) or resolve_budget(
+             workers=nthreads
+         )
++        uses_parallel_numba = adapter != "rna_lib_size_unsigned"
+         threads = min(
+             max(1, int(resources.workers)),
+             max(1, int(numba.config.NUMBA_NUM_THREADS)),
+@@ -224,7 +225,8 @@ def find_markers_by_rank(
+         logger.debug(
+             f"Marker search bounded groups: features={len(feat_idx)} "
+             f"groups={n_groups} adapter={adapter} workers={resources.workers} "
+-            f"numbaThreads={threads} memoryBytes={resources.memoryBytes}"
++            f"numbaThreads={threads if uses_parallel_numba else 1} "
++            f"memoryBytes={resources.memoryBytes}"
+         )
+ 
+         def process_group(group: Any) -> None:
+@@ -295,7 +297,7 @@ def process_group(group: Any) -> None:
+                 metrics=consume_metrics,
+                 scratchBytes=scratch,
+                 extraItemsize=extra_itemsize,
+-                orderedCompute=False,
++                orderedCompute=uses_parallel_numba,
+             ):
+                 pass
+         finally:
+diff --git a/tests/test_numba_workqueue.py b/tests/test_numba_workqueue.py
+new file mode 100644
+index 00000000..408ce2e0
+--- /dev/null
++++ b/tests/test_numba_workqueue.py
+@@ -0,0 +1,138 @@
++import os
++import subprocess
++import sys
++import textwrap
++
++
++_WORKQUEUE_CHILD = textwrap.dedent(
++    """
++    import numpy as np
++    import pandas as pd
++    import zarr
++    from numba import threading_layer
++    from zarr.storage import MemoryStore
++
++    from scarf import DataStore, configure_output
++    from scarf.assay import norm_dummy, norm_lib_size
++    from scarf.features.markers.search import find_markers_by_rank
++    from scarf.storage.budget import ResourceBudget
++    from scarf.storage.count_matrix import CountMatrixPolicy
++    from scarf.storage.schema import create_cell_data, create_zarr_count_assay
++    from scarf.writers.counts_t import finalize_writer_counts_t
++
++    configure_output(progress=False)
++
++    n_cells = 512
++    n_features = 1_024
++    rng = np.random.default_rng(41)
++    values = rng.integers(
++        0,
++        6,
++        size=(n_cells, n_features),
++        dtype=np.uint32,
++    )
++    values[rng.random(values.shape) < 0.7] = 0
++
++    store = MemoryStore()
++    root = zarr.open_group(store=store, mode="w")
++    cell_ids = np.array([f"c{i}" for i in range(n_cells)])
++    feature_ids = np.array([f"f{i}" for i in range(n_features)])
++    create_cell_data(
++        root,
++        None,
++        ids=cell_ids,
++        names=cell_ids,
++        profile="fast_local",
++    )
++    policy = CountMatrixPolicy(unitBytes=262_144, chunkBytes=65_536)
++    counts = create_zarr_count_assay(
++        root,
++        "RNA",
++        None,
++        n_cells,
++        feature_ids,
++        feature_ids,
++        profile="fast_local",
++        policy=policy,
++    )
++    counts[:] = values
++    finalize_writer_counts_t(
++        root,
++        "RNA",
++        None,
++        resources=ResourceBudget(128 * 1024**2, 4),
++        profile="fast_local",
++        policy=policy,
++    )
++
++    def open_store(workers):
++        return DataStore(
++            store,
++            assay_types={"RNA": "RNA"},
++            default_assay="RNA",
++            min_features_per_cell=0,
++            mito_pattern="",
++            ribo_pattern="",
++            nthreads=workers,
++            mem_budget=128 * 1024**2,
++            zarrProfile="fast_local",
++        )
++
++    single = open_store(1)
++    parallel = open_store(4)
++    cell_idx = np.arange(n_cells, dtype=np.int64)
++    feat_idx = np.arange(n_features, dtype=np.int64)
++
++    expected_stats = single.RNA._streaming_feature_stats(cell_idx, feat_idx)
++    actual_stats = parallel.RNA._streaming_feature_stats(cell_idx, feat_idx)
++    for name, expected in expected_stats.items():
++        np.testing.assert_array_equal(actual_stats[name], expected)
++
++    groups = np.repeat(np.array(["a", "b"]), n_cells // 2)
++
++    def marker_results(datastore, method, workers):
++        datastore.RNA.normMethod = method
++        return find_markers_by_rank(
++            datastore.RNA,
++            groups,
++            cell_idx,
++            feat_idx,
++            nthreads=workers,
++        )
++
++    for method in (norm_lib_size, norm_dummy):
++        expected_markers = marker_results(single, method, 1)
++        actual_markers = marker_results(parallel, method, 4)
++        for group, expected in expected_markers.items():
++            pd.testing.assert_frame_equal(actual_markers[group], expected)
++
++    assert threading_layer() == "workqueue"
++    print("WORKQUEUE_OK")
++    """
++)
++
++
++def test_numba_workqueue_feature_and_marker_streams_do_not_abort() -> None:
++    env = os.environ.copy()
++    env.update(
++        {
++            "NUMBA_NUM_THREADS": "4",
++            "NUMBA_THREADING_LAYER": "workqueue",
++            "SCARF_WORKERS": "4",
++        }
++    )
++    completed = subprocess.run(
++        [sys.executable, "-c", _WORKQUEUE_CHILD],
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=120,
++        check=False,
++    )
++
++    assert completed.returncode == 0, (
++        f"workqueue child exited with {completed.returncode}\n"
++        f"stdout:\n{completed.stdout}\n"
++        f"stderr:\n{completed.stderr}"
++    )
++    assert "WORKQUEUE_OK" in completed.stdout

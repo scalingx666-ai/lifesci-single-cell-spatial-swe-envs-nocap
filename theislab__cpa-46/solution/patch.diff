@@ -1,0 +1,1060 @@
+diff --git a/README.md b/README.md
+index 65d3640..489b3ec 100644
+--- a/README.md
++++ b/README.md
+@@ -36,7 +36,23 @@ The following table contains the list of tutorials:
+ 
+ How to optmize CPA hyperparamters for your data
+ -----------------------------------------------
+-We provide a [tutorial](https://cpa-tools.readthedocs.io/en/latest/tutorials/optimizing_hyperparameters.html) on how to optimize CPA hyperparameters for your data.
++We provide an example script to use the built-in hyperparameter optimization function in CPA (based on scvi-tools hyperparam optimizer). You can find the script at `examples/tune_script.py`.
++
++After the hyperparameter optimization using tune_script.py is done, `result_grid.pkl` is saved in your current directory using the `pickle` library. You can load the results using the following code:
++
++```python
++import pickle
++with open('result_grid.pkl', 'rb') as f:
++    result_grid = pickle.load(f)
++```
++From here, you can follow the instructions in the [Ray Documentations](https://docs.ray.io/en/latest/tune/examples/tune_analyze_results.html#experiment-level-analysis-working-with-resultgrid) to analyze the run, and choose the best hyperparameters for your data.
++
++You can also use the integration with wandb to log the hyperparameter optimization results. You can find the script at `examples/tune_script_wandb.py`. --> `use_wandb=True`
++
++Everything is based on [Ray Tune](https://ray.io/). You can find more information about the hyperparameter optimization in the [Ray Tune Documentations](https://docs.ray.io/en/latest/tune/index.html).
++
++The tuner is adapted and adjusted from scvi-tools v1.2.0 (unreleased) [release notes](https://docs.scvi-tools.org/en/stable/release_notes/index.html)
++
+ 
+ Datasets and Pre-trained models
+ -------------------------------
+diff --git a/cpa/__init__.py b/cpa/__init__.py
+index 5f959a7..22d9e82 100644
+--- a/cpa/__init__.py
++++ b/cpa/__init__.py
+@@ -6,6 +6,7 @@
+ from ._module import CPAModule
+ from . import _plotting as pl
+ from ._api import ComPertAPI
++from ._tuner import run_autotune
+ 
+ from importlib.metadata import version
+ 
+@@ -17,4 +18,5 @@
+     "CPAModule",
+     "ComPertAPI",
+     "pl",
++    "run_autotune"
+ ]
+diff --git a/cpa/_tuner.py b/cpa/_tuner.py
+new file mode 100644
+index 0000000..dc77c13
+--- /dev/null
++++ b/cpa/_tuner.py
+@@ -0,0 +1,735 @@
++from __future__ import annotations
++
++from os.path import join
++from typing import Any, Literal
++
++from anndata import AnnData
++from lightning.pytorch import LightningDataModule
++from lightning.pytorch.callbacks import Callback
++from lightning.pytorch.loggers import TensorBoardLogger
++from mudata import MuData
++from ray.tune import ResultGrid, Tuner
++from ray.tune.schedulers import TrialScheduler
++from ray.tune.search import SearchAlgorithm
++
++from ray.air.integrations.wandb import WandbLoggerCallback
++
++from scvi._types import AnnOrMuData
++from scvi.model.base import BaseModelClass
++
++import numpy as np
++import logging
++from typing import Any, Literal
++
++from lightning.pytorch import LightningDataModule
++
++from scvi._types import AnnOrMuData
++from scvi.model.base import BaseModelClass
++import scanpy as sc
++
++logger = logging.getLogger(__name__)
++
++
++_ASHA_DEFAULT_KWARGS = {
++    "max_t": 100,
++    "grace_period": 1,
++    "reduction_factor": 2,
++}
++
++
++class AutotuneExperiment:
++    """``BETA`` Track hyperparameter tuning experiments.
++
++    Parameters
++    ----------
++    model_cls
++        Model class on which to tune hyperparameters. Must implement a constructor and a ``train``
++        method.
++    data
++        :class:`~anndata.AnnData` or :class:`~mudata.MuData` that has been setup with
++        ``model_cls`` or a :class:`~lightning.pytorch.core.LightningDataModule` (``EXPERIMENTAL``).
++    metrics
++        Either a single metric or a list of metrics to track during the experiment. If a list is
++        provided, the primary metric will be the first element in the list.
++    mode
++        Optimization mode for the primary metric. One of ``"min"`` or ``"max"``.
++    search_space
++        Dictionary of hyperparameter names and their respective search spaces. See the
++        `API <https://docs.ray.io/en/latest/tune/api/search_space.html>`_ for available search
++        specifications. Must only contain the following top-level keys:
++
++        * ``"model_args"``: parameters to pass to the model constructor.
++        * ``"train_args"``: parameters to pass to the model's ``train`` method.
++
++        Passed into :class:`~ray.tune.Tuner` as ``param_space``.
++    num_samples
++        Total number of hyperparameter configurations to sample from the search space. Passed into
++        :class:`~ray.tune.tune_config.TuneConfig`.
++    scheduler
++        Ray Tune scheduler to use. One of the following:
++
++        * ``"asha"``: :class:`~ray.tune.schedulers.AsyncHyperBandScheduler`
++        * ``"hyperband"``: :class:`~ray.tune.schedulers.HyperBandScheduler`
++        * ``"median"``: :class:`~ray.tune.schedulers.MedianStoppingRule`
++        * ``"fifo"``: :class:`~ray.tune.schedulers.FIFOScheduler`
++
++        Configured with reasonable defaults, which can be overridden with ``scheduler_kwargs``.
++    searcher
++        Ray Tune search algorithm to use. One of the following:
++
++        * ``"hyperopt"``: :class:`~ray.tune.search.hyperopt.HyperOptSearch`
++        * ``"random"``: :class:`~ray.tune.search.basic_variant.BasicVariantGenerator`
++
++        Configured with reasonable defaults, which can be overridden with ``searcher_kwargs``.
++    seed
++        Random seed to use for the experiment. Propagated to :attr:`~scvi.settings.seed` and search
++        algorithms. If not provided, defaults to :attr:`~scvi.settings.seed`.
++    resources
++        Dictionary of resources to allocate per trial in the experiment. Available keys include:
++
++        * ``"cpu"``: number of CPU cores
++        * ``"gpu"``: number of GPUs
++        * ``"memory"``: amount of memory
++
++        Passed into :func:`~ray.tune.with_resources`.
++    name
++        Name of the experiment, used for logging purposes. Defaults to a unique ID.
++    logging_dir
++        Base directory to store experiment logs. Defaults to :attr:``scvi.settings.logging_dir``.
++    scheduler_kwargs
++        Additional keyword arguments to pass to the scheduler.
++    searcher_kwargs
++        Additional keyword arguments to pass to the search algorithm.
++
++    Notes
++    -----
++    Lifecycle: beta
++
++    See Also
++    --------
++    :func:`~scvi.autotune.run_autotune`
++    """
++
++    def __init__(
++        self,
++        model_cls: BaseModelClass,
++        data: AnnOrMuData | LightningDataModule,
++        metrics: str | list[str],
++        mode: Literal["min", "max"],
++        search_space: dict[str, dict[Literal["model_args", "train_args"], dict[str, Any]]],
++        num_samples: int,
++        scheduler: Literal["asha", "hyperband", "median", "fifo"] = "asha",
++        searcher: Literal["hyperopt", "random"] = "hyperopt",
++        seed: int | None = None,
++        resources: dict[Literal["cpu", "gpu", "memory"], float] | None = None,
++        name: str | None = None,
++        logging_dir: str | None = None,
++        scheduler_kwargs: dict | None = None,
++        searcher_kwargs: dict | None = None,
++        adata_path: str | None = None,
++        sub_sample: float | None = None,
++        setup_anndata_kwargs: dict[str, Any] = {},
++        use_wandb: bool = False,
++        wandb_name: str = "cpa_tune",
++        plan_kwargs_keys: list[str] = [],
++    ) -> None:
++        self.model_cls = model_cls
++        self.data = data
++        self.metrics = metrics
++        self.mode = mode
++        self.search_space = search_space
++        self.num_samples = num_samples
++        self.seed = seed
++        self.scheduler_kwargs = scheduler_kwargs
++        self.searcher_kwargs = searcher_kwargs
++        self.scheduler = scheduler
++        self.searcher = searcher
++        self.resources = resources
++        self.name = name
++        self.logging_dir = logging_dir
++        self.adata_path = adata_path
++        self.sub_sample = sub_sample
++        self.setup_anndata_kwargs = setup_anndata_kwargs
++        self.use_wandb = use_wandb
++        self.wandb_name = wandb_name
++        self.plan_kwargs_keys = plan_kwargs_keys
++
++    @property
++    def id(self) -> str:
++        """Unique identifier for the experiment."""
++        from uuid import uuid4
++
++        if not hasattr(self, "_id"):
++            self._id = str(uuid4())
++        return self._id
++
++    @property
++    def model_cls(self) -> BaseModelClass:
++        """Model class on which to tune hyperparameters."""
++        return self._model_cls
++
++    @model_cls.setter
++    def model_cls(self, value: BaseModelClass) -> None:
++        if hasattr(self, "_model_cls"):
++            raise AttributeError("Cannot reassign `model_cls`")
++        self._model_cls = value
++
++    @property
++    def data(self) -> AnnOrMuData | LightningDataModule:
++        """Data on which to tune hyperparameters."""
++        return self._data
++
++    @data.setter
++    def data(self, value: AnnOrMuData | LightningDataModule) -> None:
++        from scvi.data._constants import _SETUP_ARGS_KEY, _SETUP_METHOD_NAME
++
++        if hasattr(self, "_data"):
++            raise AttributeError("Cannot reassign `data`")
++
++        self._data = value
++        if isinstance(value, (AnnData, MuData)):
++            data_manager = self.model_cls._get_most_recent_anndata_manager(
++                value, required=True)
++            self._setup_method_name = data_manager._registry.get(
++                _SETUP_METHOD_NAME, "setup_anndata"
++            )
++            self._setup_method_args = data_manager._get_setup_method_args().get(
++                _SETUP_ARGS_KEY, {}
++            )
++
++    @property
++    def setup_method_name(self) -> str:
++        """Either ``"setup_anndata"`` or ``"setup_mudata"``."""
++        if not hasattr(self, "_setup_method_name"):
++            raise AttributeError("`setup_method_name` not available.")
++        return self._setup_method_name
++
++    @property
++    def setup_method_args(self) -> dict[str, Any]:
++        """Keyword arguments for the setup method."""
++        if not hasattr(self, "_setup_method_args"):
++            raise AttributeError("`setup_method_args` not available.")
++        return self._setup_method_args
++
++    @property
++    def metrics(self) -> list[str]:
++        """Metrics to track during the experiment."""
++        if not hasattr(self, "_metrics"):
++            raise AttributeError("`metrics` not yet available.")
++        return self._metrics
++
++    @metrics.setter
++    def metrics(self, value: str | list[str]) -> None:
++        if hasattr(self, "_metrics"):
++            raise AttributeError("Cannot reassign `metrics`")
++        elif value is None:
++            raise ValueError("`metrics` must not be `None`")
++        elif not isinstance(value, str) and not isinstance(value, list):
++            raise TypeError("`metrics` must be a string or a list of strings")
++        elif isinstance(value, str):
++            value = [value]
++        elif isinstance(value, list) and len(value) < 1:
++            raise ValueError("`metrics` must not be empty")
++        self._metrics = value
++
++    @property
++    def mode(self) -> Literal["min", "max"]:
++        """Optimization mode for the primary metric."""
++        if not hasattr(self, "_mode"):
++            raise AttributeError("`mode` not yet available.")
++        return self._mode
++
++    @mode.setter
++    def mode(self, value: Literal["min", "max"]) -> None:
++        if hasattr(self, "_mode"):
++            raise AttributeError("Cannot reassign `mode`")
++        elif value not in ["min", "max"]:
++            raise ValueError("`mode` must be either 'min' or 'max'")
++        self._mode = value
++
++    @property
++    def search_space(self) -> dict[str, dict[Literal["model_args", "train_args"], dict[str, Any]]]:
++        """Search space for hyperparameters."""
++        if not hasattr(self, "_search_space"):
++            raise AttributeError("`search_space` not yet available.")
++        return self._search_space
++
++    @search_space.setter
++    def search_space(self, value: dict[str, Any]) -> None:
++        if hasattr(self, "_search_space"):
++            raise AttributeError("Cannot reassign `search_space`")
++        elif not isinstance(value, dict):
++            raise TypeError("`search_space` must be a dictionary")
++        elif len(value) == 0:
++            raise ValueError("`search_space` must not be empty")
++        elif any(key not in ["model_args", "train_args"] for key in value.keys()):
++            raise KeyError(
++                "`search_space` must only contain 'model_args' and 'train_args' keys")
++
++        self._search_space = value
++
++    @property
++    def num_samples(self) -> int:
++        """Total number of hyperparameter configurations to sample."""
++        if not hasattr(self, "_num_samples"):
++            raise AttributeError("`num_samples` not yet available.")
++        return self._num_samples
++
++    @num_samples.setter
++    def num_samples(self, value: int | None) -> None:
++        if hasattr(self, "_num_samples"):
++            raise AttributeError("Cannot reassign `num_samples`")
++        elif not isinstance(value, int):
++            raise TypeError("`num_samples` must be an integer")
++        self._num_samples = value
++
++    @property
++    def scheduler(self) -> TrialScheduler:
++        """Ray Tune scheduler to use."""
++        if not hasattr(self, "_scheduler"):
++            raise AttributeError("`scheduler` not yet available.")
++        return self._scheduler
++
++    @scheduler.setter
++    def scheduler(self, value: Literal["asha", "hyperband", "median", "fifo"]) -> None:
++        from ray.tune.schedulers import (
++            AsyncHyperBandScheduler,
++            FIFOScheduler,
++            HyperBandScheduler,
++            MedianStoppingRule,
++        )
++
++        if hasattr(self, "_scheduler"):
++            raise AttributeError("Cannot reassign `scheduler`")
++        elif not isinstance(value, str):
++            raise TypeError("`scheduler` must be a string")
++        elif value not in ["asha", "hyperband", "median", "fifo"]:
++            raise ValueError(
++                "`scheduler` must be one of 'asha', 'hyperband', 'median', 'fifo'")
++
++        kwargs = {
++            "metric": self.metrics[0],
++            "mode": self.mode,
++        }
++        if value == "asha":
++            kwargs.update(_ASHA_DEFAULT_KWARGS)
++            scheduler_cls = AsyncHyperBandScheduler
++        elif value == "hyperband":
++            scheduler_cls = HyperBandScheduler
++        elif value == "median":
++            scheduler_cls = MedianStoppingRule
++        else:
++            kwargs = {}
++            scheduler_cls = FIFOScheduler
++
++        kwargs.update(self.scheduler_kwargs)
++        self._scheduler = scheduler_cls(**kwargs)
++
++    @property
++    def scheduler_kwargs(self) -> dict[str, Any]:
++        """Additional keyword arguments to pass to the scheduler."""
++        if not hasattr(self, "_scheduler_kwargs"):
++            raise AttributeError("`scheduler_kwargs` not yet available.")
++        return self._scheduler_kwargs
++
++    @scheduler_kwargs.setter
++    def scheduler_kwargs(self, value: dict | None) -> None:
++        if hasattr(self, "_scheduler_kwargs"):
++            raise AttributeError("Cannot reassign `scheduler_kwargs`")
++        elif value is not None and not isinstance(value, dict):
++            raise TypeError("`scheduler_kwargs` must be a dictionary")
++        self._scheduler_kwargs = value or {}
++
++    @property
++    def searcher(self) -> SearchAlgorithm:
++        """Ray Tune search algorithm to use."""
++        if not hasattr(self, "_searcher"):
++            raise AttributeError("`searcher` not yet available.")
++        return self._searcher
++
++    @searcher.setter
++    def searcher(self, value: Literal["hyperopt", "random"]) -> None:
++        from ray.tune.search import BasicVariantGenerator
++        from ray.tune.search.hyperopt import HyperOptSearch
++
++        if hasattr(self, "_searcher"):
++            raise AttributeError("Cannot reassign `searcher`")
++        elif not isinstance(value, str):
++            raise TypeError("`searcher` must be a string")
++        elif value not in ["hyperopt", "random"]:
++            raise ValueError("`searcher` must be one of 'hyperopt', 'random'")
++
++        if value == "random":
++            kwargs = {"random_state": self.seed}
++            searcher_cls = BasicVariantGenerator
++        else:
++            kwargs = {
++                "metric": self.metrics[0],
++                "mode": self.mode,
++                "random_state_seed": self.seed,
++            }
++            searcher_cls = HyperOptSearch
++
++        kwargs.update(self.searcher_kwargs)
++        self._searcher = searcher_cls(**kwargs)
++
++    @property
++    def searcher_kwargs(self) -> dict[str, Any]:
++        """Additional keyword arguments to pass to the search algorithm."""
++        if not hasattr(self, "_searcher_kwargs"):
++            raise AttributeError("`searcher_kwargs` not yet available.")
++        return self._searcher_kwargs
++
++    @searcher_kwargs.setter
++    def searcher_kwargs(self, value: dict | None) -> None:
++        if hasattr(self, "_searcher_kwargs"):
++            raise AttributeError("Cannot reassign `searcher_kwargs`")
++        elif value is not None and not isinstance(value, dict):
++            raise TypeError("`searcher_kwargs` must be a dictionary")
++        self._searcher_kwargs = value or {}
++
++    @property
++    def seed(self) -> int | None:
++        """Random seed to use for the experiment."""
++        if not hasattr(self, "_seed"):
++            raise AttributeError("`seed` not yet available.")
++        return self._seed
++
++    @seed.setter
++    def seed(self, value: int | None) -> None:
++        from scvi import settings
++
++        if hasattr(self, "_seed"):
++            raise AttributeError("Cannot reassign `seed`")
++        elif value is not None and not isinstance(value, int):
++            raise TypeError("`seed` must be an integer")
++        self._seed = value or settings.seed
++
++    @property
++    def resources(self) -> dict[Literal["cpu", "gpu", "memory"], float] | None:
++        """Resources to allocate per trial in the experiment."""
++        if not hasattr(self, "_resources"):
++            raise AttributeError("`resources` not yet available.")
++        return self._resources
++
++    @resources.setter
++    def resources(self, value: dict[Literal["cpu", "gpu", "memory"], float] | None) -> None:
++        if hasattr(self, "_resources"):
++            raise AttributeError("Cannot reassign `resources`")
++        elif value is not None and not isinstance(value, dict):
++            raise TypeError("`resources` must be a dictionary or `None`")
++        self._resources = value or {}
++
++    @property
++    def name(self) -> str:
++        """Name of the experiment."""
++        if not hasattr(self, "_name"):
++            raise AttributeError("`name` not yet available.")
++        return self._name
++
++    @name.setter
++    def name(self, value: str | None) -> None:
++        if hasattr(self, "_name"):
++            raise AttributeError("Cannot reassign `name`")
++        elif value is not None and not isinstance(value, str):
++            raise TypeError("`name` must be a string or `None`")
++
++        if value is None:
++            default = f"{self._model_cls.__name__.lower()}_"
++            default += self.id
++        self._name = value or default
++
++    @property
++    def logging_dir(self) -> str:
++        """Base directory to store experiment logs."""
++        if not hasattr(self, "_logging_dir"):
++            raise AttributeError("`logging_dir` not yet available.")
++        return self._logging_dir
++
++    @logging_dir.setter
++    def logging_dir(self, value: str | None) -> None:
++        from scvi import settings
++
++        if hasattr(self, "_logging_dir"):
++            raise AttributeError("Cannot reassign `logging_dir`")
++        elif value is not None and not isinstance(value, str):
++            raise TypeError("`logging_dir` must be a string")
++        self._logging_dir = value or join(settings.logging_dir, self.name)
++
++    @property
++    def metrics_callback(self) -> Callback:
++        from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
++
++        if not hasattr(self, "_metrics"):
++            raise AttributeError("`metrics_callback` not yet available.")
++
++        # this is to get around lightning import changes
++        callback_cls = type(
++            "_TuneReportCheckpointCallback",
++            (TuneReportCheckpointCallback, Callback),
++            {},
++        )
++        return callback_cls(metrics=self.metrics, on="validation_end", save_checkpoints=False)
++
++    @property
++    def result_grid(self) -> ResultGrid:
++        """Result grid for the experiment."""
++        if not hasattr(self, "_result_grid"):
++            raise AttributeError("`result_grid` not yet available.")
++        return self._result_grid
++
++    @result_grid.setter
++    def result_grid(self, value: ResultGrid) -> None:
++        if hasattr(self, "_result_grid"):
++            raise AttributeError("Cannot reassign `result_grid`")
++        self._result_grid = value
++
++    def __repr__(self) -> str:
++        return f"Experiment {self.name}"
++
++    def get_tuner(self) -> Tuner:
++        """Configure a :class:`~ray.tune.Tuner` from this experiment."""
++        from ray.train import RunConfig
++        from ray.tune import with_parameters, with_resources
++        from ray.tune.tune_config import TuneConfig
++
++        trainable = with_parameters(_trainable,
++                                    experiment=self,
++                                    adata_path=self.adata_path,
++                                    sub_sample=self.sub_sample,
++                                    setup_anndata_kwargs=self.setup_anndata_kwargs,
++                                    plan_kwargs_keys=self.plan_kwargs_keys,
++                                    )
++        trainable = with_resources(trainable, resources=self.resources)
++
++        tune_config = TuneConfig(
++            scheduler=self.scheduler,
++            search_alg=self.searcher,
++            num_samples=self.num_samples,
++        )
++        run_config = RunConfig(
++            name=self.name,
++            storage_path=self.logging_dir,
++            local_dir=self.logging_dir,
++            log_to_file=True,
++            verbose=1,
++            callbacks=[WandbLoggerCallback(project=self.wandb_name)] if self.use_wandb else None,
++
++        )
++        return Tuner(
++            trainable=trainable,
++            param_space=self.search_space,
++            tune_config=tune_config,
++            run_config=run_config,
++        )
++
++    def get_logger(self, trial_name: str) -> TensorBoardLogger:
++        """Configure TensorBoard logger for a trial in this experiment."""
++        return TensorBoardLogger(join(self.logging_dir, f"{trial_name}_tensorboard"))
++
++
++def _trainable(
++    param_sample: dict[str, dict[Literal["model_args", "train_args"], dict[str, Any]]],
++    experiment: AutotuneExperiment,
++    adata_path: str | None = None,
++    sub_sample: float | None = None,
++    setup_anndata_kwargs: dict[str, Any] = {},
++    plan_kwargs_keys: list[str] = [],
++) -> None:
++    """Implements a Ray Tune trainable function for an :class:`~scvi.autotune.AutotuneExperiment`.
++
++    Setup on the :class:`~anndata.AnnData` or :class:`~mudata.MuData` has to be performed since Ray
++    opens a new process per trial and thus the initial setup on the main process is not
++    transferred.
++
++    Parameters
++    ----------
++    param_sample
++        Hyperparameter configuration on which to train. Note: this is different from
++        :attr:`~scvi.autotune.AutotuneExperiment.search_space` in that it is a single configuration
++        sampled from the search space, not the specification of the search space itself.
++    experiment
++        :class:`~scvi.autotune.AutotuneExperiment` to evaluate.
++
++    Notes
++    -----
++    See the Ray Tune
++    `documentation <https://docs.ray.io/en/latest/tune/api/trainable.html#function-trainable-api>`_
++    for more details.
++    """
++    from ray.train import get_context
++
++    from scvi import settings
++
++    model_args, train_args = param_sample.get(
++        "model_args", {}), param_sample.get("train_args", {})
++    plan_kwargs = {}
++    for key in plan_kwargs_keys:
++        plan_kwargs[key] = train_args.pop(key)
++    train_args = {
++        "enable_progress_bar": True,
++        "logger": experiment.get_logger(get_context().get_trial_name()),
++        "callbacks": [experiment.metrics_callback],
++        **train_args,
++    }
++
++    settings.seed = experiment.seed
++    if adata_path is not None:
++        adata = sc.read_h5ad(adata_path)
++        adata.X = adata.layers['counts'].copy()
++        if sub_sample is not None:
++            sc.pp.subsample(adata, fraction=sub_sample)
++        experiment.model_cls.setup_anndata(adata, **setup_anndata_kwargs)
++
++        model = experiment.model_cls(adata, **model_args)
++        model.train(plan_kwargs=plan_kwargs,
++                    **train_args)
++        del adata
++        import gc
++        gc.collect()
++    elif isinstance(experiment.data, (AnnData, MuData)):
++        getattr(experiment.model_cls, experiment.setup_method_name)(
++            experiment.data,
++            **experiment.setup_method_args,
++        )
++        experiment.model_cls.setup_anndata(adata, **setup_anndata_kwargs)
++
++        model = experiment.model_cls(adata, **model_args)
++        model.train(max_epochs=2000,
++                    use_gpu=True,
++                    early_stopping_patience=10,
++                    check_val_every_n_epoch=5,
++                    plan_kwargs=plan_kwargs,
++                    **train_args)
++    else:  # NOT TESTED
++        model = experiment.model_cls(**model_args)
++        model.train(data_module=experiment.data, **train_args)
++
++
++def run_autotune(
++    model_cls: BaseModelClass,
++    data: AnnOrMuData | LightningDataModule,
++    metrics: str | list[str],
++    mode: Literal["min", "max"],
++    search_space: dict[str, dict[Literal["model_args", "train_args"], dict[str, Any]]],
++    num_samples: int,
++    scheduler: Literal["asha", "hyperband", "median", "fifo"] = "asha",
++    searcher: Literal["hyperopt", "random"] = "hyperopt",
++    seed: int | None = None,
++    resources: dict[Literal["cpu", "gpu", "memory"], float] | None = None,
++    experiment_name: str | None = None,
++    logging_dir: str | None = None,
++    scheduler_kwargs: dict | None = None,
++    searcher_kwargs: dict | None = None,
++    adata_path: str | None = None,
++    sub_sample: float | None = None,
++    setup_anndata_kwargs: dict[str, Any] = {},
++    use_wandb: bool = False,
++    wandb_name: str = "cpa_tune",
++    plan_kwargs_keys: list[str] = [],
++) -> AutotuneExperiment:
++    """``BETA`` Run a hyperparameter sweep.
++
++    Parameters
++    ----------
++    model_cls
++        Model class on which to tune hyperparameters.
++    data
++        :class:`~anndata.AnnData` or :class:`~mudata.MuData` that has been setup with
++        ``model_cls`` or a :class:`~lightning.pytorch.core.LightningDataModule` (``EXPERIMENTAL``).
++    metrics
++        Either a single metric or a list of metrics to track during the experiment. If a list is
++        provided, the primary metric will be the first element in the list.
++    mode
++        Optimization mode for the primary metric. One of ``"min"`` or ``"max"``.
++    search_space
++        Dictionary of hyperparameter names and their respective search spaces. See the
++        `API <https://docs.ray.io/en/latest/tune/api/search_space.html>`_ for available search
++        specifications. Must only contain the following top-level keys:
++
++        * ``"model_args"``: parameters to pass to the model constructor.
++        * ``"train_args"``: parameters to pass to the model's ``train`` method.
++
++        Passed into :class:`~ray.tune.Tuner` as ``param_space``.
++    num_samples
++        Total number of hyperparameter configurations to sample from the search space. Passed into
++        :class:`~ray.tune.tune_config.TuneConfig`.
++    scheduler
++        Ray Tune scheduler to use. One of the following:
++
++        * ``"asha"``: :class:`~ray.tune.schedulers.AsyncHyperBandScheduler`
++        * ``"hyperband"``: :class:`~ray.tune.schedulers.HyperBandScheduler`
++        * ``"median"``: :class:`~ray.tune.schedulers.MedianStoppingRule`
++        * ``"fifo"``: :class:`~ray.tune.schedulers.FIFOScheduler`
++
++        Configured with reasonable defaults, which can be overridden with ``scheduler_kwargs``.
++    searcher
++        Ray Tune search algorithm to use. One of the following:
++
++        * ``"hyperopt"``: :class:`~ray.tune.search.hyperopt.HyperOptSearch`
++        * ``"random"``: :class:`~ray.tune.search.basic_variant.BasicVariantGenerator`
++
++        Configured with reasonable defaults, which can be overridden with ``searcher_kwargs``.
++    seed
++        Random seed to use for the experiment. Propagated to :attr:`~scvi.settings.seed` and
++        search algorithms. If not provided, defaults to :attr:`~scvi.settings.seed`.
++    resources
++        Dictionary of resources to allocate per trial in the experiment. Available keys
++        include:
++
++        * ``"cpu"``: number of CPU cores
++        * ``"gpu"``: number of GPUs
++        * ``"memory"``: amount of memory
++
++        Passed into :func:`~ray.tune.with_resources`.
++    experiment_name
++        Name of the experiment, used for logging purposes. Defaults to a unique ID concatenated
++        to the model class name.
++    logging_dir
++        Base directory to store experiment logs. Defaults to :attr:``scvi.settings.logging_dir``.
++    scheduler_kwargs
++        Additional keyword arguments to pass to the scheduler.
++    searcher_kwargs
++        Additional keyword arguments to pass to the search algorithm.
++
++    Returns
++    -------
++    :class:`~scvi.autotune.AutotuneExperiment` object containing the results of the hyperparameter
++    sweep in :attr:`~scvi.autotune.AutotuneExperiment.result_grid`.
++
++    Notes
++    -----
++    Lifecycle: beta
++
++    See Also
++    --------
++    :class:`~scvi.autotune.AutotuneExperiment`
++    """
++    from ray import init
++
++    experiment = AutotuneExperiment(
++        model_cls,
++        data,
++        metrics,
++        mode,
++        search_space,
++        num_samples,
++        scheduler=scheduler,
++        searcher=searcher,
++        seed=seed,
++        resources=resources,
++        name=experiment_name,
++        logging_dir=logging_dir,
++        scheduler_kwargs=scheduler_kwargs,
++        searcher_kwargs=searcher_kwargs,
++        adata_path=adata_path,
++        sub_sample=sub_sample,
++        setup_anndata_kwargs=setup_anndata_kwargs,
++        use_wandb=use_wandb,
++        wandb_name=wandb_name,
++        plan_kwargs_keys=plan_kwargs_keys,
++    )
++    logger.info(f"Running autotune experiment {experiment.name}.")
++    init(log_to_driver=True, ignore_reinit_error=True)
++    experiment.result_grid = experiment.get_tuner().fit()
++    return experiment
+diff --git a/docs/api/index.rst b/docs/api/index.rst
+index f0d165e..4bcb509 100644
+--- a/docs/api/index.rst
++++ b/docs/api/index.rst
+@@ -27,4 +27,4 @@ ComPertAPI
+    :toctree: reference/
+    :template: class_no_inherited.rst
+ 
+-   ComPertAPI
+\ No newline at end of file
++   ComPertAPI
+diff --git a/docs/conf.py b/docs/conf.py
+index 5d108f2..603b807 100755
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -64,7 +64,6 @@
+     "sphinx.ext.autosummary",
+     "scanpydoc.elegant_typehints",
+     "scanpydoc.definition_list_typed_field",
+-    "scanpydoc.autosummary_generate_imported",
+     *[p.stem for p in (HERE / "extensions").glob("*.py")],
+ ]
+ 
+@@ -82,6 +81,7 @@
+ # source_suffix = ".rst"
+ 
+ # Generate the API documentation when building
++autosummary_imported_members = True
+ autosummary_generate = True
+ autodoc_member_order = "bysource"
+ napoleon_google_docstring = True  # for pytorch lightning
+diff --git a/docs/release_notes/index.rst b/docs/release_notes/index.rst
+index cd0f75d..8c989e3 100644
+--- a/docs/release_notes/index.rst
++++ b/docs/release_notes/index.rst
+@@ -1,8 +1,8 @@
+ Release notes
+ =============
+ 
+-This is the list of changes to scvi-tools between each release. Full commit history
+-is available in the `commit logs <https://github.com/YosefLab/scvi-tools-skeleton/commits/>`_.
++This is the list of changes to cpa-tools between each release. Full commit history
++is available in the `commit logs <https://github.com/theislab/cpa/commits/>`_.
+ 
+ Version 0.1
+ -----------
+@@ -11,3 +11,10 @@ Version 0.1
+ 
+    v0.1.1
+    v0.1.0
++
++Version 0.8
++-----------
++.. toctree::
++   :maxdepth: 2
++
++   v0.8.6
+diff --git a/docs/release_notes/v0.8.6.rst b/docs/release_notes/v0.8.6.rst
+new file mode 100644
+index 0000000..150dcad
+--- /dev/null
++++ b/docs/release_notes/v0.8.6.rst
+@@ -0,0 +1,18 @@
++New in 0.8.6 (2024-03-25)
++-------------------------
++We provide an example script to use the built-in hyperparameter optimization function in CPA (based on scvi-tools hyperparam optimizer). You can find the script at `examples/tune_script.py`.
++
++After the hyperparameter optimization using tune_script.py is done, `result_grid.pkl` is saved in your current directory using the `pickle` library. You can load the results using the following code:
++
++```python
++import pickle
++with open('result_grid.pkl', 'rb') as f:
++    result_grid = pickle.load(f)
++```
++From here, you can follow the instructions in the [Ray Documentations](https://docs.ray.io/en/latest/tune/examples/tune_analyze_results.html#experiment-level-analysis-working-with-resultgrid) to analyze the run, and choose the best hyperparameters for your data.
++
++You can also use the integration with wandb to log the hyperparameter optimization results. You can find the script at `examples/tune_script_wandb.py`. --> `use_wandb=True`
++
++Everything is based on [Ray Tune](https://ray.io/). You can find more information about the hyperparameter optimization in the [Ray Tune Documentations](https://docs.ray.io/en/latest/tune/index.html).
++
++The tuner is adapted and adjusted from scvi-tools v1.2.0 (unreleased) [release notes](https://docs.scvi-tools.org/en/stable/release_notes/index.html)
+diff --git a/examples/tune_script.py b/examples/tune_script.py
+new file mode 100644
+index 0000000..d9f8e74
+--- /dev/null
++++ b/examples/tune_script.py
+@@ -0,0 +1,164 @@
++from cpa import run_autotune
++import cpa
++
++import scanpy as sc
++from ray import tune
++import numpy as np
++
++import pickle
++
++DATA_PATH = '/PATH/TO/DATA.h5ad'  # Change this to your desired path
++adata = sc.read_h5ad(DATA_PATH)
++adata.X = adata.layers['counts'].copy()  # Counts should be available in the 'counts' layer
++sc.pp.subsample(adata, fraction=0.1)
++
++model_args = {
++    'n_latent': tune.choice([32, 64, 128, 256]),
++    'recon_loss': tune.choice(['nb']),
++    'doser_type': tune.choice(['logsigm']),
++
++    'n_hidden_encoder': tune.choice([128, 256, 512, 1024]),
++    'n_layers_encoder': tune.choice([1, 2, 3, 4, 5]),
++
++    'n_hidden_decoder': tune.choice([128, 256, 512, 1024]),
++    'n_layers_decoder': tune.choice([1, 2, 3, 4, 5]),
++
++    'use_batch_norm_encoder': tune.choice([True, False]),
++    'use_layer_norm_encoder': tune.sample_from(
++        lambda spec: False if spec.config.model_args.use_batch_norm_encoder else np.random.choice([True, False])),
++
++    'use_batch_norm_decoder': tune.choice([True, False]),
++    'use_layer_norm_decoder': tune.sample_from(
++        lambda spec: False if spec.config.model_args.use_batch_norm_decoder else np.random.choice([True, False])),
++
++    'dropout_rate_encoder': tune.choice([0.0, 0.1, 0.2, 0.25]),
++    'dropout_rate_decoder': tune.choice([0.0, 0.1, 0.2, 0.25]),
++
++    'variational': tune.choice([False]),
++
++    'seed': tune.randint(0, 10000),
++    
++    'split_key': 'split_1ct_MEC',
++    'train_split': 'train',
++    'valid_split': 'valid',
++    'test_split': 'ood',
++}
++
++train_args = {
++    ##################### plan_kwargs #####################
++    'n_epochs_adv_warmup': tune.choice([0, 1, 3, 5, 10, 50, 70]),
++    'n_epochs_kl_warmup': tune.choice([None]),
++        # lambda spec: None if not spec.config.model_args.variational else np.random.choice([0, 1, 3, 5, 10])), # Use this if you're using variational=True as well
++
++    'n_epochs_pretrain_ae': tune.choice([0, 1, 3, 5, 10, 30, 50]),
++
++    'adv_steps': tune.choice([2, 3, 5, 10, 15, 20, 25, 30]),
++
++    'mixup_alpha': tune.choice([0.0, 0.1, 0.2, 0.3, 0.4, 0.5]),
++    'n_epochs_mixup_warmup': tune.sample_from(
++        lambda spec: 0 if spec.config.train_args.mixup_alpha == 0.0 else np.random.choice([
++            0, 1, 3, 5, 10]),
++    ),
++
++    'n_layers_adv': tune.choice([1, 2, 3, 4, 5]),
++    'n_hidden_adv': tune.choice([32, 64, 128, 256]),
++
++    'use_batch_norm_adv': tune.choice([True, False]),
++    'use_layer_norm_adv': tune.sample_from(
++        lambda spec: False if spec.config.train_args.use_batch_norm_adv else np.random.choice([True, False])),
++
++    'dropout_rate_adv': tune.choice([0.0, 0.1, 0.2, 0.25, 0.3]),
++
++    'pen_adv': tune.loguniform(1e-2, 1e2),
++    'reg_adv': tune.loguniform(1e-2, 1e2),
++
++    'lr': tune.loguniform(1e-5, 1e-2),
++    'wd': tune.loguniform(1e-8, 1e-5),
++
++    'doser_lr': tune.loguniform(1e-5, 1e-2),
++    'doser_wd': tune.loguniform(1e-8, 1e-5),
++
++    'adv_lr': tune.loguniform(1e-5, 1e-2),
++    'adv_wd': tune.loguniform(1e-8, 1e-5),
++
++    'adv_loss': tune.choice(['cce']),
++
++    'do_clip_grad': tune.choice([True, False]),
++    # 'gradient_clip_value': tune.loguniform(1e-2, 1e2),
++    'gradient_clip_value': tune.choice([1.0]),
++
++    'step_size_lr': tune.choice([10, 25, 45]),
++}
++plan_kwargs_keys = list(train_args.keys())
++
++trainer_actual_args = {
++    'max_epochs': 200,
++    'use_gpu': True,
++    'early_stopping_patience': 10,
++    'check_val_every_n_epoch': 5,
++}
++train_args.update(trainer_actual_args)
++                
++search_space = {
++    'model_args': model_args,
++    'train_args': train_args,
++}
++
++scheduler_kwargs = {
++    # 'mode': 'max',
++    # 'metric': 'cpa_metric',
++    'max_t': 1000,
++    'grace_period': 5,
++    'reduction_factor': 4,
++}
++
++# searcher_kwargs = {
++#     'mode': 'max',
++#     'metric': 'cpa_metric',
++# }
++
++setup_anndata_kwargs = {
++            'perturbation_key': 'condition_ID',
++            'dosage_key': 'log_dose',
++            'control_group': 'CHEMBL504',
++            'batch_key': None,
++            'is_count_data': True,
++            'categorical_covariate_keys': ['cell_type'],
++            'deg_uns_key': 'rank_genes_groups_cov',
++            'deg_uns_cat_key': 'cov_drug_dose',
++            'max_comb_len': 2,
++}
++model = cpa.CPA
++model.setup_anndata(adata, **setup_anndata_kwargs)
++
++experiment = run_autotune(
++    model_cls=model,
++    data=adata,
++    metrics=["cpa_metric",  # The first one (cpa_metric) is the one that will be used for optimization "MAIN ONE"
++             "disnt_basal",
++             "disnt_after",
++             "r2_mean",
++             "val_r2_mean",
++             "val_r2_var",
++             "val_recon",],
++    mode="max",
++    search_space=search_space,
++    num_samples=5000,  # Change this to your desired number of samples (Number of runs)
++    scheduler="asha",
++    searcher="hyperopt",
++    seed=1,
++    resources={"cpu": 40, "gpu": 0.2, "memory": 16000},  # Change this to your desired resources
++    experiment_name="cpa_autotune",  # Change this to your desired experiment name
++    logging_dir='/PATH/TO/LOGS/',  # Change this to your desired path
++    adata_path=DATA_PATH,
++    sub_sample=0.1,
++    setup_anndata_kwargs=setup_anndata_kwargs,
++    use_wandb=False,  # If you want to use wandb, set this to True
++    wandb_name="cpa_tune",  # Change this to your desired wandb project name
++    scheduler_kwargs=scheduler_kwargs,
++    plan_kwargs_keys=plan_kwargs_keys,
++    # searcher_kwargs=searcher_kwargs,
++)
++result_grid = experiment.result_grid
++with open('result_grid.pkl', 'wb') as f:
++    pickle.dump(result_grid, f)
+diff --git a/pyproject.toml b/pyproject.toml
+index 7125500..26315a4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [tool.poetry]
+ name = "cpa-tools"
+-version = "0.8.5"
++version = "0.8.6"
+ description = "Compositional Perturbation Autoencoder (CPA)"
+ authors = ["Mohsen Naghipourfar <naghipourfar@berkeley.edu>"]
+ license = "MIT"
+@@ -26,6 +26,8 @@ gdown = "*"
+ jax = ">=0.4.16, <0.4.24"
+ jaxlib = ">=0.4.16, <0.4.24"
+ torchaudio = ">2.0.0,<=2.0.1"
++lightning = ">=2.2.0, <2.3.0"
++ray = { version = ">=2.9.0, <2.10.0", extras = ["data", "train", "tune", "serve"] }
+ 
+ # Optional dependencies
+ pytest = "*"

@@ -1,0 +1,429 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b82254a..b1617bb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,14 @@
+   0.13.0, so `--svg` is accepted and ignored rather than rejected. Both image sets are written to
+   the `.zip` either way; the flag only picks which the HTML embeds.
+ 
++- **`--phred64` is checked against the input before anything is written, when `--fastqc` is in play**
++  ([#532](https://github.com/FelixKrueger/TrimGalore/issues/532)). A Phred+64 file cannot hold a
++  quality character below ASCII 64, because Q0 is ASCII 64, so a mislabelled input is refused up
++  front rather than part-processed. The check reads the input, where FastQC saw only the trimmed
++  output, so it refuses some runs that previously completed — including ones whose low-quality
++  tail was trimmed away before FastQC could object. The scan covers the first 10,000 reads;
++  `--phred64` without `--fastqc` is unaffected.
++
+ - **`--phred64` is declared to the bundled FastQC engine, and mislabelled input is refused**
+   ([#500](https://github.com/FelixKrueger/TrimGalore/issues/500)). FastQC 0.13.0 reads Phred+33
+   unless told otherwise, where 0.12.1 inferred the encoding from the data, and Trim Galore writes
+diff --git a/docs/src/content/docs/guide/quality.md b/docs/src/content/docs/guide/quality.md
+index 17ac362..7d500fb 100644
+--- a/docs/src/content/docs/guide/quality.md
++++ b/docs/src/content/docs/guide/quality.md
+@@ -37,7 +37,7 @@ The flag applies to FASTQ input only, and is **rejected for unaligned BAM input*
+ With `--output-format ubam`, `--phred64` is honoured for FASTQ input: the output BAM's `QUAL` field stores true Phred scores (0–93) as the SAM specification requires, not the input's ASCII bytes. Note that the trimming report's `Quality encoding type selected: ASCII+64` line describes the input, not the BAM.
+ 
+ :::caution
+-Confirm the input encoding before using `--phred64` — Phred+64 was retired with Illumina 1.8 (2011). Running Phred+33 data with the flag reduces every score by 31 and floors at zero, so a typical Q2–Q41 range becomes Q0–Q10. The result looks like plausible poor-quality data rather than obviously empty output, which makes it easy to miss; Trim Galore prints a `NOTE:` when `--phred64` is combined with uBAM output for that reason.
++Confirm the input encoding before using `--phred64` — Phred+64 was retired with Illumina 1.8 (2011). Running Phred+33 data with the flag reduces every score by 31 and floors at zero, so a typical Q2–Q41 range becomes Q0–Q10. The result looks like plausible poor-quality data rather than obviously empty output, which makes it easy to miss, so Trim Galore prints a `NOTE:` on every output path when `--phred64` is given. With `--fastqc`, the claim is also checked against the input before any work starts: a Phred+64 file cannot hold a quality character below ASCII 64, because Q0 *is* ASCII 64, so a file that does is refused up front rather than part-processed and then rejected by FastQC. The scan covers the first 10,000 reads. That bound is a cost limit rather than a guarantee: a file whose only low character sits past it is not refused, and will not necessarily be caught afterwards either, because FastQC analyses the trimmed output and quality trimming tends to remove exactly those characters.
+ :::
+ 
+ ## What's logged
+diff --git a/src/main.rs b/src/main.rs
+index 8a4b42e..3d9b767 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -23,6 +23,32 @@ use trim_galore::report;
+ use trim_galore::specialty;
+ use trim_galore::trimmer;
+ 
++/// Reads scanned by the `--phred64` pre-flight. A mislabelled Phred+33 file
++/// carries sub-ASCII-64 characters in its first few records, so a bounded scan
++/// catches it cheaply. The bound is a cost limit and nothing more: a file whose
++/// only low character sits past it is not caught here, and not reliably caught
++/// anywhere else either, because FastQC analyses the trimmed output and quality
++/// trimming removes the very characters that would have given it away.
++const PHRED64_PREFLIGHT_READS: usize = 10_000;
++
++/// Lowest ASCII quality character in the first `max_reads` records, or `None`
++/// when the file holds no quality bytes at all.
++fn lowest_quality_char(path: &Path, max_reads: usize) -> Result<Option<u8>> {
++    let mut reader = open_sync_reader(path, &[])?;
++    let mut lowest: Option<u8> = None;
++    let mut scanned = 0usize;
++    while let Some(record) = reader.next_record()? {
++        if let Some(low) = record.qual.as_bytes().iter().copied().min() {
++            lowest = Some(lowest.map_or(low, |seen: u8| seen.min(low)));
++        }
++        scanned += 1;
++        if scanned >= max_reads {
++            break;
++        }
++    }
++    Ok(lowest)
++}
++
+ /// mimalloc replaces the platform allocator for the whole binary. Allocation
+ /// behaviour is the only thing that changes: no output byte differs, so the
+ /// Perl 0.6.11 validation matrix is unaffected.
+@@ -352,6 +378,45 @@ fn main() -> Result<()> {
+         );
+     }
+ 
++    // #532 — `--phred64` is a claim about the input that nothing verifies. With
++    // `--fastqc` the bundled engine contradicts a wrong one, but only after the
++    // trimmed output and the reports are on disk. A Phred+64 file cannot hold a
++    // quality character below ASCII 64, because Q0 is ASCII 64, so the input
++    // settles it before any work happens.
++    if cli.phred64 && cli.fastqc_requested() {
++        for input in cli.input.iter().chain(cli.passthrough.iter()) {
++            // BAM quality is raw Phred, and `BamReader` synthesises ASCII on read,
++            // so a scan would report a byte the file does not contain. uBAM in
++            // `--input` is already refused above; a uBAM `--passthrough` carrier is
++            // refused below, by its own check.
++            if matches!(detect_input_format(input)?, InputFormat::UnalignedBam) {
++                continue;
++            }
++            if let Some(lowest) = lowest_quality_char(input, PHRED64_PREFLIGHT_READS)?
++                && lowest < 64
++            {
++                let solexa = if (59..64).contains(&lowest) {
++                    " or Solexa / Illumina 1.0, which allows ASCII 59-63 for negative \
++                     scores and which Trim Galore does not support, flooring them to Q0"
++                } else {
++                    ""
++                };
++                anyhow::bail!(
++                    "--phred64 declares Phred+64 input, but {} contains quality \
++                     character '{}' (ASCII {}) within the first {} reads, and Illumina \
++                     1.3+ Phred+64 starts at ASCII 64 (Q0). The input is therefore \
++                     Phred+33{} — read as Phred+64 every score would drop by 31. Drop \
++                     --phred64 if the data is Phred+33.",
++                    input.display(),
++                    lowest.escape_ascii(),
++                    lowest,
++                    PHRED64_PREFLIGHT_READS,
++                    solexa
++                );
++            }
++        }
++    }
++
+     // INVARIANT ESTABLISHED HERE, RELIED ON FAR BELOW: past this point,
+     // `cli.phred_offset()` is guaranteed to be 33 whenever any input is uBAM.
+     // Every `cli.phred_offset()` call that feeds `BamWriter::create` depends on
+diff --git a/tests/integration_fastqc_phred64.rs b/tests/integration_fastqc_phred64.rs
+index d750bcf..d0106d1 100644
+--- a/tests/integration_fastqc_phred64.rs
++++ b/tests/integration_fastqc_phred64.rs
+@@ -238,3 +238,309 @@ fn phred64_reaches_both_mates_under_clump_only() {
+         assert_eq!(basic_stat(&zip, stem, "Encoding"), "Illumina 1.5", "{stem}");
+     }
+ }
++
++/// A Phred+33 file: quality '#' is ASCII 35, far below the Phred+64 floor.
++fn write_phred33_fixture(dir: &Path, name: &str) -> std::path::PathBuf {
++    let dst = dir.join(name);
++    let mut body = String::new();
++    for i in 0..4 {
++        body.push_str(&format!(
++            "@read{i}\nACGTACGTACGTACGTACGT\n+\n####################\n"
++        ));
++    }
++    std::fs::write(&dst, body).expect("fixture write");
++    dst
++}
++
++fn run_raw(dir: &Path, args: &[&str]) -> std::process::Output {
++    Command::new(env!("CARGO_BIN_EXE_trim_galore"))
++        .args(args)
++        .args(["--output_dir", dir.to_str().unwrap()])
++        .output()
++        .expect("trim_galore runs")
++}
++
++#[test]
++fn preflight_refuses_mislabelled_input_before_writing_anything() {
++    let dir = tempdir().unwrap();
++    let input = write_phred33_fixture(dir.path(), "p33.fastq");
++    let out_dir = dir.path().join("not-yet");
++
++    let out = run_raw(
++        &out_dir,
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            input.to_str().unwrap(),
++        ],
++    );
++    let stderr = String::from_utf8_lossy(&out.stderr);
++
++    assert!(!out.status.success(), "should refuse, got:\n{stderr}");
++    assert!(
++        stderr.contains("--phred64 declares Phred+64 input"),
++        "the refusal must name the flag, got:\n{stderr}"
++    );
++    assert!(
++        stderr.contains("ASCII 35"),
++        "the refusal must name the offending character, got:\n{stderr}"
++    );
++
++    // The output directory must not even be created. A pre-existing one would
++    // let this assertion pass with the guard moved below `ensure_output_dir`,
++    // which is precisely the placement the test exists to pin.
++    assert!(
++        !out_dir.exists(),
++        "created {} before refusing",
++        out_dir.display()
++    );
++}
++
++#[test]
++fn preflight_does_not_fire_without_fastqc() {
++    let dir = tempdir().unwrap();
++    let input = write_phred33_fixture(dir.path(), "p33_nofastqc.fastq");
++
++    // The check is deliberately scoped to --fastqc. Without it, --phred64 on
++    // Phred+33 data keeps its existing behaviour, NOTE and all.
++    let out = run_raw(
++        dir.path(),
++        &[
++            "--phred64",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            input.to_str().unwrap(),
++        ],
++    );
++    assert!(
++        out.status.success(),
++        "must not refuse without --fastqc:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++    assert!(dir.path().join("p33_nofastqc_trimmed.fq").exists());
++}
++
++#[test]
++fn preflight_accepts_genuine_phred64_input() {
++    let dir = tempdir().unwrap();
++    let input = fixture_copy(dir.path(), "good_p64.fastq");
++
++    // Lowest character is 'B' (ASCII 66), at or above the Phred+64 floor.
++    let out = run_raw(
++        dir.path(),
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            input.to_str().unwrap(),
++        ],
++    );
++    assert!(
++        out.status.success(),
++        "genuine Phred+64 must pass the pre-flight:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++    let zip = dir.path().join("good_p64_trimmed_fastqc.zip");
++    assert_eq!(
++        basic_stat(&zip, "good_p64_trimmed", "Encoding"),
++        "Illumina 1.5"
++    );
++}
++
++#[test]
++fn preflight_names_solexa_as_well_as_phred33() {
++    let dir = tempdir().unwrap();
++    // ASCII 59 (';') is a legitimate Solexa / Illumina 1.0 byte for a negative
++    // score, so the refusal must not assert the input is Phred+33.
++    let input = dir.path().join("solexa.fastq");
++    std::fs::write(&input, "@s1\nACGTACGTAC\n+\n;;;;;;;;;;\n").unwrap();
++
++    let out = run_raw(
++        dir.path(),
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            input.to_str().unwrap(),
++        ],
++    );
++    let stderr = String::from_utf8_lossy(&out.stderr);
++
++    assert!(
++        !out.status.success(),
++        "should refuse ASCII 59 under --phred64"
++    );
++    assert!(stderr.contains("ASCII 59"), "got:\n{stderr}");
++    assert!(
++        stderr.contains("Solexa"),
++        "the refusal must offer Solexa as a cause, not only Phred+33, got:\n{stderr}"
++    );
++}
++
++/// Phred+64 reads (`h` = ASCII 104) with an optional low tail on one of them.
++fn write_mixed_fixture(path: &Path, reads: usize, low_read: Option<usize>, low: char) {
++    let mut body = String::new();
++    for i in 0..reads {
++        let qual: String = if Some(i) == low_read {
++            format!("{}{}", "h".repeat(24), low.to_string().repeat(10))
++        } else {
++            "h".repeat(34)
++        };
++        body.push_str(&format!(
++            "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGTAC\n+\n{qual}\n"
++        ));
++    }
++    std::fs::write(path, body).expect("fixture write");
++}
++
++#[test]
++fn preflight_scans_every_input_not_just_the_first() {
++    let dir = tempdir().unwrap();
++    // R1 is clean, R2 carries the low character: scanning only R1 would accept.
++    let r1 = dir.path().join("m_R1.fastq");
++    let r2 = dir.path().join("m_R2.fastq");
++    write_mixed_fixture(&r1, 4, None, '#');
++    write_mixed_fixture(&r2, 4, Some(0), '#');
++
++    let out = run_raw(
++        &dir.path().join("out"),
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            "--paired",
++            r1.to_str().unwrap(),
++            r2.to_str().unwrap(),
++        ],
++    );
++    let stderr = String::from_utf8_lossy(&out.stderr);
++    assert!(!out.status.success(), "R2's low character must refuse");
++    assert_preflight_refused(&stderr, &dir.path().join("out"));
++    assert!(
++        stderr.contains("m_R2.fastq"),
++        "must blame R2, got:\n{stderr}"
++    );
++}
++
++#[test]
++fn preflight_scans_the_passthrough_carrier() {
++    let dir = tempdir().unwrap();
++    // Mates clean, carrier low: dropping the carrier from the scan would accept.
++    let r1 = dir.path().join("c_R1.fastq");
++    let r2 = dir.path().join("c_R2.fastq");
++    let i1 = dir.path().join("c_I1.fastq");
++    write_mixed_fixture(&r1, 4, None, '#');
++    write_mixed_fixture(&r2, 4, None, '#');
++    write_mixed_fixture(&i1, 4, Some(0), '#');
++
++    let out = run_raw(
++        &dir.path().join("out"),
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            "--paired",
++            r1.to_str().unwrap(),
++            r2.to_str().unwrap(),
++            "--passthrough",
++            i1.to_str().unwrap(),
++        ],
++    );
++    let stderr = String::from_utf8_lossy(&out.stderr);
++    assert!(
++        !out.status.success(),
++        "the carrier's low character must refuse"
++    );
++    assert_preflight_refused(&stderr, &dir.path().join("out"));
++    assert!(
++        stderr.contains("c_I1.fastq"),
++        "must blame the carrier, got:\n{stderr}"
++    );
++}
++
++#[test]
++fn preflight_keeps_the_running_minimum_not_the_last_record() {
++    let dir = tempdir().unwrap();
++    // Low character in the FIRST read, clean reads after it: keeping only the
++    // last record's minimum would accept.
++    let input = dir.path().join("early.fastq");
++    write_mixed_fixture(&input, 8, Some(0), '#');
++
++    let out = run_raw(
++        &dir.path().join("out"),
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            input.to_str().unwrap(),
++        ],
++    );
++    let stderr = String::from_utf8_lossy(&out.stderr);
++    assert!(
++        !out.status.success(),
++        "an early low character must still refuse:\n{stderr}"
++    );
++    assert_preflight_refused(&stderr, &dir.path().join("out"));
++}
++
++#[test]
++fn preflight_accepts_ascii_64_which_is_phred64_q0() {
++    let dir = tempdir().unwrap();
++    // ASCII 64 ('@') is Q0 under Phred+64 — the lowest legal value, not a defect.
++    let input = dir.path().join("q0.fastq");
++    write_mixed_fixture(&input, 4, Some(0), '@');
++
++    let out = run_raw(
++        &dir.path().join("out"),
++        &[
++            "--phred64",
++            "--fastqc",
++            "-q",
++            "0",
++            "--length",
++            "0",
++            input.to_str().unwrap(),
++        ],
++    );
++    assert!(
++        out.status.success(),
++        "ASCII 64 is Q0 and must be accepted:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++}
++
++/// The pre-flight refuses before any output exists, and says so in its own
++/// words. FastQC refuses the same inputs later, naming the same files, so a
++/// non-zero exit alone does not distinguish the two.
++fn assert_preflight_refused(stderr: &str, out_dir: &Path) {
++    assert!(
++        stderr.contains("--phred64 declares Phred+64 input"),
++        "not the pre-flight's refusal, got:\n{stderr}"
++    );
++    assert!(
++        !out_dir.exists(),
++        "{} was created, so the refusal came after work began",
++        out_dir.display()
++    );
++}

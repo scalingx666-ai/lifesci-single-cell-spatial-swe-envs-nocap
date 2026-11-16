@@ -1,0 +1,13 @@
+# Issue
+
+**Title:** Fix ORCID
+
+## Description
+
+Fix Rahul Satija's ORCID, had errors on formatting
+
+@rsatija
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `8efb6929b4dd`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

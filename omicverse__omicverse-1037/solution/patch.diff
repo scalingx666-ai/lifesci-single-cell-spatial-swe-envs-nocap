@@ -1,0 +1,164 @@
+diff --git a/omicverse/pp/_dask.py b/omicverse/pp/_dask.py
+index cac866bbd..0cfce8d3b 100644
+--- a/omicverse/pp/_dask.py
++++ b/omicverse/pp/_dask.py
+@@ -92,8 +92,7 @@ def _compute(*tasks):
+         return dask.compute(*tasks)
+     except (ImportError, ValueError):
+         pass
+-    workers = int(os.environ.get("OV_DASK_WORKERS", "8"))
+-    return dask.compute(*tasks, scheduler="threads", num_workers=workers)
++    return dask.compute(*tasks, scheduler="threads", num_workers=_workers())
+ 
+ 
+ def _persist(*arrays):
+@@ -104,8 +103,7 @@ def _persist(*arrays):
+         return dask.persist(*arrays)
+     except (ImportError, ValueError):
+         pass
+-    return dask.persist(*arrays, scheduler="threads",
+-                        num_workers=int(os.environ.get("OV_DASK_WORKERS", "8")))
++    return dask.persist(*arrays, scheduler="threads", num_workers=_workers())
+ 
+ 
+ def _row_ids(indptr, nnz):
+@@ -237,6 +235,29 @@ def _gpu_csr(blk):
+ _STAGE_BYTES = 64 << 20
+ 
+ 
++def _workers():
++    return int(os.environ.get("OV_DASK_WORKERS", "8"))
++
++
++def _decode_threads():
++    """Decoder threads per block read: the CPUs shared by the concurrent
++    block reads (compressed h5ad files are bound by decompression)."""
++    try:
++        n = len(os.sched_getaffinity(0))
++    except AttributeError:  # not Linux
++        n = os.cpu_count() or 1
++    return max(1, n // _workers())
++
++
++def _copy_from_stage(dst, src):
++    """Host → device copy out of the reused pinned buffer.  ``set`` from
++    pinned memory is asynchronous, so wait before the buffer is refilled."""
++    import cupy as cp
++    stream = cp.cuda.get_current_stream()
++    dst.set(src, stream=stream)
++    stream.synchronize()
++
++
+ def _staging():
+     """This thread's pinned host buffer for disk → GPU copies."""
+     buf = getattr(_LOCAL, "stage", None)
+@@ -291,6 +312,9 @@ def read_device(self, k, a, b):
+         dt = np.dtype(self.dtypes[k])
+         off = self.offsets[k]
+         if off is None or not hasattr(os, "preadv"):
++            ds = self._chunked(k)
++            if ds is not None and hasattr(ds, "read_into"):
++                return self._decode_device(ds, k, a, b)
+             return cp.asarray(self.read(k, a, b))
+         out = cp.empty(b - a, dtype=dt)
+         stage = _staging()
+@@ -308,7 +332,31 @@ def read_device(self, k, a, b):
+                     raise OSError(f"short read from {self.path}")
+                 done += n
+             o = (e0 - a) * dt.itemsize
+-            dst[o:o + nbytes].set(stage[:nbytes])
++            _copy_from_stage(dst[o:o + nbytes], stage[:nbytes])
++        return out
++
++    def _target_dtype(self, k):
++        """Decode values to float32/64 and indices to int32 (the GPU layout)."""
++        dt = np.dtype(self.dtypes[k])
++        if k == "indices":
++            return np.dtype(np.int32) if self.shape[1] < 2**31 else np.dtype(np.int64)
++        return dt if dt in (np.float32, np.float64) else np.dtype(np.float32)
++
++    def _decode_device(self, ds, k, a, b):
++        """Compressed chunks decoded by anndataoom-fast straight into this
++        thread's pinned buffer (already converted to the GPU dtype), then
++        copied to the device piece by piece."""
++        import cupy as cp
++        dt = self._target_dtype(k)
++        out = cp.empty(b - a, dtype=dt)
++        stage = _staging()
++        per = max(1, stage.nbytes // dt.itemsize)
++        view = stage[:per * dt.itemsize].view(dt)
++        nt = _decode_threads()
++        for e0 in range(a, b, per):
++            e1 = min(b, e0 + per)
++            ds.read_into(e0, e1, view[:e1 - e0], nt)
++            _copy_from_stage(out[e0 - a:e1 - a], view[:e1 - e0])
+         return out
+ 
+     def _fd(self):
+@@ -323,6 +371,10 @@ def read(self, k, a, b):
+         off = self.offsets[k]
+         if off is None or not hasattr(os, "preadv"):
+             ds = self._chunked(k)
++            if ds is not None and hasattr(ds, "read_into"):
++                out = np.empty(b - a, dtype=self._target_dtype(k))
++                ds.read_into(a, b, out, _decode_threads())
++                return out
+             if ds is not None:  # anndataoom-fast decodes chunks without the HDF5 lock
+                 return ds.read(a, b).astype(dt, copy=False)
+             import h5py
+diff --git a/tests/pp/test_dask_mode.py b/tests/pp/test_dask_mode.py
+index 1ca0ac725..57596f349 100644
+--- a/tests/pp/test_dask_mode.py
++++ b/tests/pp/test_dask_mode.py
+@@ -184,3 +184,51 @@ def test_read_layer_as_x(tmp_path, monkeypatch):
+     monkeypatch.setattr(ov.settings, "mode", "cpu")
+     with pytest.raises(NotImplementedError, match="layer="):
+         ov.read(path, storage="disk", layer="UMIs")
++
++
++@pytest.mark.skipif("gpu" not in DEVICES, reason="needs a CUDA device")
++def test_staging_copy_waits_for_the_device():
++    """The pinned staging buffer is refilled right after each copy; the copy
++    must have landed by then even when the GPU queue is busy (regression:
++    asynchronous copies corrupted ~5% of the values of SEA-AD)."""
++    import cupy as cp
++    from omicverse.pp import _dask
++    busy = cp.RawKernel(r"""
++    extern "C" __global__ void busy(long long cycles) {
++        long long t0 = clock64();
++        while (clock64() - t0 < cycles) {}
++    }""", "busy")
++    stage = _dask._staging()
++    n = 1 << 20
++    src = stage[:n]
++    src[:] = 7
++    dst = cp.zeros(n, dtype=cp.uint8)
++    busy((1,), (1,), (cp.int64(400_000_000),))  # ~0.2 s ahead of the copy on the stream
++    _dask._copy_from_stage(dst, src)
++    src[:] = 0                                  # refill, as the next piece would
++    assert int((dst == 7).sum()) == n
++
++
++@pytest.mark.skipif("gpu" not in DEVICES, reason="needs a CUDA device")
++@pytest.mark.parametrize("compression", [None, "gzip"])
++def test_gpu_blocks_exact_through_pinned_buffer(tmp_path, compression):
++    """Blocks larger than the pinned staging buffer are decoded and copied
++    piece by piece; the device blocks equal the file exactly."""
++    import threading
++    import anndata as ad
++    from omicverse.pp import _dask
++    X = sp.random(20_000, 500, density=0.05, format="csr", dtype=np.float32,
++                  random_state=np.random.default_rng(7))
++    X.data = np.ceil(X.data * 30)
++    path = tmp_path / f"big_{compression}.h5ad"
++    ad.AnnData(X).write_h5ad(path, compression=compression)
++    old_bytes, old_local = _dask._STAGE_BYTES, _dask._LOCAL
++    _dask._STAGE_BYTES, _dask._LOCAL = 1 << 16, threading.local()  # many pieces per block
++    try:
++        b = _dask.read_h5ad(path, chunk_size=7_000, device="gpu")
++        _dask._GENE_STATS.clear()
++        st = _dask.gene_stats(b.X)
++    finally:
++        _dask._STAGE_BYTES, _dask._LOCAL = old_bytes, old_local
++    np.testing.assert_array_equal(st["nnz"], np.diff(X.tocsc().indptr))
++    np.testing.assert_allclose(st["sum"], np.asarray(X.sum(0)).ravel(), rtol=1e-12)

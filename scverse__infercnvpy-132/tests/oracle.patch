@@ -1,0 +1,585 @@
+diff --git a/.gitignore b/.gitignore
+index 7aab72c0..643a49a8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -28,5 +28,9 @@ __pycache__/
+ /.idea/
+ /.vscode/
+ 
++infercnv_env/
+ # Notebooks
+ .ipynb_checkpoints
++
++# Node.js
++node_modules/
+diff --git a/pyproject.toml b/pyproject.toml
+index 07eae2e2..3b514823 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -16,6 +16,9 @@ authors = [
+ maintainers = [
+     {name = "Gregor Sturm", email="gregor.sturm@i-med.ac.at"}
+ ]
++contributors = [
++    {name = "Grant Neilson", email = "grant.neilson5@gmail.com"}
++]
+ urls.Documentation = "https://infercnvpy.readthedocs.io/"
+ urls.Source = "https://github.com/icbi-lab/infercnvpy"
+ urls.Home-page = "https://github.com/icbi-lab/infercnvpy"
+@@ -30,6 +33,7 @@ dependencies = [
+     'pycairo>=1.20; sys_platform == "win32"',
+     'leidenalg',
+     'pyreadr',
++    'pytest-benchmark',
+     # for debug logging (referenced from the issue template)
+     "session-info",
+     "ipython"
+diff --git a/src/infercnvpy/tl/_infercnv.py b/src/infercnvpy/tl/_infercnv.py
+index b4762b30..81cc5c48 100644
+--- a/src/infercnvpy/tl/_infercnv.py
++++ b/src/infercnvpy/tl/_infercnv.py
+@@ -4,6 +4,7 @@
+ from multiprocessing import cpu_count
+ 
+ import numpy as np
++import pandas as pd
+ import scipy.ndimage
+ import scipy.sparse
+ from anndata import AnnData
+@@ -30,7 +31,8 @@ def infercnv(
+     inplace: bool = True,
+     layer: str | None = None,
+     key_added: str = "cnv",
+-) -> None | tuple[dict, scipy.sparse.csr_matrix]:
++    calculate_gene_values: bool = False,
++) -> None | tuple[dict, scipy.sparse.csr_matrix, np.ndarray | None]:
+     """Infer Copy Number Variation (CNV) by averaging gene expression over genomic regions.
+ 
+     This method is heavily inspired by `infercnv <https://github.com/broadinstitute/inferCNV/>`_
+@@ -79,6 +81,13 @@ def infercnv(
+         Key under which the cnv matrix will be stored in adata if `inplace=True`.
+         Will store the matrix in `adata.obsm["X_{key_added}"] and additional information
+         in `adata.uns[key_added]`.
++    calculate_gene_values
++        If True per gene CNVs will be calculated and stored in `adata.layers["gene_values_{key_added}"]`.
++        As many genes will be included in each segment the resultant per gene value will be an average of the genes included in the segment.
++        Additionally not all genes will be included in the per gene CNV, due to the window size and step size not always being a multiple of
++        the number of genes. Any genes not included in the per gene CNV will be filled with NaN.
++        Note this will significantly increase the memory and computation time, it is recommended to decrease the chunksize to ~100 if this is set to True.
++
+ 
+     Returns
+     -------
+@@ -108,7 +117,7 @@ def infercnv(
+ 
+     var = tmp_adata.var.loc[:, ["chromosome", "start", "end"]]  # type: ignore
+ 
+-    chr_pos, chunks = zip(
++    chr_pos, chunks, convolved_dfs = zip(
+         *process_map(
+             _infercnv_chunk,
+             [expr[i : i + chunksize, :] for i in range(0, adata.shape[0], chunksize)],
+@@ -118,19 +127,38 @@ def infercnv(
+             itertools.repeat(window_size),
+             itertools.repeat(step),
+             itertools.repeat(dynamic_threshold),
++            itertools.repeat(calculate_gene_values),
+             tqdm_class=tqdm,
+             max_workers=cpu_count() if n_jobs is None else n_jobs,
+         ),
+         strict=False,
+     )
++
+     res = scipy.sparse.vstack(chunks)
+ 
++    chr_pos = chr_pos[0]
++
++    if calculate_gene_values:
++        per_gene_df = pd.concat(convolved_dfs, axis=0)
++        # Ensure the DataFrame has the correct row index
++        per_gene_df.index = adata.obs.index
++        # Ensure the per gene CNV matches the adata var (genes) index, any genes
++        # that are not included in the CNV will be filled with NaN
++        per_gene_df = per_gene_df.reindex(columns=adata.var_names, fill_value=np.nan)
++        # This needs to be a numpy array as colnames are too large to save in anndata
++        per_gene_mtx = per_gene_df.values
++    else:
++        per_gene_mtx = None
++
+     if inplace:
+         adata.obsm[f"X_{key_added}"] = res
+-        adata.uns[key_added] = {"chr_pos": chr_pos[0]}
++        adata.uns[key_added] = {"chr_pos": chr_pos}
++
++        if calculate_gene_values:
++            adata.layers[f"gene_values_{key_added}"] = per_gene_mtx
+ 
+     else:
+-        return chr_pos[0], res
++        return chr_pos, res, per_gene_mtx
+ 
+ 
+ def _natural_sort(l: Sequence):
+@@ -148,8 +176,15 @@ def alphanum_key(key):
+     return sorted(l, key=alphanum_key)
+ 
+ 
+-def _running_mean(x: np.ndarray | scipy.sparse.spmatrix, n: int = 50, step: int = 10) -> np.ndarray:
+-    """Compute a pyramidially weighted running mean.
++def _running_mean(
++    x: np.ndarray | scipy.sparse.spmatrix,
++    n: int = 50,
++    step: int = 10,
++    gene_list: list = None,
++    calculate_gene_values: bool = False,
++) -> tuple[np.ndarray, pd.DataFrame | None]:
++    """
++    Compute a pyramidially weighted running mean.
+ 
+     Densifies the matrix. Use `step` and `chunksize` to save memory.
+ 
+@@ -160,27 +195,112 @@ def _running_mean(x: np.ndarray | scipy.sparse.spmatrix, n: int = 50, step: int
+     n
+         Length of the running window
+     step
+-        only compute running windows ever `step` columns, e.g. if step is 10
+-        0:100, 10:110, 20:120 etc. Saves memory.
++        only compute running windows every `step` columns, e.g. if step is 10
++        0:99, 10:109, 20:119 etc. Saves memory.
++    gene_list
++        List of gene names to be used in the convolution
++    calculate_gene_values
++        If True per gene CNVs will be calculated and stored in `adata.layers["gene_values_{key_added}"]`.
+     """
+     if n < x.shape[1]:  # regular convolution: the filter is smaller than the #genes
+         r = np.arange(1, n + 1)
+-
+         pyramid = np.minimum(r, r[::-1])
+-        smoothed_x = np.apply_along_axis(lambda row: np.convolve(row, pyramid, mode="same"), axis=1, arr=x) / np.sum(
+-            pyramid
+-        )
+-        return smoothed_x[:, np.arange(0, smoothed_x.shape[1], step)]
++        smoothed_x = np.apply_along_axis(
++            lambda row: np.convolve(row, pyramid, mode="valid"),
++            axis=1,
++            arr=x,
++        ) / np.sum(pyramid)
++
++        ## get the indices of the genes used in the convolution
++        convolution_indices = get_convolution_indices(x, n)[np.arange(0, smoothed_x.shape[1], step)]
++        ## Pull out the genes used in the convolution
++        convolved_gene_names = gene_list[convolution_indices]
++        smoothed_x = smoothed_x[:, np.arange(0, smoothed_x.shape[1], step)]
++
++        if calculate_gene_values:
++            convolved_gene_values = _calculate_gene_averages(convolved_gene_names, smoothed_x)
++        else:
++            convolved_gene_values = None
+ 
+-    else:  # there's less genes than the filtersize. just apply a single conv with a smaller filter (no sliding)
+-        r = np.arange(1, x.shape[1] + 1)
+-        pyramid = np.minimum(r, r[::-1])
+-        smoothed_x = x @ pyramid.reshape(-1, 1)
+-        smoothed_x = smoothed_x / pyramid.sum()
+-        return smoothed_x
++        return smoothed_x, convolved_gene_values
++
++    else:  # If there is less genes than the window size, set the window size to the number of genes and perform a single convolution
++        n = x.shape[1]  # set the filter size to the number of genes
++        r = np.arange(1, n + 1)
++        ## As we are only doing one convolution the values should be equal
++        pyramid = np.array([1] * n)
++        smoothed_x = np.apply_along_axis(
++            lambda row: np.convolve(row, pyramid, mode="valid"),
++            axis=1,
++            arr=x,
++        ) / np.sum(pyramid)
++
++        if calculate_gene_values:
++            ## As all genes are used the convolution the values are identical for all genes
++            convolved_gene_values = pd.DataFrame(np.repeat(smoothed_x, len(gene_list), axis=1), columns=gene_list)
++        else:
++            convolved_gene_values = None
++
++        return smoothed_x, convolved_gene_values
+ 
+ 
+-def _running_mean_by_chromosome(expr, var, window_size, step) -> tuple[dict, np.ndarray]:
++def _calculate_gene_averages(
++    convolved_gene_names: np.ndarray,
++    smoothed_x: np.ndarray,
++) -> pd.DataFrame:
++    """
++    Calculate the average value of each gene in the convolution
++
++    Parameters
++    ----------
++    convolved_gene_names
++        A numpy array with the gene names used in the convolution
++    smoothed_x
++        A numpy array with the smoothed gene expression values
++
++    Returns
++    -------
++    convolved_gene_values
++        A DataFrame with the average value of each gene in the convolution
++    """
++    ## create a dictionary to store the gene values per sample
++    gene_to_values = {}
++    # Calculate the number of genes in each convolution, will be same as the window size default=100
++    length = len(convolved_gene_names[0])
++    # Convert the flattened convolved gene names to a list
++    flatten_list = list(convolved_gene_names.flatten())
++
++    # For each sample in smoothed_x find the value for each gene and store it in a dictionary
++    for sample, row in enumerate(smoothed_x):
++        # Create sample level in the dictionary
++        if sample not in gene_to_values:
++            gene_to_values[sample] = {}
++        # For each gene in the flattened gene list find the value and store it in the dictionary
++        for i, gene in enumerate(flatten_list):
++            if gene not in gene_to_values[sample]:
++                gene_to_values[sample][gene] = []
++            # As the gene list has been flattend we can use the floor division of the index
++            # to get the correct position of the gene to get the value and store it in the dictionary
++            gene_to_values[sample][gene].append(row[i // length])
++
++    for sample in gene_to_values:
++        for gene in gene_to_values[sample]:
++            gene_to_values[sample][gene] = np.mean(gene_to_values[sample][gene])
++
++    convolved_gene_values = pd.DataFrame(gene_to_values).T
++    return convolved_gene_values
++
++
++def get_convolution_indices(x, n):
++    indices = []
++    for i in range(x.shape[1] - n + 1):
++        indices.append(np.arange(i, i + n))
++    return np.array(indices)
++
++
++def _running_mean_by_chromosome(
++    expr, var, window_size, step, calculate_gene_values
++) -> tuple[dict, np.ndarray, pd.DataFrame | None]:
+     """Compute the running mean for each chromosome independently. Stack the resulting arrays ordered by chromosome.
+ 
+     Parameters
+@@ -206,16 +326,31 @@ def _running_mean_by_chromosome(expr, var, window_size, step) -> tuple[dict, np.
+     """
+     chromosomes = _natural_sort([x for x in var["chromosome"].unique() if x.startswith("chr") and x != "chrM"])
+ 
+-    def _running_mean_for_chromosome(chr):
+-        genes = var.loc[var["chromosome"] == chr].sort_values("start").index.values
+-        tmp_x = expr[:, var.index.get_indexer(genes)]
+-        return _running_mean(tmp_x, n=window_size, step=step)
++    running_means = [
++        _running_mean_for_chromosome(chr, expr, var, window_size, step, calculate_gene_values) for chr in chromosomes
++    ]
+ 
+-    running_means = [_running_mean_for_chromosome(chr) for chr in chromosomes]
++    running_means, convolved_dfs = zip(*running_means, strict=False)
+ 
+-    chr_start_pos = dict(zip(chromosomes, np.cumsum([0] + [x.shape[1] for x in running_means]), strict=False))
++    chr_start_pos = {}
++    for chr, i in zip(chromosomes, np.cumsum([0] + [x.shape[1] for x in running_means]), strict=False):
++        chr_start_pos[chr] = i
+ 
+-    return chr_start_pos, np.hstack(running_means)
++    ## Concatenate the gene dfs
++    if calculate_gene_values:
++        convolved_dfs = pd.concat(convolved_dfs, axis=1)
++
++    return chr_start_pos, np.hstack(running_means), convolved_dfs
++
++
++def _running_mean_for_chromosome(chr, expr, var, window_size, step, calculate_gene_values):
++    genes = var.loc[var["chromosome"] == chr].sort_values("start").index.values
++    tmp_x = expr[:, var.index.get_indexer(genes)]
++    x_conv, convolved_gene_values = _running_mean(
++        tmp_x, n=window_size, step=step, gene_list=genes, calculate_gene_values=calculate_gene_values
++    )
++
++    return x_conv, convolved_gene_values
+ 
+ 
+ def _get_reference(
+@@ -264,7 +399,7 @@ def _get_reference(
+     return reference
+ 
+ 
+-def _infercnv_chunk(tmp_x, var, reference, lfc_cap, window_size, step, dynamic_threshold):
++def _infercnv_chunk(tmp_x, var, reference, lfc_cap, window_size, step, dynamic_threshold, calculate_gene_values=False):
+     """The actual infercnv work is happening here.
+ 
+     Process chunks of serveral thousand genes independently since this
+@@ -291,17 +426,23 @@ def _infercnv_chunk(tmp_x, var, reference, lfc_cap, window_size, step, dynamic_t
+     # Step 2 - clip log fold changes
+     x_clipped = np.clip(x_centered, -lfc_cap, lfc_cap)
+     # Step 3 - smooth by genomic position
+-    chr_pos, x_smoothed = _running_mean_by_chromosome(x_clipped, var, window_size=window_size, step=step)
++    chr_pos, x_smoothed, conv_df = _running_mean_by_chromosome(
++        x_clipped, var, window_size=window_size, step=step, calculate_gene_values=calculate_gene_values
++    )
+     # Step 4 - center by cell
+-    x_cell_centered = x_smoothed - np.median(x_smoothed, axis=1)[:, np.newaxis]
++    x_res = x_smoothed - np.median(x_smoothed, axis=1)[:, np.newaxis]
++    if calculate_gene_values:
++        gene_res = conv_df - np.median(conv_df, axis=1)[:, np.newaxis]
++    else:
++        gene_res = None
+ 
+-    # Noise filtering
+-    x_res = x_cell_centered
+     # step 5 - standard deviation based noise filtering
+     if dynamic_threshold is not None:
+         noise_thres = dynamic_threshold * np.std(x_res)
+         x_res[np.abs(x_res) < noise_thres] = 0
++        if calculate_gene_values:
++            gene_res[np.abs(gene_res) < noise_thres] = 0
+ 
+     x_res = scipy.sparse.csr_matrix(x_res)
+ 
+-    return chr_pos, x_res
++    return chr_pos, x_res, gene_res
+diff --git a/tests/conftest.py b/tests/conftest.py
+index e054fcf3..7b777e11 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -51,6 +51,56 @@ def adata_mock(request):
+     return adata
+ 
+ 
++@pytest.fixture
++def adata_full_mock():
++    np.random.seed(0)  # Set the seed to a fixed value
++    obs = pd.DataFrame().assign(sample=["sample1", "sample2", "sample3", "sample4"])  # Added "sample4"
++    var = pd.DataFrame().assign(
++        gene=["gene1", "gene2", "gene3", "gene4", "gene5", "gene6", "gene7", "gene8", "gene9", "gene10"],
++        start=[100, 200, 300, 400, 500, 0, 100, 200, 300, 400],
++        end=[199, 299, 399, 499, 599, 99, 199, 299, 399, 499],
++        chromosome=["chr1", "chr1", "chr1", "chr1", "chr1", "chr2", "chr2", "chr2", "chr2", "chr2"],
++    )
++    var.index = var["gene"]
++    X = sp.csr_matrix(np.random.randint(low=0, high=50, size=(4, 10)))  # Changed size to (4, 10)
++    adata = sc.AnnData(X=X, obs=obs, var=var)
++
++    return adata
++
++
++@pytest.fixture
++def gene_res_actual():
++    df = pd.DataFrame(
++        {
++            "gene1": [0.75, -1.00, 0.00, 0.00],
++            "gene2": [0.00, 0.00, 0.75, 0.00],
++            "gene3": [0.000000, 0.000000, 0.91666667, 0.000000],
++            "gene4": [0.00, 0.00, 1.25, 0.00],
++            "gene5": [-0.75, 0.00, 1.25, 0.00],
++            "gene6": [0.000000, 0.000000, 0.000000, 0.921875],
++            "gene7": [0.000000, 0.000000, 0.000000, 0.703125],
++            "gene8": [0.0, 0.0, 0.0, 0.0],
++            "gene9": [0.0, 0.0, 0.0, 0.0],
++            "gene10": [0.75, 0.00, 0.00, 0.00],
++        }
++    )
++    df.index = df.index.astype(str)
++    return df
++
++
++@pytest.fixture
++def x_res_actual():
++    arr = np.array(
++        [
++            [1.00, 0.00, 0.00, 0.00, 0.00, 1.00],
++            [-1.00, 0.00, 0.00, 0.00, 0.00, 0.00],
++            [0.00, 1.25, 1.25, 0.00, 0.00, 0.00],
++            [0.00, 0.00, 0.00, 0.875, 0.00, 0.00],
++        ]
++    )
++    return arr
++
++
+ @pytest.fixture(params=[np.array, sp.csr_matrix, sp.csc_matrix])
+ def adata_ithgex(request):
+     return sc.AnnData(
+diff --git a/tests/test_tools.py b/tests/test_tools.py
+index 9f1decfa..61a98316 100644
+--- a/tests/test_tools.py
++++ b/tests/test_tools.py
+@@ -1,5 +1,6 @@
+ import numpy as np
+ import numpy.testing as npt
++import pandas as pd
+ import pytest
+ import scanpy as sc
+ 
+@@ -47,6 +48,147 @@ def test_get_reference_given_reference(adata_mock):
+ )
+ def test_infercnv(adata_oligodendroma, reference_key, reference_cat):
+     cnv.tl.infercnv(adata_oligodendroma, reference_key=reference_key, reference_cat=reference_cat)
++    assert "X_cnv" in adata_oligodendroma.obsm_keys(), "cnv not in adata.obsm"
++    assert "cnv" in adata_oligodendroma.uns_keys(), "cnv not in adata.uns"
++    ## Test that the gene values are not calculated by default
++    assert "gene_values_cnv" not in adata_oligodendroma.layers.keys(), "gene_values_cnv in .layers"
++
++
++def test_infercnv_gene_values(adata_oligodendroma):
++    cnv.tl.infercnv(adata_oligodendroma, calculate_gene_values=True)
++    assert "X_cnv" in adata_oligodendroma.obsm_keys(), "cnv not in adata.obsm"
++    assert "cnv" in adata_oligodendroma.uns_keys(), "cnv not in adata.uns"
++    assert "gene_values_cnv" in adata_oligodendroma.layers.keys(), "gene_values_cnv not in .layers"
++
++
++def test_running_mean_n_less_than_genes():
++    # Create a 2D numpy array
++    x = np.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
++    n = 3
++    step = 1
++    gene_list = np.array(["gene1", "gene2", "gene3", "gene4", "gene5"])
++
++    # Call the function with the test parameters
++    result, convolved_gene_values = cnv.tl._infercnv._running_mean(x, n, step, gene_list, calculate_gene_values=True)
++
++    # Define the expected output
++    expected_result = np.array([[2, 3, 4], [7, 8, 9]])
++    expected_gene_values = pd.DataFrame(
++        {
++            "gene1": [2.0, 7.0],
++            "gene2": [2.5, 7.5],
++            "gene3": [3.0, 8.0],
++            "gene4": [3.5, 8.5],
++            "gene5": [4.0, 9.0],
++        }
++    )
++
++    # Assert that the function output is as expected
++    np.testing.assert_array_equal(result, expected_result)
++    # Assert that the gene dfs are equal
++    pd.testing.assert_frame_equal(convolved_gene_values, expected_gene_values)
++
++
++def test_running_mean_n_greater_than_genes():
++    # Create a 2D numpy array
++    x = np.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
++    n = 7
++    step = 1
++    gene_list = np.array(["gene1", "gene2", "gene3", "gene4", "gene5"])
++
++    # Call the function with the test parameters
++    result, convolved_gene_values = cnv.tl._infercnv._running_mean(x, n, step, gene_list, calculate_gene_values=True)
++
++    # Define the expected output
++    expected_result = np.array([[3], [8]])
++    expected_gene_values = pd.DataFrame(
++        {
++            "gene1": [3.0, 8.0],
++            "gene2": [3.0, 8.0],
++            "gene3": [3.0, 8.0],
++            "gene4": [3.0, 8.0],
++            "gene5": [3.0, 8.0],
++        }
++    )
++
++    # Assert that the function output is as expected
++    np.testing.assert_array_equal(result, expected_result)
++    # Assert that the gene dfs are equal
++    pd.testing.assert_frame_equal(convolved_gene_values, expected_gene_values)
++
++
++def test_calculate_gene_averages():
++    convolved_gene_names = np.array(
++        [["gene1", "gene2", "gene3"], ["gene2", "gene3", "gene4"], ["gene3", "gene4", "gene5"]]
++    )
++
++    smoothed_x = np.array([[2, 3, 4], [4, 4, 6], [6, 2, 1]])
++
++    convolved_gene_values = cnv.tl._infercnv._calculate_gene_averages(convolved_gene_names, smoothed_x)
++
++    pd.testing.assert_frame_equal(
++        convolved_gene_values,
++        pd.DataFrame(
++            {
++                "gene1": [2.0, 4.0, 6.0],
++                "gene2": [2.5, 4.0, 4.0],
++                "gene3": [3.000000, 4.666667, 3.000000],
++                "gene4": [3.5, 5.0, 1.5],
++                "gene5": [4.0, 6.0, 1.0],
++            }
++        ),
++    )
++
++
++def test_infercnv_chunk_with_gene_values(adata_full_mock, gene_res_actual, x_res_actual):
++    reference = _get_reference(adata_full_mock, reference_key=None, reference_cat=None, reference=None)
++    var = adata_full_mock.var.loc[:, ["chromosome", "start", "end"]]
++    tmp_x = adata_full_mock.X
++
++    chr_pos, x_res, gene_res = cnv.tl._infercnv._infercnv_chunk(
++        tmp_x, var, reference, lfc_cap=1, window_size=3, step=1, dynamic_threshold=1, calculate_gene_values=True
++    )
++
++    gene_res.index = gene_res.index.astype(str)
++    pd.testing.assert_frame_equal(gene_res, gene_res_actual)
++    np.testing.assert_array_equal(x_res.toarray(), x_res_actual)
++    assert chr_pos == {"chr1": 0, "chr2": 3}, "chr_pos is not as expected"
++
++
++def test_infercnv_chunk_default(adata_full_mock, x_res_actual):
++    reference = _get_reference(adata_full_mock, reference_key=None, reference_cat=None, reference=None)
++    var = adata_full_mock.var.loc[:, ["chromosome", "start", "end"]]
++    tmp_x = adata_full_mock.X
++
++    chr_pos, x_res, gene_res = cnv.tl._infercnv._infercnv_chunk(
++        tmp_x, var, reference, lfc_cap=1, window_size=3, step=1, dynamic_threshold=1
++    )
++
++    assert gene_res is None
++    np.testing.assert_array_equal(x_res.toarray(), x_res_actual)
++    assert chr_pos == {"chr1": 0, "chr2": 3}, "chr_pos is not as expected"
++
++
++def test_infercnv_more_than_2_chunks(adata_full_mock, x_res_actual):
++    chr_pos, res, per_gene_mtx = cnv.tl.infercnv(
++        adata_full_mock,
++        reference_key=None,
++        reference_cat=None,
++        reference=None,
++        chunksize=2,
++        lfc_clip=1,
++        window_size=3,
++        step=1,
++        dynamic_threshold=1,
++        calculate_gene_values=True,
++        inplace=False,
++    )
++
++    ## each chunk will contain 2 samples, this simulatanously tests the chunking and the merging
++    np.testing.assert_array_equal(per_gene_mtx[0], np.array([0.75, 0.0, 0.0, 0.0, -0.75, 0.0, 0.0, 0.0, 0.0, 0.75]))
++    np.testing.assert_array_equal(per_gene_mtx[3], np.array([0, 0, 0, 0, 0, 0.921875, 0.703125, 0, 0, 0]))
++    np.testing.assert_array_equal(res.toarray(), x_res_actual)
++    assert chr_pos == {"chr1": 0, "chr2": 3}, "chr_pos is not as expected"
+ 
+ 
+ def test_infercnv_manual_reference(adata_oligodendroma):
+@@ -74,3 +216,20 @@ def test_workflow(adata_oligodendroma):
+     cnv.pl.tsne(adata_oligodendroma, color=["cnv_score", "cnv_leiden"], show=False)
+     cnv.pl.chromosome_heatmap(adata_oligodendroma, show=False)
+     cnv.pl.chromosome_heatmap_summary(adata_oligodendroma, show=False)
++
++
++def test_calculate_gene_values_speed(benchmark, adata_oligodendroma):
++    # Benchmark with calculate_gene_values=True
++    benchmark(
++        cnv.tl.infercnv,
++        adata_oligodendroma,
++        calculate_gene_values=True,
++    )
++
++
++def test_default_infercnv(benchmark, adata_oligodendroma):
++    benchmark(
++        cnv.tl.infercnv,
++        adata_oligodendroma,
++        calculate_gene_values=False,
++    )

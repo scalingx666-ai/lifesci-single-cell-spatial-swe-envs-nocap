@@ -1,0 +1,420 @@
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index 99b6a8d57..53eaceaf1 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -737,7 +737,7 @@ where
+         let mut workers = Vec::with_capacity(cfg.nthreads);
+         for _ in 0..cfg.nthreads {
+             let rx = rx.clone();
+-            workers.push(scope.spawn(move || -> (Local, u64) {
++            workers.push(scope.spawn(move || -> (Local, u64, u64) {
+                 let mut local = Local::new(
+                     cfg.use_error_model,
+                     cfg.error_bins,
+@@ -748,6 +748,7 @@ where
+                     cfg.pos_bias,
+                 );
+                 let mut count = 0u64;
++                let mut mapped = 0u64;
+                 let mut frags: Vec<FragRecord> = Vec::new();
+                 while let Ok((log_fm, raw_batch)) = rx.recv() {
+                     let ctx = FragCtx {
+@@ -769,6 +770,7 @@ where
+                         log_fm,
+                     };
+                     let mut since_flush = 0usize;
++                    let mut batch_mapped = 0u64;
+                     for raw_group in &raw_batch {
+                         frags.clear();
+                         for r in raw_group {
+@@ -776,7 +778,9 @@ where
+                                 frags.push(f);
+                             }
+                         }
+-                        process_fragment(&frags, &ctx, &mut local);
++                        if process_fragment(&frags, &ctx, &mut local) {
++                            batch_mapped += 1;
++                        }
+                         // Publish the error-model delta into the shared model
+                         // every FLUSH_INTERVAL fragments so other workers' `basis`
+                         // sees fresh-enough training. The update granularity is
+@@ -799,16 +803,20 @@ where
+                         }
+                     }
+                     count += raw_batch.len() as u64;
+-                    // Live progress: alignment mode treats every fragment in the
+-                    // BAM as processed+mapped (see the totals below), so bump both.
++                    mapped += batch_mapped;
++                    // Live progress: every fragment in the BAM is "processed";
++                    // only fragments with a surviving strand-compatible placement
++                    // are "mapped" (so percent_mapped is correct on stranded data).
+                     if let Some(p) = cfg.progress {
+-                        let n = raw_batch.len() as u64;
+-                        p.processed
+-                            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+-                        p.mapped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
++                        p.processed.fetch_add(
++                            raw_batch.len() as u64,
++                            std::sync::atomic::Ordering::Relaxed,
++                        );
++                        p.mapped
++                            .fetch_add(batch_mapped, std::sync::atomic::Ordering::Relaxed);
+                     }
+                 }
+-                (local, count)
++                (local, count, mapped)
+             }));
+         }
+         drop(rx); // workers hold their own clones; lets the queue disconnect
+@@ -828,18 +836,23 @@ where
+             cfg.pos_bias,
+         );
+         let mut total = 0u64;
++        let mut total_mapped = 0u64;
+         for w in workers {
+-            let (local, count) = w
++            let (local, count, mapped) = w
+                 .join()
+                 .map_err(|_| anyhow::anyhow!("alignment worker thread panicked"))?;
+             merged = merged.merge(local);
+             total += count;
++            total_mapped += mapped;
+         }
+         acc.seq_obs = merged.seq_obs;
+         acc.gc_obs = merged.gc_obs;
+         acc.pos_obs = merged.pos_obs;
++        // num_processed = every aligned fragment in the BAM; num_mapped = those
++        // with a surviving strand-compatible placement (assigned to an eq-class).
++        // They differ only for stranded libraries; matches reads-mode (#1025).
+         acc.num_processed = total;
+-        acc.num_mapped = total;
++        acc.num_mapped = total_mapped;
+         Ok(())
+     })
+ }
+@@ -961,7 +974,13 @@ impl Local {
+ /// (during burn-in) accumulate the error-model and bias deltas into `local`.
+ /// Pure with respect to shared state except for the concurrency-safe sinks
+ /// (`fld`, `online`, `eq_builder`), so it is safe to run in parallel.
+-fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) {
++/// Returns `true` if the fragment was assigned (had at least one surviving,
++/// strand-compatible placement and joined an equivalence class), `false` if it
++/// was dropped (every reported alignment incompatible / orphan-discarded). The
++/// caller counts a fragment as *mapped* only when this returns `true`, so a
++/// stranded library does not over-report `num_mapped` for fragments whose every
++/// alignment is strand-incompatible (the alignment-mode analog of #1025).
++fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) -> bool {
+     use salmon_model::seqbias::{CONTEXT_LEFT, CONTEXT_LENGTH, CONTEXT_RIGHT};
+     // salmon's LOG_EPSILON = log(0.375e-10): the orphan / implausible-length penalty.
+     const LOG_EPSILON: f64 = -23.998_158_637_57;
+@@ -1054,7 +1073,7 @@ fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) {
+     // a fragment whose every reported alignment was incompatible is a
+     // zero-probability fragment: it is not assigned and joins no eq-class.
+     if sp_tid.is_empty() {
+-        return;
++        return false;
+     }
+ 
+     // Aggregate surviving placements by distinct transcript id (sorted).
+@@ -1197,6 +1216,7 @@ fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) {
+         TranscriptGroup::from_sorted(tids)
+     };
+     ctx.eq_builder.add_group(group, weights, 1);
++    true
+ }
+ 
+ /// Is the input coordinate-sorted and *not* grouped by read name?
+@@ -1749,9 +1769,14 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+     salmon_model::dumps::write_aux_bias_dumps(&dir.join("aux_info"), &res.bias_dump)
+         .context("writing aux bias dumps")?;
+     std::fs::create_dir_all(dir.join("logs")).context("creating logs")?;
++    // In alignment mode the input records are already aligned, so `num_processed`
++    // is the count of aligned fragments and `num_mapped` is those with a strand-
++    // compatible placement that were quantified; label them accordingly so a
++    // <100% rate on a stranded library is not read as lost alignments.
+     let log = format!(
+         "salmon (rust port, alignment mode) v{SALMON_VERSION}\nstart: {}\nend:   {}\n\
+-         library type: {}\nobserved fragments: {}\nmapped fragments:   {}\nmapping rate: {pct:.4}%\n\
++         library type: {}\naligned fragments: {}\nstrand-compatible (quantified): {}\n\
++         compatible rate: {pct:.4}%\n\
+          number of equivalence classes: {}\nfragment length mean (sd): {:.2} ({:.2})\n",
+         res.start_time,
+         asctime_now(),
+diff --git a/crates/salmon-align/tests/stranded_num_mapped.rs b/crates/salmon-align/tests/stranded_num_mapped.rs
+new file mode 100644
+index 000000000..e8b9d2c5f
+--- /dev/null
++++ b/crates/salmon-align/tests/stranded_num_mapped.rs
+@@ -0,0 +1,95 @@
++//! Regression test for the alignment-mode analog of issue #1025: on a stranded
++//! library, `num_mapped` must count only fragments with a surviving strand-
++//! compatible placement, so the mass-conservation invariant `num_mapped == Σ
++//! counts` holds (and `percent_mapped` is not inflated). Before the fix,
++//! alignment mode counted every aligned fragment as mapped, regardless of the
++//! strand-compatibility filter applied during assignment.
++
++use salmon_align::{quantify_alignments, AlignQuantOptions};
++use std::io::Write;
++use std::path::{Path, PathBuf};
++
++/// Write a tiny transcriptome SAM with mixed-orientation FR fragments to `dir`.
++/// `n_fwd` fragments have read1 on the forward strand (inward, ISF-compatible);
++/// `n_rev` have read1 on the reverse strand (ISR-compatible, ISF-incompatible).
++/// Records of a fragment are consecutive (grouped by read name), as an aligner
++/// emits them. Returns the SAM path.
++fn write_sam(dir: &Path, n_fwd: usize, n_rev: usize) -> PathBuf {
++    let path = dir.join("aln.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:unsorted").unwrap();
++    writeln!(f, "@SQ\tSN:tx0\tLN:5000").unwrap();
++    let emit = |f: &mut std::fs::File, name: &str, fwd: bool, p: usize| {
++        let (l, r) = (p + 1, p + 201); // 1-based leftmost of the two mates
++        let tlen = 300i32;
++        if fwd {
++            // read1 forward upstream, read2 reverse downstream -> inward, ISF
++            writeln!(f, "{name}\t99\ttx0\t{l}\t60\t100M\t=\t{r}\t{tlen}\t*\t*").unwrap();
++            writeln!(f, "{name}\t147\ttx0\t{r}\t60\t100M\t=\t{l}\t-{tlen}\t*\t*").unwrap();
++        } else {
++            // read1 reverse downstream, read2 forward upstream -> inward, ISR
++            writeln!(f, "{name}\t83\ttx0\t{r}\t60\t100M\t=\t{l}\t-{tlen}\t*\t*").unwrap();
++            writeln!(f, "{name}\t163\ttx0\t{l}\t60\t100M\t=\t{r}\t{tlen}\t*\t*").unwrap();
++        }
++    };
++    let mut pos = 1usize;
++    for i in 0..n_fwd {
++        emit(&mut f, &format!("fwd{i}"), true, pos);
++        pos += 400;
++    }
++    for i in 0..n_rev {
++        emit(&mut f, &format!("rev{i}"), false, pos);
++        pos += 400;
++    }
++    path
++}
++
++fn run(sam: &Path, out: &Path, lib_type: &str) -> salmon_align::AlignQuantResult {
++    let mut opts = AlignQuantOptions::new(sam.to_path_buf(), out.to_path_buf());
++    opts.lib_type = lib_type.to_string();
++    opts.transcripts = None; // lengths from @SQ; no error model / bias
++    opts.no_error_model = true;
++    quantify_alignments(&opts).expect("quantify_alignments")
++}
++
++#[test]
++fn stranded_align_num_mapped_matches_quantified_mass() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (n_fwd, n_rev) = (5usize, 3usize);
++    let sam = write_sam(tmp.path(), n_fwd, n_rev);
++    let total = (n_fwd + n_rev) as u64;
++
++    let mass_conserved = |res: &salmon_align::AlignQuantResult, tag: &str| {
++        let sum: f64 = res.counts.iter().sum();
++        assert!(
++            (res.num_mapped as f64 - sum).abs() <= 1e-6,
++            "{tag}: mass not conserved: num_mapped={} but Σ counts={sum:.6}",
++            res.num_mapped
++        );
++    };
++
++    // Unstranded: every fragment is compatible -> all mapped, mass conserved.
++    let iu = run(&sam, &tmp.path().join("iu"), "IU");
++    assert_eq!(iu.num_processed, total, "IU: num_processed");
++    assert_eq!(iu.num_mapped, total, "IU: every fragment should map");
++    mass_conserved(&iu, "IU");
++
++    // Stranded ISF: the reverse-strand fragments are strand-incompatible and are
++    // dropped during assignment. They must NOT be counted as mapped, and mass
++    // must stay conserved. (Before the fix, num_mapped was `total` for both.)
++    let isf = run(&sam, &tmp.path().join("isf"), "ISF");
++    assert_eq!(
++        isf.num_processed, total,
++        "ISF: num_processed counts all aligned"
++    );
++    assert!(
++        isf.num_mapped < total,
++        "ISF: strand-incompatible fragments counted as mapped: num_mapped={} of {total}",
++        isf.num_mapped
++    );
++    assert_eq!(
++        isf.num_mapped, n_fwd as u64,
++        "ISF: only the forward (ISF-compatible) fragments should map"
++    );
++    mass_conserved(&isf, "ISF");
++}
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index 806bbf119..5b265bb08 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -808,13 +808,29 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         } else {
+             0.0
+         };
+-        tracing::info!(
+-            "processed {} fragments, mapped {} ({:.2}%), {} equivalence classes",
+-            res.num_processed,
+-            res.num_mapped,
+-            pct,
+-            res.num_eq_classes
+-        );
++        // Alignment mode: the records are already aligned (by the upstream
++        // aligner), so `num_processed` is the count of *aligned* fragments and
++        // `num_mapped` is those with a strand-compatible placement we could
++        // quantify. Report it that way so a (necessarily) <100% rate on a
++        // stranded library reads as "strand-incompatible", not "lost alignments".
++        if res.num_processed > res.num_mapped {
++            tracing::info!(
++                "{} aligned fragments; {} strand-compatible and quantified ({:.2}%); \
++                 {} dropped as incompatible with library type {}; {} equivalence classes",
++                res.num_processed,
++                res.num_mapped,
++                pct,
++                res.num_processed - res.num_mapped,
++                opts.lib_type,
++                res.num_eq_classes
++            );
++        } else {
++            tracing::info!(
++                "{} aligned fragments, all strand-compatible and quantified; {} equivalence classes",
++                res.num_processed,
++                res.num_eq_classes
++            );
++        }
+         if let Some(gm) = &gene_map {
+             write_gene_level(
+                 &out_dir,
+diff --git a/crates/salmon-quant/src/processor.rs b/crates/salmon-quant/src/processor.rs
+index a1d90494b..1a07fab11 100644
+--- a/crates/salmon-quant/src/processor.rs
++++ b/crates/salmon-quant/src/processor.rs
+@@ -365,19 +365,10 @@ fn record(
+     if maps.is_empty() {
+         return;
+     }
+-    sh.num_mapped.fetch_add(1, Ordering::Relaxed);
+-
+-    // Classify the fragment as orphan when its representative mapping has only
+-    // one mate of a pair placed (PairedEndLeft / PairedEndRight). Single-end
+-    // libraries never count as orphan here.
+-    if matches!(
+-        maps[0].status,
+-        MateStatus::PairedEndLeft | MateStatus::PairedEndRight
+-    ) {
+-        sh.num_orphan.fetch_add(1, Ordering::Relaxed);
+-    }
+ 
+     // Sample the observed library format for auto-detection (auto mode only).
++    // Sampled from the raw mappings, before the strand-compatibility filter
++    // below, so detection sees the true observed orientation/strand.
+     if let Some(det) = sh.detector {
+         if det.is_active() {
+             if let Some(m) = maps
+@@ -414,7 +405,26 @@ fn record(
+         })
+         .collect();
+     if compat.is_empty() {
+-        return; // no compatible mapping -> fragment is unassigned
++        return; // no compatible mapping -> fragment is unassigned (not mapped)
++    }
++
++    // The fragment has at least one strand-compatible mapping, so it contributes
++    // mass and counts as mapped. Count it *after* the compatibility filter above:
++    // counting on any mapping (before the filter) over-reported `num_mapped` /
++    // `percent_mapped` / `num_compatible_fragments` on stranded libraries, because
++    // a fragment whose every mapping was strand-incompatible is dropped here yet
++    // quantifies as nothing — which also broke the invariant `Σ NumReads ==
++    // num_mapped`. C++ salmon likewise counts a fragment as mapped only once it
++    // has a compatible mapping.
++    sh.num_mapped.fetch_add(1, Ordering::Relaxed);
++    // Classify the fragment as orphan when its best compatible mapping has only
++    // one mate of a pair placed (PairedEndLeft / PairedEndRight). Single-end
++    // libraries never count as orphan here.
++    if matches!(
++        compat[0].0.status,
++        MateStatus::PairedEndLeft | MateStatus::PairedEndRight
++    ) {
++        sh.num_orphan.fetch_add(1, Ordering::Relaxed);
+     }
+ 
+     // Capture ONE immutable FLD snapshot pair (PMF + CMF) for this fragment — a
+diff --git a/crates/salmon-quant/tests/quant_end_to_end.rs b/crates/salmon-quant/tests/quant_end_to_end.rs
+index 8ff1fac9b..f869fed81 100644
+--- a/crates/salmon-quant/tests/quant_end_to_end.rs
++++ b/crates/salmon-quant/tests/quant_end_to_end.rs
+@@ -179,6 +179,77 @@ fn selective_alignment_quantification_tracks_truth() {
+     assert_eq!(sf.lines().count(), 1 + res.names.len());
+ }
+ 
++/// Regression test for the stranded-library mapped-count invariant.
++///
++/// A fragment must be counted in `num_mapped` only if it has a strand-compatible
++/// mapping that actually contributes to quantification. The mapped counter was
++/// incremented before the strand-compatibility filter, so on a stranded library a
++/// fragment whose every mapping was strand-incompatible (dropped, contributing no
++/// count) was still counted as mapped. That inflated `num_mapped` /
++/// `percent_mapped` / `num_compatible_fragments` and broke the mass-conservation
++/// invariant `Σ NumReads == num_mapped` (C++ salmon counts mapped post-filter, so
++/// `Σ NumReads == num_mapped` there). The simulated reads are inward FR (observed
++/// `ISF`): quantified under `ISF` they map and conserve mass; quantified under the
++/// opposite stranded type `ISR` every proper pair is incompatible and dropped, so
++/// `num_mapped` must fall to ~0 — not stay at the fragment total.
++#[test]
++fn stranded_num_mapped_matches_quantified_mass() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (fasta, r1, r2, truth) = simulate(tmp.path());
++    let total_truth: u64 = truth.values().sum();
++
++    let idx_dir = tmp.path().join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    // Mass conservation must hold for any library type: every fragment counted as
++    // mapped distributes its full unit of mass across transcripts.
++    let mass_conserved = |res: &salmon_quant::QuantResult| {
++        let sum_counts: f64 = res.counts.iter().sum();
++        let tol = 1.0 + 0.005 * res.num_mapped as f64;
++        assert!(
++            (res.num_mapped as f64 - sum_counts).abs() <= tol,
++            "mass not conserved: num_mapped={} but Σ counts={sum_counts:.3}",
++            res.num_mapped,
++        );
++    };
++
++    // Compatible stranded type: reads map and mass is conserved.
++    let out_isf = tmp.path().join("quant_isf");
++    let mut opts = QuantOptions::new(idx_dir.clone(), out_isf);
++    opts.mates1 = vec![r1.clone()];
++    opts.mates2 = vec![r2.clone()];
++    opts.lib_type = "ISF".to_string();
++    opts.num_threads = 1;
++    let res_isf = quantify(&opts).expect("quantify ISF");
++    assert!(
++        res_isf.num_mapped as f64 >= 0.9 * total_truth as f64,
++        "ISF: only {} / {} fragments mapped",
++        res_isf.num_mapped,
++        total_truth
++    );
++    mass_conserved(&res_isf);
++
++    // Opposite stranded type: every proper pair is strand-incompatible and
++    // dropped. The mapped count must reflect post-filter assignment (~0), and mass
++    // conservation must still hold.
++    let out_isr = tmp.path().join("quant_isr");
++    let mut opts = QuantOptions::new(idx_dir, out_isr);
++    opts.mates1 = vec![r1];
++    opts.mates2 = vec![r2];
++    opts.lib_type = "ISR".to_string();
++    opts.num_threads = 1;
++    let res_isr = quantify(&opts).expect("quantify ISR");
++    assert!(
++        (res_isr.num_mapped as f64) < 0.1 * total_truth as f64,
++        "ISR: strand-incompatible fragments counted as mapped: num_mapped={} of {}",
++        res_isr.num_mapped,
++        total_truth
++    );
++    mass_conserved(&res_isr);
++}
++
+ #[test]
+ fn pseudoalignment_quantification_tracks_truth() {
+     let tmp = tempfile::tempdir().unwrap();

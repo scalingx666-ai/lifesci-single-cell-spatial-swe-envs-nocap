@@ -1,0 +1,1992 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a8fbf6bc5..86c60269f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2649,9 +2649,13 @@ name = "salmon-quant"
+ version = "2.3.4"
+ dependencies = [
+  "anyhow",
++ "crossbeam-channel",
+  "flate2",
+  "jiff",
+  "libradicl",
++ "noodles-bam",
++ "noodles-bgzf",
++ "noodles-sam",
+  "paraseq",
+  "piscem-rs",
+  "rayon",
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index 62d41e9f2..f55d82532 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -412,9 +412,44 @@ struct QuantArgs {
+     #[arg(long = "writeUnmappedNames")]
+     write_unmapped_names: bool,
+     /// Write per-mapping SAM records to this file (spoofed CIGAR, like salmon's
+-    /// standard `--writeMappings`).
+-    #[arg(short = 'z', long = "writeMappings")]
++    /// standard `--writeMappings`). `--writeSam` is an accepted alias, naming
++    /// the format explicitly to pair with `--writeBam`.
++    #[arg(
++        short = 'z',
++        long = "writeMappings",
++        visible_alias = "writeSam",
++        conflicts_with = "write_bam"
++    )]
+     write_mappings: Option<PathBuf>,
++    /// Write per-mapping BAM records to this file. Mutually exclusive with
++    /// --writeMappings/--writeSam.
++    #[arg(long = "writeBam", conflicts_with = "write_mappings")]
++    write_bam: Option<PathBuf>,
++    /// BGZF compression workers for --writeBam [default: about one per 3
++    /// mapping threads, at most 8].
++    ///
++    /// These threads run alongside the -p mapping threads and do nothing but
++    /// compress BGZF blocks. The default balances the two stages from measured
++    /// throughput: one worker compresses ~165 MiB/s of BAM records, while one
++    /// mapping thread produces at most ~52 MiB/s of them, so roughly one worker
++    /// per 3 mapping threads keeps compression from becoming the bottleneck.
++    /// The result is capped at 8, which is already about 3x the fastest record
++    /// production measured at any thread count.
++    ///
++    /// The cost is very lopsided, so the default errs upward: one worker too
++    /// few can halve throughput, whereas surplus workers just block on an empty
++    /// queue and cost nothing measurable. It stops at the balance point rather
++    /// than going higher, because past that these cores do more good mapping
++    /// reads. Raise it if you are writing BAM to unusually fast storage and can
++    /// spare the cores; there is no reason to lower it.
++    // `requires` alone would let `--writeSam out.sam --bamCompressThreads 8`
++    // through and then quietly ignore it, since SAM has no compression stage.
++    #[arg(
++        long = "bamCompressThreads",
++        requires = "write_bam",
++        conflicts_with = "write_mappings"
++    )]
++    bam_compress_threads: Option<std::num::NonZeroUsize>,
+     /// Write per-fragment mappings to a RAD file at this path. Sketch or
+     /// selective-alignment profile is chosen automatically from the mapping
+     /// mode. Quantification still runs; add --skipQuant to map only. The file is
+@@ -1138,6 +1173,12 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     }
+     // Alignment-based mode: quantify directly from a BAM.
+     if let Some(bam) = args.alignments {
++        warn_unsupported_mapping_output(
++            &args.write_mappings,
++            &args.write_bam,
++            "alignment mode (-a)",
++            "the input alignments already are the per-mapping records",
++        );
+         let mut opts = AlignQuantOptions::new(bam, args.output);
+         opts.lib_type = args.lib_type;
+         opts.em.use_vbem = use_vbem;
+@@ -1294,6 +1335,12 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+ 
+     // RAD-input mode: quantify directly from a RAD file of mappings, in parallel.
+     if let Some(rad_path) = args.rad {
++        warn_unsupported_mapping_output(
++            &args.write_mappings,
++            &args.write_bam,
++            "RAD-input mode (--rad)",
++            "a RAD carries no read names or sequences, so SAM/BAM records cannot be reconstructed",
++        );
+         // The RAD reuses alignment mode's inference/output; AlignQuantOptions
+         // carries the relevant knobs (lib type, EM/VBEM, score-exp, FLD prior,
+         // bootstrap/Gibbs). `bam` is unused by the RAD path.
+@@ -1374,6 +1421,8 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     opts.dump_eq_weights = args.dump_eq_weights;
+     opts.write_unmapped_names = args.write_unmapped_names;
+     opts.write_mappings = args.write_mappings;
++    opts.write_bam = args.write_bam;
++    opts.bam_compress_threads = args.bam_compress_threads;
+     opts.write_rad = args.write_rad;
+     opts.seq_bias = args.seq_bias;
+     opts.gc_bias = args.gc_bias;
+@@ -1694,3 +1743,119 @@ fn run_debug_map(args: DebugMapArgs) -> Result<()> {
+     }
+     Ok(())
+ }
++
++/// `--writeMappings`/`--writeSam`/`--writeBam` only apply to the read-mapping
++/// path. Rather than ignoring them silently in the alignment and RAD-input
++/// modes, say so — the repo's accept-and-warn policy for flags that are no-ops
++/// in the selected mode.
++fn warn_unsupported_mapping_output(
++    write_mappings: &Option<PathBuf>,
++    write_bam: &Option<PathBuf>,
++    mode: &str,
++    why: &str,
++) {
++    let flag = match (write_mappings, write_bam) {
++        (Some(_), _) => "--writeMappings/--writeSam",
++        (_, Some(_)) => "--writeBam",
++        _ => return,
++    };
++    tracing::warn!("{flag} has no effect in {mode}: {why}; ignoring it");
++}
++
++#[cfg(test)]
++mod tests {
++    use std::num::NonZeroUsize;
++
++    use super::*;
++
++    /// Parse a minimal `salmon quant` invocation plus `extra`, returning the
++    /// mapping-output flags only (`QuantArgs` itself is not `Debug`).
++    fn write_flags(extra: &[&str]) -> Result<(Option<PathBuf>, Option<PathBuf>), clap::Error> {
++        quant_args(extra).map(|args| (args.write_mappings, args.write_bam))
++    }
++
++    /// Parse a minimal `salmon quant` invocation plus `extra`.
++    fn quant_args(extra: &[&str]) -> Result<QuantArgs, clap::Error> {
++        let mut argv = vec![
++            "salmon", "quant", "-i", "idx", "-l", "A", "-r", "r.fq", "-o", "out",
++        ];
++        argv.extend_from_slice(extra);
++        match Cli::try_parse_from(argv)?.command {
++            Command::Quant(args) => Ok(args),
++            _ => unreachable!("parsed a non-quant subcommand"),
++        }
++    }
++
++    /// `--writeSam` is a spelling of `--writeMappings`, giving SAM output a
++    /// format-named flag to match `--writeBam`.
++    #[test]
++    fn write_sam_is_an_alias_for_write_mappings() {
++        let expected = Some(PathBuf::from("m.sam"));
++        for sam_flag in ["--writeMappings", "--writeSam", "-z"] {
++            let (mappings, bam) = write_flags(&[sam_flag, "m.sam"]).unwrap();
++            assert_eq!(mappings, expected, "{sam_flag} should set write_mappings");
++            assert_eq!(bam, None, "{sam_flag} should not set write_bam");
++        }
++    }
++
++    /// The alias shares `write_mappings`' arg id, so it inherits the
++    /// `--writeBam` conflict rather than silently allowing both formats.
++    #[test]
++    fn write_sam_conflicts_with_write_bam() {
++        for sam_flag in ["--writeMappings", "--writeSam", "-z"] {
++            let err = write_flags(&[sam_flag, "m.sam", "--writeBam", "m.bam"])
++                .expect_err("should conflict with --writeBam");
++            assert_eq!(
++                err.kind(),
++                clap::error::ErrorKind::ArgumentConflict,
++                "{sam_flag} + --writeBam"
++            );
++        }
++    }
++
++    /// `--bamCompressThreads` is user-facing but only meaningful with
++    /// `--writeBam`: unset means "derive it", and it must reject 0 rather than
++    /// silently starting no compression workers.
++    #[test]
++    fn bam_compress_threads_is_optional_and_positive() {
++        let derived = quant_args(&["--writeBam", "m.bam"]).unwrap();
++        assert_eq!(
++            derived.bam_compress_threads, None,
++            "unset must stay None so the derived default applies"
++        );
++
++        let explicit = quant_args(&["--writeBam", "m.bam", "--bamCompressThreads", "4"]).unwrap();
++        assert_eq!(
++            explicit.bam_compress_threads.map(NonZeroUsize::get),
++            Some(4)
++        );
++
++        let zero = quant_args(&["--writeBam", "m.bam", "--bamCompressThreads", "0"])
++            .map(|_| ())
++            .expect_err("0 compression workers is not a valid pool size");
++        assert_eq!(zero.kind(), clap::error::ErrorKind::ValueValidation);
++    }
++
++    /// Without `--writeBam` there is nothing to compress, so the flag is a
++    /// usage error rather than a silently ignored value.
++    #[test]
++    fn bam_compress_threads_requires_write_bam() {
++        let err = quant_args(&["--bamCompressThreads", "4"])
++            .map(|_| ())
++            .expect_err("--bamCompressThreads alone should be rejected");
++        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
++
++        // SAM output has no compression stage, so pairing the two is a
++        // conflict, not a silently ignored value.
++        for sam_flag in ["--writeMappings", "--writeSam", "-z"] {
++            let err = quant_args(&[sam_flag, "m.sam", "--bamCompressThreads", "4"])
++                .map(|_| ())
++                .expect_err("--bamCompressThreads needs --writeBam");
++            assert_eq!(
++                err.kind(),
++                clap::error::ErrorKind::ArgumentConflict,
++                "{sam_flag} + --bamCompressThreads"
++            );
++        }
++    }
++}
+diff --git a/crates/salmon-quant/Cargo.toml b/crates/salmon-quant/Cargo.toml
+index 74339be58..b7f061fe0 100644
+--- a/crates/salmon-quant/Cargo.toml
++++ b/crates/salmon-quant/Cargo.toml
+@@ -24,10 +24,14 @@ serde_json = { workspace = true }
+ tracing = { workspace = true }
+ flate2 = { workspace = true }
+ rayon = { workspace = true }
++crossbeam-channel = { workspace = true }
++noodles-bgzf = "0.47"
+ jiff = "0.2"
+ 
+ [dev-dependencies]
+ tempfile = { workspace = true }
++noodles-bam = "0.90"
++noodles-sam = "0.85"
+ # reading back RAD output in the end-to-end test
+ libradicl = { workspace = true }
+ 
+diff --git a/crates/salmon-quant/src/bam.rs b/crates/salmon-quant/src/bam.rs
+new file mode 100644
+index 000000000..89e70c61f
+--- /dev/null
++++ b/crates/salmon-quant/src/bam.rs
+@@ -0,0 +1,487 @@
++//! Chunked `--writeBam` output.
++//!
++//! # Ordering contract
++//!
++//! Exactly one guarantee: **all records for a fragment are contiguous**. A
++//! worker encodes a whole fragment before testing the chunk-size threshold, and
++//! chunks are written whole, so a fragment can never be split across chunks and
++//! interleaved with another worker's output.
++//!
++//! Nothing else is ordered. Fragments appear in whatever order workers finish
++//! chunks, which varies with thread count and scheduling. That is deliberate:
++//! any stronger guarantee would mean making workers wait for each other.
++//!
++//! # Where the pipeline is (and is not) serial
++//!
++//! - Record encoding: fully parallel, into per-worker buffers, no shared state.
++//! - Handoff: a bounded channel; sending moves only the `Vec` descriptor, never
++//!   the bytes.
++//! - This module's writer thread: copies chunk bytes into BGZF-sized blocks.
++//!   Serial, but a `memcpy` — ~4% utilized at the ~410 MiB/s peak record rate
++//!   measured here.
++//! - Deflate: fully parallel across [`compression_worker_count`] workers. This
++//!   is the expensive part, and it is the part that scales.
++//! - noodles' frame writer: emits compressed blocks in submission order. Serial,
++//!   but only a `memcpy` plus the file write.
++//!
++//! So the only serialized work is proportional to bytes moved, not to
++//! compression effort, which is the most concurrency an ordered BGZF stream
++//! admits. Nothing waits on a *particular* worker at any point.
++
++use std::io::{self, Write};
++use std::num::NonZeroUsize;
++use std::path::Path;
++use std::sync::{Arc, Mutex};
++use std::thread::JoinHandle;
++
++use crossbeam_channel::{Receiver, Sender};
++use noodles_bgzf as bgzf;
++use salmon_index::SalmonIndex;
++use salmon_map::ScoredMapping;
++
++use crate::mapping_record::{self, AlignmentRecord, CigarKind};
++
++const CHUNK_TARGET: usize = 2 * 1024 * 1024;
++const INITIAL_CAPACITY: usize = 64 * 1024;
++/// A chunk only overshoots [`CHUNK_TARGET`] by one fragment's records, so this
++/// ceiling exists to drop pathological growth, not as a routine limit.
++const RETAIN_CAPACITY: usize = 2 * CHUNK_TARGET;
++
++/// Uncompressed BAM bytes one BGZF deflate worker consumes per second.
++///
++/// Measured with `noodles_bgzf::io::MultithreadedWriter` (zlib-rs backend,
++/// default level) over 1 GiB of real salmon BAM records: 168.5, 167.3, 167.6,
++/// 167.0, 165.1 and 153.9 MiB/s per worker at 1/2/4/8/16/32 workers. Flat, so
++/// deflate scales linearly and one constant describes it.
++const DEFLATE_MIB_PER_SEC: f64 = 165.0;
++
++/// Peak uncompressed BAM bytes one mapping thread produces per second.
++///
++/// Measured by sweeping the deflate worker count until compression stopped
++/// being the limit: record output plateaus at ~413 MiB/s across 8 mapping
++/// threads, i.e. ~52 MiB/s each. This is an intentionally pessimistic number —
++/// it comes from a tiny-transcriptome fixture where mapping is nearly free and
++/// almost every read yields several records, so real workloads (expensive
++/// mapping, same record volume) produce *less* per thread and need fewer
++/// deflate workers than this predicts.
++const RECORD_MIB_PER_SEC_PER_MAPPER: f64 = 52.0;
++
++/// Ceiling on deflate workers. `DEFLATE_MIB_PER_SEC * MAX_COMPRESSION_WORKERS`
++/// is ~1.3 GiB/s of compression, three times the fastest record production
++/// measured at any thread count, so past this point extra workers cannot be the
++/// thing standing between salmon and full throughput — they would only take
++/// cores from mapping.
++const MAX_COMPRESSION_WORKERS: usize = 8;
++
++/// How many BGZF deflate workers to run alongside `mapping_threads`.
++///
++/// Deflate is the only stage whose cost scales with output volume, and each
++/// worker is a core not mapping reads, so we provision the smallest number that
++/// stops compression being the bottleneck and no more. Production scales with
++/// the mapping threads and consumption with the deflate workers, so the balance
++/// point is
++///
++/// ```text
++/// workers = ceil(mapping_threads * 52 MiB/s / 165 MiB/s)  ~=  mapping_threads / 3
++/// ```
++///
++/// The sweep this comes from (2.4M fragments, mapping-phase time relative to a
++/// no-BAM-output run, best of 5):
++///
++/// ```text
++///  -p 8    C=1 2.32x   C=2 1.18x   C=3 1.09x   C=4 1.06x   C=6 1.00x   C=8 0.98x
++/// ```
++///
++/// At `-p 16` and `-p 32` only the `C=1` point reproduced cleanly (2.08x and
++/// 2.20x); every `C >= 2` point there fell within run-to-run noise on a shared
++/// machine, so the shape above is what the constants are fitted to.
++///
++/// The curve is sharply asymmetric, and that asymmetry is what this heuristic is
++/// shaped around: one worker too few costs >2x — record output pins to exactly
++/// one worker's 165 MiB/s — while extra workers past the balance point cost
++/// nothing measurable, because they simply block on an empty queue. So round up,
++/// and cap at [`MAX_COMPRESSION_WORKERS`].
++///
++/// The residual ~9% at `-p 8, C=3` is deliberately left on the table. Buying it
++/// back means spending cores that, on a workload where mapping is not nearly
++/// free, contribute more to mapping than to compression; `--bamCompressThreads`
++/// is there for anyone who wants to make that trade explicitly.
++///
++/// A low estimate also degrades gracefully rather than catastrophically: the
++/// chunk queue is bounded, so mapping workers block instead of growing memory.
++fn compression_worker_count(mapping_threads: usize) -> NonZeroUsize {
++    let mapping_threads = mapping_threads.max(1);
++    let balanced =
++        (mapping_threads as f64 * RECORD_MIB_PER_SEC_PER_MAPPER / DEFLATE_MIB_PER_SEC).ceil();
++    // Never more workers than mapping threads: below that ratio the pipeline is
++    // producer-limited no matter how much compression capacity is available.
++    let workers = (balanced as usize).clamp(1, MAX_COMPRESSION_WORKERS.min(mapping_threads));
++    NonZeroUsize::new(workers).expect("clamped to at least 1")
++}
++
++struct WriterFailure(Mutex<Option<String>>);
++
++impl WriterFailure {
++    fn record(&self, error: &io::Error) {
++        let mut slot = self.0.lock().unwrap();
++        if slot.is_none() {
++            *slot = Some(error.to_string());
++        }
++    }
++
++    fn error(&self) -> Option<io::Error> {
++        self.0
++            .lock()
++            .unwrap()
++            .as_ref()
++            .map(|message| io::Error::other(message.clone()))
++    }
++}
++
++pub struct BamOutput {
++    sender: Option<Sender<Vec<u8>>>,
++    recycled: Receiver<Vec<u8>>,
++    failure: Arc<WriterFailure>,
++    handle: Option<JoinHandle<io::Result<()>>>,
++}
++
++impl BamOutput {
++    /// Open `path` and start the writer thread. `threads` is the mapping thread
++    /// count (`-p`); `compress_threads` overrides the derived BGZF worker count
++    /// (`--bamCompressThreads`) for benchmarking or unusual storage.
++    pub fn create(
++        path: &Path,
++        salmon: &SalmonIndex,
++        command: &str,
++        threads: usize,
++        compress_threads: Option<NonZeroUsize>,
++    ) -> anyhow::Result<Self> {
++        use anyhow::Context as _;
++        if let Some(parent) = path.parent() {
++            if !parent.as_os_str().is_empty() {
++                std::fs::create_dir_all(parent)
++                    .with_context(|| format!("creating BAM output dir {}", parent.display()))?;
++            }
++        }
++        let file = std::fs::File::create(path)
++            .with_context(|| format!("creating BAM output {}", path.display()))?;
++        let queue_capacity = (threads.max(1) * 2).clamp(4, 32);
++        let (sender, receiver): (Sender<Vec<u8>>, Receiver<Vec<u8>>) =
++            crossbeam_channel::bounded(queue_capacity);
++        let (recycle_sender, recycled): (Sender<Vec<u8>>, Receiver<Vec<u8>>) =
++            crossbeam_channel::bounded(queue_capacity + threads);
++        let failure = Arc::new(WriterFailure(Mutex::new(None)));
++        let writer_failure = Arc::clone(&failure);
++        let header = encode_header(salmon, command)?;
++        let compression_workers =
++            compress_threads.unwrap_or_else(|| compression_worker_count(threads));
++        tracing::debug!(
++            mapping_threads = threads,
++            bgzf_workers = compression_workers.get(),
++            "BAM output pipeline"
++        );
++        let handle = std::thread::Builder::new()
++            .name("salmon-bam-writer".into())
++            .spawn(move || {
++                let result = (|| {
++                    let file = std::io::BufWriter::with_capacity(1 << 20, file);
++                    let mut writer =
++                        bgzf::io::MultithreadedWriter::with_worker_count(compression_workers, file);
++                    writer.write_all(&header)?;
++                    while let Ok(mut chunk) = receiver.recv() {
++                        writer.write_all(&chunk)?;
++                        chunk.clear();
++                        if chunk.capacity() <= RETAIN_CAPACITY {
++                            let _ = recycle_sender.try_send(chunk);
++                        }
++                    }
++                    // `finish` hands back the inner writer after appending the
++                    // BGZF EOF block; that block is still sitting in the
++                    // `BufWriter`, and `BufWriter::drop` flushes only on a
++                    // best-effort basis and *discards* any error. Flush it here
++                    // so a failure at the very end of the run (ENOSPC, I/O
++                    // error) surfaces instead of silently truncating the BAM.
++                    let mut file = writer.finish()?;
++                    file.flush()?;
++                    Ok(())
++                })();
++                if let Err(error) = &result {
++                    writer_failure.record(error);
++                }
++                result
++            })?;
++        Ok(Self {
++            sender: Some(sender),
++            recycled,
++            failure,
++            handle: Some(handle),
++        })
++    }
++
++    /// A per-worker encode buffer bound to this output. Tying the borrow into
++    /// the scratch makes "a scratch always has its writer" a type-level fact,
++    /// so callers never have to re-derive it.
++    pub fn scratch(&self) -> BamScratch<'_> {
++        BamScratch {
++            output: self,
++            buffer: self.take_buffer(),
++        }
++    }
++
++    /// A cleared chunk buffer: a recycled one if the writer has returned any,
++    /// otherwise a fresh modest allocation that grows toward `CHUNK_TARGET`.
++    fn take_buffer(&self) -> Vec<u8> {
++        self.recycled
++            .try_recv()
++            .unwrap_or_else(|_| Vec::with_capacity(INITIAL_CAPACITY))
++    }
++
++    fn send(&self, chunk: Vec<u8>) -> io::Result<()> {
++        if let Some(error) = self.failure.error() {
++            return Err(error);
++        }
++        self.sender.as_ref().unwrap().send(chunk).map_err(|_| {
++            self.failure
++                .error()
++                .unwrap_or_else(|| io::Error::other("BAM writer stopped"))
++        })
++    }
++
++    pub fn finish(mut self) -> anyhow::Result<()> {
++        drop(self.sender.take());
++        self.handle
++            .take()
++            .unwrap()
++            .join()
++            .map_err(|_| anyhow::anyhow!("BAM writer thread panicked"))?
++            .map_err(anyhow::Error::from)
++    }
++}
++
++impl Drop for BamOutput {
++    fn drop(&mut self) {
++        drop(self.sender.take());
++        if let Some(handle) = self.handle.take() {
++            let _ = handle.join();
++        }
++    }
++}
++
++/// One mapping worker's private BAM encode buffer, bound to the output it feeds.
++pub struct BamScratch<'a> {
++    output: &'a BamOutput,
++    buffer: Vec<u8>,
++}
++
++impl BamScratch<'_> {
++    /// Encode every record for one fragment, then hand the chunk off if it has
++    /// reached the target size.
++    ///
++    /// The size check deliberately happens *after* the whole fragment is
++    /// encoded, never between its records: all records for a fragment are
++    /// therefore contiguous in one chunk, and chunks are written whole. That is
++    /// what keeps the output collated by fragment even though nothing else
++    /// about the record order is constrained.
++    pub fn write_fragment(
++        &mut self,
++        salmon: &SalmonIndex,
++        r1_id: &[u8],
++        r1_seq: &[u8],
++        r2: Option<(&[u8], &[u8])>,
++        maps: &[ScoredMapping],
++    ) -> io::Result<()> {
++        mapping_record::emit_fragment_records(salmon, r1_id, r1_seq, r2, maps, |record| {
++            encode_record(&mut self.buffer, record)
++        })?;
++        if self.buffer.len() >= CHUNK_TARGET {
++            self.flush()?;
++        }
++        Ok(())
++    }
++
++    /// Hand the accumulated chunk to the writer thread. Only the `Vec`
++    /// descriptor moves; the backing allocation is not copied.
++    pub fn flush(&mut self) -> io::Result<()> {
++        if self.buffer.is_empty() {
++            return Ok(());
++        }
++        let chunk = std::mem::take(&mut self.buffer);
++        self.output.send(chunk)?;
++        self.buffer = self.output.take_buffer();
++        Ok(())
++    }
++}
++
++fn push_i32(buf: &mut Vec<u8>, value: i32) {
++    buf.extend_from_slice(&value.to_le_bytes());
++}
++
++fn push_u32(buf: &mut Vec<u8>, value: u32) {
++    buf.extend_from_slice(&value.to_le_bytes());
++}
++
++/// Encode the BAM header block: the shared SAM header text (byte-identical to
++/// what `--writeMappings` writes) followed by the binary reference table.
++fn encode_header(salmon: &SalmonIndex, command: &str) -> anyhow::Result<Vec<u8>> {
++    let text = mapping_record::header_text(salmon, command);
++    let mut buf = Vec::with_capacity(text.len() + salmon.num_refs() * 32);
++    buf.extend_from_slice(b"BAM\x01");
++    push_i32(&mut buf, i32::try_from(text.len())?);
++    buf.extend_from_slice(text.as_bytes());
++    push_i32(&mut buf, i32::try_from(salmon.num_refs())?);
++    for tid in 0..salmon.num_refs() {
++        let name = salmon.ref_name(tid).as_bytes();
++        push_i32(&mut buf, i32::try_from(name.len() + 1)?);
++        buf.extend_from_slice(name);
++        buf.push(0);
++        push_i32(
++            &mut buf,
++            i32::try_from(salmon.ref_len(tid))
++                .map_err(|_| anyhow::anyhow!("reference {} exceeds BAM length limit", tid))?,
++        );
++    }
++    Ok(buf)
++}
++
++fn reg2bin(start: i32, end: i32) -> u16 {
++    let start = start.max(0) as u32;
++    let end = end.max(start as i32 + 1) as u32 - 1;
++    if start >> 14 == end >> 14 {
++        (4681 + (start >> 14)) as u16
++    } else if start >> 17 == end >> 17 {
++        (585 + (start >> 17)) as u16
++    } else if start >> 20 == end >> 20 {
++        (73 + (start >> 20)) as u16
++    } else if start >> 23 == end >> 23 {
++        (9 + (start >> 23)) as u16
++    } else if start >> 26 == end >> 26 {
++        (1 + (start >> 26)) as u16
++    } else {
++        0
++    }
++}
++
++fn base_code(base: u8) -> u8 {
++    match base.to_ascii_uppercase() {
++        b'A' => 1,
++        b'C' => 2,
++        b'G' => 4,
++        b'T' => 8,
++        _ => 15,
++    }
++}
++
++fn record_base(record: &AlignmentRecord<'_>, index: usize) -> u8 {
++    if record.reverse_complement {
++        mapping_record::complement(record.sequence[record.sequence.len() - 1 - index])
++    } else {
++        record.sequence[index]
++    }
++}
++
++fn push_aux_i64(buf: &mut Vec<u8>, tag: [u8; 2], value: i64) {
++    buf.extend_from_slice(&tag);
++    if let Ok(value) = u8::try_from(value) {
++        buf.push(b'C');
++        buf.push(value);
++    } else if let Ok(value) = i8::try_from(value) {
++        buf.push(b'c');
++        buf.push(value as u8);
++    } else if let Ok(value) = u16::try_from(value) {
++        buf.push(b'S');
++        buf.extend_from_slice(&value.to_le_bytes());
++    } else if let Ok(value) = i16::try_from(value) {
++        buf.push(b's');
++        buf.extend_from_slice(&value.to_le_bytes());
++    } else if let Ok(value) = u32::try_from(value) {
++        buf.push(b'I');
++        buf.extend_from_slice(&value.to_le_bytes());
++    } else {
++        buf.push(b'i');
++        buf.extend_from_slice(&(value as i32).to_le_bytes());
++    }
++}
++
++fn encode_record(buf: &mut Vec<u8>, record: &AlignmentRecord<'_>) -> io::Result<()> {
++    let block_start = buf.len();
++    push_u32(buf, 0);
++    push_i32(buf, record.reference_id as i32);
++    push_i32(buf, record.position.max(0));
++    let name_len = record.name.len() + 1;
++    let cigar_len = record.cigar.as_slice().len();
++    let reference_span: i32 = record
++        .cigar
++        .as_slice()
++        .iter()
++        .filter(|op| matches!(op.kind, CigarKind::Match))
++        .map(|op| op.len as i32)
++        .sum();
++    buf.push(u8::try_from(name_len).map_err(|_| io::Error::other("BAM read name too long"))?);
++    buf.push(record.mapping_quality);
++    buf.extend_from_slice(
++        &reg2bin(record.position, record.position + reference_span).to_le_bytes(),
++    );
++    buf.extend_from_slice(&(cigar_len as u16).to_le_bytes());
++    buf.extend_from_slice(&record.flags.to_le_bytes());
++    push_i32(buf, record.sequence.len() as i32);
++    push_i32(buf, record.mate_reference_id.map_or(-1, |id| id as i32));
++    push_i32(buf, record.mate_position.unwrap_or(-1));
++    push_i32(buf, record.template_length);
++    buf.extend_from_slice(record.name);
++    buf.push(0);
++    for op in record.cigar.as_slice() {
++        let code = match op.kind {
++            CigarKind::Match => 0,
++            CigarKind::SoftClip => 4,
++        };
++        push_u32(buf, ((op.len as u32) << 4) | code);
++    }
++    for i in (0..record.sequence.len()).step_by(2) {
++        let high = base_code(record_base(record, i));
++        let low = if i + 1 < record.sequence.len() {
++            base_code(record_base(record, i + 1))
++        } else {
++            0
++        };
++        buf.push((high << 4) | low);
++    }
++    buf.resize(buf.len() + record.sequence.len(), 0xff);
++    push_aux_i64(buf, *b"NH", record.nh as i64);
++    push_aux_i64(buf, *b"HI", record.hi as i64);
++    buf.extend_from_slice(b"XTA");
++    buf.push(record.xt);
++    push_aux_i64(buf, *b"AS", record.alignment_score as i64);
++    let block_size = u32::try_from(buf.len() - block_start - 4)
++        .map_err(|_| io::Error::other("BAM record too large"))?;
++    buf[block_start..block_start + 4].copy_from_slice(&block_size.to_le_bytes());
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn compression_workers_track_the_measured_balance_point() {
++        // One deflate worker per ~3 mapping threads (52 / 165 MiB/s).
++        for (threads, expected) in [(1, 1), (2, 1), (3, 1), (4, 2), (8, 3), (16, 6), (24, 8)] {
++            assert_eq!(
++                compression_worker_count(threads).get(),
++                expected,
++                "-p {threads}"
++            );
++        }
++    }
++
++    #[test]
++    fn compression_workers_are_bounded() {
++        // Never zero, never past the cap, and never more than the mapping
++        // threads they are meant to keep up with.
++        for threads in [0usize, 1, 7, 32, 64, 256, usize::MAX] {
++            let workers = compression_worker_count(threads).get();
++            assert!(workers >= 1);
++            assert!(workers <= MAX_COMPRESSION_WORKERS, "-p {threads}");
++            assert!(workers <= threads.max(1), "-p {threads}");
++        }
++    }
++}
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index 0d43f2398..68b80683f 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -10,6 +10,8 @@
+ //! Selective alignment is the default; set [`QuantOptions::sketch`] for the
+ //! alignment-free pseudoalignment path.
+ 
++mod bam;
++mod mapping_record;
+ mod output;
+ mod processor;
+ mod sam;
+@@ -79,6 +81,14 @@ pub struct QuantOptions {
+     /// write per-mapping SAM records to this path (`--writeMappings`); spoofed
+     /// CIGAR (`<readLen>M` + end soft-clips), matching salmon's standard output
+     pub write_mappings: Option<PathBuf>,
++    /// write per-mapping BAM records to this path (`--writeBam`); mutually
++    /// exclusive with [`Self::write_mappings`]
++    pub write_bam: Option<PathBuf>,
++    /// override the number of BGZF compression workers used by `--writeBam`
++    /// (`--bamCompressThreads`). `None` derives it from `num_threads` so that
++    /// compression just keeps up with record production; set it only to
++    /// benchmark or to compensate for unusually slow/fast storage.
++    pub bam_compress_threads: Option<std::num::NonZeroUsize>,
+     /// write per-fragment mappings to this RAD file (`--writeRad`); sketch or
+     /// selective-alignment profile is chosen from `sketch`. Quantification still
+     /// runs; combine with `skip_quant` to map only.
+@@ -187,6 +197,8 @@ impl QuantOptions {
+             dump_eq_weights: false,
+             write_unmapped_names: false,
+             write_mappings: None,
++            write_bam: None,
++            bam_compress_threads: None,
+             write_rad: None,
+             deterministic_fld: false,
+             seq_bias: false,
+@@ -308,6 +320,10 @@ pub struct QuantResult {
+ 
+ /// Run quantification end-to-end, writing outputs and returning the results.
+ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
++    anyhow::ensure!(
++        opts.write_mappings.is_none() || opts.write_bam.is_none(),
++        "--writeMappings and --writeBam are mutually exclusive"
++    );
+     let start_time = asctime_now();
+     let run_timer = std::time::Instant::now();
+     let mut timer = PhaseTimer::new();
+@@ -347,6 +363,13 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let unmapped_collector: Option<std::sync::Mutex<Vec<String>>> = opts
+         .write_unmapped_names
+         .then(|| std::sync::Mutex::new(Vec::new()));
++    let nthreads = if opts.num_threads == 0 {
++        std::thread::available_parallelism()
++            .map(|n| n.get())
++            .unwrap_or(1)
++    } else {
++        opts.num_threads
++    };
+     // SAM sink for `--writeMappings` (header written here).
+     let sam_writer: Option<sam::SamWriter> = match &opts.write_mappings {
+         Some(path) => {
+@@ -355,6 +378,16 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         }
+         None => None,
+     };
++    let bam_output: Option<bam::BamOutput> = match &opts.write_bam {
++        Some(path) => {
++            let cmd = format!("salmon quant -i {}", opts.index_dir.display());
++            Some(
++                bam::BamOutput::create(path, &salmon, &cmd, nthreads, opts.bam_compress_threads)
++                    .context("opening BAM output")?,
++            )
++        }
++        None => None,
++    };
+     // RAD sink for `--writeRad` (prelude + file tags written here). Sketch vs
+     // selective-alignment profile follows the mapping mode salmon is already in.
+     let mut rad_writer: Option<salmon_rad::RadOutputWriter> = match &opts.write_rad {
+@@ -383,14 +416,6 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         }
+         None => None,
+     };
+-    let nthreads = if opts.num_threads == 0 {
+-        std::thread::available_parallelism()
+-            .map(|n| n.get())
+-            .unwrap_or(1)
+-    } else {
+-        opts.num_threads
+-    };
+-
+     // Auto-detect the library type when requested (`-l A`).
+     let auto_detect = LibraryFormat::is_auto(&opts.lib_type);
+     let read_type = if opts.is_paired() {
+@@ -546,6 +571,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+             num_below_threshold_vm: &num_below_threshold_vm,
+             unmapped_names: unmapped_collector.as_ref(),
+             sam: sam_writer.as_ref(),
++            bam: bam_output.as_ref(),
+             rad: rad_writer.as_ref(),
+             discrete_fld: discrete_fld.as_ref(),
+             naive_eq: naive_eq.as_ref(),
+@@ -589,6 +615,9 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     if let Some(sw) = &sam_writer {
+         sw.flush().context("flushing SAM output")?;
+     }
++    if let Some(output) = bam_output {
++        output.finish().context("finalizing BAM output")?;
++    }
+     // NB: `rad_writer` is finalized *after* EM below, so the cached FLD and the
+     // abundance estimates can be baked into the header (single-pass deterministic
+     // requant + exact FLD parity). The mapping pass scope above has closed, so all
+diff --git a/crates/salmon-quant/src/mapping_record.rs b/crates/salmon-quant/src/mapping_record.rs
+new file mode 100644
+index 000000000..6a00114c0
+--- /dev/null
++++ b/crates/salmon-quant/src/mapping_record.rs
+@@ -0,0 +1,324 @@
++//! Format-neutral borrowed alignment records shared by SAM and BAM output.
++
++use std::io;
++
++use salmon_core::MateStatus;
++use salmon_core::RefProvider as _;
++use salmon_index::SalmonIndex;
++use salmon_map::ScoredMapping;
++
++pub const PAIRED: u16 = 0x1;
++pub const PROPER_PAIR: u16 = 0x2;
++pub const MATE_UNMAPPED: u16 = 0x8;
++pub const IS_RC: u16 = 0x10;
++pub const MATE_RC: u16 = 0x20;
++pub const READ1: u16 = 0x40;
++pub const READ2: u16 = 0x80;
++pub const SECONDARY: u16 = 0x100;
++
++#[derive(Clone, Copy)]
++pub enum CigarKind {
++    Match,
++    SoftClip,
++}
++
++#[derive(Clone, Copy)]
++pub struct CigarOp {
++    pub kind: CigarKind,
++    pub len: usize,
++}
++
++#[derive(Clone, Copy)]
++pub struct Cigar {
++    ops: [CigarOp; 2],
++    len: usize,
++}
++
++impl Cigar {
++    pub fn as_slice(&self) -> &[CigarOp] {
++        &self.ops[..self.len]
++    }
++}
++
++pub struct AlignmentRecord<'a> {
++    pub name: &'a [u8],
++    pub flags: u16,
++    pub reference_id: usize,
++    pub position: i32,
++    pub mapping_quality: u8,
++    pub cigar: Cigar,
++    pub mate_reference_id: Option<usize>,
++    pub mate_position: Option<i32>,
++    pub template_length: i32,
++    pub sequence: &'a [u8],
++    pub reverse_complement: bool,
++    pub nh: usize,
++    pub hi: usize,
++    pub xt: u8,
++    pub alignment_score: i32,
++}
++
++/// SAM version reported in `@HD VN:`. Shared by SAM and BAM so the two formats
++/// cannot drift; kept at `1.0` to match C++ salmon's `--writeMappings` header
++/// byte-for-byte.
++const SAM_VERSION: &str = "1.0";
++
++/// The header text shared by both mapping-output formats: `@HD`, one `@SQ` per
++/// reference (including decoys, matching salmon's full ref table), and `@PG`.
++///
++/// This is the single source of truth for the header, mirroring
++/// [`emit_fragment_records`] for record bodies. SAM writes the text verbatim;
++/// BAM stores it as the `text` block and then repeats the reference table in
++/// binary form (see `bam::encode_header`).
++pub fn header_text(salmon: &SalmonIndex, command: &str) -> String {
++    use std::fmt::Write as _;
++    // ~48 B/@SQ line for typical transcript names, plus the @HD and @PG lines.
++    let mut text = String::with_capacity(salmon.num_refs() * 48 + command.len() + 64);
++    let _ = writeln!(text, "@HD\tVN:{SAM_VERSION}\tSO:unknown");
++    for tid in 0..salmon.num_refs() {
++        let _ = writeln!(
++            text,
++            "@SQ\tSN:{}\tLN:{}",
++            salmon.ref_name(tid),
++            salmon.ref_len(tid)
++        );
++    }
++    let _ = writeln!(
++        text,
++        "@PG\tID:salmon\tPN:salmon\tVN:{}\tCL:{}",
++        crate::output::SALMON_VERSION,
++        command
++    );
++    text
++}
++
++pub fn read_name(id: &[u8]) -> &[u8] {
++    let end = id
++        .iter()
++        .position(|&b| b == b' ' || b == b'\t')
++        .unwrap_or(id.len());
++    let name = &id[..end];
++    if name.len() > 2 && name[name.len() - 2] == b'/' && matches!(name[name.len() - 1], b'1' | b'2')
++    {
++        &name[..name.len() - 2]
++    } else {
++        name
++    }
++}
++
++pub fn complement(base: u8) -> u8 {
++    match base {
++        b'A' | b'a' => b'T',
++        b'C' | b'c' => b'G',
++        b'G' | b'g' => b'C',
++        b'T' | b't' => b'A',
++        _ => b'N',
++    }
++}
++
++fn overhang_cigar(pos: i32, read_len: i32, txp_len: i32) -> (Cigar, i32) {
++    let read_len = read_len.max(0) as usize;
++    let empty = CigarOp {
++        kind: CigarKind::Match,
++        len: 0,
++    };
++    let one = |kind, len| Cigar {
++        ops: [CigarOp { kind, len }, empty],
++        len: 1,
++    };
++    let two = |a, b| Cigar {
++        ops: [a, b],
++        len: 2,
++    };
++    if pos + (read_len as i32) < 0 {
++        (one(CigarKind::SoftClip, read_len), 0)
++    } else if pos < 0 {
++        let matched = (read_len as i32 + pos).max(0) as usize;
++        (
++            two(
++                CigarOp {
++                    kind: CigarKind::SoftClip,
++                    len: read_len - matched,
++                },
++                CigarOp {
++                    kind: CigarKind::Match,
++                    len: matched,
++                },
++            ),
++            0,
++        )
++    } else if pos > txp_len {
++        (one(CigarKind::SoftClip, read_len), pos)
++    } else if pos + read_len as i32 > txp_len {
++        let matched = (txp_len - pos).max(0) as usize;
++        (
++            two(
++                CigarOp {
++                    kind: CigarKind::Match,
++                    len: matched,
++                },
++                CigarOp {
++                    kind: CigarKind::SoftClip,
++                    len: read_len - matched,
++                },
++            ),
++            pos,
++        )
++    } else {
++        (one(CigarKind::Match, read_len), pos)
++    }
++}
++
++/// Emit borrowed records immediately; no record, name, sequence, CIGAR, or tag
++/// allocation is retained between callback invocations.
++pub fn emit_fragment_records(
++    salmon: &SalmonIndex,
++    r1_id: &[u8],
++    r1_seq: &[u8],
++    r2: Option<(&[u8], &[u8])>,
++    maps: &[ScoredMapping],
++    mut emit: impl FnMut(&AlignmentRecord<'_>) -> io::Result<()>,
++) -> io::Result<()> {
++    let name1 = read_name(r1_id);
++    let (name2, r2_seq) = r2.map_or((name1, &[][..]), |(id, seq)| (read_name(id), seq));
++    let nh = maps.len();
++
++    for (index, mapping) in maps.iter().enumerate() {
++        let secondary = if index == 0 { 0 } else { SECONDARY };
++        let hi = index + 1;
++        let tid = mapping.tid as usize;
++        let txp_len = salmon.ref_len(tid) as i32;
++        let xt = if salmon.is_decoy(mapping.tid) {
++            b'D'
++        } else {
++            b'T'
++        };
++
++        match mapping.status {
++            MateStatus::PairedEndPaired => {
++                let (c1, p1) = overhang_cigar(mapping.r1_pos, r1_seq.len() as i32, txp_len);
++                let (c2, p2) = overhang_cigar(mapping.r2_pos, r2_seq.len() as i32, txp_len);
++                let mut fragment_length = mapping.fragment_len;
++                let min_pos = mapping.r1_pos.min(mapping.r2_pos);
++                if min_pos + fragment_length > txp_len {
++                    fragment_length = txp_len - min_pos;
++                }
++                let tlen1 = if mapping.r1_pos <= mapping.r2_pos {
++                    fragment_length
++                } else {
++                    -fragment_length
++                };
++                let mut f1 = PAIRED | PROPER_PAIR | READ1 | secondary;
++                let mut f2 = PAIRED | PROPER_PAIR | READ2 | secondary;
++                if !mapping.is_fw {
++                    f1 |= IS_RC;
++                    f2 |= MATE_RC;
++                }
++                if !mapping.r2_fw {
++                    f2 |= IS_RC;
++                    f1 |= MATE_RC;
++                }
++                emit(&AlignmentRecord {
++                    name: name1,
++                    flags: f1,
++                    reference_id: tid,
++                    position: p1,
++                    mapping_quality: 1,
++                    cigar: c1,
++                    mate_reference_id: Some(tid),
++                    mate_position: Some(p2),
++                    template_length: tlen1,
++                    sequence: r1_seq,
++                    reverse_complement: !mapping.is_fw,
++                    nh,
++                    hi,
++                    xt,
++                    alignment_score: mapping.r1_score,
++                })?;
++                emit(&AlignmentRecord {
++                    name: name2,
++                    flags: f2,
++                    reference_id: tid,
++                    position: p2,
++                    mapping_quality: 1,
++                    cigar: c2,
++                    mate_reference_id: Some(tid),
++                    mate_position: Some(p1),
++                    template_length: -tlen1,
++                    sequence: r2_seq,
++                    reverse_complement: !mapping.r2_fw,
++                    nh,
++                    hi,
++                    xt,
++                    alignment_score: mapping.score - mapping.r1_score,
++                })?;
++            }
++            MateStatus::SingleEnd => {
++                let (cigar, position) =
++                    overhang_cigar(mapping.r1_pos, r1_seq.len() as i32, txp_len);
++                emit(&AlignmentRecord {
++                    name: name1,
++                    flags: secondary | if mapping.is_fw { 0 } else { IS_RC },
++                    reference_id: tid,
++                    position,
++                    mapping_quality: 1,
++                    cigar,
++                    mate_reference_id: None,
++                    mate_position: None,
++                    template_length: 0,
++                    sequence: r1_seq,
++                    reverse_complement: !mapping.is_fw,
++                    nh,
++                    hi,
++                    xt,
++                    alignment_score: mapping.r1_score,
++                })?;
++            }
++            MateStatus::PairedEndLeft | MateStatus::PairedEndRight => {
++                let left = mapping.status == MateStatus::PairedEndLeft;
++                let (name, sequence, position, forward, score, read_flag) = if left {
++                    (
++                        name1,
++                        r1_seq,
++                        mapping.r1_pos,
++                        mapping.is_fw,
++                        mapping.r1_score,
++                        READ1,
++                    )
++                } else {
++                    (
++                        name2,
++                        r2_seq,
++                        mapping.r2_pos,
++                        mapping.r2_fw,
++                        mapping.score - mapping.r1_score,
++                        READ2,
++                    )
++                };
++                let (cigar, position) = overhang_cigar(position, sequence.len() as i32, txp_len);
++                emit(&AlignmentRecord {
++                    name,
++                    flags: PAIRED
++                        | MATE_UNMAPPED
++                        | read_flag
++                        | secondary
++                        | if forward { 0 } else { IS_RC },
++                    reference_id: tid,
++                    position,
++                    mapping_quality: 1,
++                    cigar,
++                    mate_reference_id: None,
++                    mate_position: None,
++                    template_length: 0,
++                    sequence,
++                    reverse_complement: !forward,
++                    nh,
++                    hi,
++                    xt,
++                    alignment_score: score,
++                })?;
++            }
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/salmon-quant/src/processor.rs b/crates/salmon-quant/src/processor.rs
+index 082e1109c..32e6e6e48 100644
+--- a/crates/salmon-quant/src/processor.rs
++++ b/crates/salmon-quant/src/processor.rs
+@@ -124,6 +124,8 @@ pub(crate) struct Shared<'a> {
+     pub unmapped_names: Option<&'a Mutex<Vec<String>>>,
+     /// when set, write per-mapping SAM records (`--writeMappings`)
+     pub sam: Option<&'a crate::sam::SamWriter>,
++    /// when set, encode per-mapping BAM records into reusable worker chunks
++    pub bam: Option<&'a crate::bam::BamOutput>,
+     /// when set, write per-fragment mappings to a RAD file (`--writeRad`)
+     pub rad: Option<&'a salmon_rad::RadOutputWriter>,
+     /// `--deterministic` mode: collect an order-independent fragment-length
+@@ -157,6 +159,10 @@ pub(crate) struct QuantProcessor<'a> {
+     pub unmapped: Vec<String>,
+     /// per-thread SAM record buffer (flushed to the shared writer per batch)
+     pub sam_buf: String,
++    /// per-thread raw BAM record chunk; allocated only for `--writeBam`. Holds
++    /// its own borrow of the writer, so "have a chunk ⇒ have somewhere to send
++    /// it" is enforced by the type rather than re-checked at each use.
++    pub bam_scratch: Option<crate::bam::BamScratch<'a>>,
+     /// per-thread RAD chunk buffer (flushed as one chunk per batch); `None`
+     /// unless `--writeRad` is set
+     pub rad_buf: Option<salmon_rad::FragmentChunkBuf>,
+@@ -189,6 +195,7 @@ impl<'a> QuantProcessor<'a> {
+             posbias,
+             unmapped: Vec::new(),
+             sam_buf: String::new(),
++            bam_scratch: shared.bam.map(|output| output.scratch()),
+             rad_buf: shared.rad.map(|rad| {
+                 salmon_rad::FragmentChunkBuf::with_capacity_codec(64 * 1024, rad.codec())
+             }),
+@@ -842,6 +849,7 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+             posbias,
+             unmapped,
+             sam_buf,
++            bam_scratch,
+             rad_buf,
+         } = self;
+         let sh = *shared;
+@@ -925,6 +933,17 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+                     &maps,
+                 );
+             }
++            if let Some(scratch) = bam_scratch.as_mut() {
++                if !maps.is_empty() {
++                    scratch.write_fragment(
++                        sh.salmon,
++                        r1.id(),
++                        s1.as_ref(),
++                        Some((r2.id(), s2.as_ref())),
++                        &maps,
++                    )?;
++                }
++            }
+             if let (Some(rad), Some(buf)) = (sh.rad, rad_buf.as_mut()) {
+                 if !maps.is_empty() {
+                     let rec = build_rad_record(&maps);
+@@ -952,7 +971,8 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+         // next batch's per-fragment reads are stable (see `record`). No-op once the
+         // final FLD cache is taken; amortized over the whole batch.
+         self.shared.fld.refresh_online();
+-        flush_sam(self);
++        flush_sam(self)?;
++        flush_bam(self)?;
+         flush_rad(self);
+         Ok(())
+     }
+@@ -960,7 +980,8 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+         merge_bias(self);
+         merge_unmapped(self);
+-        flush_sam(self);
++        flush_sam(self)?;
++        flush_bam(self)?;
+         flush_rad(self);
+         Ok(())
+     }
+@@ -980,6 +1001,7 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+             posbias,
+             unmapped,
+             sam_buf,
++            bam_scratch,
+             rad_buf,
+         } = self;
+         let sh = *shared;
+@@ -1035,6 +1057,11 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+             if sh.sam.is_some() && !maps.is_empty() {
+                 crate::sam::write_fragment(sam_buf, sh.salmon, rec.id(), s.as_ref(), None, &maps);
+             }
++            if let Some(scratch) = bam_scratch.as_mut() {
++                if !maps.is_empty() {
++                    scratch.write_fragment(sh.salmon, rec.id(), s.as_ref(), None, &maps)?;
++                }
++            }
+             if let (Some(rad), Some(buf)) = (sh.rad, rad_buf.as_mut()) {
+                 if !maps.is_empty() {
+                     let radrec = build_rad_record(&maps);
+@@ -1062,7 +1089,8 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+         // next batch's per-fragment reads are stable (see `record`). No-op once the
+         // final FLD cache is taken; amortized over the whole batch.
+         self.shared.fld.refresh_online();
+-        flush_sam(self);
++        flush_sam(self)?;
++        flush_bam(self)?;
+         flush_rad(self);
+         Ok(())
+     }
+@@ -1070,20 +1098,31 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+         merge_bias(self);
+         merge_unmapped(self);
+-        flush_sam(self);
++        flush_sam(self)?;
++        flush_bam(self)?;
+         flush_rad(self);
+         Ok(())
+     }
+ }
+ 
+ /// Flush this thread's accumulated SAM buffer to the shared writer (under lock).
+-fn flush_sam(proc: &mut QuantProcessor) {
++fn flush_sam(proc: &mut QuantProcessor) -> paraseq::Result<()> {
+     if let Some(sw) = proc.shared.sam {
+         if !proc.sam_buf.is_empty() {
+-            let _ = sw.write_block(&proc.sam_buf);
++            sw.write_block(&proc.sam_buf)?;
+             proc.sam_buf.clear();
+         }
+     }
++    Ok(())
++}
++
++/// Hand this thread's accumulated BAM chunk to the writer thread. No-op unless
++/// `--writeBam` is set; the scratch carries its own writer borrow.
++fn flush_bam(proc: &mut QuantProcessor) -> paraseq::Result<()> {
++    if let Some(scratch) = proc.bam_scratch.as_mut() {
++        scratch.flush()?;
++    }
++    Ok(())
+ }
+ 
+ /// Build a salmon RAD record for one fragment's finalized, decoy-filtered
+diff --git a/crates/salmon-quant/src/sam.rs b/crates/salmon-quant/src/sam.rs
+index cb2c0bc4d..5944fa187 100644
+--- a/crates/salmon-quant/src/sam.rs
++++ b/crates/salmon-quant/src/sam.rs
+@@ -1,34 +1,19 @@
+ //! `--writeMappings` SAM output.
+-//!
+-//! Mirrors salmon/pufferfish's `writeAlignmentsToStream` (`SAMWriter.hpp`): under
+-//! standard parameters salmon does **not** compute a real CIGAR — it spoofs a
+-//! full-length `<readLen>M` (soft-clipping only where the read overhangs the
+-//! transcript end, via `adjustOverhang`), so no traceback is needed and this is
+-//! compatible with our score-only aligner. Each fragment emits one record per
+-//! retained mapping (the eq-class members), with `NH`/`HI`/`XT`/`AS` tags.
+-//!
+-//! Records are accumulated per worker thread into a string and flushed to the
+-//! shared output under a mutex at batch boundaries to bound lock contention.
+ 
++use std::fmt::Write as _;
+ use std::io::Write;
+ use std::sync::Mutex;
+ 
+-use salmon_core::MateStatus;
+-use salmon_core::RefProvider as _;
+ use salmon_index::SalmonIndex;
+ use salmon_map::ScoredMapping;
+ 
+-const SAM_VERSION: &str = "1.0";
++use crate::mapping_record::{self, AlignmentRecord, CigarKind};
+ 
+-/// Thread-safe SAM sink: a buffered file behind a mutex. Per-thread record
+-/// strings are appended in bulk via [`SamWriter::write_block`].
+ pub struct SamWriter {
+     inner: Mutex<Box<dyn Write + Send>>,
+ }
+ 
+ impl SamWriter {
+-    /// Open `path` for SAM output and write the header (`@HD`, one `@SQ` per
+-    /// reference — including decoys, matching salmon's full ref table — `@PG`).
+     pub fn create(path: &std::path::Path, salmon: &SalmonIndex, cmd: &str) -> anyhow::Result<Self> {
+         use anyhow::Context as _;
+         if let Some(parent) = path.parent() {
+@@ -37,110 +22,83 @@ impl SamWriter {
+                     .with_context(|| format!("creating SAM output dir {}", parent.display()))?;
+             }
+         }
+-        let f = std::fs::File::create(path)
++        let file = std::fs::File::create(path)
+             .with_context(|| format!("creating SAM output {}", path.display()))?;
+-        let mut w: Box<dyn Write + Send> = Box::new(std::io::BufWriter::with_capacity(1 << 20, f));
+-        writeln!(w, "@HD\tVN:{SAM_VERSION}\tSO:unknown")?;
+-        for tid in 0..salmon.num_refs() {
+-            writeln!(
+-                w,
+-                "@SQ\tSN:{}\tLN:{}",
+-                salmon.ref_name(tid),
+-                salmon.ref_len(tid)
+-            )?;
+-        }
+-        writeln!(
+-            w,
+-            "@PG\tID:salmon\tPN:salmon\tVN:{}\tCL:{}",
+-            crate::output::SALMON_VERSION,
+-            cmd
+-        )?;
++        let mut writer: Box<dyn Write + Send> =
++            Box::new(std::io::BufWriter::with_capacity(1 << 20, file));
++        // Same header text BAM embeds, so the two formats cannot drift.
++        writer.write_all(mapping_record::header_text(salmon, cmd).as_bytes())?;
+         Ok(Self {
+-            inner: Mutex::new(w),
++            inner: Mutex::new(writer),
+         })
+     }
+ 
+-    /// Append a worker thread's accumulated SAM text in one locked write.
+     pub fn write_block(&self, block: &str) -> std::io::Result<()> {
+         if block.is_empty() {
+             return Ok(());
+         }
+-        let mut g = self.inner.lock().unwrap();
+-        g.write_all(block.as_bytes())
++        self.inner.lock().unwrap().write_all(block.as_bytes())
+     }
+ 
+-    /// Flush the underlying writer (call once at end of run).
+     pub fn flush(&self) -> std::io::Result<()> {
+         self.inner.lock().unwrap().flush()
+     }
+ }
+ 
+-// SAM flag bits.
+-const PAIRED: u16 = 0x1;
+-const PROPER_PAIR: u16 = 0x2;
+-#[allow(dead_code)] // kept for completeness of the SAM flag-bit set
+-const UNMAPPED: u16 = 0x4;
+-const MATE_UNMAPPED: u16 = 0x8;
+-const IS_RC: u16 = 0x10;
+-const MATE_RC: u16 = 0x20;
+-const READ1: u16 = 0x40;
+-const READ2: u16 = 0x80;
+-const SECONDARY: u16 = 0x100;
+-
+-/// Reverse-complement a read; reverse the qualities (so the SAM SEQ/QUAL are in
+-/// forward-reference orientation, as salmon writes them for reverse-strand mates).
+-fn rc(seq: &[u8]) -> Vec<u8> {
+-    seq.iter()
+-        .rev()
+-        .map(|&b| match b {
+-            b'A' | b'a' => b'T',
+-            b'C' | b'c' => b'G',
+-            b'G' | b'g' => b'C',
+-            b'T' | b't' => b'A',
+-            _ => b'N',
+-        })
+-        .collect()
+-}
+-
+-/// Spoofed CIGAR with transcript-end overhang clipping (pufferfish `adjustOverhang`):
+-/// `<readLen>M`, becoming `<S>...<M>` where the read hangs off either end.
+-/// Returns `(cigar, adjusted_pos)`.
+-fn overhang_cigar(pos: i32, read_len: i32, txp_len: i32) -> (String, i32) {
+-    if pos + read_len < 0 {
+-        (format!("{read_len}S"), 0)
+-    } else if pos < 0 {
+-        let match_len = read_len + pos;
+-        let clip = read_len - match_len;
+-        (format!("{clip}S{match_len}M"), 0)
+-    } else if pos > txp_len {
+-        (format!("{read_len}S"), pos)
+-    } else if pos + read_len > txp_len {
+-        let match_len = txp_len - pos;
+-        let clip = read_len - match_len;
+-        (format!("{match_len}M{clip}S"), pos)
++fn write_sequence(buf: &mut String, record: &AlignmentRecord<'_>) {
++    if record.reverse_complement {
++        for &base in record.sequence.iter().rev() {
++            buf.push(mapping_record::complement(base) as char);
++        }
+     } else {
+-        (format!("{read_len}M"), pos)
++        for &base in record.sequence {
++            buf.push(base as char);
++        }
+     }
+ }
+ 
+-/// Processed read name: up to the first space, with a trailing `/1` or `/2` trimmed.
+-fn read_name(id: &[u8]) -> &[u8] {
+-    let end = id
+-        .iter()
+-        .position(|&b| b == b' ' || b == b'\t')
+-        .unwrap_or(id.len());
+-    let n = &id[..end];
+-    if n.len() > 2 && n[n.len() - 2] == b'/' && matches!(n[n.len() - 1], b'1' | b'2') {
+-        &n[..n.len() - 2]
++fn write_record(buf: &mut String, salmon: &SalmonIndex, record: &AlignmentRecord<'_>) {
++    let name = String::from_utf8_lossy(record.name);
++    let reference = salmon.ref_name(record.reference_id);
++    let _ = write!(
++        buf,
++        "{name}\t{}\t{reference}\t{}\t{}",
++        record.flags,
++        record.position + 1,
++        record.mapping_quality
++    );
++    buf.push('\t');
++    for op in record.cigar.as_slice() {
++        let kind = match op.kind {
++            CigarKind::Match => 'M',
++            CigarKind::SoftClip => 'S',
++        };
++        let _ = write!(buf, "{}{kind}", op.len);
++    }
++    if let (Some(mate_id), Some(mate_position)) = (record.mate_reference_id, record.mate_position) {
++        let mate_reference = if mate_id == record.reference_id {
++            "="
++        } else {
++            salmon.ref_name(mate_id)
++        };
++        let _ = write!(
++            buf,
++            "\t{mate_reference}\t{}\t{}",
++            mate_position + 1,
++            record.template_length
++        );
+     } else {
+-        n
++        let _ = write!(buf, "\t*\t0\t{}", record.template_length);
+     }
++    buf.push('\t');
++    write_sequence(buf, record);
++    let _ = writeln!(
++        buf,
++        "\t*\tNH:i:{}\tHI:i:{}\tXT:A:{}\tAS:i:{}",
++        record.nh, record.hi, record.xt as char, record.alignment_score
++    );
+ }
+ 
+-/// Append SAM records for one fragment's mappings to `buf`.
+-///
+-/// `r2` is `None` for single-end. `maps` are the fragment's retained mappings
+-/// (eq-class members); the first is primary, the rest carry the secondary flag.
+ pub fn write_fragment(
+     buf: &mut String,
+     salmon: &SalmonIndex,
+@@ -149,98 +107,9 @@ pub fn write_fragment(
+     r2: Option<(&[u8], &[u8])>,
+     maps: &[ScoredMapping],
+ ) {
+-    use std::fmt::Write as _;
+-    let name1 = String::from_utf8_lossy(read_name(r1_id)).into_owned();
+-    let (name2, r2_seq) = match r2 {
+-        Some((id, seq)) => (String::from_utf8_lossy(read_name(id)).into_owned(), seq),
+-        None => (name1.clone(), &b""[..]),
+-    };
+-    let r1_len = r1_seq.len() as i32;
+-    let r2_len = r2_seq.len() as i32;
+-    let nh = maps.len();
+-
+-    for (idx, m) in maps.iter().enumerate() {
+-        let secondary = if idx == 0 { 0 } else { SECONDARY };
+-        let hi = idx + 1;
+-        let txp_len = salmon.ref_len(m.tid as usize) as i32;
+-        let refname = salmon.ref_name(m.tid as usize).to_string();
+-        let xt = if salmon.is_decoy(m.tid) { 'D' } else { 'T' };
+-
+-        match m.status {
+-            MateStatus::PairedEndPaired => {
+-                let (read1_first, min_pos) = (m.r1_pos <= m.r2_pos, m.r1_pos.min(m.r2_pos));
+-                let mut frag_len = m.fragment_len;
+-                if min_pos + frag_len > txp_len {
+-                    frag_len = txp_len - min_pos;
+-                }
+-                let mut f1 = PAIRED | PROPER_PAIR | READ1 | secondary;
+-                let mut f2 = PAIRED | PROPER_PAIR | READ2 | secondary;
+-                if !m.is_fw {
+-                    f1 |= IS_RC;
+-                    f2 |= MATE_RC;
+-                }
+-                if !m.r2_fw {
+-                    f2 |= IS_RC;
+-                    f1 |= MATE_RC;
+-                }
+-                let (c1, p1) = overhang_cigar(m.r1_pos, r1_len, txp_len);
+-                let (c2, p2) = overhang_cigar(m.r2_pos, r2_len, txp_len);
+-                let seq1 = if m.is_fw { r1_seq.to_vec() } else { rc(r1_seq) };
+-                let seq2 = if m.r2_fw { r2_seq.to_vec() } else { rc(r2_seq) };
+-                let tlen1 = if read1_first { frag_len } else { -frag_len };
+-                let as1 = m.r1_score;
+-                let as2 = m.score - m.r1_score;
+-                // QUAL is `*` (salmon's default writeMappings omits qualities).
+-                let _ = writeln!(
+-                    buf,
+-                    "{name1}\t{f1}\t{refname}\t{}\t1\t{c1}\t=\t{}\t{tlen1}\t{}\t*\tNH:i:{nh}\tHI:i:{hi}\tXT:A:{xt}\tAS:i:{as1}",
+-                    p1 + 1, p2 + 1, String::from_utf8_lossy(&seq1),
+-                );
+-                let _ = writeln!(
+-                    buf,
+-                    "{name2}\t{f2}\t{refname}\t{}\t1\t{c2}\t=\t{}\t{}\t{}\t*\tNH:i:{nh}\tHI:i:{hi}\tXT:A:{xt}\tAS:i:{as2}",
+-                    p2 + 1, p1 + 1, -tlen1, String::from_utf8_lossy(&seq2),
+-                );
+-            }
+-            MateStatus::SingleEnd => {
+-                let mut f1 = secondary;
+-                if !m.is_fw {
+-                    f1 |= IS_RC;
+-                }
+-                let (c1, p1) = overhang_cigar(m.r1_pos, r1_len, txp_len);
+-                let seq1 = if m.is_fw { r1_seq.to_vec() } else { rc(r1_seq) };
+-                let _ = writeln!(
+-                    buf,
+-                    "{name1}\t{f1}\t{refname}\t{}\t1\t{c1}\t*\t0\t0\t{}\t*\tNH:i:{nh}\tHI:i:{hi}\tXT:A:{xt}\tAS:i:{}",
+-                    p1 + 1, String::from_utf8_lossy(&seq1), m.r1_score,
+-                );
+-            }
+-            MateStatus::PairedEndLeft | MateStatus::PairedEndRight => {
+-                // Orphan: one mate mapped. Emit the mapped mate (the unmapped mate
+-                // is omitted; salmon writes it with the unmapped flag, but it carries
+-                // no placement and downstream tools tolerate its absence).
+-                let left_mapped = matches!(m.status, MateStatus::PairedEndLeft);
+-                let (mapped_pos, mapped_len, mapped_seq, mapped_name, is_r1) = if left_mapped {
+-                    (m.r1_pos, r1_len, r1_seq, &name1, true)
+-                } else {
+-                    (m.r2_pos, r2_len, r2_seq, &name2, false)
+-                };
+-                let mut f = PAIRED | secondary | MATE_UNMAPPED | if is_r1 { READ1 } else { READ2 };
+-                if !m.is_fw {
+-                    f |= IS_RC;
+-                }
+-                let (c, p) = overhang_cigar(mapped_pos, mapped_len, txp_len);
+-                let seq = if m.is_fw {
+-                    mapped_seq.to_vec()
+-                } else {
+-                    rc(mapped_seq)
+-                };
+-                let _ = writeln!(
+-                    buf,
+-                    "{mapped_name}\t{f}\t{refname}\t{}\t1\t{c}\t*\t0\t0\t{}\t*\tNH:i:{nh}\tHI:i:{hi}\tXT:A:{xt}\tAS:i:{}",
+-                    p + 1, String::from_utf8_lossy(&seq), m.r1_score,
+-                );
+-            }
+-        }
+-    }
++    mapping_record::emit_fragment_records(salmon, r1_id, r1_seq, r2, maps, |record| {
++        write_record(buf, salmon, record);
++        Ok(())
++    })
++    .expect("writing to String is infallible");
+ }
+diff --git a/crates/salmon-quant/tests/quant_end_to_end.rs b/crates/salmon-quant/tests/quant_end_to_end.rs
+index 75916bfad..cbd7340a9 100644
+--- a/crates/salmon-quant/tests/quant_end_to_end.rs
++++ b/crates/salmon-quant/tests/quant_end_to_end.rs
+@@ -64,11 +64,19 @@ impl FastqWriters {
+ /// Build a transcriptome FASTA + simulated inward paired reads. Returns the
+ /// fasta path, the two read files, and the true fragment counts per name.
+ fn simulate(dir: &Path) -> (PathBuf, PathBuf, PathBuf, HashMap<String, u64>) {
++    simulate_scaled(dir, 1)
++}
++
++/// [`simulate`] with `scale` times as many fragments per transcript. Tests that
++/// depend on more than one mapping worker actually running need enough
++/// fragments to fill several paraseq batches (16384 records each) — at `scale`
++/// 1 the whole fixture is a single batch handled by a single worker.
++fn simulate_scaled(dir: &Path, scale: u64) -> (PathBuf, PathBuf, PathBuf, HashMap<String, u64>) {
+     // (name, length seed, length, true fragment count)
+     let specs = [
+-        ("t0", 11u64, 600usize, 300u64),
+-        ("t1", 22, 900, 100),
+-        ("t2", 33, 1200, 600),
++        ("t0", 11u64, 600usize, 300 * scale),
++        ("t1", 22, 900, 100 * scale),
++        ("t2", 33, 1200, 600 * scale),
+     ];
+ 
+     let fasta = dir.join("txome.fa");
+@@ -349,6 +357,245 @@ fn writes_rad_output_readable_and_complete() {
+     }
+ }
+ 
++fn read_sam_records(path: &Path) -> (noodles_sam::Header, Vec<noodles_sam::alignment::RecordBuf>) {
++    let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
++    let mut reader = noodles_sam::io::Reader::new(file);
++    let header = reader.read_header().unwrap();
++    let records = reader
++        .record_bufs(&header)
++        .collect::<Result<Vec<_>, _>>()
++        .unwrap();
++    (header, records)
++}
++
++fn read_bam_records(path: &Path) -> (noodles_sam::Header, Vec<noodles_sam::alignment::RecordBuf>) {
++    let mut reader = noodles_bam::io::Reader::new(std::fs::File::open(path).unwrap());
++    let header = reader.read_header().unwrap();
++    let records = reader
++        .record_bufs(&header)
++        .collect::<Result<Vec<_>, _>>()
++        .unwrap();
++    (header, records)
++}
++
++/// Total order over records that is independent of which worker emitted them.
++/// Every field the two encoders could disagree on is in the key, so sorting by
++/// it and comparing element-wise gives a structural diff on failure rather than
++/// "these two big vectors differ".
++fn record_sort_key(
++    record: &noodles_sam::alignment::RecordBuf,
++) -> (Vec<u8>, u16, Option<usize>, Option<usize>, u8) {
++    (
++        record.name().map(|n| n.to_vec()).unwrap_or_default(),
++        record.flags().bits(),
++        record.reference_sequence_id(),
++        record.alignment_start().map(usize::from),
++        record.mapping_quality().map_or(255, |q| q.get()),
++    )
++}
++
++/// Quantify `reads` once per output format and return the parsed results.
++fn quant_to_sam_and_bam(
++    tmp: &Path,
++    threads: usize,
++    scale: u64,
++) -> (
++    (noodles_sam::Header, Vec<noodles_sam::alignment::RecordBuf>),
++    (noodles_sam::Header, Vec<noodles_sam::alignment::RecordBuf>),
++) {
++    let (fasta, r1, r2, _truth) = simulate_scaled(tmp, scale);
++    let index = tmp.join("idx");
++    let mut build_opts = IndexBuildOptions::new(vec![fasta], index.clone());
++    build_opts.threads = 1;
++    build(&build_opts).expect("build index");
++
++    let quant = |out: &str, set: &dyn Fn(&mut QuantOptions)| {
++        let mut opts = QuantOptions::new(index.clone(), tmp.join(out));
++        opts.mates1 = vec![r1.clone()];
++        opts.mates2 = vec![r2.clone()];
++        opts.lib_type = "IU".into();
++        opts.num_threads = threads;
++        set(&mut opts);
++        quantify(&opts).unwrap_or_else(|e| panic!("{out} quantification: {e}"));
++    };
++
++    let sam_path = tmp.join("mappings.sam");
++    quant("quant_sam", &|o: &mut QuantOptions| {
++        o.write_mappings = Some(sam_path.clone())
++    });
++    let bam_path = tmp.join("mappings.bam");
++    quant("quant_bam", &|o: &mut QuantOptions| {
++        o.write_bam = Some(bam_path.clone())
++    });
++
++    (read_sam_records(&sam_path), read_bam_records(&bam_path))
++}
++
++#[test]
++fn sam_and_bam_mapping_outputs_are_semantically_equal() {
++    let tmp = tempfile::tempdir().unwrap();
++    let ((sam_header, mut sam_records), (bam_header, mut bam_records)) =
++        quant_to_sam_and_bam(tmp.path(), 4, 1);
++
++    // The header is built once and shared by both encoders, so it must match in
++    // full — not just the reference sequences.
++    assert_eq!(sam_header, bam_header);
++    assert!(!bam_header.programs().as_ref().is_empty());
++
++    // Worker completion order is intentionally unspecified, so compare the
++    // record multisets. `RecordBuf: PartialEq` covers flags, coordinates, MAPQ,
++    // CIGAR, mate fields, template length, sequence, qualities, and every tag.
++    assert!(!bam_records.is_empty(), "no BAM records were written");
++    assert_eq!(sam_records.len(), bam_records.len());
++    sam_records.sort_by_key(record_sort_key);
++    bam_records.sort_by_key(record_sort_key);
++    for (i, (sam, bam)) in sam_records.iter().zip(&bam_records).enumerate() {
++        assert_eq!(sam, bam, "record {i} differs between SAM and BAM");
++    }
++}
++
++/// The one ordering guarantee the BAM path makes: every record for a fragment
++/// is contiguous. Workers encode a whole fragment before the chunk-size check,
++/// and chunks are written whole, so a fragment can never be split across chunks
++/// and interleaved with another worker's output.
++///
++/// Nothing stronger is promised: the order the fragments themselves appear in
++/// is whatever order the workers happen to finish chunks in, which is why
++/// [`bam_content_is_independent_of_thread_count`] compares multisets and not
++/// sequences.
++#[test]
++fn bam_records_for_a_fragment_are_collated() {
++    let tmp = tempfile::tempdir().unwrap();
++    // paraseq hands out 16384-record batches, so the fixture must be several
++    // batches deep before more than one worker ever runs — at the default scale
++    // the entire input is one batch and this test would pass vacuously.
++    const THREADS: usize = 8;
++    let (_, (_, bam_records)) = quant_to_sam_and_bam(tmp.path(), THREADS, 100);
++    assert!(!bam_records.is_empty());
++
++    let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
++    let mut current: Option<Vec<u8>> = None;
++    for (i, record) in bam_records.iter().enumerate() {
++        let name = record.name().map(|n| n.to_vec()).unwrap_or_default();
++        if current.as_ref() != Some(&name) {
++            // Starting a new run: this name must not have appeared before.
++            if let Some(first) = seen.insert(name.clone(), i) {
++                panic!(
++                    "records for {} are split: a run starts at {i} but an earlier \
++                     run started at {first}",
++                    String::from_utf8_lossy(&name)
++                );
++            }
++            current = Some(name);
++        }
++    }
++    // Sanity: the fixture really does produce multi-record fragments, otherwise
++    // collation would hold vacuously.
++    assert!(
++        bam_records.len() > seen.len(),
++        "fixture has no fragment with more than one record; collation is untested"
++    );
++}
++
++/// Thread count changes the order chunks land in, but must not change what is
++/// written. Comparing a 1-thread run against an 8-thread run as multisets is
++/// the strongest claim the design supports — and asserting no more than that is
++/// deliberate, since imposing a global record order would mean serializing the
++/// writer.
++#[test]
++fn bam_content_is_independent_of_thread_count() {
++    let mut runs = Vec::new();
++    for threads in [1usize, 8] {
++        let tmp = tempfile::tempdir().unwrap();
++        let (fasta, r1, r2, _truth) = simulate(tmp.path());
++        let index = tmp.path().join("idx");
++        let mut build_opts = IndexBuildOptions::new(vec![fasta], index.clone());
++        build_opts.threads = 1;
++        build(&build_opts).expect("build index");
++
++        let bam_path = tmp.path().join("mappings.bam");
++        let mut opts = QuantOptions::new(index, tmp.path().join("quant"));
++        opts.mates1 = vec![r1];
++        opts.mates2 = vec![r2];
++        opts.lib_type = "IU".into();
++        opts.num_threads = threads;
++        opts.write_bam = Some(bam_path.clone());
++        quantify(&opts).expect("BAM-output quantification");
++
++        let (_, mut records) = read_bam_records(&bam_path);
++        records.sort_by_key(record_sort_key);
++        runs.push(records);
++        // `tmp` must outlive the read above.
++    }
++
++    let (single, many) = (&runs[0], &runs[1]);
++    assert!(!single.is_empty());
++    assert_eq!(
++        single.len(),
++        many.len(),
++        "1-thread and 8-thread runs wrote different record counts"
++    );
++    for (i, (a, b)) in single.iter().zip(many).enumerate() {
++        assert_eq!(a, b, "record {i} differs between 1- and 8-thread runs");
++    }
++    // Both runs must still be well-formed BAM with names on every record.
++    assert!(many.iter().all(|record| record.name().is_some()));
++}
++
++/// A BAM that could not be written must not be reported as success.
++///
++/// The BGZF EOF block is the last thing to land in the writer's 1 MiB
++/// `BufWriter`, and `BufWriter::drop` flushes only on a best-effort basis and
++/// discards the error. Without an explicit flush, a full disk silently produced
++/// a truncated BAM and an exit status of 0.
++///
++/// `/dev/full` accepts the open and fails every write with `ENOSPC`. The
++/// fixture's BAM is well under 1 MiB, so nothing reaches the device until that
++/// final flush — exactly the path being guarded.
++#[cfg(target_os = "linux")]
++#[test]
++fn bam_write_failure_is_reported() {
++    if std::fs::OpenOptions::new()
++        .write(true)
++        .open("/dev/full")
++        .is_err()
++    {
++        eprintln!("skipping: /dev/full is not writable here");
++        return;
++    }
++
++    let tmp = tempfile::tempdir().unwrap();
++    let (fasta, r1, r2, _truth) = simulate(tmp.path());
++    let index = tmp.path().join("idx");
++    let mut build_opts = IndexBuildOptions::new(vec![fasta], index.clone());
++    build_opts.threads = 1;
++    build(&build_opts).expect("build index");
++
++    let mut opts = QuantOptions::new(index, tmp.path().join("quant"));
++    opts.mates1 = vec![r1];
++    opts.mates2 = vec![r2];
++    opts.lib_type = "IU".into();
++    opts.num_threads = 2;
++    opts.write_bam = Some(PathBuf::from("/dev/full"));
++
++    let error = quantify(&opts).expect_err("writing to /dev/full must fail");
++    let chain = format!("{error:#}");
++    assert!(
++        chain.contains("No space left on device"),
++        "expected the ENOSPC to propagate, got: {chain}"
++    );
++}
++
++#[test]
++fn sam_and_bam_outputs_are_mutually_exclusive() {
++    let tmp = tempfile::tempdir().unwrap();
++    let mut opts = QuantOptions::new(tmp.path().join("idx"), tmp.path().join("quant"));
++    opts.write_mappings = Some(tmp.path().join("mappings.sam"));
++    opts.write_bam = Some(tmp.path().join("mappings.bam"));
++    let error = quantify(&opts).unwrap_err().to_string();
++    assert!(error.contains("mutually exclusive"), "{error}");
++}
++
+ #[test]
+ fn pseudoalignment_quantification_tracks_truth() {
+     let tmp = tempfile::tempdir().unwrap();
+diff --git a/docs/cli-flag-status.md b/docs/cli-flag-status.md
+index 67068673b..cf3f465a6 100644
+--- a/docs/cli-flag-status.md
++++ b/docs/cli-flag-status.md
+@@ -51,7 +51,8 @@ misbehaves.
+ 
+ | Flag | Status | Notes |
+ |------|--------|-------|
+-| `-l/--libType`, `-o/--output`, `-p/--threads`, `-z/--writeMappings` | ✅ | |
++| `-l/--libType`, `-o/--output`, `-p/--threads`, `-z/--writeMappings`, `--writeBam` | ✅ | `--writeSam` is a visible alias for `--writeMappings`. `--writeMappings`/`--writeSam` and `--writeBam` are mutually exclusive, and are warned-and-ignored in `-a`/`--rad` modes. Records for a fragment are contiguous; no other order is imposed. |
++| `--bamCompressThreads` | ✅ | BGZF compression pool for `--writeBam`; defaults to ~1 worker per 3 mapping threads (max 8), balancing measured deflate throughput against record production. Rust-port feature; not in this salmon build. |
+ | `--useEM` | ✅ | VBEM is the default; `--useEM` selects plain EM. |
+ | `--meta` | ✅ | Metagenomic preset: plain EM, no range-factorized eq-classes, uniform init (the Rust EM already inits uniformly). Overrides `--useEM`/`--rangeFactorizationBins`. |
+ | `--useVBOpt` | 🔁 | VBEM is already the default. |
+diff --git a/website/src/content/docs/reference/cli.mdx b/website/src/content/docs/reference/cli.mdx
+index 61d1d5022..52f180cae 100644
+--- a/website/src/content/docs/reference/cli.mdx
++++ b/website/src/content/docs/reference/cli.mdx
+@@ -123,7 +123,9 @@ See the [RAD I/O & deterministic quantification](../../guides/rad-and-determinis
+ | --- | --- |
+ | `--dumpEq` / `--dumpEqWeights` | Dump equivalence classes (with weights). |
+ | `--writeUnmappedNames` | Write unmapped fragment names. |
+-| `-z, --writeMappings <FILE>` | Write per-mapping SAM records. |
++| `-z, --writeMappings <FILE>` | Write per-mapping SAM records. `--writeSam` is an alias. |
++| `--writeBam <FILE>` | Write the same per-mapping records as BGZF-compressed BAM. Mutually exclusive with `--writeMappings`/`--writeSam`; records for a fragment are contiguous, but no other order is imposed. |
++| `--bamCompressThreads <N>` | BGZF compression workers for `--writeBam`. Defaults to about one per 3 mapping threads (at most 8), which balances compression against record production; see [Record order](../output-formats/#record-order). |
+ 
+ ```sh
+ salmon quant -i salmon_index -l A -1 r1.fq.gz -2 r2.fq.gz -p 16 -o out
+diff --git a/website/src/content/docs/reference/output-formats.md b/website/src/content/docs/reference/output-formats.md
+index a0d54ce9a..5dfa1a3fe 100644
+--- a/website/src/content/docs/reference/output-formats.md
++++ b/website/src/content/docs/reference/output-formats.md
+@@ -282,3 +282,55 @@ Two salmon-relevant details on top of the base format:
+   (uncompressed)**, so every RAD produced before this feature, and every piscem
+   RAD, reads as uncompressed automatically. Decompression happens in the reader,
+   so record parsing downstream is identical for compressed and uncompressed RADs.
++
++## Mapping alignment output
++
++`salmon quant --writeMappings <FILE>` (alias `--writeSam`) writes the retained
++mappings as unsorted SAM records. `--writeBam <FILE>` writes semantically
++equivalent records as BGZF-compressed BAM. The options are mutually exclusive,
++and `--writeSam` names the SAM format explicitly so both formats have a
++format-named flag. Both share one header and one record builder, so the two
++formats cannot drift apart.
++
++Both options apply to the read-mapping path only. In alignment mode (`-a`) and
++RAD-input mode (`--rad`) they are accepted but ignored, with a warning.
++
++### Compression threads
++
++`--writeBam` compresses BGZF blocks on a small pool of threads that run
++alongside the `-p` mapping threads. `--bamCompressThreads <N>` sets the pool
++size; left unset, salmon derives it from measured throughput.
++
++One worker compresses about 165 MiB/s of BAM records, and one mapping thread
++produces at most about 52 MiB/s of them, so roughly **one compression worker per
++3 mapping threads** is the point at which compression stops limiting the run.
++That is the default, capped at 8 workers — already around three times the
++fastest record production measured at any thread count.
++
++The default deliberately errs upward but stops there. The two failure modes are
++not symmetric: one worker too few can halve throughput, because record output
++pins to a single worker's 165 MiB/s, while surplus workers simply block on an
++empty queue and cost nothing measurable. Going beyond the balance point,
++however, spends cores that would otherwise be mapping reads. Raise it if you are
++writing BAM to unusually fast storage and have cores to spare; there is no
++reason to lower it.
++
++### Record order
++
++Mapping workers run in parallel, and the output makes exactly one ordering
++guarantee:
++
++- **All records for a fragment are contiguous.** A worker encodes an entire
++  fragment before deciding to hand off its buffer, and buffers are written
++  whole, so a fragment is never split or interleaved with another worker's
++  records. Tools that stream a file and group by read name — the common reason
++  to want `samtools collate` — can read the output directly.
++- **Nothing else is ordered.** Fragments appear in whatever order workers finish
++  their buffers, which varies with thread count and scheduling. Sort the result
++  if a downstream tool needs coordinate or query-name order.
++
++The second point is deliberate rather than incidental: imposing a global record
++order would require workers to wait for one another. Only the parts that must be
++serial (copying bytes into BGZF blocks, and writing compressed blocks in
++submission order) are, while record encoding and block compression both run
++fully in parallel.

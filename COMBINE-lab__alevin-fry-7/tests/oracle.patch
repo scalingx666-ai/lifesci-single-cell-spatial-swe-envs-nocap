@@ -1,0 +1,1305 @@
+diff --git a/libradicl/Cargo.toml b/libradicl/Cargo.toml
+index 9008cf78..5680b2f8 100644
+--- a/libradicl/Cargo.toml
++++ b/libradicl/Cargo.toml
+@@ -14,6 +14,7 @@ slog-async = "2.5.0"
+ serde = { version = "1.0.114", features = ["derive"] }
+ bincode = "1.3.1"
+ csv = "1.1.3"
++dashmap = "3.11.10"
+ indicatif = "0.15.0"
+ crossbeam-channel = "0.4.3"
+ crossbeam-queue = "0.2.3"
+diff --git a/libradicl/src/collate.rs b/libradicl/src/collate.rs
+index 215ea58d..8227e5ba 100644
+--- a/libradicl/src/collate.rs
++++ b/libradicl/src/collate.rs
+@@ -4,34 +4,84 @@
+ 
+ extern crate bincode;
+ extern crate indicatif;
+-extern crate serde;
+ extern crate slog;
+ 
+ use self::indicatif::{ProgressBar, ProgressStyle};
+ use self::slog::{crit, info};
+ use bio_types::strand::Strand;
+-use serde_json::json;
++use crossbeam_queue::ArrayQueue;
++use dashmap::DashMap;
++use scroll::Pwrite;
+ use std::collections::HashMap;
+ use std::fs::File;
+ use std::io::BufReader;
+-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
++use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::thread;
+ 
+ use crate as libradicl;
+ 
+ pub fn collate(
+     input_dir: String,
+     rad_file: String,
++    num_threads: u32,
+     max_records: u32,
+     //expected_ori: Strand,
+     log: &slog::Logger,
+ ) -> Result<(), Box<dyn std::error::Error>> {
+     let parent = std::path::Path::new(&input_dir);
++    type TSVRec = (u64, u64);
++    let mut tsv_map = Vec::<TSVRec>::new(); //HashMap::<u64, u64>::new();
+ 
+-    // open the metadata file and read the json
+-    let meta_data_file = File::open(parent.join("generate_permit_list.json"))
+-        .expect("could not open the generate_permit_list.json file.");
+-    let mdata: serde_json::Value = serde_json::from_reader(meta_data_file)?;
++    let freq_file =
++        std::fs::File::open(parent.join("permit_freq.tsv")).expect("couldn't open file");
++    let mut rdr = csv::ReaderBuilder::new()
++        .has_headers(false)
++        .delimiter(b'\t')
++        .from_reader(freq_file);
++
++    let mut total_to_collate = 0;
++    for result in rdr.deserialize() {
++        let record: TSVRec = result?;
++        tsv_map.push(record);
++        total_to_collate += record.1;
++    }
++    // sort this so that we deal with largest cells (by # of reads) first
++    // sort in _descending_ order by count.
++    quickersort::sort_by_key(&mut tsv_map[..], |&a: &(u64, u64)| std::cmp::Reverse(a.1));
++
++    let est_num_rounds = (total_to_collate as f64 / max_records as f64).ceil() as u64;
++    info!(
++        log,
++        "estimated that collation would require {} passes over input.", est_num_rounds
++    );
++    if est_num_rounds > 2 {
++        info!(log, "executing temporary file scatter-gather strategy.");
++        collate_with_temp(
++            input_dir,
++            rad_file,
++            num_threads,
++            max_records,
++            tsv_map,
++            total_to_collate,
++            log,
++        )
++    } else {
++        info!(log, "executing multi-pass strategy.");
++        collate_in_memory_multipass(
++            input_dir,
++            rad_file,
++            num_threads,
++            max_records,
++            tsv_map,
++            total_to_collate,
++            log,
++        )
++    }
++}
+ 
++fn get_orientation(mdata: &serde_json::Value, log: &slog::Logger) -> Strand {
+     // next line is ugly — should be a better way.  We need a char to
+     // get the strand, so we get the correct field as a `str` then
+     // use the chars iterator and get the first char.
+@@ -48,6 +98,33 @@ pub fn collate(
+             std::process::exit(1);
+         }
+     };
++    expected_ori
++}
++
++pub fn collate_in_memory_multipass(
++    input_dir: String,
++    rad_file: String,
++    num_threads: u32,
++    max_records: u32,
++    tsv_map: Vec<(u64, u64)>,
++    total_to_collate: u64,
++    log: &slog::Logger,
++) -> Result<(), Box<dyn std::error::Error>> {
++    let parent = std::path::Path::new(&input_dir);
++
++    // open the metadata file and read the json
++    let meta_data_file = File::open(parent.join("generate_permit_list.json"))
++        .expect("could not open the generate_permit_list.json file.");
++    let mdata: serde_json::Value = serde_json::from_reader(meta_data_file)?;
++
++    let expected_ori = get_orientation(&mdata, log);
++
++    // because :
++    // https://superuser.com/questions/865710/write-to-newfile-vs-overwriting-performance-issue
++    let oname = parent.join("map.collated.rad");
++    if oname.exists() {
++        std::fs::remove_file(oname)?;
++    }
+ 
+     let mut ofile = File::create(parent.join("map.collated.rad")).unwrap();
+     let i_file = File::open(&rad_file).unwrap();
+@@ -93,33 +170,9 @@ pub fn collate(
+         std::io::copy(&mut br2.by_ref().take(pos), &mut ofile).expect("couldn't copy header.");
+     }
+ 
+-    let mut owriter = BufWriter::new(ofile);
+-
+-    type TSVRec = (u64, u64);
+-    let mut tsv_map = Vec::<(u64, u64)>::new(); //HashMap::<u64, u64>::new();
+-
+-    let freq_file =
+-        std::fs::File::open(parent.join("permit_freq.tsv")).expect("couldn't open file");
+-    let mut rdr = csv::ReaderBuilder::new()
+-        .has_headers(false)
+-        .delimiter(b'\t')
+-        .from_reader(freq_file);
+-
+-    let mut total_to_collate = 0;
+-    for result in rdr.deserialize() {
+-        let record: TSVRec = result?;
+-        tsv_map.push(record);
+-        total_to_collate += record.1;
+-    }
+-
+-    // sort this so that we deal with largest cells (by # of reads) first
+-    // sort in _descending_ order by count.
+-    quickersort::sort_by_key(&mut tsv_map[..], |&a: &(u64, u64)| std::cmp::Reverse(a.1));
+-    //println!("{:?}", tsv_map);
+-
+     // get the correction map
+     let cmfile = std::fs::File::open(parent.join("permit_map.bin")).unwrap();
+-    let correct_map: HashMap<u64, u64> = bincode::deserialize_from(&cmfile).unwrap();
++    let correct_map: Arc<HashMap<u64, u64>> = Arc::new(bincode::deserialize_from(&cmfile).unwrap());
+ 
+     info!(
+         log,
+@@ -127,31 +180,42 @@ pub fn collate(
+         correct_map.len()
+     );
+ 
+-    let mut pass_num = 1;
+     let cc = libradicl::ChunkConfig {
+         num_chunks: hdr.num_chunks,
+         bc_type: bct,
+         umi_type: umit,
+     };
+ 
+-    let mut output_cache = HashMap::<u64, libradicl::CorrectedCBChunk>::new();
++    let owriter = Arc::new(Mutex::new(BufWriter::with_capacity(1048576, ofile)));
++    let output_cache = Arc::new(DashMap::<u64, libradicl::CorrectedCBChunk>::new());
+     let mut allocated_records;
+     let mut total_allocated_records = 0;
+     let mut last_idx = 0;
+     let mut num_output_chunks = 0;
+ 
+-    let pbar = ProgressBar::new(total_to_collate);
+-    pbar.set_style(
+-        ProgressStyle::default_bar()
+-            .template(
+-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
+-            )
+-            .progress_chars("╢▌▌░╟"),
+-    );
++    let sty = ProgressStyle::default_bar()
++        .template(
++            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
++        )
++        .progress_chars("╢▌▌░╟");
++
++    let pbar_inner = ProgressBar::new(cc.num_chunks);
++    pbar_inner.set_style(sty);
++    pbar_inner.tick();
++
++    // create a thread-safe queue based on the number of worker threads
++    let n_workers = if num_threads > 1 {
++        (num_threads - 1) as usize
++    } else {
++        1
++    };
++    let q = Arc::new(ArrayQueue::<(usize, Vec<u8>)>::new(4 * n_workers));
+ 
+     while last_idx < tsv_map.len() {
+         allocated_records = 0;
+         output_cache.clear();
++        // the number of cells left to process
++        let chunks_to_process = Arc::new(AtomicUsize::new(cc.num_chunks as usize));
+ 
+         // The tsv_map tells us, for each "true" barcode
+         // how many records belong to it.  We can scan this information
+@@ -165,7 +229,6 @@ pub fn collate(
+             allocated_records += rec.1;
+             last_idx = i + 1;
+             if allocated_records >= (max_records as u64) {
+-                //info!(log, "pass {:?} will collate {:?} records", pass_num, allocated_records);
+                 break;
+             }
+         }
+@@ -174,18 +237,500 @@ pub fn collate(
+         total_allocated_records += allocated_records;
+         last_idx += init_offset;
+ 
+-        // collect the output for the current barcode set
+-        libradicl::collect_records(&mut br, &cc, &correct_map, &expected_ori, &mut output_cache);
+-
+-        // dump the output we have
+-        libradicl::dump_output_cache(&mut owriter, &output_cache, &cc);
++        let mut thread_handles: Vec<thread::JoinHandle<_>> = Vec::with_capacity(n_workers);
++        // for each worker, spawn off a thread
++        for _worker in 0..n_workers {
++            // each thread will need to access the work queue
++            let in_q = q.clone();
++            // the output cache and correction map
++            let oc = output_cache.clone();
++            let correct_map = correct_map.clone();
++            // the number of chunks remaining to be processed
++            let chunks_remaining = chunks_to_process.clone();
++            // and knowledge of the UMI and BC types
++            let bc_type =
++                libradicl::decode_int_type_tag(cc.bc_type).expect("unknown barcode type id.");
++            let umi_type =
++                libradicl::decode_int_type_tag(cc.umi_type).expect("unknown barcode type id.");
++            let owrite = owriter.clone();
++            // now, make the worker thread
++            let handle = std::thread::spawn(move || {
++                // pop from the work queue until everything is
++                // processed
++                while chunks_remaining.load(Ordering::SeqCst) > 0 {
++                    if let Ok((_chunk_num, buf)) = in_q.pop() {
++                        chunks_remaining.fetch_sub(1, Ordering::SeqCst);
++                        let mut nbr = BufReader::new(&buf[..]);
++                        libradicl::process_corrected_cb_chunk(
++                            &mut nbr,
++                            &bc_type,
++                            &umi_type,
++                            &correct_map,
++                            &expected_ori,
++                            &oc,
++                            &owrite,
++                        );
++                    }
++                }
++            });
++
++            thread_handles.push(handle);
++        } // for each worker
++
++        // read each chunk
++        pbar_inner.reset();
++        pbar_inner.set_message(&format!(
++            "processing {} / {} total records",
++            total_allocated_records, total_to_collate
++        ));
++        let mut buf = vec![0u8; 65536];
++        for cell_num in 0..(cc.num_chunks as usize) {
++            let (nbytes_chunk, nrec_chunk) = libradicl::Chunk::read_header(&mut br);
++            buf.resize(nbytes_chunk as usize, 0);
++            buf.pwrite::<u32>(nbytes_chunk, 0)?;
++            buf.pwrite::<u32>(nrec_chunk, 4)?;
++            br.read_exact(&mut buf[8..]).unwrap();
++            loop {
++                if !q.is_full() {
++                    let r = q.push((cell_num, buf.clone()));
++                    if r.is_ok() {
++                        pbar_inner.inc(1);
++                        break;
++                    }
++                }
++            }
++        }
++        pbar_inner.finish();
++
++        for h in thread_handles {
++            match h.join() {
++                Ok(_) => {}
++                Err(_e) => {
++                    info!(log, "thread panicked");
++                }
++            }
++        }
+ 
+         // reset the reader to start of the chunks
++        if total_allocated_records < total_to_collate {
++            br.get_ref().seek(SeekFrom::Start(pos)).unwrap();
++        }
++    }
++
++    // make sure we wrote the same number of records that our
++    // file suggested we should.
++    info!(
++        log,
++        "\n\ntotal_allocated_records = {}, total_to_collate = {}\n\n",
++        total_allocated_records,
++        total_to_collate
++    );
++    assert!(total_allocated_records == total_to_collate);
++
++    pbar_inner.finish_with_message("collated all records.");
++
++    info!(
++        log,
++        "writing num output chunks ({:?}) to header", num_output_chunks
++    );
++
++    owriter.lock().unwrap().flush()?;
++    owriter
++        .lock()
++        .unwrap()
++        .get_ref()
++        .seek(SeekFrom::Start(
++            end_header_pos - (std::mem::size_of::<u64>() as u64),
++        ))
++        .expect("couldn't seek in output file");
++    owriter
++        .lock()
++        .unwrap()
++        .write_all(&num_output_chunks.to_le_bytes())
++        .expect("couldn't write to output file.");
++
++    info!(log, "finished collating input rad file {:?}.", rad_file);
++    Ok(())
++}
++
++pub fn collate_with_temp(
++    input_dir: String,
++    rad_file: String,
++    num_threads: u32,
++    max_records: u32,
++    tsv_map: Vec<(u64, u64)>,
++    total_to_collate: u64,
++    log: &slog::Logger,
++) -> Result<(), Box<dyn std::error::Error>> {
++    let parent = std::path::Path::new(&input_dir);
++
++    let n_workers = if num_threads > 1 {
++        (num_threads - 1) as usize
++    } else {
++        1
++    };
++
++    // open the metadata file and read the json
++    let meta_data_file = File::open(parent.join("generate_permit_list.json"))
++        .expect("could not open the generate_permit_list.json file.");
++    let mdata: serde_json::Value = serde_json::from_reader(meta_data_file)?;
++
++    let expected_ori = get_orientation(&mdata, log);
++
++    // because :
++    // https://superuser.com/questions/865710/write-to-newfile-vs-overwriting-performance-issue
++    let oname = parent.join("map.collated.rad");
++    if oname.exists() {
++        std::fs::remove_file(oname)?;
++    }
++
++    let mut ofile = File::create(parent.join("map.collated.rad")).unwrap();
++    let i_file = File::open(&rad_file).unwrap();
++    let mut br = BufReader::new(i_file);
++
++    let hdr = libradicl::RADHeader::from_bytes(&mut br);
++
++    let end_header_pos =
++        br.get_ref().seek(SeekFrom::Current(0)).unwrap() - (br.buffer().len() as u64);
++
++    info!(
++        log,
++        "paired : {:?}, ref_count : {:?}, num_chunks : {:?}, expected_ori : {:?}",
++        hdr.is_paired != 0,
++        hdr.ref_count,
++        hdr.num_chunks,
++        expected_ori
++    );
++    // file-level
++    let fl_tags = libradicl::TagSection::from_bytes(&mut br);
++    info!(log, "read {:?} file-level tags", fl_tags.tags.len());
++    // read-level
++    let rl_tags = libradicl::TagSection::from_bytes(&mut br);
++    info!(log, "read {:?} read-level tags", rl_tags.tags.len());
++    // alignment-level
++    let al_tags = libradicl::TagSection::from_bytes(&mut br);
++    info!(log, "read {:?} alignemnt-level tags", al_tags.tags.len());
++
++    let ft_vals = libradicl::FileTags::from_bytes(&mut br);
++    info!(log, "File-level tag values {:?}", ft_vals);
++
++    let bct = rl_tags.tags[0].typeid;
++    let umit = rl_tags.tags[1].typeid;
++
++    let pos = br.get_ref().seek(SeekFrom::Current(0)).unwrap() - (br.buffer().len() as u64);
++
++    // copy the header
++    {
++        br.get_mut()
++            .seek(SeekFrom::Start(0))
++            .expect("could not get read pointer.");
++        let mut br2 = BufReader::new(br.get_ref());
++        std::io::copy(&mut br2.by_ref().take(pos), &mut ofile).expect("couldn't copy header.");
++    }
++
++    // get the correction map
++    let cmfile = std::fs::File::open(parent.join("permit_map.bin")).unwrap();
++    let correct_map: Arc<HashMap<u64, u64>> = Arc::new(bincode::deserialize_from(&cmfile).unwrap());
++
++    info!(
++        log,
++        "deserialized correction map of length : {:?}",
++        correct_map.len()
++    );
++
++    let cc = libradicl::ChunkConfig {
++        num_chunks: hdr.num_chunks,
++        bc_type: bct,
++        umi_type: umit,
++    };
++
++    let owriter = Arc::new(Mutex::new(BufWriter::with_capacity(1048576, ofile)));
++    // TODO: see if we can do this without the Arc
++    let mut output_cache = Arc::new(HashMap::<u64, Arc<libradicl::TempBucket>>::new());
++
++    // max_records is the max size of each intermediate file
++    let num_output_chunks = tsv_map.len() as u64;
++    let mut total_allocated_records = 0;
++    let mut allocated_records = 0;
++    let mut temp_buckets = vec![(
++        0,
++        0,
++        Arc::new(libradicl::TempBucket::from_id_and_parent(0, parent)),
++    )];
++
++    let max_records_per_thread = (max_records / n_workers as u32) + 1;
++    // The tsv_map tells us, for each "true" barcode
++    // how many records belong to it.  We can scan this information
++    // to determine what true barcodes we will keep in memory.
++    let mut num_bucket_chunks = 0u32;
++    {
++        let moutput_cache = Arc::make_mut(&mut output_cache);
++        for rec in tsv_map.iter() {
++            // corrected barcode points to the bucket
++            // file.
++            moutput_cache.insert(rec.0, temp_buckets.last().unwrap().2.clone());
++            allocated_records += rec.1;
++            num_bucket_chunks += 1;
++            if allocated_records >= (max_records_per_thread as u64) {
++                temp_buckets.last_mut().unwrap().0 = num_bucket_chunks;
++                temp_buckets.last_mut().unwrap().1 = allocated_records as u32;
++                let tn = temp_buckets.len() as u32;
++                temp_buckets.push((
++                    0,
++                    0,
++                    Arc::new(libradicl::TempBucket::from_id_and_parent(tn, parent)),
++                ));
++                total_allocated_records += allocated_records;
++                allocated_records = 0;
++                num_bucket_chunks = 0;
++            }
++        }
++    }
++    if num_bucket_chunks > 0 {
++        temp_buckets.last_mut().unwrap().0 = num_bucket_chunks;
++        temp_buckets.last_mut().unwrap().1 = allocated_records as u32;
++    }
++    total_allocated_records += allocated_records;
++    info!(log, "Generated {} temporary buckets.", temp_buckets.len());
++
++    let sty = ProgressStyle::default_bar()
++        .template(
++            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos:>7}/{len:7} {msg}",
++        )
++        .progress_chars("╢▌▌░╟");
++
++    let pbar_inner = ProgressBar::new(cc.num_chunks);
++    pbar_inner.set_style(sty.clone());
++    pbar_inner.tick();
++
++    // create a thread-safe queue based on the number of worker threads
++    let q = Arc::new(ArrayQueue::<(usize, Vec<u8>)>::new(4 * n_workers));
++
++    // the number of cells left to process
++    let chunks_to_process = Arc::new(AtomicUsize::new(cc.num_chunks as usize));
++
++    let mut thread_handles: Vec<thread::JoinHandle<_>> = Vec::with_capacity(n_workers);
++    // for each worker, spawn off a thread
++    for _worker in 0..n_workers {
++        // each thread will need to access the work queue
++        let in_q = q.clone();
++        // the output cache and correction map
++        let oc = output_cache.clone();
++        let correct_map = correct_map.clone();
++        // the number of chunks remaining to be processed
++        let chunks_remaining = chunks_to_process.clone();
++        // and knowledge of the UMI and BC types
++        let bc_type = libradicl::decode_int_type_tag(cc.bc_type).expect("unknown barcode type id.");
++        let umi_type =
++            libradicl::decode_int_type_tag(cc.umi_type).expect("unknown barcode type id.");
++        let nbuckets = temp_buckets.len();
++        let loc_temp_buckets = temp_buckets.clone();
++        //let owrite = owriter.clone();
++        // now, make the worker thread
++        let handle = std::thread::spawn(move || {
++            let mut local_buffers = vec![Cursor::new(vec![0u8; 524288]); nbuckets];
++
++            // pop from the work queue until everything is
++            // processed
++            while chunks_remaining.load(Ordering::SeqCst) > 0 {
++                if let Ok((_chunk_num, buf)) = in_q.pop() {
++                    chunks_remaining.fetch_sub(1, Ordering::SeqCst);
++                    let mut nbr = BufReader::new(&buf[..]);
++                    libradicl::dump_corrected_cb_chunk_to_temp_file(
++                        &mut nbr,
++                        &bc_type,
++                        &umi_type,
++                        &correct_map,
++                        &expected_ori,
++                        &oc,
++                        &mut local_buffers,
++                    );
++                }
++            }
++
++            // empty any remaining local buffers
++            for (bucket_id, lb) in local_buffers.iter().enumerate() {
++                let len = lb.position() as usize;
++                if len > 0 {
++                    let mut filebuf = loc_temp_buckets[bucket_id].2.bucket_writer.lock().unwrap();
++                    filebuf.write_all(&lb.get_ref()[0..len]).unwrap();
++                }
++            }
++        });
++
++        thread_handles.push(handle);
++    } // for each worker
++
++    // read each chunk
++    pbar_inner.reset();
++    pbar_inner.set_message(&format!(
++        "processing {} / {} total records",
++        total_allocated_records, total_to_collate
++    ));
++
++    // read chunks from the input file and pass them to the
++    // worker threads.
++    let mut buf = vec![0u8; 65536];
++    for cell_num in 0..(cc.num_chunks as usize) {
++        let (nbytes_chunk, nrec_chunk) = libradicl::Chunk::read_header(&mut br);
++        buf.resize(nbytes_chunk as usize, 0);
++        buf.pwrite::<u32>(nbytes_chunk, 0)?;
++        buf.pwrite::<u32>(nrec_chunk, 4)?;
++        br.read_exact(&mut buf[8..]).unwrap();
++        loop {
++            if !q.is_full() {
++                let r = q.push((cell_num, buf.clone()));
++                if r.is_ok() {
++                    pbar_inner.inc(1);
++                    break;
++                }
++            }
++        }
++    }
++    pbar_inner.finish();
++
++    // wait for the worker threads to finish
++    for h in thread_handles.drain(0..) {
++        match h.join() {
++            Ok(_) => {}
++            Err(_e) => {
++                info!(log, "thread panicked");
++            }
++        }
++    }
++    pbar_inner.finish_with_message("partitioned records into temporary files.");
++
++    // At this point, we are done with the "scatter"
++    // phase of writing the records to the corresponding
++    // intermediate files.  Now, we'll begin the gather
++    // phase of collating the temporary files and merging
++    // them into the final output file.
++
++    for (i, temp_bucket) in temp_buckets.iter().enumerate() {
++        // make sure we flush each temp bucket
++        temp_bucket
++            .2
++            .bucket_writer
++            .lock()
++            .unwrap()
++            .flush()
++            .expect("could not flush temporary output file!");
++        // a sanity check that we have the correct number of records
++        // and the expected number of bytes in each file
++        let expected = temp_bucket.1;
++        let observed = temp_bucket.2.num_records_written.load(Ordering::SeqCst);
++        assert!(expected == observed);
++
++        let md = std::fs::metadata(parent.join(&format!("bucket_{}.tmp", i)))?;
++        let expected_bytes = temp_bucket.2.num_bytes_written.load(Ordering::SeqCst);
++        let observed_bytes = md.len();
++        assert!(expected_bytes == observed_bytes);
++    }
++
++    // to hold the temp buckets threads will process
++    let fq = Arc::new(ArrayQueue::<(
++        u32,
++        u32,
++        std::sync::Arc<libradicl::TempBucket>,
++    )>::new(2 * n_workers));
++    // the number of cells left to process
++    let buckets_to_process = Arc::new(AtomicUsize::new(temp_buckets.len()));
++
++    let pbar_gather = ProgressBar::new(temp_buckets.len() as u64);
++    pbar_gather.set_style(sty);
++    pbar_gather.tick();
++
++    // for each worker, spawn off a thread
++    for _worker in 0..n_workers {
++        // each thread will need to access the work queue
++        let in_q = fq.clone();
++        // the output cache and correction map
++        let mut cmap = HashMap::<u64, libradicl::CorrectedCBChunk>::new();
++        // the number of chunks remaining to be processed
++        let buckets_remaining = buckets_to_process.clone();
++        // and knowledge of the UMI and BC types
++        let bc_type = libradicl::decode_int_type_tag(cc.bc_type).expect("unknown barcode type id.");
++        let umi_type =
++            libradicl::decode_int_type_tag(cc.umi_type).expect("unknown barcode type id.");
++        // have access to the input directory
++        let input_dir = input_dir.clone();
++        // the output file
++        let owriter = owriter.clone();
++        // and the progress bar
++        let pbar_gather = pbar_gather.clone();
++
++        // now, make the worker threads
++        let handle = std::thread::spawn(move || {
++            let parent = std::path::Path::new(&input_dir);
++            // pop from the work queue until everything is
++            // processed
++            while buckets_remaining.load(Ordering::SeqCst) > 0 {
++                if let Ok(temp_bucket) = in_q.pop() {
++                    buckets_remaining.fetch_sub(1, Ordering::SeqCst);
++                    cmap.clear();
++                    cmap.reserve(temp_bucket.0 as usize);
++
++                    let fname = parent.join(&format!("bucket_{}.tmp", temp_bucket.2.bucket_id));
++                    // create a new handle for reading
++                    let tfile = std::fs::File::open(&fname).expect("couldn't open temporary file.");
++                    let mut treader = BufReader::new(tfile);
++
++                    libradicl::collate_temporary_bucket(
++                        &mut treader,
++                        &bc_type,
++                        &umi_type,
++                        temp_bucket.0,
++                        temp_bucket.1,
++                        &mut cmap,
++                    );
++
++                    // we don't need the file or reader anymore
++                    std::fs::remove_file(fname).expect("could not delete temporary file.");
++                    drop(treader);
++
++                    // go through, add a header to each chunk
++                    // and flush the chunk to the global output
++                    // file
++                    for mut v in cmap.values_mut() {
++                        libradicl::dump_chunk(&mut v, &owriter);
++                    }
++                    pbar_gather.inc(1);
++                }
++            }
++        });
++        thread_handles.push(handle);
++    } // for each worker
++
++    // push the temporary buckets onto the work queue to be dispatched
++    // by the worker threads.
++    for temp_bucket in temp_buckets {
++        loop {
++            if !q.is_full() {
++                let r = fq.push(temp_bucket.clone());
++                if r.is_ok() {
++                    let expected = temp_bucket.1;
++                    let observed = temp_bucket.2.num_records_written.load(Ordering::SeqCst);
++                    assert!(expected == observed);
++                    break;
++                }
++            }
++        }
++    }
++
++    // wait for all of the workers to finish
++    for h in thread_handles.drain(0..) {
++        match h.join() {
++            Ok(_) => {}
++            Err(_e) => {
++                info!(log, "thread panicked");
++            }
++        }
++    }
++    pbar_gather.finish_with_message("gathered all temp files.");
++
++    // reset the reader to start of the chunks
++    if total_allocated_records < total_to_collate {
+         br.get_ref().seek(SeekFrom::Start(pos)).unwrap();
+-        pass_num += 1;
+-        //info!(log, "total collated {:?} / {:?}", total_allocated_records, total_to_collate);
+-        //info!(log, "last index processed {:?} / {:?}", last_idx, tsv_map.len());
+-        pbar.inc(allocated_records);
+     }
+ 
+     // make sure we wrote the same number of records that our
+@@ -196,18 +741,21 @@ pub fn collate(
+         log,
+         "writing num output chunks ({:?}) to header", num_output_chunks
+     );
+-    owriter.flush()?;
++
++    owriter.lock().unwrap().flush()?;
+     owriter
++        .lock()
++        .unwrap()
+         .get_ref()
+         .seek(SeekFrom::Start(
+             end_header_pos - (std::mem::size_of::<u64>() as u64),
+         ))
+         .expect("couldn't seek in output file");
+     owriter
++        .lock()
++        .unwrap()
+         .write_all(&num_output_chunks.to_le_bytes())
+         .expect("couldn't write to output file.");
+-    let pb_msg = format!("finished collating in {} passes", pass_num);
+-    pbar.finish_with_message(&pb_msg);
+ 
+     info!(log, "finished collating input rad file {:?}.", rad_file);
+     Ok(())
+diff --git a/libradicl/src/lib.rs b/libradicl/src/lib.rs
+index 7d488ec2..a25edbbb 100644
+--- a/libradicl/src/lib.rs
++++ b/libradicl/src/lib.rs
+@@ -11,13 +11,16 @@ extern crate sce;
+ extern crate scroll;
+ 
+ use bio_types::strand::*;
++use dashmap::DashMap;
+ use needletail::bitkmer::*;
+ use num::cast::AsPrimitive;
+ use scroll::Pread;
+ use std::collections::HashMap;
+ use std::fs::File;
+-use std::io::{BufRead, BufReader, Read};
++use std::io::{BufRead, BufReader, Cursor, Read};
+ use std::io::{BufWriter, Write};
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
+ use std::vec::Vec;
+ 
+ pub mod cellfilter;
+@@ -78,20 +81,29 @@ pub struct Chunk {
+ pub struct CorrectedCBChunk {
+     remaining_records: u64,
+     corrected_bc: u64,
+-    umis: Vec<u64>,
+-    ref_offsets: Vec<u32>,
+-    ref_ids: Vec<u32>,
++    nrec: u32,
++    data: Cursor<Vec<u8>>, /*,
++                           umis: Vec<u64>,
++                           ref_offsets: Vec<u32>,
++                           ref_ids: Vec<u32>,
++                           */
+ }
+ 
+ impl CorrectedCBChunk {
+     pub fn from_label_and_counter(corrected_bc_in: u64, num_remain: u64) -> CorrectedCBChunk {
+-        CorrectedCBChunk {
++        let mut cc = CorrectedCBChunk {
+             remaining_records: num_remain,
+             corrected_bc: corrected_bc_in,
+-            umis: Vec::<u64>::with_capacity(num_remain as usize),
+-            ref_offsets: Vec::<u32>::with_capacity(num_remain as usize),
+-            ref_ids: Vec::<u32>::with_capacity(3 * num_remain as usize),
+-        }
++            nrec: 0u32,
++            data: Cursor::new(Vec::<u8>::with_capacity((num_remain * 24) as usize))
++            //umis: Vec::<u64>::with_capacity(num_remain as usize),
++            //ref_offsets: Vec::<u32>::with_capacity(num_remain as usize),
++            //ref_ids: Vec::<u32>::with_capacity(3 * num_remain as usize),
++        };
++        let dummy = 0u32;
++        cc.data.write_all(&dummy.to_le_bytes()).unwrap();
++        cc.data.write_all(&dummy.to_le_bytes()).unwrap();
++        cc
+     }
+ }
+ 
+@@ -151,7 +163,7 @@ impl RADIntID {
+     pub fn write_to<T: PrimitiveInteger, U: Write>(
+         &self,
+         v: T,
+-        owriter: &mut BufWriter<U>,
++        owriter: &mut U,
+     ) -> std::io::Result<()> {
+         match self {
+             Self::U8 => {
+@@ -214,12 +226,13 @@ pub fn decode_int_type_tag(type_id: u8) -> Option<RADIntID> {
+     }
+ }
+ 
++/*
+ pub fn collect_records<T: Read>(
+     reader: &mut BufReader<T>,
+     chunk_config: &ChunkConfig,
+     correct_map: &HashMap<u64, u64>,
+     expected_ori: &Strand,
+-    output_cache: &mut HashMap<u64, CorrectedCBChunk>,
++    output_cache: &DashMap<u64, CorrectedCBChunk>,
+ ) {
+     // NOTE: since the chunks are independent, this part could be multithreaded
+     let bc_type = decode_int_type_tag(chunk_config.bc_type).expect("unknown barcode type id.");
+@@ -236,6 +249,7 @@ pub fn collect_records<T: Read>(
+         );
+     }
+ }
++*/
+ 
+ fn read_into_u64<T: Read>(reader: &mut BufReader<T>, rt: &RADIntID) -> u64 {
+     let mut rbuf = [0u8; 8];
+@@ -297,9 +311,9 @@ impl ReadRecord {
+         bct: &RADIntID,
+         umit: &RADIntID,
+     ) -> (u64, u64, u32) {
+-        let mut rbuf = [0u8; 255];
+-        reader.read_exact(&mut rbuf[0..4]).unwrap();
+-        let na = rbuf.pread::<u32>(0).unwrap();
++        let mut rbuf = [0u8; 4];
++        reader.read_exact(&mut rbuf).unwrap();
++        let na = u32::from_le_bytes(rbuf); //.pread::<u32>(0).unwrap();
+         let bc = read_into_u64(reader, bct);
+         let umi = read_into_u64(reader, umit);
+         (bc, umi, na)
+@@ -384,30 +398,66 @@ impl ReadRecord {
+     }
+ }
+ 
++#[inline]
++pub fn dump_chunk(v: &mut CorrectedCBChunk, owriter: &Mutex<BufWriter<File>>) {
++    v.data.set_position(0);
++    let nbytes = (v.data.get_ref().len()) as u32;
++    let nrec = v.nrec;
++    v.data.write_all(&nbytes.to_le_bytes()).unwrap();
++    v.data.write_all(&nrec.to_le_bytes()).unwrap();
++    owriter.lock().unwrap().write_all(v.data.get_ref()).unwrap();
++}
++
++pub fn collate_temporary_bucket<T: Read>(
++    reader: &mut BufReader<T>,
++    bct: &RADIntID,
++    umit: &RADIntID,
++    nchunks: u32,
++    nrec: u32,
++    output_cache: &mut HashMap<u64, CorrectedCBChunk>,
++) {
++    let mut tbuf = [0u8; 65536];
++    // estimated average number of records per barcode
++    // this is just for trying to pre-allocate buffers
++    // right; should not affect correctness
++    let est_num_rec = (nrec / nchunks) + 1;
++
++    // for each record, read it
++    for _ in 0..(nrec as usize) {
++        // read the header of the record
++        // we don't bother reading the whole thing here
++        // because we will just copy later as need be
++        let tup = ReadRecord::from_bytes_record_header(reader, &bct, &umit);
++
++        // get the entry for this chunk, or create a new one
++        let v = output_cache
++            .entry(tup.0)
++            .or_insert_with(|| CorrectedCBChunk::from_label_and_counter(tup.0, est_num_rec as u64));
++
++        // keep track of the number of records we're writing
++        (*v).nrec += 1;
++        // write the num align
++        let na = tup.2;
++        (*v).data.write_all(&na.to_le_bytes()).unwrap();
++        // write the corrected barcode
++        bct.write_to(tup.0, &mut (*v).data).unwrap();
++        umit.write_to(tup.1, &mut (*v).data).unwrap();
++        // read the alignment records
++        reader.read_exact(&mut tbuf[0..(4 * na as usize)]).unwrap();
++        // write them
++        (*v).data.write_all(&tbuf[..(4 * na as usize)]).unwrap();
++    }
++}
++
+ pub fn process_corrected_cb_chunk<T: Read>(
+     reader: &mut BufReader<T>,
+     bct: &RADIntID,
+     umit: &RADIntID,
+     correct_map: &HashMap<u64, u64>,
+     expected_ori: &Strand,
+-    output_cache: &mut HashMap<u64, CorrectedCBChunk>,
++    output_cache: &DashMap<u64, CorrectedCBChunk>,
++    owriter: &Mutex<BufWriter<File>>,
+ ) {
+-    /*
+-    let (s, r) = unbounded();
+-
+-    thread::spawn(
+-      |correct_map, output_cache| {
+-        for c in r.iter() {
+-             // update the corresponding corrected chunk entry
+-             v.umis.push(rr.umi);
+-             let ref_offset = v.ref_ids.len() as u32;
+-             v.ref_offsets.push(ref_offset);
+-             v.ref_ids.extend(&rr.refs);
+-             v.remaining_records -= 1;
+-        }
+-      }
+-    )
+-    */
+     let mut buf = [0u8; 8];
+     let mut tbuf = [0u8; 65536];
+ 
+@@ -429,19 +479,29 @@ pub fn process_corrected_cb_chunk<T: Read>(
+                 tup.2,
+                 expected_ori,
+             );
+-            if let Some(v) = output_cache.get_mut(corrected_id) {
++
++            if let Some(mut v) = output_cache.get_mut(corrected_id) {
+                 // update the corresponding corrected chunk entry
+                 v.remaining_records -= 1;
++                let last_record = v.remaining_records == 0;
+                 // if there are no alignments in the record
+                 // (potentially b/c of orientation filtering)
+                 // then don't push info on to the vector.
+                 if rr.is_empty() {
++                    if last_record {
++                        dump_chunk(&mut v, owriter);
++                    }
+                     continue;
+                 }
+-                v.umis.push(rr.umi);
+-                let ref_offset = v.ref_ids.len() as u32;
+-                v.ref_offsets.push(ref_offset);
+-                v.ref_ids.extend(&rr.refs);
++                v.nrec += 1;
++                let na = rr.refs.len() as u32;
++                v.data.write_all(&na.to_le_bytes()).unwrap();
++                bct.write_to(*corrected_id, &mut v.data).unwrap();
++                umit.write_to(rr.umi, &mut v.data).unwrap();
++                v.data.write_all(as_u8_slice(&rr.refs[..])).unwrap();
++                if last_record {
++                    dump_chunk(&mut v, owriter);
++                }
+             }
+         } else {
+             reader
+@@ -451,76 +511,199 @@ pub fn process_corrected_cb_chunk<T: Read>(
+     }
+ }
+ 
+-fn as_u8_slice(v: &[u32]) -> &[u8] {
+-    unsafe {
+-        std::slice::from_raw_parts(
+-            v.as_ptr() as *const u8,
+-            v.len() * std::mem::size_of::<u32>(),
+-        )
++pub struct TempBucket {
++    pub bucket_id: u32,
++    pub bucket_writer: Arc<Mutex<BufWriter<File>>>,
++    pub num_chunks: u32,
++    pub num_records: u32,
++    pub num_records_written: AtomicU32,
++    pub num_bytes_written: AtomicU64,
++}
++
++impl TempBucket {
++    pub fn from_id_and_parent(bucket_id: u32, parent: &std::path::Path) -> Self {
++        TempBucket {
++            bucket_id,
++            bucket_writer: Arc::new(Mutex::new(BufWriter::new(
++                File::create(parent.join(&format!("bucket_{}.tmp", bucket_id))).unwrap(),
++            ))),
++            num_chunks: 0u32,
++            num_records: 0u32,
++            num_records_written: AtomicU32::new(0u32),
++            num_bytes_written: AtomicU64::new(0u64),
++        }
+     }
+ }
+ 
+-pub fn dump_output_cache(
+-    mut owriter: &mut BufWriter<File>,
+-    output_cache: &HashMap<u64, CorrectedCBChunk>,
+-    chunk_config: &ChunkConfig,
++pub fn dump_corrected_cb_chunk_to_temp_file<T: Read>(
++    reader: &mut BufReader<T>,
++    bct: &RADIntID,
++    umit: &RADIntID,
++    correct_map: &HashMap<u64, u64>,
++    expected_ori: &Strand,
++    output_cache: &HashMap<u64, Arc<TempBucket>>,
++    local_buffers: &mut [Cursor<Vec<u8>>],
+ ) {
+-    // NOTE: since the chunks are independent, this part could be multithreaded
+-    let bc_type = decode_int_type_tag(chunk_config.bc_type).expect("unknown barcode type id.");
+-    let umi_type = decode_int_type_tag(chunk_config.umi_type).expect("unknown barcode type id.");
++    let mut buf = [0u8; 8];
++    let mut tbuf = vec![0u8; 65536];
++    //let mut tcursor = Cursor::new(tbuf);
++    //tcursor.set_position(0);
+ 
+-    for (_bc, chunk) in output_cache.iter() {
+-        // number of bytes
+-        let mut nbytes: u32 = 0;
+-        let bytes_for_u32 = std::mem::size_of::<u32>();
+-        let bytes_for_bc = bc_type.bytes_for_type();
+-        let bytes_for_umi = umi_type.bytes_for_type();
+-
+-        // for reference IDs in this chunk
+-        nbytes += (chunk.ref_ids.len() * bytes_for_u32) as u32;
+-        // umis
+-        nbytes += (chunk.umis.len() * bytes_for_umi) as u32;
+-        // barcodes
+-        nbytes += (chunk.umis.len() * bytes_for_bc) as u32;
+-        // num alignment fields
+-        nbytes += (chunk.umis.len() * bytes_for_u32) as u32;
+-
+-        let nrec = chunk.umis.len() as u32;
+-
+-        owriter
+-            .write_all(&nbytes.to_le_bytes())
+-            .expect("couldn't write output.");
+-        owriter
+-            .write_all(&nrec.to_le_bytes())
+-            .expect("couldn't write output.");
+-
+-        for i in 0..chunk.umis.len() {
+-            let s = chunk.ref_offsets[i];
+-            let e = if i == chunk.umis.len() - 1 {
+-                chunk.ref_ids.len() as u32
+-            } else {
+-                chunk.ref_offsets[i + 1]
+-            };
++    // get the number of bytes and records for
++    // the next chunk
++    reader.read_exact(&mut buf).unwrap();
++    let _nbytes = buf.pread::<u32>(0).unwrap();
++    let nrec = buf.pread::<u32>(4).unwrap();
++
++    let bc_bytes = bct.bytes_for_type();
++    let umi_bytes = bct.bytes_for_type();
++    let na_bytes = std::mem::size_of::<u32>();
++    let target_id_bytes = std::mem::size_of::<u32>();
+ 
+-            // num alignments
+-            let num_aln = (e - s) as u32;
+-            owriter
+-                .write_all(&num_aln.to_le_bytes())
+-                .expect("couldn't write output.");
+-
+-            bc_type
+-                .write_to(*_bc, &mut owriter)
+-                .expect("couldn't write output.");
+-            umi_type
+-                .write_to(chunk.umis[i], &mut owriter)
+-                .expect("couldn't write output.");
+-            owriter
+-                .write_all(as_u8_slice(&chunk.ref_ids[(s as usize)..(e as usize)]))
+-                .expect("couldn't write output.");
++    // for each record, read it
++    for _ in 0..(nrec as usize) {
++        let tup = ReadRecord::from_bytes_record_header(reader, &bct, &umit);
++        //let rr = ReadRecord::from_bytes_keep_ori(reader, &bct, &umit, expected_ori);
++        // if this record had a correct or correctable barcode
++        if let Some(corrected_id) = correct_map.get(&tup.0) {
++            let rr = ReadRecord::from_bytes_with_header_keep_ori(
++                reader,
++                tup.0,
++                tup.1,
++                tup.2,
++                expected_ori,
++            );
++
++            if rr.is_empty() {
++                continue;
++            }
++            if let Some(v) = output_cache.get(corrected_id) {
++                // if this is a valid barcode, then
++                // write the corresponding entry to the
++                // thread-local buffer for this bucket
++
++                // update number of written records
++                v.num_records_written.fetch_add(1, Ordering::SeqCst);
++                let nb = (rr.refs.len() * target_id_bytes + na_bytes + bc_bytes + umi_bytes) as u64;
++
++                v.num_bytes_written.fetch_add(nb, Ordering::SeqCst);
++                let buffidx = v.bucket_id as usize;
++                let bcursor = &mut local_buffers[buffidx];
++                let na = rr.refs.len() as u32;
++                bcursor.write_all(&na.to_le_bytes()).unwrap();
++                bct.write_to(*corrected_id, bcursor).unwrap();
++                umit.write_to(rr.umi, bcursor).unwrap();
++                bcursor.write_all(as_u8_slice(&rr.refs[..])).unwrap();
++                let len = bcursor.position() as usize;
++
++                // if the thread-local buffer for this bucket is
++                // greater than the flush size, then flush to file
++                if len > 65536 {
++                    let mut filebuf = v.bucket_writer.lock().unwrap();
++                    filebuf
++                        .write_all(&bcursor.get_ref()[0..len as usize])
++                        .unwrap();
++                    // and reset the local buffer cursor
++                    bcursor.set_position(0);
++                }
++            }
++        } else {
++            reader
++                .read_exact(&mut tbuf[0..(target_id_bytes * (tup.2 as usize))])
++                .unwrap();
+         }
+     }
+ }
+ 
++fn as_u8_slice(v: &[u32]) -> &[u8] {
++    unsafe {
++        std::slice::from_raw_parts(
++            v.as_ptr() as *const u8,
++            v.len() * std::mem::size_of::<u32>(),
++        )
++    }
++}
++
++//pub fn dump_output_cache(
++//    mut owriter: &mut BufWriter<File>,
++//    output_cache: &DashMap<u64, CorrectedCBChunk>,
++//    chunk_config: &ChunkConfig,
++//) {
++//    // NOTE: since the chunks are independent, this part could be multithreaded
++//    let bc_type = decode_int_type_tag(chunk_config.bc_type).expect("unknown barcode type id.");
++//    let umi_type = decode_int_type_tag(chunk_config.umi_type).expect("unknown barcode type id.");
++//
++//    for entry_ref in output_cache.iter() {
++//        let _bc = entry_ref.key();
++//        let chunk = entry_ref.value();
++//        // number of bytes
++//        let mut nbytes: u32 = 0;
++//        let bytes_for_u32 = std::mem::size_of::<u32>();
++//
++//        let bytes_for_bc = bc_type.bytes_for_type();
++//        let bytes_for_umi = umi_type.bytes_for_type();
++//
++//        // new
++//        /*nbytes += chunk.data.get_ref().len() as u32;
++//        owriter
++//            .write_all(&nbytes.to_le_bytes())
++//            .expect("couldn't write output.");
++//        let nrec = chunk.nrec;
++//        owriter
++//            .write_all(&nrec.to_le_bytes())
++//            .expect("couldn't write output.");
++//        */
++//        owriter
++//            .write_all(&chunk.data.get_ref())
++//            .expect("couldn't write output.");
++//        // end new
++//        /*
++//        // for reference IDs in this chunk
++//        nbytes += (chunk.ref_ids.len() * bytes_for_u32) as u32;
++//        // umis
++//        nbytes += (chunk.umis.len() * bytes_for_umi) as u32;
++//        // barcodes
++//        nbytes += (chunk.umis.len() * bytes_for_bc) as u32;
++//        // num alignment fields
++//        nbytes += (chunk.umis.len() * bytes_for_u32) as u32;
++//
++//        let nrec = chunk.umis.len() as u32;
++//
++//        owriter
++//            .write_all(&nbytes.to_le_bytes())
++//            .expect("couldn't write output.");
++//        owriter
++//            .write_all(&nrec.to_le_bytes())
++//            .expect("couldn't write output.");
++//
++//        for i in 0..chunk.umis.len() {
++//            let s = chunk.ref_offsets[i];
++//            let e = if i == chunk.umis.len() - 1 {
++//                chunk.ref_ids.len() as u32
++//            } else {
++//                chunk.ref_offsets[i + 1]
++//            };
++//
++//            // num alignments
++//            let num_aln = (e - s) as u32;
++//            owriter
++//                .write_all(&num_aln.to_le_bytes())
++//                .expect("couldn't write output.");
++//
++//            bc_type
++//                .write_to(*_bc, &mut owriter)
++//                .expect("couldn't write output.");
++//            umi_type
++//                .write_to(chunk.umis[i], &mut owriter)
++//                .expect("couldn't write output.");
++//            owriter
++//                .write_all(as_u8_slice(&chunk.ref_ids[(s as usize)..(e as usize)]))
++//                .expect("couldn't write output.");
++//        }
++//        */
++//    }
++//}
++
+ impl Chunk {
+     pub fn read_header<T: Read>(reader: &mut BufReader<T>) -> (u32, u32) {
+         let mut buf = [0u8; 8];
+diff --git a/libradicl/src/quant.rs b/libradicl/src/quant.rs
+index ac4c0273..0ee1297a 100644
+--- a/libradicl/src/quant.rs
++++ b/libradicl/src/quant.rs
+@@ -22,7 +22,7 @@ use crossbeam_queue::ArrayQueue;
+ use needletail::bitkmer::*;
+ use scroll::Pwrite;
+ use serde_json::json;
+-use smallvec::{smallvec, SmallVec};
++use smallvec::SmallVec;
+ use std::collections::HashMap;
+ use std::fs;
+ use std::fs::File;
+@@ -748,7 +748,7 @@ pub fn quantify(
+     let mut buf = vec![0u8; 65536];
+     for cell_num in 0..(hdr.num_chunks as usize) {
+         let (nbytes_chunk, nrec_chunk) = libradicl::Chunk::read_header(&mut br);
+-        buf.resize(nbytes_chunk as usize + 8, 0);
++        buf.resize(nbytes_chunk as usize, 0);
+         buf.pwrite::<u32>(nbytes_chunk, 0)?;
+         buf.pwrite::<u32>(nrec_chunk, 4)?;
+         br.read_exact(&mut buf[8..]).unwrap();
+diff --git a/src/main.rs b/src/main.rs
+index a55a8a04..31c3bc40 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -79,8 +79,9 @@ fn main() {
+     .author(crate_authors)
+     .arg(Arg::from("-i, --input-dir=<input-dir> 'input directory made by generate-permit-list'"))
+     .arg(Arg::from("-r, --rad-file=<rad-file> 'the RAD file to be collated'"))
++    .arg(Arg::from("-t, --threads 'number of threads to use for processing'").default_value(&max_num_threads))
+     .arg(Arg::from("-m, --max-records=[max-records] 'the maximum number of read records to keep in memory at once'")
+-         .default_value("10000000"));
++         .default_value("50000000"));
+     //.arg(Arg::from("-e, --expected-ori=[expected-ori] 'the expected orientation of alignments'")
+     //     .default_value("fw"));
+ 
+@@ -204,8 +205,9 @@ fn main() {
+     if let Some(ref t) = opts.subcommand_matches("collate") {
+         let input_dir: String = t.value_of_t("input-dir").unwrap();
+         let rad_file: String = t.value_of_t("rad-file").unwrap();
++        let num_threads = t.value_of_t("threads").unwrap();
+         let max_records: u32 = t.value_of_t("max-records").unwrap();
+-        libradicl::collate::collate(input_dir, rad_file, max_records, &log)
++        libradicl::collate::collate(input_dir, rad_file, num_threads, max_records, &log)
+             .expect("could not collate.");
+     }
+ 

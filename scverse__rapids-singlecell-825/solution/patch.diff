@@ -1,0 +1,236 @@
+diff --git a/docs/release-notes/0.18.0.md b/docs/release-notes/0.18.0.md
+index 1e709c00a..392055894 100644
+--- a/docs/release-notes/0.18.0.md
++++ b/docs/release-notes/0.18.0.md
+@@ -12,6 +12,7 @@
+ * Add Over Representation Analysis with {func}`~rapids_singlecell.dcg.ora` for matrices and {func}`~rapids_singlecell.dcg.query_set` for gene lists. {pr}`806` {smaller}`S Dicks`
+ * Bundle a version-matched agent analysis skill with the package, installed with `rapids-singlecell-install-skills` and checked with `rapids-singlecell-check-kernel` (see {ref}`Agent skill <agent-skill>`). {pr}`739` {smaller}`S Dicks & L Heumos`
+ * Speed up {func}`~rapids_singlecell.tl.umap` on large graphs; ``rng=None`` uses cuML's faster unseeded optimizer {pr}`822` {smaller}`S Dicks`
++* Speed up {func}`~rapids_singlecell.pp.neighbors` with ``algorithm="all_neighbors"`` on large datasets {pr}`825` {smaller}`S Dicks`
+ 
+ ```{rubric} Bug fixes
+ ```
+@@ -20,6 +21,7 @@
+ * Preserve existing `.obs` metadata, including categorical dtypes, when running {func}`~rapids_singlecell.pp.scrublet` with `batch_key`.
+ {pr}`817` {smaller}`S Dicks`
+ * Fix incorrect energy distances in {class}`~rapids_singlecell.ptg.Distance` for Fortran-ordered inputs. {pr}`818` {smaller}`S Dicks`
++* Fix wrong neighbors from {func}`~rapids_singlecell.pp.neighbors` with ``algorithm="ivfflat"`` for more than 2**32 query values {pr}`825` {smaller}`S Dicks`
+ * Use 200 epochs in {func}`~rapids_singlecell.tl.umap` for more than 10,000 cells, like scanpy {pr}`827` {smaller}`S Dicks`
+ 
+ ```{rubric} Upcoming deprecations
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/__init__.py b/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
+index c2aa55566..6ebc93ae7 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
+@@ -24,6 +24,7 @@
+     _Algorithms,
+     _build_sparse_distances,
+     _calc_connectivities,
++    _large_coo_to_host_csr,
+     _Metrics,
+ )
+ from rapids_singlecell.tools._utils import _choose_representation
+@@ -147,7 +148,7 @@ def neighbors(
+ 
+         * 'n_clusters': Number of clusters/batches to partition the dataset into (> overlap_factor). Default is 1 if the data fits on a single GPU, otherwise sized to the data and free memory (e.g. 24 for 100M cells on 8 GPUs).
+ 
+-        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 unbatched, 2 with automatic `n_clusters` and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` otherwise. Lower values are faster but lose neighbors at cluster boundaries.
++        * 'overlap_factor': Number of clusters each point is assigned to. Must be < n_clusters when the build is batched (`n_clusters > 1`). Default is 1 unbatched, 2 with automatic `n_clusters` or clusters of at least 20,000 cells, and `min(max(2, ceil(log2(n_clusters))), n_clusters - 1)` for smaller ones. Lower values are faster but lose neighbors at cluster boundaries.
+ 
+         * 'n_lists': Number of inverted lists for IVF indexing. Default is 2 * next_power_of_2(sqrt(n_samples)). Only available for `ivf_pq` algorithm.
+ 
+@@ -224,6 +225,8 @@ def neighbors(
+         algorithm_kwds=algorithm_kwds,
+     )
+     knn_dist = _fix_self_distances(knn_dist, metric)
++    # free the GPU copy of the representation: the connectivities need the memory for large data
++    del X, X_contiguous
+ 
+     params = dict(
+         n_neighbors=n_neighbors,
+@@ -248,7 +251,11 @@ def neighbors(
+         metric=metric,
+     )
+     if connectivities.nnz >= np.iinfo(np.int32).max:
+-        connectivities = connectivities.get().tocsr()
++        connectivities = (
++            _large_coo_to_host_csr(connectivities)
++            if connectivities.format == "coo"  # gauss and jaccard return CSR
++            else connectivities.get().tocsr()
++        )
+     else:
+         connectivities = connectivities.tocsr().get()
+ 
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_all_neighbors.py b/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_all_neighbors.py
+index 144babc54..f75704cff 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_all_neighbors.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_all_neighbors.py
+@@ -30,12 +30,17 @@
+ _MEMORY_FRACTION = 0.5  # share of free memory a build may use
+ # cuVS nn-descent overflows int32 indices (rows x 32 samples) beyond this many rows
+ _NN_DESCENT_MAX_ROWS = 2**31 // 32
++# Clusters this large keep their recall with the default overlap (measured on 0.2-10M cells:
++# within 0.001 of the log2 rule, at 2-3x the speed); only smaller ones need more.
++_MIN_CLUSTER_ROWS = 20_000
+ 
+ 
+-def _default_overlap_factor(n_clusters: int) -> int:
++def _default_overlap_factor(n_clusters: int, n_obs: int = 0) -> int:
+     """Overlap needed to hold recall as the dataset is split into more clusters."""
+     if n_clusters <= 1:
+         return 1
++    if n_obs * _DEFAULT_OVERLAP_FACTOR / n_clusters >= _MIN_CLUSTER_ROWS:
++        return _DEFAULT_OVERLAP_FACTOR
+     return max(2, math.ceil(math.log2(n_clusters)))
+ 
+ 
+@@ -114,7 +119,7 @@ def _all_neighbors_batching(
+             while n_clusters <= overlap_factor:
+                 n_clusters += n_devices
+     if overlap_factor is None:
+-        overlap_factor = _default_overlap_factor(n_clusters)
++        overlap_factor = _default_overlap_factor(n_clusters, shape[0])
+         if n_clusters > 1:
+             overlap_factor = min(overlap_factor, n_clusters - 1)
+     if n_clusters > 1 and overlap_factor >= n_clusters:
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfflat.py b/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfflat.py
+index 791819c89..4e1973d86 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfflat.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfflat.py
+@@ -6,6 +6,7 @@
+ import cupy as cp
+ 
+ from rapids_singlecell.preprocessing._neighbors._helper import (
++    _batched_search,
+     _compute_nlist,
+     _cuvs_switch,
+ )
+@@ -50,7 +51,9 @@ def _ivf_flat_knn(
+ 
+     # Create SearchParams with nprobes if provided
+     search_params = ivf_flat.SearchParams(n_probes=n_probes)
+-    distances, neighbors = ivf_flat.search(search_params, index, Y, k, **search_kwargs)
++    distances, neighbors = _batched_search(
++        lambda q: ivf_flat.search(search_params, index, q, k, **search_kwargs), Y
++    )
+ 
+     if resources is not None:
+         resources.sync()
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfpq.py b/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfpq.py
+index 3deb94b05..a1a7a780c 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfpq.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_algorithms/_ivfpq.py
+@@ -6,6 +6,7 @@
+ import cupy as cp
+ 
+ from rapids_singlecell.preprocessing._neighbors._helper import (
++    _batched_search,
+     _compute_nlist,
+     _cuvs_switch,
+ )
+@@ -50,7 +51,9 @@ def _ivf_pq_knn(
+     index = ivf_pq.build(index_params, X, **build_kwargs)
+     # Create SearchParams with nprobes if provided
+     search_params = ivf_pq.SearchParams(n_probes=n_probes)
+-    distances, neighbors = ivf_pq.search(search_params, index, Y, k, **search_kwargs)
++    distances, neighbors = _batched_search(
++        lambda q: ivf_pq.search(search_params, index, q, k, **search_kwargs), Y
++    )
+     if resources is not None:
+         resources.sync()
+ 
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py b/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py
+index 7f3f01cef..2fbaa1b81 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py
+@@ -115,6 +115,22 @@ def _check_metrics(algorithm: _Algorithms, metric: _Metrics) -> bool:
+     return True
+ 
+ 
++# cuVS IVF searches return wrong neighbors for queries beyond the 2**32nd value of one query array
++_MAX_QUERY_VALUES = 2**31
++
++
++def _batched_search(search, Y: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
++    """``search(Y)`` (returning distances, neighbors), in batches of queries small enough for cuVS."""
++    rows = max(1, _MAX_QUERY_VALUES // Y.shape[1])
++    parts = [search(Y[start : start + rows]) for start in range(0, Y.shape[0], rows)]
++    if len(parts) == 1:
++        return parts[0]
++    return (
++        cp.concatenate([cp.asarray(d) for d, _ in parts]),
++        cp.concatenate([cp.asarray(n) for _, n in parts]),
++    )
++
++
+ def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:
+     """Ensure zero self-distances for all definitionally applicable metrics.
+ 
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py b/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py
+index 6fee8684f..4db9ad47b 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py
+@@ -131,6 +131,26 @@ def _build_sparse_distances(
+     return distances.get()
+ 
+ 
++def _large_coo_to_host_csr(coo: cp_sparse.coo_matrix) -> sc_sparse.csr_matrix:
++    """Host CSR of a GPU COO matrix with too many entries for CuPy's 32-bit CSR.
++
++    The graphs cuML builds are sorted by row and column, so only the row pointers
++    have to be computed (on the GPU), instead of converting billions of entries on the host.
++    """
++    row, col = coo.row, coo.col
++    canonical = (row[1:] > row[:-1]) | ((row[1:] == row[:-1]) & (col[1:] > col[:-1]))
++    if not bool(cp.all(canonical)):
++        return coo.get().tocsr()
++    del canonical
++    indptr = cp.zeros(coo.shape[0] + 1, dtype=cp.int64)
++    cp.cumsum(cp.bincount(row, minlength=coo.shape[0]), out=indptr[1:])
++    csr = sc_sparse.csr_matrix(
++        (coo.data.get(), col.get(), indptr.get()), shape=coo.shape
++    )
++    csr.has_canonical_format = True
++    return csr
++
++
+ def _get_connectivities_umap(
+     knn_indices: cp.ndarray,
+     knn_dist: cp.ndarray,
+diff --git a/tests/test_mg_neighbors.py b/tests/test_mg_neighbors.py
+index cd65237fb..579c2fc6e 100644
+--- a/tests/test_mg_neighbors.py
++++ b/tests/test_mg_neighbors.py
+@@ -123,6 +123,8 @@ def test_all_neighbors_batching_overrides():
+ 
+     assert _all_neighbors_batching({"n_clusters": 16}) == (16, 4)
+     assert _all_neighbors_batching({"n_clusters": 8, "overlap_factor": 2}) == (8, 2)
++    # large clusters keep the default overlap
++    assert _all_neighbors_batching({"n_clusters": 44}, (100_000_000, 50), 15) == (44, 2)
+     # The default overlap is capped at n_clusters - 1, so small explicit cluster
+     # counts stay usable instead of tripping the guard below.
+     assert _all_neighbors_batching({"n_clusters": 2}) == (2, 1)
+diff --git a/tests/test_neighbors.py b/tests/test_neighbors.py
+index 561b654e8..87d69cfaa 100644
+--- a/tests/test_neighbors.py
++++ b/tests/test_neighbors.py
+@@ -158,6 +158,19 @@ def test_ivf_algorithm_kwds(algo):
+     )
+ 
+ 
++def test_ivfflat_batched_search(monkeypatch):
++    from rapids_singlecell.preprocessing._neighbors import _helper
++
++    adata = pbmc68k_reduced()
++    # all lists probed: exact, so independent of the index's clustering
++    kwds = {"n_lists": 10, "n_probes": 10}
++    neighbors(adata, n_neighbors=15, algorithm="ivfflat", algorithm_kwds=kwds)
++    ref = adata.obsp["distances"].copy()
++    monkeypatch.setattr(_helper, "_MAX_QUERY_VALUES", 50 * 100)  # batches of 100 cells
++    neighbors(adata, n_neighbors=15, algorithm="ivfflat", algorithm_kwds=kwds)
++    assert (adata.obsp["distances"] != ref).nnz == 0
++
++
+ @pytest.mark.parametrize("algo", ["nn_descent", "ivfpq"])
+ def test_indices_approx_nn(algo):
+     adata = pbmc68k_reduced()

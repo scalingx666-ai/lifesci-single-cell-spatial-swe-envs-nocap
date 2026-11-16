@@ -1,0 +1,764 @@
+diff --git a/omicverse/external/monocle2_py/dimension_reduction.py b/omicverse/external/monocle2_py/dimension_reduction.py
+index b9bcadb46..1428fcda5 100644
+--- a/omicverse/external/monocle2_py/dimension_reduction.py
++++ b/omicverse/external/monocle2_py/dimension_reduction.py
+@@ -5,6 +5,7 @@
+ """
+ 
+ import numpy as np
++from patsy import PatsyError, dmatrix
+ from scipy import sparse
+ from scipy.sparse import csr_matrix
+ from scipy.spatial.distance import pdist, squareform
+@@ -18,6 +19,94 @@
+ _FAST_HINT_SHOWN = False
+ 
+ 
++def _residualize_model_effects(FM, obs, residual_model_formula):
++    """Regress phenotype effects from a genes-by-cells expression matrix.
++
++    This mirrors the ``residualModelFormulaStr`` stage in R Monocle 2's
++    ``reduceDimension``: build a model matrix from cell metadata, fit every
++    gene jointly by least squares, retain the intercept, and subtract the
++    fitted contribution of all other terms.
++
++    Parameters
++    ----------
++    FM : np.ndarray
++        Normalized expression matrix with shape ``(genes, cells)``.
++    obs : pandas.DataFrame
++        Cell metadata. Its row order must match the columns of ``FM``.
++    residual_model_formula : str
++        Patsy/R-style formula such as ``"~ batch"`` or
++        ``"~ batch + percent_mito"``. An intercept is required; use the
++        conventional ``~ batch`` form rather than ``~ 0 + batch``.
++
++    Returns
++    -------
++    residualized : np.ndarray
++        Expression with non-intercept model effects removed.
++    metadata : dict
++        JSON-serializable audit metadata for ``adata.uns['monocle']``.
++    """
++    if not isinstance(residual_model_formula, str) or not residual_model_formula.strip():
++        raise ValueError("residualModelFormulaStr must be a non-empty formula string")
++
++    try:
++        design_df = dmatrix(
++            residual_model_formula,
++            data=obs,
++            return_type="dataframe",
++            NA_action="raise",
++        )
++    except (PatsyError, KeyError, TypeError, ValueError) as exc:
++        raise ValueError(
++            f"Invalid residualModelFormulaStr {residual_model_formula!r}: {exc}"
++        ) from exc
++
++    if len(design_df) != FM.shape[1]:
++        raise ValueError(
++            "residualModelFormulaStr changed the number of cells; missing metadata "
++            "must be resolved before trajectory inference"
++        )
++
++    columns = list(design_df.columns)
++    if "Intercept" not in columns:
++        raise ValueError(
++            "residualModelFormulaStr must include an intercept; use '~ batch' "
++            "instead of '~ 0 + batch' or '~ batch - 1'"
++        )
++
++    design = np.asarray(design_df, dtype=np.float64)
++    if not np.all(np.isfinite(design)):
++        raise ValueError("residualModelFormulaStr produced non-finite design values")
++
++    rank = int(np.linalg.matrix_rank(design))
++    if rank < design.shape[1]:
++        raise ValueError(
++            "residualModelFormulaStr produced a rank-deficient design matrix "
++            f"(rank {rank} < {design.shape[1]} columns). Remove nested or "
++            "redundant covariates before trajectory inference."
++        )
++
++    effect_mask = np.asarray([name != "Intercept" for name in columns])
++    if not effect_mask.any():
++        adjusted = np.array(FM, dtype=np.float64, copy=True)
++    else:
++        # Solve all genes at once: design is cells x terms and FM.T is
++        # cells x genes. Retain the intercept and subtract only covariate
++        # contributions, matching R Monocle 2's beta[, -1] behavior for
++        # ordinary formulas with an intercept.
++        coefficients = np.linalg.lstsq(design, FM.T, rcond=None)[0]
++        fitted_effects = design[:, effect_mask] @ coefficients[effect_mask, :]
++        adjusted = (FM.T - fitted_effects).T
++
++    metadata = {
++        "formula": residual_model_formula,
++        "design_columns": columns,
++        "design_rank": rank,
++        "n_cells": int(design.shape[0]),
++        "n_terms": int(design.shape[1]),
++    }
++    return adjusted, metadata
++
++
+ def _cal_ncenter(ncells, ncells_limit=100, auto_scale=True):
+     """Calculate number of centers for DDRTree.
+ 
+@@ -114,7 +203,8 @@ def _normalize_expr_data(adata, norm_method='log', pseudo_expr=1):
+ 
+ def reduce_dimension(adata, max_components=2, reduction_method='DDRTree',
+                      norm_method='log', pseudo_expr=1, auto_param_selection=True,
+-                     verbose=False, scaling=True, random_state=2016, **kwargs):
++                     verbose=False, scaling=True, random_state=2016,
++                     residualModelFormulaStr=None, **kwargs):
+     """
+     Reduce dimensionality of the data.
+ 
+@@ -139,6 +229,11 @@ def reduce_dimension(adata, max_components=2, reduction_method='DDRTree',
+         Seed used for stochastic initialisation (tSNE, K-means, ICA).
+         Does NOT mutate numpy's global RNG — pass it through to
+         scikit-learn estimators directly.
++    residualModelFormulaStr : str or None
++        Patsy/R-style model formula specifying cell-level effects to remove
++        after normalization and before scaling and dimension reduction, for
++        example ``"~ batch"`` or ``"~ batch + percent_mito"``. The formula
++        must include an intercept and reference columns in ``adata.obs``.
+     **kwargs : dict
+         Additional arguments passed to DDRTree or other methods.
+ 
+@@ -147,6 +242,9 @@ def reduce_dimension(adata, max_components=2, reduction_method='DDRTree',
+     adata with updated .obsm, .uns['monocle'] fields
+     """
+     _init_monocle_uns(adata)
++    # This field describes the current reduction only. Avoid retaining stale
++    # correction metadata if the same object is reduced again without a model.
++    adata.uns['monocle'].pop('residual_model', None)
+ 
+     # Normalize expression
+     FM, use_mask, gene_names = _normalize_expr_data(adata, norm_method, pseudo_expr)
+@@ -157,6 +255,38 @@ def reduce_dimension(adata, max_components=2, reduction_method='DDRTree',
+     nonzero_var = xsd > 0
+     FM = FM[nonzero_var, :]
+ 
++    if residualModelFormulaStr is not None:
++        FM, residual_model = _residualize_model_effects(
++            FM, adata.obs, residualModelFormulaStr,
++        )
++        # A gene explained entirely by the residual model has no remaining
++        # trajectory information. Drop it before z-scoring and DDRTree.
++        residual_sd = FM.std(axis=1, ddof=1)
++        # Exact model effects normally leave floating-point residuals rather
++        # than bitwise zeros. Treat values at least-squares precision as zero
++        # so the following z-score cannot amplify numerical noise.
++        residual_scale = np.maximum(1.0, np.max(np.abs(FM), axis=1))
++        residual_tol = np.sqrt(np.finfo(np.float64).eps) * residual_scale
++        residual_nonzero = (
++            np.isfinite(residual_sd) & (residual_sd > residual_tol)
++        )
++        residual_model["n_genes_before"] = int(FM.shape[0])
++        residual_model["n_genes_removed_zero_variance"] = int(
++            (~residual_nonzero).sum()
++        )
++        FM = FM[residual_nonzero, :]
++        if FM.shape[0] == 0:
++            raise ValueError(
++                "All ordering genes have zero variance after applying "
++                "residualModelFormulaStr"
++            )
++        adata.uns['monocle']['residual_model'] = residual_model
++        if verbose:
++            print(
++                "Removed model effects before dimension reduction: "
++                f"{residualModelFormulaStr}"
++            )
++
+     # Scale genes (z-score across cells)
+     if scaling:
+         row_means = FM.mean(axis=1, keepdims=True)
+diff --git a/omicverse/external/monocle2_py/ordering.py b/omicverse/external/monocle2_py/ordering.py
+index 5f0777b65..cb35991bd 100644
+--- a/omicverse/external/monocle2_py/ordering.py
++++ b/omicverse/external/monocle2_py/ordering.py
+@@ -396,11 +396,22 @@ def _edge(a, b):
+     return ordering_df
+ 
+ 
+-def _select_root_cell(adata, root_state=None, reverse=False):
++def _select_root_cell(adata, root_state=None, reverse=False, root_cell=None):
+     """Select root cell for pseudotime ordering."""
+     monocle = adata.uns['monocle']
+ 
+-    if root_state is not None:
++    if root_cell is not None:
++        root_cell = str(root_cell)
++        if root_cell not in adata.obs_names:
++            raise ValueError(f"Unknown root_cell {root_cell!r}")
++        if monocle['dim_reduce_type'] == 'DDRTree':
++            closest = np.asarray(
++                monocle['pr_graph_cell_proj_closest_vertex']
++            ).ravel().astype(int)
++            cell_idx = int(adata.obs_names.get_loc(root_cell))
++            return monocle['mst'].vs[int(closest[cell_idx])]['name']
++        return root_cell
++    elif root_state is not None:
+         if 'State' not in adata.obs.columns:
+             raise ValueError("State not set. Call order_cells() without root_state first.")
+ 
+@@ -449,7 +460,7 @@ def _select_root_cell(adata, root_state=None, reverse=False):
+         return mst.vs[diameter_path[0]]['name']
+ 
+ 
+-def order_cells(adata, root_state=None, reverse=None):
++def order_cells(adata, root_state=None, reverse=None, root_cell=None):
+     """
+     Order cells along the learned trajectory and assign pseudotime.
+ 
+@@ -458,6 +469,10 @@ def order_cells(adata, root_state=None, reverse=None):
+     adata : AnnData
+     root_state : int or None
+         If specified, use cells in this state as root.
++    root_cell : str or None
++        If specified, anchor pseudotime at this exact observation. This is
++        used by ``root_by_column`` so a mixed State cannot silently choose a
++        root from the wrong metadata population.
+     reverse : bool or None
+         If True, reverse the ordering direction.
+ 
+@@ -491,8 +506,12 @@ def order_cells(adata, root_state=None, reverse=None):
+                 )
+ 
+         # Initial ordering on Y-center MST
+-        root_cell = _select_root_cell(adata, root_state, reverse)
+-        cc_ordering = _extract_ddrtree_ordering(adata, root_cell, use_cell_mst=False)
++        root_center = _select_root_cell(
++            adata, root_state, reverse, root_cell=root_cell
++        )
++        cc_ordering = _extract_ddrtree_ordering(
++            adata, root_center, use_cell_mst=False
++        )
+ 
+         # Project cells onto MST edges
+         _project_cells_to_mst(adata)
+@@ -501,13 +520,13 @@ def order_cells(adata, root_state=None, reverse=None):
+         closest_vertex = monocle['pr_graph_cell_proj_closest_vertex']
+ 
+         # Find root in cell MST
+-        old_root_idx = list(mst.vs['name']).index(root_cell)
++        old_root_idx = list(mst.vs['name']).index(root_center)
+         cells_at_root = np.where(closest_vertex == old_root_idx)[0]
+ 
+         tip_leaves_cell = [v.index for v in cell_mst.vs if cell_mst.degree(v) == 1]
+         tip_names = [cell_mst.vs[v]['name'] for v in tip_leaves_cell]
+ 
+-        root_cell_new = None
++        root_cell_new = str(root_cell) if root_cell is not None else None
+         # Preferred: a cell mapped to the root Y-centre that is also a
+         # tip of the cell MST (matches R Monocle 2)
+         for cell_idx in cells_at_root:
+@@ -538,7 +557,7 @@ def order_cells(adata, root_state=None, reverse=None):
+         # cc_ordering is keyed by Y-centre *vertex name* ("Y_0", ..., "Y_K-1"),
+         # not by positional index. closest_vertex is an array of integer
+         # Y-centre indices. Bounds-check, then look up by name.
+-        if root_state is None:
++        if root_state is None and root_cell is None:
+             n_Y = mst.vcount()
+             cv = np.asarray(closest_vertex).ravel().astype(int)
+             if cv.size and (cv.min() < 0 or cv.max() >= n_Y):
+@@ -579,11 +598,15 @@ def order_cells(adata, root_state=None, reverse=None):
+ 
+     elif dim_reduce_type == 'ICA':
+         mst = monocle['mst']
+-        root_cell = _select_root_cell(adata, root_state, reverse)
+-        monocle['root_cell'] = root_cell
++        selected_root_cell = _select_root_cell(
++            adata, root_state, reverse, root_cell=root_cell
++        )
++        monocle['root_cell'] = selected_root_cell
+ 
+         dp = monocle['cellPairwiseDistances']
+-        cc_ordering = _extract_ddrtree_ordering(adata, root_cell, use_cell_mst=False)
++        cc_ordering = _extract_ddrtree_ordering(
++            adata, selected_root_cell, use_cell_mst=False
++        )
+ 
+         adata.obs['Pseudotime'] = cc_ordering.loc[adata.obs_names, 'pseudo_time'].values
+         adata.obs['State'] = pd.Categorical(
+diff --git a/omicverse/single/_monocle.py b/omicverse/single/_monocle.py
+index 43db37c0b..9db8b87cd 100644
+--- a/omicverse/single/_monocle.py
++++ b/omicverse/single/_monocle.py
+@@ -34,6 +34,105 @@
+ # ``__init__`` and stores it on the instance as ``self._m2``.
+ 
+ 
++def _cell_mst_graph(adata: AnnData):
++    """The cell-level weighted MST for whichever reduction was run, or None.
++
++    The two reductions store it in different places, and only one of them
++    stores it under ``projected_dp``:
++
++    * **DDRTree** builds the principal graph over Y-CENTRES, then
++      ``_project_cells_to_mst`` projects cells onto it and writes the
++      cell-level tree to ``projected_dp``.
++    * **ICA** has no centres — its MST is already over cells, and
++      ``cellPairwiseDistances`` is the cell x cell distance matrix it was
++      built from. Nothing ever writes ``projected_dp``.
++
++    Reading ``projected_dp`` alone therefore works on DDRTree and raises on
++    ICA, which is what it did. The shape check below is not decoration: on
++    DDRTree ``cellPairwiseDistances`` is CENTRES x CENTRES, so using it
++    unconditionally would silently index the wrong graph.
++    """
++    from scipy.sparse import csr_matrix, issparse
++    from scipy.sparse.csgraph import minimum_spanning_tree
++
++    monocle = adata.uns.get('monocle', {})
++    graph = monocle.get('projected_dp')
++    if graph is not None:
++        return csr_matrix(graph) if not issparse(graph) else graph.tocsr()
++
++    dp = monocle.get('cellPairwiseDistances')
++    if dp is None:
++        return None
++    dp = np.asarray(dp, dtype=float)
++    if dp.shape != (adata.n_obs, adata.n_obs):
++        return None                       # centres, not cells — wrong graph
++    return minimum_spanning_tree(csr_matrix(dp)).tocsr()
++
++
++def _population_graph_medoid(adata: AnnData, mask: pd.Series) -> str:
++    """Return a matching cell minimizing distance to the target population.
++
++    On a tree, all-node sums of distances to a weighted target set can be
++    computed in linear time by rerooting the tree. Restricting the final
++    minimum to matching cells gives a deterministic, representative root
++    without materializing an all-pairs distance matrix.
++    """
++
++    graph = _cell_mst_graph(adata)
++    target = np.asarray(mask, dtype=bool)
++    target_indices = np.flatnonzero(target)
++    if target_indices.size == 0:
++        raise ValueError("Cannot select a root medoid without target cells")
++    if graph is None:
++        raise ValueError(
++            "Cannot select a root medoid: no cell-level MST is available for "
++            f"dim_reduce_type="
++            f"{adata.uns.get('monocle', {}).get('dim_reduce_type')!r}. "
++            "Run reduce_dimension() with DDRTree or ICA before order_cells()."
++        )
++
++    graph = graph.tocsr().maximum(graph.T.tocsr()).tocsr()
++    n_obs = adata.n_obs
++    parent = np.full(n_obs, -2, dtype=int)
++    edge_to_parent = np.zeros(n_obs, dtype=float)
++    distance_from_zero = np.zeros(n_obs, dtype=float)
++    parent[0] = -1
++    stack = [0]
++    traversal = []
++    while stack:
++        node = stack.pop()
++        traversal.append(node)
++        for offset in range(graph.indptr[node], graph.indptr[node + 1]):
++            neighbor = int(graph.indices[offset])
++            if neighbor == parent[node] or parent[neighbor] != -2:
++                continue
++            parent[neighbor] = node
++            weight = float(graph.data[offset])
++            edge_to_parent[neighbor] = weight
++            distance_from_zero[neighbor] = distance_from_zero[node] + weight
++            stack.append(neighbor)
++    if len(traversal) != n_obs:
++        raise ValueError("Cell projection MST is disconnected")
++
++    subtree_targets = target.astype(int)
++    for node in reversed(traversal[1:]):
++        subtree_targets[parent[node]] += subtree_targets[node]
++
++    total_targets = int(target_indices.size)
++    distance_sum = np.empty(n_obs, dtype=float)
++    distance_sum[0] = float(distance_from_zero[target].sum())
++    for node in traversal[1:]:
++        distance_sum[node] = (
++            distance_sum[parent[node]]
++            + edge_to_parent[node]
++            * (total_targets - 2 * subtree_targets[node])
++        )
++    root_index = int(
++        target_indices[np.argmin(distance_sum[target_indices])]
++    )
++    return str(adata.obs_names[root_index])
++
++
+ @register_function(
+     aliases=["Monocle", "monocle", "monocle2", "monocle 2", "DDRTree trajectory", "BEAM"],
+     category="trajectory",
+@@ -320,7 +419,9 @@ def reduce_dimension(self, max_components: int = 2,
+                           reduction_method: str = 'DDRTree',
+                           norm_method: str = 'log',
+                           method: str = 'fast',
+-                          verbose: bool = False, **kwargs):
++                          verbose: bool = False,
++                          residualModelFormulaStr: Optional[str] = None,
++                          **kwargs):
+         """
+         Reduce dimensionality and learn the principal graph.
+ 
+@@ -345,6 +446,13 @@ def reduce_dimension(self, max_components: int = 2,
+               full objective (including the expensive ``||X − WZ||_2^2``
+               term) on every iteration and terminates when it stops
+               decreasing.  Pass this when you need bitwise R parity.
++        residualModelFormulaStr : str or None
++            Patsy/R-style model formula specifying cell-level effects to
++            subtract before scaling and dimension reduction, for example
++            ``"~ batch"`` or ``"~ batch + percent_mito"``. This is the
++            pure-Python equivalent of R Monocle 2's parameter of the same
++            name. The formula must include an intercept and reference columns
++            in ``adata.obs``.
+         **kwargs : additional DDRTree parameters
+             ``ncenter``, ``lambda_param``, ``param_gamma``, ``sigma``,
+             ``maxIter``, ``tol``.
+@@ -353,14 +461,16 @@ def reduce_dimension(self, max_components: int = 2,
+             self.adata, max_components=max_components,
+             reduction_method=reduction_method,
+             norm_method=norm_method, verbose=verbose,
+-            method=method, **kwargs,
++            method=method,
++            residualModelFormulaStr=residualModelFormulaStr,
++            **kwargs,
+         )
+         self._reduced = True
+         return self
+ 
+     def order_cells(self, root_state=None, reverse: Optional[bool] = None,
+                     root_by_column: Optional[str] = None,
+-                    root_by_value=None):
++                    root_by_value=None, root_cell: Optional[str] = None):
+         """Order cells along the learned trajectory, assigning Pseudotime and State.
+ 
+         Parameters
+@@ -373,11 +483,16 @@ def order_cells(self, root_state=None, reverse: Optional[bool] = None,
+             If ``True``, flip the default diameter-endpoint choice
+             (match R's ``orderCells(reverse=TRUE)``).
+         root_by_column : str or None
+-            Name of a column in ``mono.adata.obs``. If given, the
+-            state with the most cells matching ``root_by_value`` in
+-            that column is auto-chosen as the root state. This
+-            replicates R Monocle 2's ``GM_state()`` tutorial helper —
+-            e.g. for HSMM::
++            Name of a column in ``mono.adata.obs``. If given, the cell
++            minimising total tree distance to the matching population — its
++            graph medoid — is chosen as an exact root cell.
++
++            This is stricter than R Monocle 2's ``GM_state()`` helper, which
++            returns the *State* holding most of the progenitor cells and lets
++            ordering pick any cell within it. Anchoring on a specific cell
++            stops a State that mixes progenitors with other cells from
++            silently rooting the trajectory in the wrong population. The
++            calling pattern is unchanged — e.g. for HSMM::
+ 
+                 mono.order_cells()                 # first pass
+                 mono.order_cells(root_by_column='Hours',
+@@ -388,6 +503,10 @@ def order_cells(self, root_state=None, reverse: Optional[bool] = None,
+         root_by_value
+             Value within ``root_by_column`` that marks the progenitor
+             population. Defaults to the column minimum.
++        root_cell : str or None
++            Exact observation name to use as the root. When
++            ``root_by_column`` is supplied, Monocle chooses the matching
++            population's graph medoid and uses it as this exact anchor.
+         """
+         # Auto-detect root_state from a metadata column if requested.
+         # Requires a previous order_cells() call so that `State` exists.
+@@ -409,14 +528,20 @@ def order_cells(self, root_state=None, reverse: Optional[bool] = None,
+                 raise ValueError(
+                     f"No cells matched {root_by_column}={target!r}"
+                 )
+-            counts = self.adata.obs.loc[mask, 'State'].value_counts()
+-            if counts.empty:
+-                raise ValueError("No State values under the selected mask")
+-            root_state = counts.idxmax()
++            root_cell = _population_graph_medoid(self.adata, mask)
++            # An exact population medoid supersedes the State-only heuristic.
++            root_state = None
+ 
+         self.adata = self._m2.order_cells(
+             self.adata, root_state=root_state, reverse=reverse,
++            root_cell=root_cell,
+         )
++        if root_by_column is not None:
++            self.adata.uns['monocle']['root_by_column'] = root_by_column
++            self.adata.uns['monocle']['root_by_value'] = str(target)
++            self.adata.uns['monocle']['root_selection_method'] = (
++                'target_population_graph_medoid'
++            )
+         self._ordered = True
+         return self
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+index 48b649877..9f0e53804 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -40,6 +40,7 @@ dependencies = [
+     'seaborn>=0.11',
+     'datetime>=4.5',
+     'statsmodels>=0.13',
++    'patsy>=0.5',
+     'joblib>=1.2',
+     #'gseapy==0.10.8',
+     'ipywidgets>=8.0',
+diff --git a/tests/monocle2_py/test_residual_model.py b/tests/monocle2_py/test_residual_model.py
+new file mode 100644
+index 000000000..3454e8143
+--- /dev/null
++++ b/tests/monocle2_py/test_residual_model.py
+@@ -0,0 +1,164 @@
++"""Tests for Monocle 2-style residual model correction."""
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData
++
++from omicverse.external.monocle2_py.dimension_reduction import (
++    _residualize_model_effects,
++    reduce_dimension,
++)
++from omicverse.single import Monocle
++
++
++def test_residualize_categorical_batch_preserves_intercept_and_biology():
++    """Batch offsets are removed while a balanced biological contrast remains."""
++    obs = pd.DataFrame(
++        {
++            "batch": ["a", "a", "b", "b"],
++            "state": ["early", "late", "early", "late"],
++        },
++        index=[f"c{i}" for i in range(4)],
++    )
++    # gene 0: batch-only; gene 1: state-only; gene 2: both effects
++    FM = np.array(
++        [
++            [1.0, 1.0, 11.0, 11.0],
++            [2.0, 8.0, 2.0, 8.0],
++            [3.0, 9.0, 13.0, 19.0],
++        ]
++    )
++
++    adjusted, metadata = _residualize_model_effects(FM, obs, "~ batch")
++
++    np.testing.assert_allclose(adjusted[0], np.repeat(1.0, 4), atol=1e-12)
++    np.testing.assert_allclose(adjusted[1], FM[1], atol=1e-12)
++    np.testing.assert_allclose(adjusted[2], [3.0, 9.0, 3.0, 9.0], atol=1e-12)
++    assert metadata["design_columns"] == ["Intercept", "batch[T.b]"]
++    assert metadata["design_rank"] == 2
++
++
++def test_residualize_multiple_terms_matches_vectorized_ols():
++    obs = pd.DataFrame(
++        {
++            "batch": ["a", "a", "b", "b", "c", "c"],
++            "qc": [0.0, 1.0, 0.5, 1.5, 1.0, 2.0],
++        },
++        index=[f"c{i}" for i in range(6)],
++    )
++    FM = np.array(
++        [
++            [2.0, 3.0, 7.5, 8.5, 13.0, 14.0],
++            [5.0, 4.0, 6.0, 5.0, 7.0, 6.0],
++        ]
++    )
++
++    adjusted, metadata = _residualize_model_effects(FM, obs, "~ batch + qc")
++
++    # Residualized expression must have no linear association with any
++    # non-intercept design column, up to floating-point tolerance.
++    from patsy import dmatrix
++
++    design = np.asarray(dmatrix("~ batch + qc", obs), dtype=float)
++    for column in range(1, design.shape[1]):
++        np.testing.assert_allclose(
++            design[:, column] @ adjusted.T,
++            design[:, column].sum() * adjusted.mean(axis=1),
++            atol=1e-10,
++        )
++    assert metadata["n_terms"] == 4
++
++
++def test_residual_model_rejects_missing_values():
++    obs = pd.DataFrame({"batch": ["a", None, "b"]})
++    FM = np.ones((2, 3))
++
++    with pytest.raises(ValueError, match="Invalid residualModelFormulaStr"):
++        _residualize_model_effects(FM, obs, "~ batch")
++
++
++def test_residual_model_requires_intercept():
++    obs = pd.DataFrame({"batch": ["a", "a", "b", "b"]})
++    FM = np.ones((2, 4))
++
++    with pytest.raises(ValueError, match="must include an intercept"):
++        _residualize_model_effects(FM, obs, "~ 0 + batch")
++
++
++def test_residual_model_rejects_rank_deficient_design():
++    obs = pd.DataFrame(
++        {
++            "batch": ["a", "a", "b", "b"],
++            "duplicate": ["a", "a", "b", "b"],
++        }
++    )
++    FM = np.ones((2, 4))
++
++    with pytest.raises(ValueError, match="rank-deficient"):
++        _residualize_model_effects(FM, obs, "~ batch + duplicate")
++
++
++def test_residual_model_drops_least_squares_roundoff_as_zero_variance():
++    adata = AnnData(
++        X=np.array([[1.0], [1.0], [11.0], [11.0]]),
++        obs=pd.DataFrame(
++            {"batch": ["a", "a", "b", "b"]},
++            index=[f"c{i}" for i in range(4)],
++        ),
++    )
++    adata.var["use_for_ordering"] = True
++
++    with pytest.raises(
++        ValueError,
++        match="zero variance after applying residualModelFormulaStr",
++    ):
++        reduce_dimension(
++            adata,
++            reduction_method="ICA",
++            norm_method="none",
++            pseudo_expr=0,
++            residualModelFormulaStr="~ batch",
++        )
++
++
++def test_public_monocle_api_records_residual_model(small_branching_adata):
++    adata = small_branching_adata.copy()
++    adata.obs["batch"] = np.where(
++        np.arange(adata.n_obs) % 2 == 0, "batch_a", "batch_b"
++    )
++    mono = Monocle(adata)
++    mono.preprocess().select_ordering_genes()
++    mono.reduce_dimension(
++        reduction_method="ICA",
++        random_state=0,
++        residualModelFormulaStr="~ batch",
++    )
++
++    metadata = mono.adata.uns["monocle"]["residual_model"]
++    assert metadata["formula"] == "~ batch"
++    assert metadata["design_columns"] == ["Intercept", "batch[T.batch_b]"]
++    assert metadata["n_cells"] == adata.n_obs
++    assert "X_ICA" in mono.adata.obsm
++
++
++def test_reducing_again_without_model_clears_residual_metadata(
++    small_branching_adata,
++):
++    adata = small_branching_adata.copy()
++    adata.obs["batch"] = np.where(
++        np.arange(adata.n_obs) % 2 == 0, "batch_a", "batch_b"
++    )
++    mono = Monocle(adata)
++    mono.preprocess().select_ordering_genes()
++    mono.reduce_dimension(
++        reduction_method="ICA",
++        random_state=0,
++        residualModelFormulaStr="~ batch",
++    )
++    assert "residual_model" in mono.adata.uns["monocle"]
++
++    mono.reduce_dimension(reduction_method="ICA", random_state=0)
++
++    assert "residual_model" not in mono.adata.uns["monocle"]
+diff --git a/tests/monocle2_py/test_root_selection.py b/tests/monocle2_py/test_root_selection.py
+index 70d65c954..9a9590a05 100644
+--- a/tests/monocle2_py/test_root_selection.py
++++ b/tests/monocle2_py/test_root_selection.py
+@@ -40,6 +40,10 @@ def test_order_cells_root_by_column_sets_progenitor_state(small_branching_adata)
+          .reduce_dimension()
+          .order_cells(root_by_column='time', root_by_value=0))
+ 
++    root_cell = mono.adata.uns['monocle']['root_cell']
++    assert mono.adata.obs.loc[root_cell, 'time'] == 0
++    assert mono.adata.obs.loc[root_cell, 'Pseudotime'] == pytest.approx(0.0)
++
+     # Find the state that contains most t=0 cells
+     t0_mask = mono.adata.obs['time'] == 0
+     progenitor_state = mono.adata.obs.loc[t0_mask, 'State'].mode().iloc[0]
+@@ -67,6 +71,8 @@ def test_order_cells_root_by_column_defaults_to_min(small_branching_adata):
+          .select_ordering_genes()
+          .reduce_dimension()
+          .order_cells(root_by_column='hours'))  # no value → use min (0)
++    root_cell = mono.adata.uns['monocle']['root_cell']
++    assert mono.adata.obs.loc[root_cell, 'hours'] == 0
+     # State hosting the most 0h cells must be the root state
+     t0 = mono.adata.obs[mono.adata.obs['hours'] == 0]
+     root_state = t0['State'].mode().iloc[0]
+@@ -100,3 +106,59 @@ def test_root_by_column_missing_value_raises(small_branching_adata):
+          .order_cells())
+     with pytest.raises(ValueError, match='matched'):
+         mono.order_cells(root_by_column='time', root_by_value=999)
++
++
++def test_order_cells_root_by_column_works_after_ica(small_branching_adata):
++    """Regression: ``root_by_column=`` raised on the ICA reduction.
++
++    The medoid helper read ``uns['monocle']['projected_dp']``, which only
++    DDRTree writes — ``_project_cells_to_mst`` is called from the DDRTree
++    branch of ``order_cells`` and nothing writes it on the ICA path. So this
++    exact call worked after ``reduce_dimension()`` and raised
++    ``ValueError: Cannot select a root medoid without target cells and MST``
++    after ``reduce_dimension(reduction_method='ICA')``.
++
++    Both reductions are supported by ``order_cells``, and the previous
++    State-mode implementation worked on both, so this was a regression rather
++    than an unimplemented combination.
++    """
++    adata = small_branching_adata.copy()
++    adata.obs['time'] = ([0] * 50 + [1] * 50 + [2] * 50)
++    mono = Monocle(adata)
++    (mono.preprocess()
++         .select_ordering_genes()
++         .reduce_dimension(reduction_method='ICA', random_state=0)
++         .order_cells(root_by_column='time', root_by_value=0))
++
++    root_cell = mono.adata.uns['monocle']['root_cell']
++    assert mono.adata.obs.loc[root_cell, 'time'] == 0
++    assert mono.adata.uns['monocle']['root_selection_method'] == (
++        'target_population_graph_medoid'
++    )
++    assert mono.adata.obs['Pseudotime'].min() == pytest.approx(0.0)
++
++
++def test_cell_mst_graph_refuses_the_centre_level_matrix(small_branching_adata):
++    """The shape guard, tested directly.
++
++    On DDRTree ``cellPairwiseDistances`` is CENTRES x CENTRES. Falling back to
++    it without checking the shape would build a medoid over the wrong graph and
++    return a nonsense cell index rather than raising — the kind of wrong answer
++    that looks like a working feature.
++    """
++    from omicverse.single._monocle import _cell_mst_graph
++
++    adata = small_branching_adata.copy()
++    mono = Monocle(adata)
++    mono.preprocess().select_ordering_genes().reduce_dimension()
++
++    monocle = mono.adata.uns['monocle']
++    assert 'projected_dp' not in monocle, (
++        "this test assumes reduce_dimension() has not projected cells yet"
++    )
++    dp = np.asarray(monocle['cellPairwiseDistances'])
++    assert dp.shape[0] != mono.adata.n_obs, (
++        "DDRTree cellPairwiseDistances should be over centres, not cells"
++    )
++    assert _cell_mst_graph(mono.adata) is None
++

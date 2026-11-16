@@ -1,0 +1,574 @@
+diff --git a/docs/api/aggregation.md b/docs/api/aggregation.md
+index f62f852e..dc1fe775 100644
+--- a/docs/api/aggregation.md
++++ b/docs/api/aggregation.md
+@@ -1,7 +1,7 @@
+ # Aggregation
+ 
+ !!! tips "Recommendation"
+-    We recommend using the `sopa.aggregate` function below, which is a wrapper for all types of aggregation. Internally, it uses `aggregate_channels`, `count_transcripts`, and/or `aggregate_bins`, which are also documented below if needed.
++    We recommend using the `sopa.aggregate` function below, which is a wrapper for all types of aggregation. Internally, it uses `aggregate_channels`, `count_transcripts`, and/or `aggregate_bins`, which are also documented below if needed. For marker expression prediction, see `sopa.aggregation.nimbus`.
+ 
+ ::: sopa.aggregate
+ 
+@@ -12,3 +12,5 @@
+ ::: sopa.aggregation.aggregate_bins
+ 
+ ::: sopa.overlay_segmentation
++
++::: sopa.aggregation.nimbus
+diff --git a/sopa/aggregation/__init__.py b/sopa/aggregation/__init__.py
+index c806c1e6..bc137e73 100644
+--- a/sopa/aggregation/__init__.py
++++ b/sopa/aggregation/__init__.py
+@@ -1,5 +1,29 @@
++from __future__ import annotations
++
++from typing import TYPE_CHECKING, Any
++
++import sopa
++
+ from .bins import aggregate_bins
+ from .channels import aggregate_channels
+ from .transcripts import count_transcripts
+ from .aggregation import aggregate, Aggregator
+ from .overlay import overlay_segmentation
++
++if TYPE_CHECKING:
++    from ._nimbus import nimbus_aggregation as nimbus
++
++
++def __getattr__(name: str) -> Any:
++    if name == "nimbus":
++        try:
++            from ._nimbus import nimbus_aggregation
++        except ModuleNotFoundError as e:
++            if e.name and e.name.startswith("nimbus"):
++                raise ModuleNotFoundError(
++                    "You need to install `nimbus_inference` to use `nimbus`."
++                    "You can install it via `pip install Nimbus-Inference`."
++                ) from e
++            raise
++        return nimbus_aggregation
++    return getattr(sopa.aggregation, name)
+diff --git a/sopa/aggregation/_nimbus.py b/sopa/aggregation/_nimbus.py
+new file mode 100644
+index 00000000..191f3466
+--- /dev/null
++++ b/sopa/aggregation/_nimbus.py
+@@ -0,0 +1,216 @@
++import logging
++import shutil
++from pathlib import Path
++
++import geopandas as gpd
++import numpy as np
++import pandas as pd
++from anndata import AnnData
++from nimbus_inference.nimbus import Nimbus, prep_naming_convention
++from nimbus_inference.utils import MultiplexDataset
++from shapely.geometry import Polygon
++from spatialdata import SpatialData, rasterize
++from tifffile import imwrite
++from xarray import DataArray
++
++from ..constants import NimbusFiles
++from ..shapes import expand_radius
++from ..utils import get_boundaries, get_cache_dir, get_spatial_image, to_intrinsic, validated_channel_names
++from .table import parse_table
++
++log = logging.getLogger(__name__)
++
++
++def nimbus_aggregation(
++    sdata: SpatialData,
++    image_key: str | None = None,
++    shapes_key: str | None = None,
++    include_channels: list[str] | None = None,
++    expand_radius_ratio: float = 0,
++    no_overlap: bool = False,
++    quantile: float = 0.999,
++    multiprocessing: bool = True,
++    batch_size: int = 4,
++    clip_values: tuple = (0, 2),
++    delete_cache: bool = True,
++    **nimbus_model_kwargs,
++) -> AnnData:
++    """Run [Nimbus](https://github.com/angelolab/Nimbus-Inference) aggregation to predict marker confidence scores for each cell.
++    This is an alternative to [sopa.aggregation.aggregate_channels][] that uses a deep learning model to predict denoised marker scores.
++
++    !!! warning "Nimbus installation"
++        Make sure to install the Nimbus-Inference in your environment for this method to work:
++        ```
++        pip install 'Nimbus-Inference'
++        ```
++
++    Args:
++        sdata: A `SpatialData` object
++        image_key: Key of `sdata` containing the image. If only one `images` element, this does not have to be provided.
++        shapes_key: Key of `sdata` containing the cell boundaries. If only one `shapes` element, this does not have to be provided.
++        include_channels: List of channels to include in the prediction. If None, all channels are included.
++        expand_radius_ratio: Cells polygons will be expanded by `expand_radius_ratio * mean_radius`. This help better aggregate boundary stainings.
++        no_overlap: If `True`, the (expanded) cells will not overlap.
++        quantile: Quantile used for Nimbus intensity normalization.
++        multiprocessing: Whether to use multiprocessing.
++        batch_size: Nimbus inference batch size.
++        clip_values: Values to clip images to after Nimbus intensity normalization.
++        delete_cache: Whether to delete temporary cache files after inference.
++
++
++    Returns:
++        An `AnnData` object with the predicted marker confidence scores
++    """
++    image_key, image = get_spatial_image(sdata, image_key, return_key=True)
++
++    shapes_key, geo_df = get_boundaries(sdata, key=shapes_key, return_key=True)
++    geo_df = to_intrinsic(sdata, geo_df, image)
++    geo_df = expand_radius(geo_df, expand_radius_ratio, no_overlap=no_overlap)
++    cache_dir = get_cache_dir(sdata)
++
++    adata = _run_nimbus(
++        image=image,
++        geo_df=geo_df,
++        include_channels=include_channels,
++        work_dir=cache_dir,
++        quantile=quantile,
++        batch_size=batch_size,
++        clip_values=clip_values,
++        multiprocessing=multiprocessing,
++        delete_cache=delete_cache,
++        **nimbus_model_kwargs,
++    )
++
++    return parse_table(adata, geo_df, shapes_key=shapes_key, image_key=image_key)
++
++
++def _write_segmentation_data(image: DataArray, mask: np.ndarray, work_dir: Path, channel_names: list[str]) -> None:
++    tiff_dir = work_dir / NimbusFiles.IMAGE_DIR / NimbusFiles.IMAGE_FOV_DIR
++    seg_dir = work_dir / NimbusFiles.SEGMENTATION_DIR / NimbusFiles.SEGMENTATION_OUTPUT_DIR
++    tiff_dir.mkdir(parents=True, exist_ok=True)
++    seg_dir.mkdir(parents=True, exist_ok=True)
++
++    for stale_tiff in tiff_dir.glob("*.tiff"):
++        stale_tiff.unlink()
++
++    for c, name in enumerate(channel_names):
++        imwrite(tiff_dir / f"{name}.tiff", image[c])
++
++    seg_file = seg_dir / NimbusFiles.SEGMENTATION_MASK
++    if seg_file.exists():
++        seg_file.unlink()
++
++    imwrite(seg_file, mask)
++
++
++def _build_multiplex_dataset(work_dir: Path, include_channels: list[str] | None) -> MultiplexDataset:
++    tiff_dir = work_dir / NimbusFiles.IMAGE_DIR
++    seg_dir = work_dir / NimbusFiles.SEGMENTATION_DIR / NimbusFiles.SEGMENTATION_OUTPUT_DIR
++    nimbus_output_dir = work_dir / NimbusFiles.NIMBUS_OUTPUT_DIR
++    nimbus_output_dir.mkdir(parents=True, exist_ok=True)
++
++    fov_paths = sorted(str(p) for p in tiff_dir.iterdir() if p.is_dir() and not p.name.startswith("."))
++    if not fov_paths:
++        raise FileNotFoundError(f"No FOV directories found in {tiff_dir}")
++
++    segmentation_naming = prep_naming_convention(seg_dir)
++
++    missing = [p for p in fov_paths if not Path(segmentation_naming(str(p))).exists()]
++    if missing:
++        raise FileNotFoundError(f"Missing segmentation files for {len(missing)} FOV(s), first: {missing[0]}")
++
++    return MultiplexDataset(
++        fov_paths=list(fov_paths),
++        suffix=".tiff",
++        include_channels=include_channels,
++        segmentation_naming_convention=segmentation_naming,
++        output_dir=nimbus_output_dir,
++    )
++
++
++def _nimbus_inference(
++    work_dir: Path,
++    mpx_data: MultiplexDataset,
++    quantile: float,
++    batch_size: int,
++    clip_values: tuple,
++    multiprocessing: bool,
++    **nimbus_model_kwargs,
++) -> pd.DataFrame:
++    nimbus_output_dir = work_dir / NimbusFiles.NIMBUS_OUTPUT_DIR
++
++    nimbus = Nimbus(
++        dataset=mpx_data,
++        save_predictions=False,
++        batch_size=batch_size,
++        output_dir=nimbus_output_dir,
++        **nimbus_model_kwargs,
++    )
++
++    mpx_data.prepare_normalization_dict(
++        quantile=quantile, clip_values=clip_values, multiprocessing=multiprocessing, n_subset=1, overwrite=True
++    )
++
++    return nimbus.predict_fovs()
++
++
++def _run_nimbus(
++    image: DataArray,
++    geo_df: gpd.GeoDataFrame | list[Polygon],
++    include_channels: list[str] | None,
++    work_dir: Path,
++    quantile: float,
++    batch_size: int,
++    clip_values: tuple,
++    multiprocessing: bool,
++    delete_cache: bool = True,
++    **nimbus_model_kwargs,
++) -> AnnData:
++    available_channels = validated_channel_names(image)
++    channel_names = available_channels if include_channels is None else include_channels
++    unknown_channels = sorted(set(channel_names) - set(available_channels))
++    if unknown_channels:
++        raise ValueError(f"Unknown include_channels: {unknown_channels}. Available channels: {available_channels}")
++
++    log.info(f"Predicting marker confidence scores for {len(geo_df)} cells with {include_channels=}")
++
++    if image.shape[1] < 2 or image.shape[2] < 2:
++        raise ValueError(f"Image spatial dimensions must be >= 2, got {(image.shape[1], image.shape[2])}.")
++
++    rasterized = rasterize(
++        data=geo_df,
++        axes=("x", "y"),
++        min_coordinate=[0, 0],
++        max_coordinate=[image.shape[2], image.shape[1]],
++        target_coordinate_system="global",
++        target_unit_to_pixels=1,
++    )
++
++    mask = rasterized.to_numpy()
++
++    _write_segmentation_data(image, mask, work_dir, channel_names)
++
++    mpx_data = _build_multiplex_dataset(work_dir, channel_names)
++
++    mpx_data.check_inputs()
++
++    cell_table = _nimbus_inference(
++        work_dir,
++        mpx_data,
++        quantile=quantile,
++        batch_size=batch_size,
++        clip_values=clip_values,
++        multiprocessing=multiprocessing,
++        **nimbus_model_kwargs,
++    )
++
++    if delete_cache and work_dir.exists():
++        shutil.rmtree(work_dir)
++
++    X = cell_table[channel_names].to_numpy()
++
++    return AnnData(
++        X,
++        var=pd.DataFrame(index=channel_names),
++        obs=pd.DataFrame(index=geo_df.index.astype(str)),
++    )
+diff --git a/sopa/aggregation/aggregation.py b/sopa/aggregation/aggregation.py
+index e75b8cce..ea5cff64 100644
+--- a/sopa/aggregation/aggregation.py
++++ b/sopa/aggregation/aggregation.py
+@@ -1,18 +1,15 @@
+ import logging
+ 
+-import geopandas as gpd
+ import numpy as np
+-import pandas as pd
+ from anndata import AnnData
+ from scipy.sparse import csr_matrix
+ from spatialdata import SpatialData
+-from spatialdata.models import TableModel
+ 
+-from ..constants import ATTRS_KEY, SopaAttrs, SopaKeys
+-from ..io.explorer.utils import str_cell_id
+-from ..utils import add_spatial_element, get_boundaries, get_spatial_element, get_spatial_image
++from ..constants import SopaAttrs, SopaKeys
++from ..utils import get_boundaries, get_spatial_element, get_spatial_image
+ from . import aggregate_bins, count_transcripts
+ from . import aggregate_channels as _aggregate_channels
++from .table import add_parsed_table
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -231,43 +228,15 @@ def compute_table(
+             SopaKeys.UNS_HAS_INTENSITIES: aggregate_channels,
+         }
+ 
+-        self.add_standardized_table(key_added)
+-
+-    def add_standardized_table(self, key_added: str):
+-        add_standardized_table(
+-            self.sdata, self.table, self.geo_df, self.shapes_key, key_added, self.image_key, self.drop_filtered_cells
++        self.add_parsed_table(key_added)
++
++    def add_parsed_table(self, key_added: str):
++        add_parsed_table(
++            self.sdata,
++            self.table,
++            self.geo_df,
++            self.shapes_key,
++            key_added,
++            self.image_key,
++            add_shapes=self.drop_filtered_cells,
+         )
+-
+-
+-def add_standardized_table(
+-    sdata: SpatialData,
+-    table: AnnData,
+-    geo_df: gpd.GeoDataFrame,
+-    shapes_key: str,
+-    table_key: str,
+-    image_key: str | None = None,
+-    drop_filtered_cells: bool = True,
+-):
+-    table.obs_names = list(map(str_cell_id, range(table.n_obs)))
+-    geo_df.index = list(table.obs_names)
+-
+-    if drop_filtered_cells:
+-        add_spatial_element(sdata, shapes_key, geo_df)
+-
+-    table.obsm["spatial"] = np.array([[centroid.x, centroid.y] for centroid in geo_df.centroid])
+-    table.obs[SopaKeys.REGION_KEY] = pd.Series(shapes_key, index=table.obs_names, dtype="category")
+-    table.obs[SopaKeys.SLIDE_KEY] = pd.Series(image_key or "None", index=table.obs_names, dtype="category")
+-    table.obs[SopaKeys.INSTANCE_KEY] = geo_df.index
+-    table.obs[SopaKeys.AREA_OBS] = geo_df.area.values
+-
+-    if ATTRS_KEY in table.uns:
+-        del table.uns[ATTRS_KEY]
+-
+-    table = TableModel.parse(
+-        table,
+-        region_key=SopaKeys.REGION_KEY,
+-        region=shapes_key,
+-        instance_key=SopaKeys.INSTANCE_KEY,
+-    )
+-
+-    add_spatial_element(sdata, table_key, table)
+diff --git a/sopa/aggregation/bins.py b/sopa/aggregation/bins.py
+index e9881eff..c69cccc2 100644
+--- a/sopa/aggregation/bins.py
++++ b/sopa/aggregation/bins.py
+@@ -9,6 +9,7 @@
+ 
+ from ..shapes import expand_radius
+ from ..utils import to_intrinsic
++from .table import parse_table
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -56,7 +57,8 @@ def aggregate_bins(
+     adata = AnnData(indices_matrix @ bins_table.X, obs=cells[[]], var=bins_table.var)
+     adata.obsm["spatial"] = np.stack([cells.centroid.x, cells.centroid.y], axis=1)
+     adata.obsm["bins_assignments"] = indices_matrix
+-    return adata
++
++    return parse_table(adata, cells, shapes_key=shapes_key)
+ 
+ 
+ def _get_unique_bins_assignments(
+diff --git a/sopa/aggregation/channels.py b/sopa/aggregation/channels.py
+index 4107ddd6..ee36632d 100644
+--- a/sopa/aggregation/channels.py
++++ b/sopa/aggregation/channels.py
+@@ -13,6 +13,7 @@
+ 
+ from ..shapes import expand_radius, pixel_outer_bounds, rasterize
+ from ..utils import get_boundaries, get_spatial_image, to_intrinsic, validated_channel_names
++from .table import parse_table
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -42,13 +43,15 @@ def aggregate_channels(
+     """
+     assert mode in AVAILABLE_MODES, f"Invalid {mode=}. Available modes are {AVAILABLE_MODES}"
+ 
+-    image = get_spatial_image(sdata, image_key)
++    image_key, image = get_spatial_image(sdata, image_key, return_key=True)
+ 
+-    geo_df = get_boundaries(sdata, key=shapes_key)
++    shapes_key, geo_df = get_boundaries(sdata, key=shapes_key, return_key=True)
+     geo_df = to_intrinsic(sdata, geo_df, image)
+     geo_df = expand_radius(geo_df, expand_radius_ratio, no_overlap=no_overlap)
+ 
+-    return _aggregate_channels_aligned(image, geo_df, mode)
++    adata = _aggregate_channels_aligned(image, geo_df, mode)
++
++    return parse_table(adata, geo_df, shapes_key=shapes_key, image_key=image_key)
+ 
+ 
+ def _aggregate_channels_aligned(image: DataArray, geo_df: gpd.GeoDataFrame, mode: str) -> AnnData:
+diff --git a/sopa/aggregation/overlay.py b/sopa/aggregation/overlay.py
+index c0738b12..e37cee64 100644
+--- a/sopa/aggregation/overlay.py
++++ b/sopa/aggregation/overlay.py
+@@ -93,7 +93,7 @@ def overlay_segmentation(
+     aggregator.geo_df = pd.concat([geo_df_cropped, geo_df], join="outer", axis=0)
+     aggregator.geo_df.attrs = old_geo_df.attrs
+ 
+-    aggregator.add_standardized_table(table_key)
++    aggregator.add_parsed_table(table_key)
+ 
+ 
+ def _overlap_area_ratio(row) -> float:
+diff --git a/sopa/aggregation/table.py b/sopa/aggregation/table.py
+new file mode 100644
+index 00000000..42113b27
+--- /dev/null
++++ b/sopa/aggregation/table.py
+@@ -0,0 +1,49 @@
++import geopandas as gpd
++import pandas as pd
++from anndata import AnnData
++from spatialdata import SpatialData
++from spatialdata.models import TableModel
++
++from ..constants import ATTRS_KEY, SopaKeys
++from ..io.explorer.utils import str_cell_id
++from ..utils import add_spatial_element
++
++
++def add_parsed_table(
++    sdata: SpatialData,
++    table: AnnData,
++    geo_df: gpd.GeoDataFrame,
++    shapes_key: str,
++    table_key: str,
++    image_key: str | None = None,
++    add_shapes: bool = True,
++):
++    table = parse_table(table, geo_df, shapes_key, image_key)
++
++    if add_shapes:
++        add_spatial_element(sdata, shapes_key, geo_df)
++
++    add_spatial_element(sdata, table_key, table)
++
++
++def parse_table(table: AnnData, geo_df: gpd.GeoDataFrame, shapes_key: str, image_key: str | None = None) -> AnnData:
++    table.obs_names = list(map(str_cell_id, range(table.n_obs)))
++    geo_df.index = table.obs_names.to_list()
++
++    table.obsm["spatial"] = geo_df.centroid.get_coordinates().values
++    table.obs[SopaKeys.REGION_KEY] = pd.Series(shapes_key, index=table.obs_names, dtype="category")
++    table.obs[SopaKeys.SLIDE_KEY] = pd.Series(image_key or "None", index=table.obs_names, dtype="category")
++    table.obs[SopaKeys.INSTANCE_KEY] = geo_df.index
++    table.obs[SopaKeys.AREA_OBS] = geo_df.area.values
++
++    if ATTRS_KEY in table.uns:
++        del table.uns[ATTRS_KEY]
++
++    table = TableModel.parse(
++        table,
++        region_key=SopaKeys.REGION_KEY,
++        region=shapes_key,
++        instance_key=SopaKeys.INSTANCE_KEY,
++    )
++
++    return table
+diff --git a/sopa/aggregation/transcripts.py b/sopa/aggregation/transcripts.py
+index a16fc93b..2d6fdb1c 100644
+--- a/sopa/aggregation/transcripts.py
++++ b/sopa/aggregation/transcripts.py
+@@ -12,6 +12,7 @@
+ from .. import settings
+ from ..constants import SopaAttrs, SopaKeys
+ from ..utils import get_boundaries, get_feature_key, get_spatial_element, to_intrinsic
++from .table import parse_table
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -31,24 +32,29 @@ def count_transcripts(
+         gene_column: Column of the transcript dataframe containing the gene names
+         shapes_key: Key of `sdata` containing the cell boundaries. If only one `shapes` element, this does not have to be provided.
+         points_key: Key of `sdata` containing the transcripts. If only one `points` element, this does not have to be provided.
+-        geo_df: If the cell boundaries are not yet in `sdata`, a `GeoDataFrame` can be directly provided for cell boundaries
++        geo_df: If the cell boundaries are not yet in `sdata`, a `GeoDataFrame` can be directly provided for cell boundaries. If `geo_df` is provided but not `shapes_key`, the table will not be parsed.
+         only_excluded: By default, the genes matching the pattern in `sopa.settings.gene_exclude_pattern` are excluded from the count. If `only_excluded=True`, it counts **only** these excluded genes.
+ 
+     Returns:
+-        An `AnnData` object of shape `(n_cells, n_genes)` with the counts per cell
++        An `AnnData` object of shape `(n_cells, n_genes)` with the counts per cell.
+     """
+     points_key, points = get_spatial_element(
+         sdata.points, key=points_key or sdata.attrs.get(SopaAttrs.TRANSCRIPTS), return_key=True
+     )
+ 
+     if geo_df is None:
+-        geo_df = get_boundaries(sdata, key=shapes_key)
++        shapes_key, geo_df = get_boundaries(sdata, key=shapes_key, return_key=True)
+         geo_df = to_intrinsic(sdata, geo_df, points_key)
+ 
+     gene_column = gene_column or get_feature_key(points, raise_error=True)
+ 
+     log.info(f"Aggregating transcripts over {len(geo_df)} cells")
+-    return _count_transcripts_aligned(geo_df, points, gene_column, only_excluded)
++    adata = _count_transcripts_aligned(geo_df, points, gene_column, only_excluded)
++
++    if shapes_key is None:
++        return adata
++
++    return parse_table(adata, geo_df, shapes_key=shapes_key)
+ 
+ 
+ def _count_transcripts_aligned(
+diff --git a/sopa/constants.py b/sopa/constants.py
+index ba520fc1..11862693 100644
+--- a/sopa/constants.py
++++ b/sopa/constants.py
+@@ -70,6 +70,15 @@ class SopaFiles:
+     TOML_CONFIG_FILE = "config.toml"
+ 
+ 
++class NimbusFiles:
++    SEGMENTATION_DIR = "segmentation"
++    SEGMENTATION_OUTPUT_DIR = "output"
++    SEGMENTATION_MASK = "fov_whole_cell.tiff"
++    IMAGE_DIR = "image_data"
++    IMAGE_FOV_DIR = "fov"
++    NIMBUS_OUTPUT_DIR = "nimbus_output"
++
++
+ VALID_DIMENSIONS = ("c", "y", "x")
+ LOW_AVERAGE_COUNT = 0.01
+ ATTRS_KEY = "spatialdata_attrs"
+diff --git a/sopa/segmentation/methods/_proseg.py b/sopa/segmentation/methods/_proseg.py
+index 4a099f2f..0e96064c 100644
+--- a/sopa/segmentation/methods/_proseg.py
++++ b/sopa/segmentation/methods/_proseg.py
+@@ -11,7 +11,7 @@
+ from spatialdata.models import ShapesModel
+ from spatialdata.transformations import BaseTransformation, Identity
+ 
+-from ...aggregation.aggregation import add_standardized_table
++from ...aggregation.aggregation import add_parsed_table
+ from ...constants import SopaAttrs, SopaKeys
+ from ...utils import (
+     copy_transformations,
+@@ -110,7 +110,7 @@ def _proseg_points(
+     _run_proseg(proseg_command, patch_dir)
+     adata, geo_df = _read_proseg(patch_dir, copy_transformations(sdata[points_key]))
+ 
+-    add_standardized_table(sdata, adata, geo_df, key_added, SopaKeys.TABLE)
++    add_parsed_table(sdata, adata, geo_df, key_added, SopaKeys.TABLE)
+ 
+     set_boundaries_attrs(sdata, key_added)
+ 
+@@ -170,7 +170,7 @@ def _proseg_bins(
+ 
+     adata, geo_df = _read_proseg(work_dir, _transformations_from_microns(bins_shapes))
+ 
+-    add_standardized_table(sdata, adata, geo_df, key_added, SopaKeys.TABLE)
++    add_parsed_table(sdata, adata, geo_df, key_added, SopaKeys.TABLE)
+ 
+     set_boundaries_attrs(sdata, key_added)
+ 

@@ -1,0 +1,2940 @@
+diff --git a/.claude/skills/spatial-tutorials/SKILL.md b/.claude/skills/spatial-tutorials/SKILL.md
+index bd845af18..a50688a82 100644
+--- a/.claude/skills/spatial-tutorials/SKILL.md
++++ b/.claude/skills/spatial-tutorials/SKILL.md
+@@ -56,8 +56,9 @@ adata = ov.space.read_visium_10x(path="binned_outputs/square_002um/",
+ ov.pp.filter_genes(adata, min_cells=3)
+ ov.pp.filter_cells(adata, min_counts=1)
+ 
+-# H&E-based segmentation
+-adata = ov.space.visium_10x_hd_cellpose_he(adata, mpp=0.3, gpu=True, buffer=150)
++# H&E-based segmentation (in place, returns None: do not reassign adata);
++# method="stardist" runs bin2cell's StarDist path instead of Cellpose
++ov.space.visium_10x_hd_cellpose_he(adata, mpp=0.3, gpu=True, buffer=150)
+ # Expand labels to neighboring bins
+ ov.space.visium_10x_hd_cellpose_expand(adata, labels_key='labels_he',
+                                         expanded_labels_key='labels_he_expanded', max_bin_distance=4)
+@@ -69,6 +70,37 @@ ov.space.salvage_secondary_labels(adata, primary_label='labels_he_expanded',
+ cdata = ov.space.bin2cell(adata, labels_key='labels_joint')
+ ```
+ 
++### Image and transcript segmentation (`ov.space.seg`)
++
++For a raw microscopy image (DAPI / H&E / IF) or an imaging-platform
++transcript table (Xenium, CosMx, MERSCOPE), use `ov.space.seg`. Check that it
++exists first (`hasattr(ov.space, "seg")`); older omicverse releases lack it.
++
++```python
++ov.space.seg.methods()                      # backends, installed?, GPU?, input type
++labels = ov.space.seg.segment("dapi.tif", method="cellpose", gpu=True)   # tiled, seam-free
++# method: "watershed" (no deps) | "cellpose" (v3/v4) | "stardist" | "sam" | "sam2"
++#         | "micro_sam" | "cellsam"; image_type="he" for H&E, diameter= in pixels
++tx["cell"] = ov.space.seg.assign_transcripts(tx, labels, pixel_size=0.2125)
++cdata = ov.space.seg.aggregate(tx, cell="cell", gene="feature_name", labels=labels,
++                               pixel_size=0.2125)       # cells x genes AnnData + polygons
++# Transcript-only (Baysor CLI must be on PATH), optionally with the image labels as a prior
++tx2 = ov.space.seg.segment_transcripts(tx, method="baysor", scale=8, prior="cell")
++# Reference-free CellSPA metrics and a ranked comparison of several segmentations
++res = {m: ov.space.seg.evaluate(lab, transcripts=tx.assign(
++          cell=ov.space.seg.assign_transcripts(tx, lab))) for m, lab in labels_by_method.items()}
++ov.space.seg.compare(res)
++```
++
++- Coordinates: `pixel_size` (µm per pixel), `offset`, or a 3x3 `transform`
++  map transcript units to image pixels; get them from the platform's metadata.
++- Picking a method: in the Nat. Methods 2026 benchmark no method won
++  everywhere. SAM / SAM 2 led the unadjusted overall score and transcript QC,
++  Baysor ranked near the top once segmentation yield was accounted for, and
++  Cellpose and watershed ranked lower. Run 2-3 candidates and pick with
++  `ov.space.seg.compare` on your own data.
++- `sam` / `sam2` fall back to CPU on Apple MPS; run them on a CUDA GPU.
++
+ ## Stage 2: Deconvolution
+ 
+ ### Critical API Reference: Method Selection
+@@ -202,7 +234,7 @@ best, index, distance = spatial_match(embeddings, adatas=[adata1, adata2])
+ 
+ ## Dependencies
+ - Core: `omicverse`, `scanpy`, `anndata`, `squidpy`, `numpy`, `matplotlib`
+-- Segmentation: `cellpose`, `opencv-python`/`tifffile`, optional GPU PyTorch
++- Segmentation: `cellpose`, `opencv-python`/`tifffile`, optional GPU PyTorch; `pip install 'omicverse[seg]'` for the `ov.space.seg` backends (Cellpose, SAM, SAM 2)
+ - Deconvolution: `tangram-sc`, `cell2location`, `pytorch-lightning`; Starfysh needs `torch`, `scikit-learn`
+ - Downstream: `scikit-learn`, `commot`, `flowsig`, `gseapy`, torch-backed modules (STAligner, SpaceFlow, GASTON, SLAT)
+ 
+diff --git a/.claude/skills/spatial-tutorials/reference.md b/.claude/skills/spatial-tutorials/reference.md
+index 88b51834b..31cacc6b7 100644
+--- a/.claude/skills/spatial-tutorials/reference.md
++++ b/.claude/skills/spatial-tutorials/reference.md
+@@ -28,7 +28,7 @@ adata = ov.space.read_visium_10x(
+ )
+ ov.pp.filter_genes(adata, min_cells=3)
+ ov.pp.filter_cells(adata, min_counts=1)
+-adata = ov.space.visium_10x_hd_cellpose_he(
++ov.space.visium_10x_hd_cellpose_he(  # in place, returns None
+     adata,
+     mpp=0.3,
+     he_save_path="stardist/he_colon1.tiff",
+diff --git a/omicverse/external/bin2cell/bin2cell.py b/omicverse/external/bin2cell/bin2cell.py
+index ff3d60ad1..8a110d716 100644
+--- a/omicverse/external/bin2cell/bin2cell.py
++++ b/omicverse/external/bin2cell/bin2cell.py
+@@ -129,148 +129,6 @@ def normalize(img):
+     ma = np.percentile(img,99.8)
+     return ((img - mi) / ( ma - mi + eps ))
+ 
+-# -*- coding: utf-8 -*-
+-# Drop-in replacement for bin2cell.stardist using Cellpose with tiled inference.
+-
+-
+-
+-
+-
+-def _ensure_gray(img: np.ndarray) -> np.ndarray:
+-    from skimage.color import rgb2gray
+-    if img.ndim == 3 and img.shape[-1] in (3, 4):
+-        # skimage.rgb2gray handles RGB/RGBA -> grayscale [0..1]
+-
+-        g = rgb2gray(img)
+-        # keep dtype close to original
+-        if img.dtype.kind in ("u", "i"):
+-            g = (g * np.iinfo(img.dtype).max).astype(img.dtype)
+-        return g
+-    return img
+-
+-def _tiles(H: int, W: int, block: int, overlap: int, context: int):
+-    """
+-    Yield tile windows with overlap+context.
+-    Returns tuples: (y0,y1,x0,x1) = effective crop (with context),
+-                    (yy0,yy1,xx0,xx1) = paste window (without context, i.e., core).
+-    """
+-    stride = block - overlap
+-    y_starts = list(range(0, max(H - block, 0) + 1, stride)) or [0]
+-    x_starts = list(range(0, max(W - block, 0) + 1, stride)) or [0]
+-    # Ensure last tile reaches image border
+-    if y_starts[-1] + block < H:
+-        y_starts.append(H - block)
+-    if x_starts[-1] + block < W:
+-        x_starts.append(W - block)
+-
+-    for ys in y_starts:
+-        for xs in x_starts:
+-            core_y0, core_y1 = ys, min(ys + block, H)
+-            core_x0, core_x1 = xs, min(xs + block, W)
+-
+-            y0 = max(0, core_y0 - context)
+-            x0 = max(0, core_x0 - context)
+-            y1 = min(H, core_y1 + context)
+-            x1 = min(W, core_x1 + context)
+-
+-            # core (without context) in global coords:
+-            yield (y0, y1, x0, x1), (core_y0, core_y1, core_x0, core_x1)
+-
+-def _merge_labels_overlapping(
+-    base_core: np.ndarray,
+-    new_core: np.ndarray,
+-    iou_thresh: float = 0.5,
+-) -> Dict[int, int]:
+-    """
+-    In overlapping paste area between existing labels (base_core) and new labels (new_core),
+-    compute IoU and decide a mapping from new IDs -> existing IDs (to avoid duplicates).
+-    Returns a dict: {new_id: existing_id}
+-    """
+-    mapping = {}
+-    # quickly skip if nearly empty
+-    if base_core.max() == 0 or new_core.max() == 0:
+-        return mapping
+-
+-    # Build contingency of pairs (base_id, new_id) on overlapping pixels where both > 0
+-    overlap_mask = (base_core > 0) & (new_core > 0)
+-    if not overlap_mask.any():
+-        return mapping
+-
+-    base_ids = base_core[overlap_mask]
+-    new_ids = new_core[overlap_mask]
+-    pairs = np.stack([base_ids, new_ids], axis=1)
+-
+-    # Count intersection per (base_id, new_id)
+-    # We compress pairs into unique rows and counts
+-    # Using np.unique with return_counts
+-    uniq_pairs, counts = np.unique(pairs, axis=0, return_counts=True)
+-    # Build areas
+-    base_area = np.bincount(base_core.ravel())
+-    new_area = np.bincount(new_core.ravel())
+-
+-    for (b_id, n_id), inter in zip(uniq_pairs, counts):
+-        if b_id == 0 or n_id == 0:  # safety
+-            continue
+-        # IoU = inter / (area_b + area_n - inter)
+-        if b_id < len(base_area) and n_id < len(new_area):
+-            union = base_area[b_id] + new_area[n_id] - inter
+-            if union > 0 and (inter / union) >= iou_thresh:
+-                # prefer first strong match; if multiple, keep largest IoU by updating only if better
+-                # We don't precompute IoU ranking for brevity; this heuristic works well in practice.
+-                if n_id not in mapping:
+-                    mapping[n_id] = b_id
+-    return mapping
+-
+-def _paste_with_relabel(
+-    global_rows, global_cols, global_vals,
+-    tile_mask: np.ndarray,
+-    paste_win: Tuple[int, int, int, int],
+-    existing_global: Optional[np.ndarray],
+-    next_label_start: int,
+-    iou_thresh: float = 0.5,
+-):
+-    """
+-    Accumulate sparse coordinates for tile_mask pasted into global coords with ID relabeling.
+-    - existing_global: optional small array view (current labels) of the same paste window;
+-                       if provided, used to compute IoU-based merge mapping.
+-    Returns new_next_label, and extends lists global_rows, global_cols, global_vals
+-    """
+-    y0, y1, x0, x1 = paste_win
+-    core_h, core_w = (y1 - y0), (x1 - x0)
+-    core = tile_mask[:core_h, :core_w]  # ensure exact core cut (tile_mask is already cropped to core)
+-
+-    # Determine mapping using IoU in the paste area
+-    mapping = {}
+-    if existing_global is not None:
+-        mapping = _merge_labels_overlapping(existing_global, core, iou_thresh=iou_thresh)
+-
+-    # Relabel: new IDs -> either mapped to existing, or shifted by next_label_start
+-    # Compute relabel array:
+-    max_id = core.max()
+-    if max_id == 0:
+-        return next_label_start
+-
+-    relabel = np.zeros(max_id + 1, dtype=np.int32)
+-    for nid in range(1, max_id + 1):
+-        if nid in mapping:
+-            relabel[nid] = mapping[nid]
+-        else:
+-            relabel[nid] = next_label_start
+-            next_label_start += 1
+-
+-    core_re = relabel[core]  # remapped core IDs
+-
+-    # Append nonzero pixels into global sparse coordinates
+-    nz = core_re.nonzero()
+-    if len(nz[0]) == 0:
+-        return next_label_start
+-    gy = nz[0] + y0
+-    gx = nz[1] + x0
+-    global_rows.append(gy)
+-    global_cols.append(gx)
+-    global_vals.append(core_re[nz])
+-
+-    return next_label_start
+ 
+ def cellseg(
+     image_path: str,
+@@ -279,7 +137,6 @@ def cellseg(
+     block_size: int = 2048,
+     min_overlap: int = 256,
+     context: int = 64,
+-    # Cellpose-related knobs (can be passed via **kwargs in original calls)
+     gpu: bool = False,
+     diameter: Optional[float] = None,
+     mask_threshold: Optional[float] = None,   # maps from prob_thresh if provided
+@@ -293,9 +150,12 @@ def cellseg(
+     **kwargs,
+ ):
+     """
+-    Cell segmentation with tiled inference using Cellpose or CellSAM.
++    Tiled cell segmentation of a bin2cell image with any ``ov.space.seg`` backend.
+     Writes a SciPy sparse CSR label matrix to labels_npz_path.
+ 
++    Tiles are stitched by centroid ownership (see ``ov.space.seg.segment_tiled``),
++    so a cell crossing a tile seam keeps one label.
++
+     Parameters
+     ----------
+     image_path : str
+@@ -303,23 +163,26 @@ def cellseg(
+     labels_npz_path : str
+         Output path for the sparse label matrix (.npz).
+     stardist_model : str
+-        Model hint. For cellpose: '2D_versatile_he' -> 'cyto',
+-        '2D_versatile_fluo' -> 'nuclei'. Ignored for CellSAM.
++        Image hint: '2D_versatile_he' (H&E) or '2D_versatile_fluo' (expression
++        or fluorescence image). It is the model for ``backend='stardist'``;
++        for Cellpose < 4 it selects 'cyto' / 'nuclei'.
+     block_size, min_overlap, context : int
+-        Tiling parameters.
++        Tile size; the margin segmented around each tile is
++        ``max(context, min_overlap // 2)``.
+     gpu : bool
+         Whether to use GPU.
+     backend : str
+-        Segmentation backend: 'cellpose' (default) or 'cellsam'.
++        'cellpose' (default), 'stardist', 'watershed', 'sam', 'sam2',
++        'micro_sam' or 'cellsam'.
+     bbox_threshold : float
+         CellSAM bounding box confidence threshold. Default 0.4.
+     show_progress : bool
+         Display progress bar.
+     **kwargs
+-        Additional arguments forwarded to the backend.
++        Additional arguments forwarded to the backend
++        (see ``ov.space.seg.segment``); ``iou_merge_threshold`` and
++        ``build_sparse_directly`` are accepted for compatibility and unused.
+     """
+-    from skimage.io import imread
+-
+     if backend == "cellsam":
+         return _cellseg_cellsam(
+             image_path, labels_npz_path,
+@@ -329,190 +192,37 @@ def cellseg(
+             bbox_threshold=bbox_threshold, **kwargs,
+         )
+ 
+-    # --- Cellpose backend ---
+-    from cellpose import models
+-    if stardist_model == "2D_versatile_he":
+-        model_type = "cyto"
+-    elif stardist_model == "2D_versatile_fluo":
+-        model_type = "nuclei"
+-    else:
+-        model_type = "cyto"
+-
+-    # map StarDist prob_thresh -> Cellpose mask_threshold if user passed it in kwargs
+-    if "prob_thresh" in kwargs and mask_threshold is None:
+-        mask_threshold = kwargs.pop("prob_thresh")
+-
+-    # load image
+-    img = imread(image_path)
+-    img = _ensure_gray(img)
+-    H, W = img.shape[:2]
+-
+-    # init model
+-    cp = models.CellposeModel(gpu=gpu, model_type=model_type)
+-    # inspect eval signature once for compatibility handling
+-    import inspect
+-    eval_params = inspect.signature(cp.eval).parameters
+-    supports_channels = "channels" in eval_params
+-    supports_channel_axis = "channel_axis" in eval_params
+-
+-    # holders for building sparse
+-    global_rows, global_cols, global_vals = [], [], []
+-    # For overlap IoU merge we need a small existing view; we won't build a dense global label.
+-    # Instead, for each paste window, we materialize an "existing view" from what we've already
+-    # appended by rasterizing only that window to a small dense array. To keep memory small,
+-    # we do it window-by-window.
+-    # We'll keep a simple list of pasted windows and their sparse coords to reconstruct a small view.
+-
+-    pasted_windows = []  # list of tuples (y0,y1,x0,x1, rows_sub, cols_sub, vals_sub)
+-
+-    next_label = 1
+-
+-    # Setup progress bar over tiles
+-    pbar = None
+-    use_fallback_progress = False
+-    tiles_done = 0
+-    print_every = 1
+-    if show_progress:
+-        # compute total number of tiles with same logic as _tiles()
+-        stride = block_size - min_overlap
+-        y_starts = list(range(0, max(H - block_size, 0) + 1, stride)) or [0]
+-        x_starts = list(range(0, max(W - block_size, 0) + 1, stride)) or [0]
+-        if y_starts[-1] + block_size < H:
+-            y_starts.append(H - block_size)
+-        if x_starts[-1] + block_size < W:
+-            x_starts.append(W - block_size)
+-        total_tiles = len(y_starts) * len(x_starts)
+-        try:
+-            from tqdm import tqdm  # type: ignore
+-            pbar = tqdm(total=total_tiles, desc=progress_desc or "bin2cell.cellseg", unit="tile")
+-        except Exception:
+-            use_fallback_progress = True
+-            print_every = max(1, total_tiles // 10) if total_tiles > 0 else 1
+-
+-    for (y0, y1, x0, x1), (cy0, cy1, cx0, cx1) in _tiles(H, W, block_size, min_overlap, context):
+-        # crop with context
+-        tile = img[y0:y1, x0:x1]
+-
+-        # run cellpose on tile
+-        # channels=[0,0] meaning single-channel grayscale
+-        eval_kwargs = {}
+-        if diameter is not None:
+-            eval_kwargs["diameter"] = diameter
++    from ...space.seg import segment
++
++    # an H&E hint on a single-channel image still segments, as before
++    image_type = "fluorescence" if stardist_model == "2D_versatile_fluo" else "auto"
++    method_kwargs = dict(kwargs)
++    if backend == "cellpose":
++        # StarDist-style threshold names used by the Visium HD wrappers
++        prob = method_kwargs.pop("prob_thresh", None)
++        method_kwargs.pop("nms_thresh", None)
++        if mask_threshold is None:
++            mask_threshold = prob
+         if mask_threshold is not None:
+-            # cellpose versions differ: prefer 'cellprob_threshold'; fall back to 'mask_threshold' if needed
+-            if "cellprob_threshold" in eval_params:
+-                eval_kwargs["cellprob_threshold"] = mask_threshold
+-            elif "mask_threshold" in eval_params:
+-                eval_kwargs["mask_threshold"] = mask_threshold
++            method_kwargs["cellprob_threshold"] = mask_threshold
+         if flow_threshold is not None:
+-            # only pass if supported by current cellpose version
+-            if "flow_threshold" in eval_params:
+-                eval_kwargs["flow_threshold"] = flow_threshold
+-        # forward supported extra kwargs to Cellpose eval (e.g., min_size, stitch_threshold, tile_overlap, niter, etc.)
+-        for _k, _v in list(kwargs.items()):
+-            if _k in eval_params and _k not in ("channels", "channel_axis", "progress") and _k not in eval_kwargs:
+-                eval_kwargs[_k] = _v
+-
+-        # guard against very small tiles that can cause mask computation errors in cellpose
+-        if tile.shape[0] < 11 or tile.shape[1] < 11:
+-            masks = np.zeros(tile.shape[:2], dtype=np.int32)
+-            flows, styles, diams = None, None, None
+-        else:
+-            # build call-time kwargs for channel specification depending on version
+-            call_kwargs = {**eval_kwargs}
+-            # prefer channel_axis in newer versions to avoid deprecation warnings
+-            if supports_channel_axis:
+-                call_kwargs["channel_axis"] = None  # 2D grayscale image
+-            elif supports_channels:
+-                call_kwargs["channels"] = [0, 0]
++            method_kwargs["flow_threshold"] = flow_threshold
++        if "model" not in method_kwargs:
++            from importlib.metadata import version
+             try:
+-                _out = cp.eval(tile, **call_kwargs)
+-                # robustly unpack depending on cellpose version
+-                if isinstance(_out, tuple):
+-                    if len(_out) == 4:
+-                        masks, flows, styles, diams = _out
+-                    elif len(_out) == 3:
+-                        masks, flows, styles = _out
+-                        diams = None
+-                    elif len(_out) == 2:
+-                        masks, flows = _out
+-                        styles = diams = None
+-                    else:
+-                        masks = _out[0]
+-                        flows = styles = diams = None
+-                else:
+-                    masks = _out
+-                    flows = styles = diams = None
+-            except Exception as e:
+-                # safe fallback: yield empty mask for this tile
+-                print(f"[bin2cell.cellseg] Cellpose eval failed on a tile: {e}. Using empty mask for this tile.")
+-                masks = np.zeros(tile.shape[:2], dtype=np.int32)
+-                flows, styles, diams = None, None, None
+-
+-        # cut back to core (remove context)
+-        core_y0, core_y1 = cy0 - y0, cy1 - y0
+-        core_x0, core_x1 = cx0 - x0, cx1 - x0
+-        core_mask = masks[core_y0:core_y1, core_x0:core_x1]
+-
+-        # Build a small dense "existing" view just for the paste window to compute IoU
+-        existing = None
+-        if pasted_windows:
+-            # rasterize the existing sparse pixels intersecting this paste window
+-            ph, pw = (cy1 - cy0), (cx1 - cx0)
+-            existing = np.zeros((ph, pw), dtype=np.int32)
+-            for (py0, py1, px0, px1, r, c, v) in pasted_windows:
+-                # intersection with current paste window
+-                iy0 = max(py0, cy0)
+-                ix0 = max(px0, cx0)
+-                iy1 = min(py1, cy1)
+-                ix1 = min(px1, cx1)
+-                if iy0 >= iy1 or ix0 >= ix1:
+-                    continue
+-                # select those coords that fall into intersection
+-                sel = (r >= iy0) & (r < iy1) & (c >= ix0) & (c < ix1)
+-                if not np.any(sel):
+-                    continue
+-                rr = r[sel] - cy0
+-                cc = c[sel] - cx0
+-                existing[rr, cc] = v[sel]
+-
+-        # accumulate sparse coordinates with IoU-based relabel/merge
+-        next_label = _paste_with_relabel(
+-            global_rows, global_cols, global_vals,
+-            core_mask,
+-            (cy0, cy1, cx0, cx1),
+-            existing,
+-            next_label_start=next_label,
+-            iou_thresh=iou_merge_threshold,
+-        )
+-
+-        # cache what we just pasted (for future "existing" rasterization)
+-        r = global_rows[-1] if global_rows else np.array([], dtype=np.int32)
+-        c = global_cols[-1] if global_cols else np.array([], dtype=np.int32)
+-        v = global_vals[-1] if global_vals else np.array([], dtype=np.int32)
+-        pasted_windows.append((cy0, cy1, cx0, cx1, r, c, v))
+-
+-        # progress update
+-        if pbar is not None:
+-            pbar.update(1)
+-        elif use_fallback_progress:
+-            tiles_done += 1
+-            if (tiles_done % print_every == 0) or (tiles_done == total_tiles):
+-                print(f"[bin2cell.cellseg] Processed {tiles_done}/{total_tiles} tiles")
+-
+-    # close progress bar if used
+-    if pbar is not None:
+-        pbar.close()
+-
+-    # Build global sparse CSR (H x W) without ever materializing dense full image
+-    if len(global_rows) == 0:
+-        labels_csr = sparse.csr_matrix((H, W), dtype=np.int32)
+-    else:
+-        rows = np.concatenate(global_rows)
+-        cols = np.concatenate(global_cols)
+-        vals = np.concatenate(global_vals)
+-        labels_csr = sparse.csr_matrix((vals, (rows, cols)), shape=(H, W), dtype=np.int32)
+-
++                major = int(version("cellpose").split(".")[0])
++            except Exception:
++                major = 4
++            if major < 4:  # keep the models this path always used before Cellpose-SAM
++                method_kwargs["model"] = "nuclei" if image_type == "fluorescence" else "cyto"
++    elif backend == "stardist":
++        method_kwargs.setdefault("model", stardist_model)
++
++    labels_csr = segment(
++        image_path, method=backend, image_type=image_type, diameter=diameter, gpu=gpu,
++        tile_size=block_size, context=max(context, min_overlap // 2), sparse=True,
++        show_progress=show_progress, **method_kwargs,
++    )
+     sparse.save_npz(labels_npz_path, labels_csr)
+ 
+ 
+diff --git a/omicverse/space/__init__.py b/omicverse/space/__init__.py
+index bde1d34d4..9301b1e00 100644
+--- a/omicverse/space/__init__.py
++++ b/omicverse/space/__init__.py
+@@ -10,6 +10,11 @@
+     clusters: Spatial domain identification
+     merge_cluster: Merge spatial clusters
+     CAST: Cellular spatial organization analysis
++
++Cell segmentation (``ov.space.seg``):
++    segment: Image segmentation (watershed, cellpose, stardist, SAM, SAM2, micro-SAM, CellSAM)
++    segment_transcripts: Transcript-based segmentation (Baysor)
++    assign_transcripts / aggregate / evaluate / compare
+     
+ Spatial integration and alignment:
+     pySTAligner: Multi-sample spatial alignment
+@@ -61,7 +66,7 @@
+ from ._stt import STT
+ from ._svg import svg,spatial_neighbors,spatial_autocorr,moranI
+ from ._niche import molecular as _niche_molecular
+-from . import geom, nb, niche
++from . import geom, nb, niche, seg
+ from ._neighborhood import (
+     interaction_matrix,
+     nhood_enrichment,
+@@ -205,4 +210,5 @@
+     'nb',
+     'niche',
+     'geom',
++    'seg',
+ ]
+diff --git a/omicverse/space/_tools.py b/omicverse/space/_tools.py
+index 549907fba..ecf47b3df 100644
+--- a/omicverse/space/_tools.py
++++ b/omicverse/space/_tools.py
+@@ -1237,34 +1237,67 @@ def read_visium_10x(
+ @register_function(
+     aliases=["Visium细胞分割HE", "visium_10x_hd_cellpose_he", "cellpose_he", "HE图像分割", "细胞核分割"],
+     category="space",
+-    description="Cell segmentation on H&E images for high-resolution Visium data using CellPose",
++    description="Cell segmentation on H&E images for high-resolution Visium data (Cellpose by default; method='stardist'/'sam'/'sam2'/'micro_sam'/'watershed'/'cellsam' via ov.space.seg)",
+     examples=[
+-        "# Basic H&E segmentation",
+-        "adata = ov.space.visium_10x_hd_cellpose_he(adata, mpp=0.3)",
++        "# Basic H&E segmentation (modifies adata in place, returns None)",
++        "ov.space.visium_10x_hd_cellpose_he(adata, mpp=0.3)",
+         "# Custom parameters",
+-        "adata = ov.space.visium_10x_hd_cellpose_he(adata, mpp=0.5,",
+-        "                                           prob_thresh=0.1,",
+-        "                                           flow_threshold=0.3)",
++        "ov.space.visium_10x_hd_cellpose_he(adata, mpp=0.5,",
++        "                                   prob_thresh=0.1,",
++        "                                   flow_threshold=0.3)",
++        "# Another backend: StarDist 2D_versatile_he (bin2cell's original model)",
++        "ov.space.visium_10x_hd_cellpose_he(adata, method='stardist')",
+         "# GPU acceleration",
+-        "adata = ov.space.visium_10x_hd_cellpose_he(adata, gpu=True,",
+-        "                                           buffer=200)"
++        "ov.space.visium_10x_hd_cellpose_he(adata, gpu=True, buffer=200)"
+     ],
+-    related=["space.visium_10x_hd_cellpose_gex", "space.bin2cell"]
++    related=["space.visium_10x_hd_cellpose_gex", "space.bin2cell", "space.seg.segment"]
+ )
+ def visium_10x_hd_cellpose_he(
+         adata,
+         mpp=0.3,
+         he_save_path="stardist/he_colon.tiff",
+-        prob_thresh=0,
++        prob_thresh=None,
+         flow_threshold=0.2,
+         gpu=True,
+         buffer=150,
+         backend='tifffile',
++        method="cellpose",
+         **kwargs,
+ ):
+-    """
+-    Convert Visium 10x data to cell-level data.
+-    
++    """Segment nuclei on the Visium HD H&E image and write ``obs['labels_he']``.
++
++    Parameters
++    ----------
++    adata : AnnData
++        Visium HD 2 µm bin AnnData with the full-resolution H&E image path.
++    mpp : float, default=0.3
++        Microns per pixel of the image that is segmented.
++    he_save_path : str
++        Where the cropped, rescaled H&E TIFF is written (reused if present);
++        labels go next to it as ``.npz``.
++    prob_thresh : float, optional
++        Detection threshold: Cellpose ``cellprob_threshold`` (default 0) or
++        StarDist ``prob_thresh`` (default 0.01, bin2cell's recommendation).
++    flow_threshold : float, default=0.2
++        Cellpose flow-error threshold.
++    gpu : bool, default=True
++        Use the GPU when the backend supports it.
++    buffer : int, default=150
++        Pixels kept around the tissue when cropping.
++    backend : str, default='tifffile'
++        Image reader for the source H&E.
++    method : str, default='cellpose'
++        Segmentation backend from :mod:`ov.space.seg`: ``'cellpose'``,
++        ``'stardist'``, ``'sam'``, ``'sam2'``, ``'micro_sam'``,
++        ``'watershed'`` or ``'cellsam'``.
++    **kwargs
++        Forwarded to the backend (e.g. ``diameter``, ``model``,
++        ``block_size``).
++
++    Returns
++    -------
++    None
++        Adds ``obs['labels_he']`` to ``adata`` in place.
+     """
+     from ..external.bin2cell import destripe, scaled_he_image, cellseg, insert_labels
+ 
+@@ -1280,13 +1313,18 @@ def visium_10x_hd_cellpose_he(
+             destripe(adata)
+             scaled_he_image(adata, mpp=mpp, buffer=buffer, save_path=None,
+                             backend=backend)
+-    cellseg(image_path=he_save_path    , 
+-             labels_npz_path=he_save_path.replace(".tiff", ".npz"), 
+-             stardist_model="2D_versatile_he", 
+-             prob_thresh=prob_thresh,
+-             flow_threshold=flow_threshold,
+-             gpu=gpu,
+-             **kwargs,
++    if prob_thresh is None:
++        prob_thresh = {"cellpose": 0, "stardist": 0.01}.get(method)
++    if prob_thresh is not None:
++        kwargs["prob_thresh"] = prob_thresh
++    if method == "cellpose":
++        kwargs["flow_threshold"] = flow_threshold
++    cellseg(image_path=he_save_path,
++            labels_npz_path=he_save_path.replace(".tiff", ".npz"),
++            stardist_model="2D_versatile_he",
++            gpu=gpu,
++            backend=method,
++            **kwargs,
+             )
+     insert_labels(adata, 
+                   labels_npz_path=he_save_path.replace(".tiff", ".npz"), 
+@@ -1301,16 +1339,15 @@ def visium_10x_hd_cellpose_he(
+     category="space",
+     description="Expand cell segmentation labels to nearby bins for improved coverage",
+     examples=[
+-        "# Basic label expansion",
+-        "adata = ov.space.visium_10x_hd_cellpose_expand(adata,",
+-        "                                               max_bin_distance=4)",
++        "# Basic label expansion (modifies adata in place, returns None)",
++        "ov.space.visium_10x_hd_cellpose_expand(adata, max_bin_distance=4)",
+         "# Custom parameters",
+-        "adata = ov.space.visium_10x_hd_cellpose_expand(adata,",
+-        "                                               max_bin_distance=6,",
+-        "                                               labels_key='cellpose_labels')",
++        "ov.space.visium_10x_hd_cellpose_expand(adata,",
++        "                                       max_bin_distance=6,",
++        "                                       labels_key='cellpose_labels')",
+         "# Different expansion keys",
+-        "adata = ov.space.visium_10x_hd_cellpose_expand(adata,",
+-        "                                               expanded_labels_key='expanded_cells')"
++        "ov.space.visium_10x_hd_cellpose_expand(adata,",
++        "                                       expanded_labels_key='expanded_cells')"
+     ],
+     related=["space.visium_10x_hd_cellpose_he", "space.visium_10x_hd_cellpose_gex"]
+ )
+@@ -1352,19 +1389,21 @@ def visium_10x_hd_cellpose_expand(
+ @register_function(
+     aliases=["Visium细胞基因表达", "visium_10x_hd_cellpose_gex", "cellpose_gex", "细胞基因表达映射", "细胞水平表达"],
+     category="space",
+-    description="Map gene expression to cell level using CellPose segmentation",
++    description="Segment cells on a Visium HD total-counts image (Cellpose by default; method='stardist' etc. via ov.space.seg) and write obs['labels_gex']",
+     examples=[
+-        "# Basic gene expression mapping",
+-        "adata = ov.space.visium_10x_hd_cellpose_gex(adata)",
++        "# Basic expression-image segmentation (modifies adata in place, returns None)",
++        "ov.space.visium_10x_hd_cellpose_gex(adata)",
+         "# Custom parameters",
+-        "adata = ov.space.visium_10x_hd_cellpose_gex(adata,",
+-        "                                            obs_key='total_counts',",
+-        "                                            mpp=0.5, sigma=3)",
++        "ov.space.visium_10x_hd_cellpose_gex(adata,",
++        "                                    obs_key='total_counts',",
++        "                                    mpp=0.5, sigma=3)",
+         "# With log transformation",
+-        "adata = ov.space.visium_10x_hd_cellpose_gex(adata, log1p=True,",
+-        "                                            prob_thresh=0.1)"
++        "ov.space.visium_10x_hd_cellpose_gex(adata, log1p=True,",
++        "                                    prob_thresh=0.1)",
++        "# StarDist 2D_versatile_fluo, as in bin2cell",
++        "ov.space.visium_10x_hd_cellpose_gex(adata, method='stardist')"
+     ],
+-    related=["space.visium_10x_hd_cellpose_he", "space.bin2cell"]
++    related=["space.visium_10x_hd_cellpose_he", "space.bin2cell", "space.seg.segment"]
+ )
+ def visium_10x_hd_cellpose_gex(
+         adata,
+@@ -1373,10 +1412,11 @@ def visium_10x_hd_cellpose_gex(
+         mpp=0.3,
+         sigma=5,
+         gex_save_path="stardist/gex_colon.tiff",
+-        prob_thresh=0.01,
+-        nms_thresh=0.1,
++        prob_thresh=None,
++        nms_thresh=None,
+         gpu=True,
+         buffer=150,
++        method="cellpose",
+         **kwargs,
+ ):
+     """Run expression-image segmentation and map labels back to spatial bins.
+@@ -1395,16 +1435,22 @@ def visium_10x_hd_cellpose_gex(
+         Gaussian smoothing parameter for grid image generation.
+     gex_save_path : str, default='stardist/gex_colon.tiff'
+         Output path of generated expression image.
+-    prob_thresh : float, default=0.01
+-        StarDist probability threshold.
+-    nms_thresh : float, default=0.1
+-        StarDist non-max-suppression threshold.
++    prob_thresh : float, optional
++        Detection threshold: Cellpose ``cellprob_threshold`` (default 0.01)
++        or StarDist ``prob_thresh`` (default 0.05, bin2cell's recommendation).
++    nms_thresh : float, optional
++        StarDist non-max-suppression threshold (default 0.5); unused by
++        other methods.
+     gpu : bool, default=True
+-        Whether to use GPU in StarDist inference.
++        Whether to use the GPU.
+     buffer : int, default=150
+         Crop buffer used for spatial coordinate key.
++    method : str, default='cellpose'
++        Segmentation backend from :mod:`ov.space.seg` (``'cellpose'``,
++        ``'stardist'``, ``'watershed'``, ``'sam'``, ``'sam2'``,
++        ``'micro_sam'``, ``'cellsam'``).
+     **kwargs
+-        Additional StarDist arguments.
++        Forwarded to the backend.
+ 
+     Returns
+     -------
+@@ -1420,12 +1466,21 @@ def visium_10x_hd_cellpose_gex(
+                 mpp=mpp, sigma=sigma, save_path=gex_save_path)
+     else:
+         print(f"gex_save_path {gex_save_path} already exists, skipping grid_image")
+-    cellseg(image_path=gex_save_path, 
+-             labels_npz_path=gex_save_path.replace(".tiff", ".npz"), 
+-             stardist_model="2D_versatile_fluo", 
+-             prob_thresh=prob_thresh, 
+-             nms_thresh=nms_thresh,gpu=gpu,
+-             **kwargs,
++    method = kwargs.pop("backend", method)  # pre-`method` spelling
++    if prob_thresh is None:
++        prob_thresh = {"cellpose": 0.01, "stardist": 0.05}.get(method)
++    if nms_thresh is None and method == "stardist":
++        nms_thresh = 0.5
++    if prob_thresh is not None:
++        kwargs["prob_thresh"] = prob_thresh
++    if nms_thresh is not None and method == "stardist":
++        kwargs["nms_thresh"] = nms_thresh
++    cellseg(image_path=gex_save_path,
++            labels_npz_path=gex_save_path.replace(".tiff", ".npz"),
++            stardist_model="2D_versatile_fluo",
++            gpu=gpu,
++            backend=method,
++            **kwargs,
+             )
+     insert_labels(adata, 
+                   labels_npz_path=gex_save_path.replace(".tiff", ".npz"), 
+diff --git a/omicverse/space/seg/__init__.py b/omicverse/space/seg/__init__.py
+new file mode 100644
+index 000000000..3276276c4
+--- /dev/null
++++ b/omicverse/space/seg/__init__.py
+@@ -0,0 +1,73 @@
++r"""Cell segmentation for spatial transcriptomics — ``ov.space.seg``.
++
++One entry point per input type, so methods can be swapped and compared on the
++same sample, as in the Nature Methods 2026 benchmark of segmentation methods
++for spatial transcriptomics (Martinez-de-Morentin et al.)::
++
++    import omicverse as ov
++
++    ov.space.seg.methods()                                   # what is installed
++
++    # image-based: DAPI / morphology / H&E, any size (tiled, seam-free)
++    nuclei = ov.space.seg.segment(dapi, method='cellpose', diameter=30, gpu=True)
++    nuclei = ov.space.seg.segment(he_rgb, method='stardist', image_type='he')
++    masks  = ov.space.seg.segment(dapi, method='sam2')       # also sam, micro_sam, cellsam
++    cells  = ov.space.seg.expand_labels(nuclei, distance=10)  # nucleus -> cell
++
++    # molecules -> cells -> AnnData (Xenium / CosMx / MERFISH / Stereo-seq GEM)
++    tx['cell'] = ov.space.seg.assign_transcripts(tx, cells, pixel_size=0.2125)
++    adata = ov.space.seg.aggregate(tx, cell='cell', gene='feature_name',
++                                   labels=cells, pixel_size=0.2125)
++    ov.pl.spatialseg(adata, color='n_transcripts')
++
++    # transcript-based: Baysor, optionally with the image segmentation as prior
++    tx['nucleus'] = ov.space.seg.assign_transcripts(tx, nuclei, pixel_size=0.2125)
++    tx = ov.space.seg.segment_transcripts(tx, method='baysor', gene='feature_name',
++                                          prior='nucleus', prior_confidence=0.5)
++
++    # reference-free CellSPA metrics and a ranked comparison
++    table = ov.space.seg.compare({
++        'cellpose': ov.space.seg.evaluate(cells, tx),
++        'baysor':   ov.space.seg.evaluate(None, tx_baysor),
++    })
++
++Methods
++-------
++``watershed``  Spateo-style marker watershed; scikit-image only.
++``cellpose``   Cellpose 2/3/4; ``restore_type='denoise_cyto3'`` (v3) and
++               Cellpose-SAM ``'cpsam'`` (v4, default when installed).
++``stardist``   StarDist ``2D_versatile_fluo`` / ``2D_versatile_he``.
++``sam``        Segment Anything ViT-H automatic masks (benchmark settings).
++``sam2``       SAM 2 ``facebook/sam2-hiera-large`` automatic masks.
++``micro_sam``  micro-SAM ``vit_b_lm`` (instance decoder, or ``amg=True``).
++``cellsam``    CellSAM foundation model.
++``baysor``     Transcript-based MRF segmentation (CLI), image-free or with prior.
++
++Visium HD uses the same backends through
++``ov.space.visium_10x_hd_cellpose_he(adata, method='stardist')`` and
++``ov.space.visium_10x_hd_cellpose_gex``.
++
++Install
++-------
++``pip install 'omicverse[seg]'`` adds Cellpose, Segment Anything and SAM 2.
++StarDist (``pip install stardist tensorflow``), micro-SAM (conda-forge),
++CellSAM (GitHub) and Baysor (binary) are installed separately;
++:func:`methods` reports what is available.
++"""
++from ._api import expand_labels, load_image, methods, segment
++from ._metrics import compare, evaluate
++from ._tiling import segment_tiled
++from ._transcripts import aggregate, assign_transcripts, segment_transcripts
++
++__all__ = [
++    "methods",
++    "segment",
++    "segment_tiled",
++    "expand_labels",
++    "load_image",
++    "assign_transcripts",
++    "aggregate",
++    "segment_transcripts",
++    "evaluate",
++    "compare",
++]
+diff --git a/omicverse/space/seg/_api.py b/omicverse/space/seg/_api.py
+new file mode 100644
+index 000000000..e9ec0a413
+--- /dev/null
++++ b/omicverse/space/seg/_api.py
+@@ -0,0 +1,229 @@
++r"""Public entry points of ``ov.space.seg`` for images."""
++from __future__ import annotations
++
++from typing import Literal
++
++import numpy as np
++import pandas as pd
++
++from ..._registry import register_function
++from ._backends import BACKENDS, _sample
++from ._tiling import segment_tiled
++
++ImageMethod = Literal["watershed", "cellpose", "stardist", "sam", "sam2", "micro_sam", "cellsam"]
++
++_METHOD_TABLE = [
++    # name, input, needs, gpu, reference
++    ("watershed", "image", "scikit-image (bundled)", "no",
++     "Spateo-style marker watershed; classical baseline"),
++    ("cellpose", "image", "cellpose>=2 (v3 restore, v4 Cellpose-SAM)", "recommended",
++     "Stringer & Pachitariu, Nat. Methods 2025"),
++    ("stardist", "image", "stardist + tensorflow", "optional",
++     "Schmidt et al., MICCAI 2018"),
++    ("sam", "image", "segment-anything", "recommended",
++     "Kirillov et al., ICCV 2023"),
++    ("sam2", "image", "sam2 + huggingface_hub (py>=3.10)", "recommended",
++     "Ravi et al., ICLR 2025"),
++    ("micro_sam", "image", "micro_sam (conda-forge)", "recommended",
++     "Archit et al., Nat. Methods 2025"),
++    ("cellsam", "image", "cellSAM (git) + DEEPCELL_ACCESS_TOKEN", "recommended",
++     "Israel et al., bioRxiv 2023"),
++    ("baysor", "transcripts (+ prior)", "Baysor CLI on PATH", "no",
++     "Petukhov et al., Nat. Biotechnol. 2022"),
++]
++
++
++@register_function(
++    aliases=["分割方法列表", "seg_methods", "segmentation methods", "细胞分割方法"],
++    category="space",
++    description="List the cell segmentation methods available through ov.space.seg, their input type, dependencies and whether each is installed.",
++    examples=["ov.space.seg.methods()"],
++    related=["space.seg.segment", "space.seg.segment_transcripts"],
++)
++def methods() -> pd.DataFrame:
++    """Segmentation methods behind ``ov.space.seg``.
++
++    Returns
++    -------
++    pandas.DataFrame
++        One row per method: ``input`` (image or transcripts), ``needs``
++        (what to install), ``gpu``, ``installed`` (importable / on PATH now)
++        and a literature ``reference``.
++    """
++    import importlib.util
++    import shutil
++
++    rows = []
++    for name, kind, needs, gpu, ref in _METHOD_TABLE:
++        if name == "baysor":
++            installed = shutil.which("baysor") is not None
++        else:
++            mods = BACKENDS[name].requires
++            installed = all(importlib.util.find_spec(m.split(".")[0]) is not None for m in mods)
++        rows.append({"method": name, "input": kind, "needs": needs, "gpu": gpu,
++                     "installed": installed, "reference": ref})
++    return pd.DataFrame(rows).set_index("method")
++
++
++def load_image(path, *, level: int = 0) -> np.ndarray:
++    """Read a TIFF/OME-TIFF (pyramid ``level``), PNG or JPEG into memory."""
++    path = str(path)
++    if path.lower().endswith((".tif", ".tiff", ".btf")):
++        import tifffile
++        with tifffile.TiffFile(path) as tif:
++            series = tif.series[0]
++            if level and len(series.levels) > level:
++                return series.levels[level].asarray()
++            return series.asarray()
++    from skimage.io import imread
++    return imread(path)
++
++
++def _channels_last(image: np.ndarray) -> np.ndarray:
++    """Move a leading channel axis ``(C, H, W)`` (C <= 4) to the end."""
++    if image.ndim == 3 and image.shape[0] <= 4 and image.shape[-1] > 4:
++        return np.moveaxis(image, 0, -1)
++    return image
++
++
++@register_function(
++    aliases=["细胞分割", "segment", "cell segmentation", "核分割", "图像分割",
++             "cellpose", "stardist", "SAM分割", "sam2", "micro_sam", "watershed"],
++    category="space",
++    description="Segment cells or nuclei in a DAPI/fluorescence or H&E image of any size with one of several backends (watershed, cellpose incl. Cellpose 3 restoration and Cellpose-SAM, stardist, SAM, SAM2, micro-SAM, CellSAM); tiled inference with seam-free stitching, returns an integer label image.",
++    examples=[
++        "labels = ov.space.seg.segment(dapi, method='cellpose', diameter=30, gpu=True)",
++        "labels = ov.space.seg.segment(dapi, method='cellpose', model='cyto3', restore_type='denoise_cyto3')",
++        "labels = ov.space.seg.segment(he_rgb, method='stardist', image_type='he')",
++        "labels = ov.space.seg.segment('morphology_focus.ome.tif', method='sam2', tile_size=1024)",
++        "labels = ov.space.seg.segment(dapi, method='watershed', diameter=20)",
++    ],
++    related=["space.seg.assign_transcripts", "space.seg.aggregate", "space.seg.evaluate",
++             "space.seg.methods", "space.visium_10x_hd_cellpose_he"],
++)
++def segment(
++    image,
++    method: ImageMethod = "cellpose",
++    *,
++    image_type: Literal["auto", "fluorescence", "he"] = "auto",
++    channel: int | None = None,
++    diameter: float | None = None,
++    gpu: bool | str = False,
++    tile_size: int | None = None,
++    context: int | None = None,
++    min_size: int = 0,
++    expand: float = 0,
++    sparse: bool = False,
++    level: int = 0,
++    show_progress: bool = True,
++    **method_kwargs,
++):
++    """Segment cells or nuclei in a 2-D image.
++
++    Large images are segmented tile by tile: every tile is processed with a
++    ``context`` margin and keeps the objects whose centroid it owns, so the
++    result has no seams and no duplicated cells. Intensity scaling is fixed
++    once from the whole image, so tiles agree with each other.
++
++    Parameters
++    ----------
++    image
++        ``(H, W)`` or ``(H, W, C)`` array, or a path to a TIFF/OME-TIFF,
++        PNG or JPEG. A leading channel axis ``(C, H, W)`` is moved last.
++    method
++        ``'watershed'`` (no extra dependency), ``'cellpose'``,
++        ``'stardist'``, ``'sam'``, ``'sam2'``, ``'micro_sam'`` or
++        ``'cellsam'``. See :func:`ov.space.seg.methods`.
++    image_type
++        ``'fluorescence'`` (bright objects on dark), ``'he'`` (RGB H&E;
++        the haematoxylin channel is the nuclear signal for single-channel
++        models) or ``'auto'`` (3/4-channel images are H&E).
++    channel
++        Channel of a multi-channel fluorescence image to segment. ``None``
++        averages channels.
++    diameter
++        Expected object diameter in pixels. Sets Cellpose's ``diameter``,
++        the watershed scales, the SAM-family area filters and the default
++        ``context``.
++    gpu
++        ``True`` for CUDA (or Apple MPS), ``False`` for CPU, or a torch
++        device string.
++    tile_size, context
++        Tile size and margin in pixels. Defaults depend on the method
++        (1024 for the SAM family, 2048 otherwise); ``context`` defaults to
++        ``max(64, 2 * diameter)``.
++    min_size
++        Drop objects of at most this many pixels.
++    expand
++        Grow each object by this many pixels without merging neighbours
++        (nucleus -> cell approximation, as in Xenium).
++    sparse
++        Return a ``scipy.sparse.csr_matrix`` (for whole-slide images).
++    level
++        Pyramid level when ``image`` is an OME-TIFF path.
++    **method_kwargs
++        Method options, e.g. ``model``, ``flow_threshold``,
++        ``cellprob_threshold``, ``restore_type`` (cellpose);
++        ``prob_thresh``, ``nms_thresh`` (stardist); ``points_per_side``,
++        ``pred_iou_thresh``, ``stability_score_thresh``, ``checkpoint``,
++        ``max_area`` (SAM family); ``otsu_classes``, ``otsu_index``,
++        ``sigma``, ``min_distance`` (watershed).
++
++    Returns
++    -------
++    numpy.ndarray or scipy.sparse.csr_matrix
++        ``int32`` label image of the input's height and width, 0 = background.
++    """
++    if method not in BACKENDS:
++        raise ValueError(f"Unknown method {method!r}; choose from {sorted(BACKENDS)}. "
++                         "Transcript-based methods are in ov.space.seg.segment_transcripts.")
++    if isinstance(image, (str, bytes)) or hasattr(image, "__fspath__"):
++        image = load_image(image, level=level)
++    image = _channels_last(np.asarray(image) if not hasattr(image, "shape") else image)
++    if image.ndim not in (2, 3):
++        raise ValueError(f"expected a 2-D image (H, W) or (H, W, C), got shape {image.shape}")
++
++    cls = BACKENDS[method]
++    backend = cls(gpu=gpu, image_type=image_type, channel=channel, diameter=diameter,
++                  **method_kwargs)
++    backend.prepare(_sample(image))
++    tile_size = int(tile_size or cls.default_tile_size)
++    if context is None:
++        context = int(max(64, 2 * diameter)) if diameter else 64
++    labels = segment_tiled(image, backend, tile_size=tile_size, context=context,
++                           min_size=min_size, sparse=sparse and not expand,
++                           show_progress=show_progress, desc=f"seg[{method}]")
++    if expand:
++        labels = expand_labels(labels, expand)
++        if sparse:
++            from scipy import sparse as sp
++            labels = sp.csr_matrix(labels)
++    return labels
++
++
++@register_function(
++    aliases=["扩展标签", "expand_labels", "核扩展为细胞", "nucleus expansion"],
++    category="space",
++    description="Grow segmented nuclei by a fixed distance into cell approximations without merging neighbouring objects.",
++    examples=["cells = ov.space.seg.expand_labels(nuclei, distance=10)"],
++    related=["space.seg.segment"],
++)
++def expand_labels(labels, distance: float):
++    """Grow every object by ``distance`` pixels; contested pixels go to the nearest.
++
++    Parameters
++    ----------
++    labels
++        Integer label image (dense or ``scipy.sparse``).
++    distance
++        Expansion distance in pixels.
++
++    Returns
++    -------
++    numpy.ndarray
++        Expanded ``int32`` label image.
++    """
++    from skimage.segmentation import expand_labels as _expand
++    if hasattr(labels, "toarray"):
++        labels = labels.toarray()
++    return _expand(np.asarray(labels), distance=distance).astype(np.int32)
+diff --git a/omicverse/space/seg/_backends.py b/omicverse/space/seg/_backends.py
+new file mode 100644
+index 000000000..7f99d2555
+--- /dev/null
++++ b/omicverse/space/seg/_backends.py
+@@ -0,0 +1,624 @@
++r"""Image segmentation backends for ``ov.space.seg.segment``.
++
++A backend is built once per call, sees a downsampled copy of the whole image in
++:meth:`Backend.prepare` (so intensity scaling is global, not per tile), and is
++then called on each window by the tiling engine. Heavy libraries are imported
++in ``_build`` only, the first time a window is segmented.
++"""
++from __future__ import annotations
++
++import os
++import warnings
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++
++from ..._optional import build_optional_dependency_error
++
++
++def _cache_dir() -> Path:
++    root = os.environ.get("OV_SEG_CACHE") or os.path.join(
++        os.path.expanduser("~"), ".cache", "omicverse", "seg"
++    )
++    path = Path(root)
++    path.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def _torch_device(gpu, *, mps: bool = True) -> str:
++    """``'cuda'`` / ``'mps'`` / ``'cpu'`` from a bool or an explicit device string.
++
++    ``mps=False`` skips Apple MPS when picking automatically, for models whose
++    post-processing needs float64 tensors (unsupported on MPS).
++    """
++    if isinstance(gpu, str):
++        return gpu
++    if not gpu:
++        return "cpu"
++    try:
++        import torch
++    except ImportError:
++        return "cpu"
++    if torch.cuda.is_available():
++        return "cuda"
++    if mps and getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
++        return "mps"
++    return "cpu"
++
++
++def _sample(image, max_pixels: int = 4_000_000) -> np.ndarray:
++    """A strided view of ``image`` with at most ``max_pixels`` pixels."""
++    H, W = int(image.shape[0]), int(image.shape[1])
++    step = max(1, int(np.ceil(np.sqrt(H * W / max_pixels))))
++    return np.asarray(image[::step, ::step])
++
++
++def _odd(n: float) -> int:
++    n = max(3, int(round(n)))
++    return n if n % 2 else n + 1
++
++
++class Backend:
++    """Base class: intensity handling shared by every image backend.
++
++    ``image_type`` decides what "signal" means. ``'fluorescence'`` -- bright
++    objects on a dark background (DAPI, a stain channel, an expression image);
++    ``'he'`` -- an RGB brightfield H&E image, whose nuclear signal is the
++    haematoxylin channel; ``'auto'`` -- ``'he'`` for 3-/4-channel images,
++    otherwise ``'fluorescence'``.
++    """
++
++    name = "base"
++    #: modules imported by ``_build``; reported in the missing-dependency error
++    requires: tuple = ()
++    install = ""
++    default_tile_size = 2048
++
++    def __init__(self, *, gpu=False, image_type="auto", channel=None,
++                 diameter=None, percentiles=(1.0, 99.8)):
++        if image_type not in ("auto", "fluorescence", "he"):
++            raise ValueError("image_type must be 'auto', 'fluorescence' or 'he'")
++        self.gpu = gpu
++        self.image_type = image_type
++        self.channel = channel
++        self.diameter = diameter
++        self.percentiles = tuple(percentiles)
++        self._model = None
++        self._lo, self._hi = 0.0, 1.0            # nuclear signal
++        self._gray_lo, self._gray_hi = 0.0, 1.0  # luminance of an RGB image
++        self._ch_lo = self._ch_hi = None         # per RGB channel
++        self._rgb_lo, self._rgb_hi = 0.0, 255.0  # whole RGB range
++
++    # -- intensity ---------------------------------------------------------
++    def _resolve_type(self, image) -> None:
++        if self.image_type == "auto":
++            is_rgb = image.ndim == 3 and image.shape[-1] in (3, 4) and self.channel is None
++            self.image_type = "he" if is_rgb else "fluorescence"
++        if self.image_type == "he" and not (image.ndim == 3 and image.shape[-1] >= 3):
++            raise ValueError("image_type='he' expects an (H, W, 3) RGB image")
++
++    def _raw_signal(self, tile: np.ndarray) -> np.ndarray:
++        """Nuclear/foreground signal, unscaled, one channel."""
++        if self.image_type == "he":
++            from skimage.color import rgb2hed
++            rgb = tile[..., :3]
++            if rgb.dtype.kind == "f" and rgb.max() > 1.0:
++                rgb = rgb / 255.0
++            return rgb2hed(rgb)[..., 0]
++        if tile.ndim == 3:
++            if self.channel is not None:
++                return tile[..., self.channel].astype(np.float32)
++            return tile.mean(axis=-1, dtype=np.float32)
++        return tile.astype(np.float32, copy=False)
++
++    def prepare(self, sample: np.ndarray) -> None:
++        """Fix the global intensity scale from a downsampled whole image."""
++        self._resolve_type(sample)
++        sig = self._raw_signal(sample)
++        lo, hi = np.percentile(sig, self.percentiles)
++        self._lo, self._hi = float(lo), float(max(hi, lo + 1e-12))
++        if sample.ndim == 3 and sample.shape[-1] >= 3:
++            rgb = sample[..., :3].astype(np.float32)
++            lo, hi = np.percentile(rgb, (0.0, 100.0))
++            self._rgb_lo, self._rgb_hi = float(lo), float(max(hi, lo + 1e-12))
++            lo, hi = np.percentile(rgb.reshape(-1, 3), self.percentiles, axis=0)
++            self._ch_lo, self._ch_hi = lo, np.maximum(hi, lo + 1e-12)
++            lo, hi = np.percentile(self._luminance(rgb), self.percentiles)
++            self._gray_lo, self._gray_hi = float(lo), float(max(hi, lo + 1e-12))
++
++    @staticmethod
++    def _luminance(rgb: np.ndarray) -> np.ndarray:
++        return rgb[..., :3].astype(np.float32) @ np.array([0.2125, 0.7154, 0.0721], np.float32)
++
++    # Percentile stretches map the global low/high percentiles to 0/1 and do not
++    # clip, like csbdeep.normalize (StarDist) and normalize99 (Cellpose).
++    def signal(self, tile: np.ndarray) -> np.ndarray:
++        """Foreground signal stretched with the global percentiles (~``[0, 1]``)."""
++        sig = (self._raw_signal(tile) - self._lo) / (self._hi - self._lo)
++        return sig.astype(np.float32)
++
++    def gray(self, tile: np.ndarray) -> np.ndarray:
++        """Luminance of an RGB tile, stretched with the global percentiles."""
++        g = (self._luminance(tile) - self._gray_lo) / (self._gray_hi - self._gray_lo)
++        return g.astype(np.float32)
++
++    def rgb_norm(self, tile: np.ndarray, *, joint: bool = False) -> np.ndarray:
++        """RGB tile stretched per channel (or jointly) with the global percentiles."""
++        rgb = tile[..., :3].astype(np.float32)
++        if joint:
++            lo, hi = np.min(self._ch_lo), np.max(self._ch_hi)
++        else:
++            lo, hi = self._ch_lo, self._ch_hi
++        return ((rgb - lo) / (hi - lo)).astype(np.float32)
++
++    def signal8(self, tile: np.ndarray) -> np.ndarray:
++        """:meth:`signal` as ``uint8``."""
++        return (np.clip(self.signal(tile), 0.0, 1.0) * 255).astype(np.uint8)
++
++    def rgb8(self, tile: np.ndarray) -> np.ndarray:
++        """``uint8`` RGB for the natural-image models (SAM family, CellSAM)."""
++        if self.image_type == "he":
++            rgb = tile[..., :3].astype(np.float32)
++            if tile.dtype == np.uint8:
++                return np.ascontiguousarray(tile[..., :3])
++            rgb = (rgb - self._rgb_lo) / (self._rgb_hi - self._rgb_lo)
++            return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
++        return np.repeat(self.signal8(tile)[..., None], 3, axis=-1)
++
++    # -- model -------------------------------------------------------------
++    def _build(self) -> Any:  # pragma: no cover - overridden
++        raise NotImplementedError
++
++    def model(self):
++        if self._model is None:
++            try:
++                self._model = self._build()
++            except ImportError as exc:
++                missing = getattr(exc, "name", None)
++                if missing and missing.split(".")[0] not in {r.split(".")[0] for r in self.requires}:
++                    raise
++                raise build_optional_dependency_error(
++                    f"ov.space.seg.segment(method={self.name!r})",
++                    self.requires,
++                    install_hint=self.install,
++                ) from exc
++        return self._model
++
++    def __call__(self, tile: np.ndarray) -> np.ndarray:  # pragma: no cover - overridden
++        raise NotImplementedError
++
++
++# ---------------------------------------------------------------------------
++# classical
++# ---------------------------------------------------------------------------
++class WatershedBackend(Backend):
++    """Marker-controlled watershed -- the classical baseline.
++
++    Follows the Spateo pipeline benchmarked by Martinez-de-Morentin et al.
++    (Nat. Methods 2026): a global multi-Otsu threshold plus a local adaptive
++    threshold give the foreground, Gaussian-smoothed intensity maxima are the
++    markers, and the watershed of the inverted smoothed image splits touching
++    objects. Needs only scikit-image.
++    """
++
++    name = "watershed"
++    requires = ("skimage",)
++
++    def __init__(self, *, otsu_classes=4, otsu_index=1, sigma=None, min_distance=None,
++                 local_block=None, local_offset=0.02, min_size=None, compactness=0.0,
++                 **kw):
++        super().__init__(**kw)
++        self.otsu_classes = otsu_classes
++        self.otsu_index = otsu_index
++        d = self.diameter
++        self.sigma = sigma if sigma is not None else (max(1.0, d / 6.0) if d else 2.0)
++        self.min_distance = (min_distance if min_distance is not None
++                             else (max(2, int(d / 3)) if d else 4))
++        self.local_block = local_block if local_block is not None else (_odd(4 * d) if d else 55)
++        self.local_offset = local_offset
++        self.min_size = (min_size if min_size is not None
++                         else (int(0.15 * np.pi * (d / 2) ** 2) if d else 16))
++        self.compactness = compactness
++        self._threshold = None
++
++    def prepare(self, sample):
++        super().prepare(sample)
++        from skimage.filters import gaussian, threshold_multiotsu
++        smooth = gaussian(np.clip(self.signal(sample), 0.0, 1.0), sigma=1.0)
++        try:
++            thresholds = threshold_multiotsu(smooth, classes=self.otsu_classes)
++            self._threshold = float(thresholds[min(self.otsu_index, len(thresholds) - 1)])
++        except ValueError:  # flat image: fewer grey levels than classes
++            self._threshold = float(smooth.mean())
++
++    def _build(self):
++        import skimage  # noqa: F401
++        return True
++
++    def __call__(self, tile):
++        from scipy import ndimage as ndi
++        from skimage.feature import peak_local_max
++        from skimage.filters import gaussian, threshold_local
++        from skimage.segmentation import watershed
++
++        self.model()
++        img = np.clip(self.signal(tile), 0.0, 1.0)
++        smooth = gaussian(img, sigma=self.sigma)
++        fg = smooth > self._threshold
++        if self.local_block and min(img.shape) > self.local_block:
++            fg &= img > threshold_local(img, self.local_block, method="gaussian",
++                                        offset=self.local_offset)
++        cross = ndi.generate_binary_structure(2, 1)
++        fg = ndi.binary_opening(ndi.binary_closing(fg, cross), cross)
++        fg = ndi.binary_fill_holes(fg)
++        components, _ = ndi.label(fg)
++        small = np.bincount(components.ravel()) < self.min_size
++        small[0] = False
++        fg[small[components]] = False
++        components[~fg] = 0
++        if not fg.any():
++            return np.zeros(img.shape, dtype=np.int32)
++        peaks = peak_local_max(smooth, min_distance=self.min_distance, labels=components,
++                               exclude_border=False)
++        markers = np.zeros(img.shape, dtype=np.int32)
++        markers[tuple(peaks.T)] = np.arange(1, len(peaks) + 1)
++        # components without a peak (flat tops) still become one object
++        seeded = np.unique(components[markers > 0])
++        orphan = np.setdiff1d(np.unique(components[components > 0]), seeded)
++        if orphan.size:
++            extra = np.isin(components, orphan)
++            markers[extra] = components[extra] + len(peaks)
++        labels = watershed(-smooth, markers, mask=fg, compactness=self.compactness)
++        return labels.astype(np.int32)
++
++
++# ---------------------------------------------------------------------------
++# deep learning, image only
++# ---------------------------------------------------------------------------
++def _call_with_supported(fn, args: tuple, kwargs: dict):
++    """Call ``fn`` with only the keyword arguments its signature accepts."""
++    import inspect
++    params = inspect.signature(fn).parameters
++    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
++        return fn(*args, **kwargs)
++    return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
++
++
++class CellposeBackend(Backend):
++    """Cellpose (v2, v3 with image restoration, v4 Cellpose-SAM).
++
++    ``model`` defaults to ``'cpsam'`` on Cellpose 4 and ``'cyto3'`` on 3
++    (``'cyto'`` before). ``restore_type='denoise_cyto3'`` runs Cellpose 3's
++    denoising model first, as in the Nature Methods 2026 benchmark. Images are
++    normalised once globally and passed with ``normalize=False``.
++    """
++
++    name = "cellpose"
++    requires = ("cellpose",)
++    install = "Install with `pip install cellpose` (or `pip install 'omicverse[seg]'`)."
++
++    _V3_ONLY = {"cyto", "cyto2", "cyto3", "nuclei", "tissuenet_cp3", "livecell_cp3",
++                "yeast_PhC_cp3", "yeast_BF_cp3", "bact_phase_cp3", "bact_fluor_cp3",
++                "deepbacs_cp3", "cyto2_cp3"}
++
++    def __init__(self, *, model=None, restore_type=None, flow_threshold=0.4,
++                 cellprob_threshold=0.0, batch_size=None, **kw):
++        eval_keys = ("niter", "min_size", "stitch_threshold", "augment", "tile_overlap",
++                     "bsize", "max_size_fraction", "resample", "normalize", "invert")
++        self.eval_kwargs = {k: kw.pop(k) for k in list(kw) if k in eval_keys}
++        super().__init__(**kw)
++        self.model_name = model
++        self.restore_type = restore_type
++        self.flow_threshold = flow_threshold
++        self.cellprob_threshold = cellprob_threshold
++        self.batch_size = batch_size
++        self._major = None
++
++    def _build(self):
++        from importlib.metadata import version
++
++        from cellpose import models
++        try:
++            self._major = int(version("cellpose").split(".")[0])
++        except Exception:  # pragma: no cover - editable installs without metadata
++            self._major = 4 if not hasattr(models, "Cellpose") else 3
++        device_gpu = _torch_device(self.gpu) != "cpu"
++        if self._major >= 4:
++            if self.restore_type:
++                raise ValueError("restore_type needs Cellpose 3; Cellpose 4 (Cellpose-SAM) "
++                                 "is trained to be robust to noise and has no restore models")
++            name = self.model_name or "cpsam"
++            if name in self._V3_ONLY:
++                warnings.warn(f"Cellpose 4 has no {name!r} model; using Cellpose-SAM ('cpsam').",
++                              stacklevel=3)
++                name = "cpsam"
++            return models.CellposeModel(gpu=device_gpu, pretrained_model=name)
++        name = self.model_name or ("cyto3" if self._major == 3 else "cyto")
++        if self.restore_type:
++            from cellpose import denoise
++            return denoise.CellposeDenoiseModel(gpu=device_gpu, model_type=name,
++                                                restore_type=self.restore_type)
++        if name in self._V3_ONLY:
++            return models.CellposeModel(gpu=device_gpu, model_type=name)
++        return models.CellposeModel(gpu=device_gpu, pretrained_model=name)
++
++    def __call__(self, tile):
++        model = self.model()
++        if self._major >= 4 and self.image_type == "he":
++            x = self.rgb_norm(tile)
++            channel_kw = {"channel_axis": -1}
++        else:
++            # Cellpose <= 3 on H&E: grayscale, as the original bin2cell path did
++            x = self.gray(tile) if self.image_type == "he" else self.signal(tile)
++            channel_kw = {"channel_axis": None, "channels": [0, 0]}
++        if min(x.shape[:2]) < 16:
++            return np.zeros(x.shape[:2], dtype=np.int32)
++        kwargs = {"diameter": self.diameter, "flow_threshold": self.flow_threshold,
++                  "cellprob_threshold": self.cellprob_threshold, "normalize": False,
++                  **channel_kw, **self.eval_kwargs}
++        if self.batch_size is not None:
++            kwargs["batch_size"] = self.batch_size
++        out = _call_with_supported(model.eval, (x,), kwargs)
++        masks = out[0] if isinstance(out, tuple) else out
++        return np.asarray(masks, dtype=np.int32)
++
++
++class StarDistBackend(Backend):
++    """StarDist star-convex polygons (``2D_versatile_fluo`` / ``2D_versatile_he``).
++
++    The model follows ``image_type`` unless given. StarDist runs on
++    TensorFlow, which picks the GPU itself; ``gpu`` is ignored.
++    """
++
++    name = "stardist"
++    requires = ("stardist", "tensorflow")
++    install = "Install with `pip install stardist tensorflow`."
++    default_tile_size = 2048
++
++    def __init__(self, *, model=None, prob_thresh=None, nms_thresh=None, n_tiles=None, **kw):
++        super().__init__(**kw)
++        self.model_name = model
++        self.prob_thresh = prob_thresh
++        self.nms_thresh = nms_thresh
++        self.n_tiles = n_tiles
++
++    def _build(self):
++        from stardist.models import StarDist2D
++        name = self.model_name or ("2D_versatile_he" if self.image_type == "he"
++                                   else "2D_versatile_fluo")
++        if os.path.isdir(str(name)):
++            p = Path(name)
++            return StarDist2D(None, name=p.name, basedir=str(p.parent))
++        return StarDist2D.from_pretrained(name)
++
++    def __call__(self, tile):
++        model = self.model()
++        if model.config.n_channel_in == 3:
++            x = self.rgb_norm(tile, joint=True)  # StarDist's normalize(img, 1, 99.8, axis=(0,1,2))
++        else:
++            x = self.signal(tile)
++        if min(x.shape[:2]) < 16:
++            return np.zeros(x.shape[:2], dtype=np.int32)
++        kwargs = {"prob_thresh": self.prob_thresh, "nms_thresh": self.nms_thresh,
++                  "show_tile_progress": False, "verbose": False}
++        if self.n_tiles is not None:
++            kwargs["n_tiles"] = self.n_tiles
++        labels, _ = _call_with_supported(model.predict_instances, (x,), kwargs)
++        return np.asarray(labels, dtype=np.int32)
++
++
++def _masks_to_labels(masks, *, min_area=0, max_area=None) -> np.ndarray | None:
++    """Paint SAM-style mask records into one label image, small over large.
++
++    Masks larger than ``max_area`` (tissue, background) are dropped; where
++    masks overlap the smaller one wins, which keeps a nucleus that SAM also
++    returned as part of a bigger blob.
++    """
++    if not masks:
++        return None
++    shape = np.asarray(masks[0]["segmentation"]).shape
++    out = np.zeros(shape, dtype=np.int32)
++    kept = [m for m in masks
++            if m.get("area", int(np.count_nonzero(m["segmentation"]))) >= min_area
++            and (max_area is None or m.get("area", 0) <= max_area)]
++    kept.sort(key=lambda m: m.get("area", 0), reverse=True)
++    for i, m in enumerate(kept, start=1):
++        out[np.asarray(m["segmentation"], dtype=bool)] = i
++    if not kept:
++        return out
++    # painting can leave a large mask as scattered fragments: renumber what survives
++    ids, out_flat = np.unique(out, return_inverse=True)
++    out = out_flat.reshape(shape).astype(np.int32)
++    if ids[0] != 0:
++        out += 1
++    if min_area:
++        area = np.bincount(out.ravel())
++        out[area[out] < min_area] = 0
++        _, out_flat = np.unique(out, return_inverse=True)
++        out = out_flat.reshape(shape).astype(np.int32)
++    return out
++
++
++class _AMGBackend(Backend):
++    """Shared logic for automatic-mask-generator models (SAM, SAM 2)."""
++
++    default_tile_size = 1024
++
++    def __init__(self, *, points_per_side=32, pred_iou_thresh=0.88,
++                 stability_score_thresh=0.95, points_per_batch=64, crop_n_layers=0,
++                 min_area=None, max_area=None, amg_kwargs=None, **kw):
++        super().__init__(**kw)
++        self.amg_kwargs = dict(points_per_side=points_per_side, pred_iou_thresh=pred_iou_thresh,
++                               stability_score_thresh=stability_score_thresh,
++                               points_per_batch=points_per_batch, crop_n_layers=crop_n_layers,
++                               **(amg_kwargs or {}))
++        d = self.diameter
++        self.min_area = min_area if min_area is not None else (
++            int(0.1 * np.pi * (d / 2) ** 2) if d else 10)
++        self.max_area = max_area if max_area is not None else (
++            int(4 * np.pi * (d / 2) ** 2) if d else None)
++
++    def __call__(self, tile):
++        amg = self.model()
++        rgb = self.rgb8(tile)
++        if min(rgb.shape[:2]) < 16:
++            return np.zeros(rgb.shape[:2], dtype=np.int32)
++        masks = amg.generate(rgb)
++        max_area = self.max_area or int(0.02 * rgb.shape[0] * rgb.shape[1])
++        out = _masks_to_labels(masks, min_area=self.min_area, max_area=max_area)
++        return np.zeros(rgb.shape[:2], dtype=np.int32) if out is None else out
++
++
++_SAM_URLS = {
++    "vit_h": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
++    "vit_l": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
++    "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
++}
++
++
++class SAMBackend(_AMGBackend):
++    """Segment Anything (Kirillov et al., ICCV 2023), automatic mask generation.
++
++    Defaults are the benchmark's: ViT-H, 32 points per side, predicted-IoU
++    threshold 0.88, stability threshold 0.95. The checkpoint is downloaded to
++    ``$OV_SEG_CACHE`` (``~/.cache/omicverse/seg``) unless ``checkpoint`` is given.
++    """
++
++    name = "sam"
++    requires = ("segment_anything", "torch")
++    install = "Install with `pip install segment-anything` (or `pip install 'omicverse[seg]'`)."
++
++    def __init__(self, *, model="vit_h", checkpoint=None, **kw):
++        super().__init__(**kw)
++        self.model_name = model
++        self.checkpoint = checkpoint
++
++    def _build(self):
++        import torch
++        from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
++
++        ckpt = self.checkpoint
++        if ckpt is None:
++            if self.model_name not in _SAM_URLS:
++                raise ValueError(f"model must be one of {sorted(_SAM_URLS)} or pass checkpoint=")
++            url = _SAM_URLS[self.model_name]
++            ckpt = _cache_dir() / Path(url).name
++            if not ckpt.exists():
++                torch.hub.download_url_to_file(url, str(ckpt))
++        sam = sam_model_registry[self.model_name](checkpoint=str(ckpt))
++        # the mask generator casts to float64, which MPS cannot hold
++        sam.to(_torch_device(self.gpu, mps=False))
++        return SamAutomaticMaskGenerator(sam, **self.amg_kwargs)
++
++
++class SAM2Backend(_AMGBackend):
++    """Segment Anything 2 (Ravi et al., ICLR 2025), automatic mask generation.
++
++    ``model`` is a Hugging Face id (default ``facebook/sam2-hiera-large``, the
++    benchmark's checkpoint) or a local config with ``checkpoint=``.
++    """
++
++    name = "sam2"
++    requires = ("sam2", "torch", "huggingface_hub")
++    install = ("Install with `pip install sam2 huggingface_hub` (Python >= 3.10, "
++               "or `pip install 'omicverse[seg]'`).")
++
++    def __init__(self, *, model="facebook/sam2-hiera-large", checkpoint=None,
++                 pred_iou_thresh=0.8, **kw):
++        super().__init__(pred_iou_thresh=pred_iou_thresh, **kw)
++        self.model_name = model
++        self.checkpoint = checkpoint
++
++    def _build(self):
++        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
++        from sam2.build_sam import build_sam2, build_sam2_hf
++
++        device = _torch_device(self.gpu, mps=False)
++        if self.checkpoint is not None:
++            net = build_sam2(self.model_name, self.checkpoint, device=device)
++        else:
++            net = build_sam2_hf(self.model_name, device=device)
++        return SAM2AutomaticMaskGenerator(net, **self.amg_kwargs)
++
++
++class MicroSAMBackend(Backend):
++    """micro-SAM (Archit et al., Nat. Methods 2025), SAM fine-tuned for microscopy.
++
++    ``model='vit_b_lm'`` (light microscopy, the benchmark's) by default.
++    micro-SAM's own automatic instance segmentation decoder is used when the
++    model has one; ``amg=True`` forces the plain mask generator instead, as in
++    the benchmark.
++    """
++
++    name = "micro_sam"
++    requires = ("micro_sam", "torch")
++    install = ("micro-SAM is distributed on conda-forge: "
++               "`conda install -c conda-forge micro_sam`.")
++    default_tile_size = 1024
++
++    def __init__(self, *, model="vit_b_lm", amg=None, generate_kwargs=None, **kw):
++        super().__init__(**kw)
++        self.model_name = model
++        self.amg = amg
++        self.generate_kwargs = generate_kwargs or {}
++
++    def _build(self):
++        from micro_sam.automatic_segmentation import get_predictor_and_segmenter
++        return get_predictor_and_segmenter(model_type=self.model_name,
++                                           device=_torch_device(self.gpu), amg=self.amg,
++                                           is_tiled=False)
++
++    def __call__(self, tile):
++        from micro_sam.automatic_segmentation import automatic_instance_segmentation
++        predictor, segmenter = self.model()
++        x = self.rgb8(tile) if self.image_type == "he" else self.signal8(tile)
++        if min(x.shape[:2]) < 16:
++            return np.zeros(x.shape[:2], dtype=np.int32)
++        labels = automatic_instance_segmentation(predictor=predictor, segmenter=segmenter,
++                                                 input_path=x, ndim=2, verbose=False,
++                                                 **self.generate_kwargs)
++        return np.asarray(labels, dtype=np.int32)
++
++
++class CellSAMBackend(Backend):
++    """CellSAM (Israel et al., 2023), a SAM-based cell foundation model.
++
++    Needs ``DEEPCELL_ACCESS_TOKEN`` for the first weight download.
++    """
++
++    name = "cellsam"
++    requires = ("cellSAM", "torch")
++    install = ("Install with `pip install git+https://github.com/vanvalenlab/cellSAM.git` "
++               "and set DEEPCELL_ACCESS_TOKEN.")
++    default_tile_size = 1024
++
++    def __init__(self, *, model="cellsam_general", bbox_threshold=0.4, **kw):
++        super().__init__(**kw)
++        self.model_name = model
++        self.bbox_threshold = bbox_threshold
++
++    def _build(self):
++        from cellSAM import get_model
++        return get_model(model=self.model_name)
++
++    def __call__(self, tile):
++        from cellSAM import segment_cellular_image
++        model = self.model()
++        try:
++            out = segment_cellular_image(self.rgb8(tile), model, device=_torch_device(self.gpu),
++                                         bbox_threshold=self.bbox_threshold)
++        except Exception as exc:  # CellSAM raises on tiles with nothing to box
++            warnings.warn(f"CellSAM failed on a tile ({exc}); leaving it empty.", stacklevel=2)
++            return None
++        masks = out[0] if isinstance(out, tuple) else out
++        if masks is None:
++            return None
++        return np.asarray(masks, dtype=np.int32)
++
++
++BACKENDS: dict[str, type[Backend]] = {
++    cls.name: cls
++    for cls in (WatershedBackend, CellposeBackend, StarDistBackend, SAMBackend,
++                SAM2Backend, MicroSAMBackend, CellSAMBackend)
++}
+diff --git a/omicverse/space/seg/_metrics.py b/omicverse/space/seg/_metrics.py
+new file mode 100644
+index 000000000..eb8a8e829
+--- /dev/null
++++ b/omicverse/space/seg/_metrics.py
+@@ -0,0 +1,191 @@
++r"""Reference-free segmentation quality metrics.
++
++The subset of the CellSPA metrics used by Martinez-de-Morentin et al.
++(Nat. Methods 2026) that needs no single-cell reference: segmentation yield
++and transcript recovery (overall characteristics), transcripts and genes per
++cell (cell-level QC), and cell morphology (area, elongation, circularity,
++sphericity, compactness, convexity, eccentricity, solidity).
++"""
++from __future__ import annotations
++
++from typing import Mapping
++
++import numpy as np
++import pandas as pd
++
++from ..._registry import register_function
++from ._transcripts import _unassigned
++
++_MORPHOLOGY = ["area", "elongation", "circularity", "sphericity", "compactness",
++               "convexity", "eccentricity", "solidity"]
++
++
++def _morphology(labels) -> pd.DataFrame:
++    """Per-cell shape descriptors; formulas follow the benchmark's Methods (M5-M12)."""
++    from scipy import ndimage as ndi
++    from skimage.measure import perimeter, regionprops
++
++    dense = labels.toarray() if hasattr(labels, "toarray") else np.asarray(labels)
++    rows = []
++    for r in regionprops(dense):
++        area = float(r.area)
++        p = float(r.perimeter) or np.sqrt(area) * 4
++        p_convex = float(perimeter(r.image_convex)) or p
++        h = r.bbox[2] - r.bbox[0]
++        w = r.bbox[3] - r.bbox[1]
++        major = float(r.axis_major_length)
++        minor = float(r.axis_minor_length)
++        # inscribed radius: deepest pixel to the nearest background pixel;
++        # circumscribed radius: half the maximum Feret diameter
++        r_in = float(ndi.distance_transform_edt(np.pad(r.image, 1)).max())
++        r_circ = max(float(r.feret_diameter_max) / 2.0, 0.5)
++        rows.append({
++            "label": r.label,
++            "area": area,
++            # bounding-box aspect ratio, >= 1 so it is rotation-symmetric in x/y
++            "elongation": max(h, w) / max(min(h, w), 1),
++            "circularity": min(4 * np.pi * area / p_convex ** 2, 1.0),
++            "sphericity": min(r_in / r_circ, 1.0),
++            "compactness": min(4 * np.pi * area / p ** 2, 1.0),
++            "convexity": min(p_convex / p, 1.0),
++            "eccentricity": major / minor if minor > 0 else np.nan,
++            "solidity": float(r.solidity),
++        })
++    return pd.DataFrame(rows, columns=["label"] + _MORPHOLOGY).set_index("label")
++
++
++@register_function(
++    aliases=["分割评估", "segmentation metrics", "evaluate segmentation", "CellSPA", "细胞形态指标"],
++    category="space",
++    description="Per-cell segmentation quality metrics (CellSPA subset from the Nature Methods 2026 benchmark): transcripts and genes per cell, area, elongation, circularity, sphericity, compactness, convexity, eccentricity, solidity.",
++    examples=[
++        "cells = ov.space.seg.evaluate(labels, transcripts=tx, cell='cell', gene='gene')",
++        "cells = ov.space.seg.evaluate(labels)  # morphology only",
++    ],
++    related=["space.seg.compare", "space.seg.segment"],
++)
++def evaluate(
++    labels=None,
++    transcripts: pd.DataFrame | None = None,
++    *,
++    cell: str = "cell",
++    gene: str = "gene",
++    count: str | None = None,
++    pixel_size: float = 1.0,
++) -> pd.DataFrame:
++    """Per-cell quality metrics of one segmentation.
++
++    Parameters
++    ----------
++    labels
++        Label image; enables the morphology columns. ``None`` for a
++        transcript-only segmentation (Baysor).
++    transcripts
++        Molecules with a ``cell`` column (0 / NaN = unassigned); enables
++        ``n_transcripts`` and ``n_genes``. The overall assignment rate is
++        stored in ``.attrs['pct_assigned']``.
++    count
++        Optional per-row count column.
++    pixel_size
++        Converts ``area`` from pixels to transcript units squared.
++
++    Returns
++    -------
++    pandas.DataFrame
++        One row per cell, indexed by cell id.
++    """
++    if labels is None and transcripts is None:
++        raise ValueError("give `labels`, `transcripts`, or both")
++    parts = []
++    if labels is not None:
++        morph = _morphology(labels)
++        morph["area"] *= pixel_size ** 2
++        morph.index = morph.index.astype(str)
++        parts.append(morph)
++    pct = None
++    if transcripts is not None:
++        miss = _unassigned(transcripts[cell])
++        w = transcripts[count].to_numpy(dtype=float) if count else np.ones(len(transcripts))
++        pct = 100.0 * w[~miss].sum() / max(w.sum(), 1e-12)
++        tx = transcripts.loc[~miss]
++        ids = tx[cell].astype(str) if labels is None else tx[cell].astype(np.int64).astype(str)
++        grouped = pd.DataFrame({"cell": ids.to_numpy(), "gene": tx[gene].to_numpy(),
++                                "w": w[~miss]}).groupby("cell", sort=False)
++        qc = pd.DataFrame({"n_transcripts": grouped["w"].sum(),
++                           "n_genes": grouped["gene"].nunique()})
++        parts.append(qc)
++    out = pd.concat(parts, axis=1) if len(parts) > 1 else parts[0]
++    if transcripts is not None:
++        out[["n_transcripts", "n_genes"]] = out[["n_transcripts", "n_genes"]].fillna(0)
++    out.index.name = "cell"
++    out.attrs["pct_assigned"] = pct
++    return out
++
++
++def _summary(cells: pd.DataFrame, *, min_transcripts, max_transcripts, min_genes) -> dict:
++    row = {"n_cells": len(cells)}
++    if "n_transcripts" in cells:
++        hq = ((cells["n_transcripts"] >= min_transcripts)
++              & (cells["n_transcripts"] <= max_transcripts)
++              & (cells["n_genes"] > min_genes))
++        row["n_hq_cells"] = int(hq.sum())
++        row["pct_assigned"] = cells.attrs.get("pct_assigned")
++        row["transcripts_per_cell"] = float(cells.loc[hq, "n_transcripts"].mean()) if hq.any() else np.nan
++        row["genes_per_cell"] = float(cells.loc[hq, "n_genes"].mean()) if hq.any() else np.nan
++    for m in _MORPHOLOGY:
++        if m in cells:
++            row[m] = float(cells[m].median())
++    return row
++
++
++@register_function(
++    aliases=["分割方法比较", "compare segmentation", "segmentation benchmark", "分割基准"],
++    category="space",
++    description="Compare several segmentations of the same sample on reference-free CellSPA metrics (high-quality cell count, % transcripts assigned, transcripts/genes per cell, morphology medians) with a min-max-scaled overall rank, as in the Nature Methods 2026 benchmark.",
++    examples=[
++        "res = {m: ov.space.seg.evaluate(lab, transcripts=tx.assign(cell=ov.space.seg.assign_transcripts(tx, lab))) for m, lab in labels.items()}",
++        "table = ov.space.seg.compare(res)",
++    ],
++    related=["space.seg.evaluate"],
++)
++def compare(
++    results: Mapping[str, pd.DataFrame],
++    *,
++    min_transcripts: int = 20,
++    max_transcripts: int = 2000,
++    min_genes: int = 20,
++    score: tuple[str, ...] = ("n_hq_cells", "pct_assigned", "transcripts_per_cell",
++                              "genes_per_cell"),
++) -> pd.DataFrame:
++    """Side-by-side summary of segmentations, ranked.
++
++    Parameters
++    ----------
++    results
++        ``{method_name: ov.space.seg.evaluate(...)}``.
++    min_transcripts, max_transcripts, min_genes
++        High-quality cell filter (the benchmark's: 20-2,000 transcripts and
++        more than 20 genes).
++    score
++        Columns that enter the overall score; each is min-max scaled across
++        methods (higher is better) and averaged, as in the benchmark.
++
++    Returns
++    -------
++    pandas.DataFrame
++        One row per method with the summary metrics, ``overall`` and ``rank``.
++    """
++    table = pd.DataFrame({name: _summary(cells, min_transcripts=min_transcripts,
++                                         max_transcripts=max_transcripts, min_genes=min_genes)
++                          for name, cells in results.items()}).T
++    table = table.apply(pd.to_numeric, errors="coerce")
++    used = [c for c in score if c in table and table[c].notna().any()]
++    if used:
++        sub = table[used]
++        span = (sub.max() - sub.min()).replace(0, np.nan)
++        scaled = ((sub - sub.min()) / span).fillna(1.0)
++        table["overall"] = scaled.mean(axis=1)
++        table["rank"] = table["overall"].rank(ascending=False, method="min").astype(int)
++        table = table.sort_values("rank")
++    table.index.name = "method"
++    return table
+diff --git a/omicverse/space/seg/_tiling.py b/omicverse/space/seg/_tiling.py
+new file mode 100644
+index 000000000..81322d75a
+--- /dev/null
++++ b/omicverse/space/seg/_tiling.py
+@@ -0,0 +1,146 @@
++r"""Tiled inference — segment an image of any size one window at a time.
++
++The image is partitioned into disjoint ``tile_size`` blocks. Each block is
++segmented together with a ``context`` margin on every side, and keeps only the
++objects whose centroid falls inside the block -- in full, including the pixels
++that spill into the margin. Every object therefore has exactly one owner, so
++nothing is cut at a seam or labelled twice, as long as ``context`` exceeds the
++object radius. When two owners claim the same margin pixel the earlier tile
++keeps it.
++"""
++from __future__ import annotations
++
++from typing import Callable, Iterator
++
++import numpy as np
++
++
++def tile_windows(shape, tile_size: int, context: int) -> Iterator[tuple[tuple, tuple]]:
++    """Yield ``(core, window)`` pairs as ``(y0, y1, x0, x1)`` in image pixels.
++
++    The cores partition the image; each window is its core grown by
++    ``context`` and clipped to the image.
++    """
++    H, W = int(shape[0]), int(shape[1])
++    tile_size = max(int(tile_size), 1)
++    context = max(int(context), 0)
++    for y0 in range(0, H, tile_size):
++        y1 = min(y0 + tile_size, H)
++        for x0 in range(0, W, tile_size):
++            x1 = min(x0 + tile_size, W)
++            yield (y0, y1, x0, x1), (
++                max(0, y0 - context), min(H, y1 + context),
++                max(0, x0 - context), min(W, x1 + context),
++            )
++
++
++def _owned_pixels(mask: np.ndarray, core: tuple, min_size: int):
++    """Pixels ``(rows, cols, ids)`` of the objects whose centroid lies in ``core``.
++
++    ``core`` is in the coordinates of ``mask``.
++    """
++    ys, xs = np.nonzero(mask)
++    if ys.size == 0:
++        return None
++    ids = mask[ys, xs].astype(np.int64, copy=False)
++    n = int(ids.max()) + 1
++    area = np.bincount(ids, minlength=n)
++    safe = np.maximum(area, 1)
++    cy = np.bincount(ids, weights=ys, minlength=n) / safe
++    cx = np.bincount(ids, weights=xs, minlength=n) / safe
++    y0, y1, x0, x1 = core
++    own = (area > max(int(min_size), 0)) & (cy >= y0) & (cy < y1) & (cx >= x0) & (cx < x1)
++    own[0] = False
++    keep = own[ids]
++    if not keep.any():
++        return None
++    return ys[keep], xs[keep], ids[keep]
++
++
++def segment_tiled(
++    image,
++    segmenter: Callable[[np.ndarray], np.ndarray],
++    *,
++    tile_size: int = 2048,
++    context: int = 128,
++    min_size: int = 0,
++    sparse: bool = False,
++    show_progress: bool = True,
++    desc: str = "ov.space.seg",
++):
++    """Run ``segmenter`` window by window and stitch one global label image.
++
++    Parameters
++    ----------
++    image
++        ``(H, W)`` or ``(H, W, C)`` array, or anything sliceable with a
++        ``shape`` (a memmap, a zarr array).
++    segmenter
++        Maps a window to an integer label image of the window's height and
++        width (0 = background).
++    tile_size, context
++        Block size and the margin segmented around it, in pixels.
++    min_size
++        Objects of at most this many pixels are dropped.
++    sparse
++        Return a ``scipy.sparse.csr_matrix`` instead of a dense array; the
++        label image is never materialised densely.
++
++    Returns
++    -------
++    numpy.ndarray or scipy.sparse.csr_matrix
++        ``int32`` labels ``1..n`` (0 = background), numbered in tile order.
++    """
++    H, W = int(image.shape[0]), int(image.shape[1])
++    windows = list(tile_windows((H, W), tile_size, context))
++    it = windows
++    if show_progress and len(windows) > 1:
++        try:
++            from tqdm.auto import tqdm
++            it = tqdm(windows, desc=desc, unit="tile")
++        except ImportError:  # pragma: no cover - tqdm ships with omicverse
++            pass
++
++    rows, cols, vals = [], [], []
++    next_id = 1
++    for core, (wy0, wy1, wx0, wx1) in it:
++        tile = np.asarray(image[wy0:wy1, wx0:wx1])
++        mask = segmenter(tile)
++        if mask is None:
++            continue
++        mask = np.asarray(mask)
++        if mask.shape[:2] != tile.shape[:2]:
++            raise ValueError(
++                f"segmenter returned shape {mask.shape} for a window of shape {tile.shape[:2]}"
++            )
++        local_core = (core[0] - wy0, core[1] - wy0, core[2] - wx0, core[3] - wx0)
++        owned = _owned_pixels(mask, local_core, min_size)
++        if owned is None:
++            continue
++        ys, xs, ids = owned
++        uniq, inv = np.unique(ids, return_inverse=True)
++        rows.append((ys + wy0).astype(np.int64))
++        cols.append((xs + wx0).astype(np.int64))
++        vals.append(inv.astype(np.int64) + next_id)
++        next_id += len(uniq)
++
++    if rows:
++        r = np.concatenate(rows)
++        c = np.concatenate(cols)
++        v = np.concatenate(vals)
++        # first writer keeps a contested pixel; np.unique keeps the first index
++        _, first = np.unique(r * W + c, return_index=True)
++        r, c, v = r[first], c[first], v[first]
++        # an object can lose every pixel to an earlier one: renumber densely
++        _, v = np.unique(v, return_inverse=True)
++        v = v.astype(np.int32) + 1
++    else:
++        r = c = np.zeros(0, dtype=np.int64)
++        v = np.zeros(0, dtype=np.int32)
++
++    if sparse:
++        from scipy import sparse as sp
++        return sp.csr_matrix((v, (r, c)), shape=(H, W), dtype=np.int32)
++    out = np.zeros((H, W), dtype=np.int32)
++    out[r, c] = v
++    return out
+diff --git a/omicverse/space/seg/_transcripts.py b/omicverse/space/seg/_transcripts.py
+new file mode 100644
+index 000000000..97348f5c7
+--- /dev/null
++++ b/omicverse/space/seg/_transcripts.py
+@@ -0,0 +1,410 @@
++r"""Transcripts meet segmentation: assignment, counting, transcript-based methods.
++
++Imaging platforms (Xenium, CosMx, MERFISH/MERSCOPE, STARmap) and Stereo-seq
++GEM files give one row per detected molecule. A label image turns them into
++cells with :func:`assign_transcripts`; :func:`segment_transcripts` instead
++segments from the molecules themselves (Baysor). :func:`aggregate` builds the
++cell x gene AnnData either way.
++"""
++from __future__ import annotations
++
++import importlib.util
++import os
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++from typing import Literal, Sequence
++
++import numpy as np
++import pandas as pd
++
++from ..._optional import build_optional_dependency_error
++from ..._registry import register_function
++
++
++def _to_pixels(x, y, *, pixel_size=1.0, offset=(0.0, 0.0), transform=None):
++    """Transcript coordinates -> fractional ``(col, row)`` pixel coordinates."""
++    x = np.asarray(x, dtype=np.float64)
++    y = np.asarray(y, dtype=np.float64)
++    if transform is not None:
++        A = np.asarray(transform, dtype=np.float64)
++        if A.shape != (3, 3):
++            raise ValueError("transform must be a 3x3 affine matrix (x, y, 1) -> (col, row, 1)")
++        col = A[0, 0] * x + A[0, 1] * y + A[0, 2]
++        row = A[1, 0] * x + A[1, 1] * y + A[1, 2]
++        return col, row
++    return (x - offset[0]) / pixel_size, (y - offset[1]) / pixel_size
++
++
++def _from_pixels(col, row, *, pixel_size=1.0, offset=(0.0, 0.0), transform=None):
++    """Inverse of :func:`_to_pixels`."""
++    col = np.asarray(col, dtype=np.float64)
++    row = np.asarray(row, dtype=np.float64)
++    if transform is not None:
++        inv = np.linalg.inv(np.asarray(transform, dtype=np.float64))
++        return (inv[0, 0] * col + inv[0, 1] * row + inv[0, 2],
++                inv[1, 0] * col + inv[1, 1] * row + inv[1, 2])
++    return col * pixel_size + offset[0], row * pixel_size + offset[1]
++
++
++@register_function(
++    aliases=["转录本分配", "assign_transcripts", "transcript assignment", "分子分配到细胞"],
++    category="space",
++    description="Assign each detected transcript (Xenium/CosMx/MERFISH/Stereo-seq molecule table) to the segmented cell whose label covers it.",
++    examples=[
++        "tx['cell'] = ov.space.seg.assign_transcripts(tx, labels, pixel_size=0.2125)",
++        "tx['cell'] = ov.space.seg.assign_transcripts(tx, labels, x='x_location', y='y_location', pixel_size=0.2125)",
++    ],
++    related=["space.seg.segment", "space.seg.aggregate"],
++)
++def assign_transcripts(
++    transcripts: pd.DataFrame,
++    labels,
++    *,
++    x: str = "x",
++    y: str = "y",
++    pixel_size: float = 1.0,
++    offset: Sequence[float] = (0.0, 0.0),
++    transform=None,
++) -> np.ndarray:
++    """Look up the label under every transcript.
++
++    Parameters
++    ----------
++    transcripts
++        One row per molecule with coordinate columns ``x`` and ``y``.
++    labels
++        Integer label image (dense or ``scipy.sparse``), e.g. from
++        :func:`ov.space.seg.segment`.
++    pixel_size, offset
++        Transcript units per image pixel and the transcript coordinate of
++        pixel ``(0, 0)``: ``col = (x - offset[0]) / pixel_size``. Xenium
++        transcripts are in microns on a 0.2125 micron morphology grid.
++    transform
++        3x3 affine ``(x, y, 1) -> (col, row, 1)``; overrides ``pixel_size``
++        and ``offset`` (e.g. a CosMx field-of-view or a registered H&E).
++
++    Returns
++    -------
++    numpy.ndarray
++        ``int64`` label per transcript; 0 = background or outside the image.
++    """
++    col, row = _to_pixels(transcripts[x].to_numpy(), transcripts[y].to_numpy(),
++                          pixel_size=pixel_size, offset=offset, transform=transform)
++    H, W = labels.shape[:2]
++    c = np.floor(col).astype(np.int64)
++    r = np.floor(row).astype(np.int64)
++    inside = (r >= 0) & (r < H) & (c >= 0) & (c < W)
++    out = np.zeros(len(transcripts), dtype=np.int64)
++    if hasattr(labels, "tocsr"):
++        out[inside] = np.asarray(labels.tocsr()[r[inside], c[inside]]).ravel()
++    else:
++        out[inside] = np.asarray(labels)[r[inside], c[inside]]
++    return out
++
++
++def _unassigned(values: pd.Series) -> np.ndarray:
++    """Background markers across tools: 0, -1, NaN, '', 'UNASSIGNED', 'noise'."""
++    if pd.api.types.is_numeric_dtype(values):
++        v = values.to_numpy()
++        return ~np.isfinite(v.astype(float)) | (v <= 0)
++    s = values.astype("string").fillna("")
++    return s.str.strip().str.upper().isin(["", "0", "-1", "UNASSIGNED", "NOISE", "NAN"]).to_numpy()
++
++
++def _polygons_wkt(labels, ids, *, pixel_size, offset, transform, tolerance=0.5) -> list[str]:
++    """WKT outline of each label in ``ids`` in transcript coordinates."""
++    from shapely.geometry import Polygon
++    from skimage.measure import find_contours, regionprops
++
++    dense = labels.toarray() if hasattr(labels, "toarray") else np.asarray(labels)
++    wkt = {}
++    for region in regionprops(dense):
++        mask = np.pad(region.image, 1).astype(np.uint8)
++        contours = find_contours(mask, 0.5)
++        if not contours:
++            continue
++        ring = max(contours, key=len)
++        if len(ring) < 4:
++            continue
++        r0, c0 = region.bbox[0] - 1, region.bbox[1] - 1
++        # pixel (r, c) covers [c, c+1) x [r, r+1): centres sit at +0.5
++        xs, ys = _from_pixels(ring[:, 1] + c0 + 0.5, ring[:, 0] + r0 + 0.5,
++                              pixel_size=pixel_size, offset=offset, transform=transform)
++        poly = Polygon(np.c_[xs, ys]).simplify(tolerance * pixel_size)
++        if not poly.is_valid:
++            poly = poly.buffer(0)
++        wkt[region.label] = poly.wkt
++    return [wkt.get(int(i), "") for i in ids]
++
++
++@register_function(
++    aliases=["转录本聚合", "aggregate", "cell by gene", "细胞表达矩阵", "transcripts_to_adata"],
++    category="space",
++    description="Count transcripts per segmented cell into a cell x gene AnnData with spatial centroids, cell area and WKT polygons ready for ov.pl.spatialseg.",
++    examples=[
++        "tx['cell'] = ov.space.seg.assign_transcripts(tx, labels, pixel_size=0.2125)",
++        "adata = ov.space.seg.aggregate(tx, cell='cell', gene='feature_name', labels=labels, pixel_size=0.2125)",
++        "adata = ov.space.seg.aggregate(baysor_tx, cell='cell', gene='gene')",
++    ],
++    related=["space.seg.assign_transcripts", "space.seg.segment_transcripts", "pl.spatialseg"],
++)
++def aggregate(
++    transcripts: pd.DataFrame,
++    *,
++    cell: str = "cell",
++    gene: str = "gene",
++    x: str = "x",
++    y: str = "y",
++    count: str | None = None,
++    labels=None,
++    pixel_size: float = 1.0,
++    offset: Sequence[float] = (0.0, 0.0),
++    transform=None,
++    geometry: bool | None = None,
++    library_id: str = "seg",
++):
++    """Build a cell x gene count matrix from assigned transcripts.
++
++    Parameters
++    ----------
++    transcripts
++        Molecule table with a cell column (0 / -1 / NaN / '' = unassigned).
++    cell, gene, x, y
++        Column names.
++    count
++        Optional per-row count column (Stereo-seq ``MIDCount``); each row
++        counts once otherwise.
++    labels
++        The label image the ``cell`` ids came from. Adds ``obs['area']``
++        (transcript units squared) and, with ``geometry``,
++        ``obs['geometry']`` WKT polygons for :func:`ov.pl.spatialseg`.
++    pixel_size, offset, transform
++        Same mapping as :func:`assign_transcripts`.
++    geometry
++        Write cell outlines (needs ``shapely``). ``None`` writes them when
++        ``shapely`` is installed; ``True`` requires it.
++    library_id
++        Key under ``uns['spatial']``.
++
++    Returns
++    -------
++    anndata.AnnData
++        Raw counts in ``X`` (CSR), ``obs['n_transcripts']``,
++        ``obs['n_genes']``, transcript centroids in ``obsm['spatial']``.
++    """
++    import anndata as ad
++    from scipy import sparse
++
++    tx = transcripts.loc[~_unassigned(transcripts[cell])]
++    cell_codes, cell_ids = pd.factorize(tx[cell], sort=True)
++    gene_codes, gene_ids = pd.factorize(tx[gene].astype(str), sort=True)
++    w = tx[count].to_numpy(dtype=np.float32) if count else np.ones(len(tx), dtype=np.float32)
++    X = sparse.csr_matrix((w, (cell_codes, gene_codes)),
++                          shape=(len(cell_ids), len(gene_ids)), dtype=np.float32)
++    X.sum_duplicates()
++
++    n = np.bincount(cell_codes, minlength=len(cell_ids)).astype(np.float64)
++    cx = np.bincount(cell_codes, weights=tx[x].to_numpy(dtype=np.float64), minlength=len(cell_ids)) / n
++    cy = np.bincount(cell_codes, weights=tx[y].to_numpy(dtype=np.float64), minlength=len(cell_ids)) / n
++
++    obs = pd.DataFrame(index=pd.Index(cell_ids.astype(str), name="cell_id"))
++    obs["n_transcripts"] = np.asarray(X.sum(axis=1)).ravel()
++    obs["n_genes"] = np.diff(X.indptr)
++    adata = ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=pd.Index(gene_ids, name="gene")))
++    adata.obsm["spatial"] = np.c_[cx, cy]
++
++    if labels is not None:
++        ids = np.asarray(cell_ids)
++        if not np.issubdtype(ids.dtype, np.integer):
++            raise ValueError("`labels` was given but the cell ids are not integer label ids")
++        flat = labels.data if hasattr(labels, "tocsr") else np.asarray(labels).ravel()
++        area_px = np.bincount(np.asarray(flat, dtype=np.int64), minlength=int(ids.max()) + 1)
++        scale = abs(np.linalg.det(np.linalg.inv(np.asarray(transform, dtype=float))[:2, :2])) \
++            if transform is not None else pixel_size ** 2
++        adata.obs["area"] = area_px[ids] * scale
++        if geometry is None:
++            geometry = importlib.util.find_spec("shapely") is not None
++        if geometry:
++            try:
++                import shapely  # noqa: F401
++            except ImportError as exc:
++                raise build_optional_dependency_error(
++                    "ov.space.seg.aggregate(geometry=True)", ("shapely",),
++                    install_hint="Install with `pip install shapely` or pass geometry=False.",
++                ) from exc
++            adata.obs["geometry"] = _polygons_wkt(labels, ids, pixel_size=pixel_size,
++                                                  offset=offset, transform=transform)
++    diam = 2 * np.sqrt(np.nanmedian(adata.obs["area"]) / np.pi) if "area" in adata.obs and adata.n_obs else 10.0
++    adata.uns["spatial"] = {library_id: {
++        "images": {},
++        "scalefactors": {"tissue_hires_scalef": 1.0, "spot_diameter_fullres": float(diam)},
++    }}
++    return adata
++
++
++# ---------------------------------------------------------------------------
++# transcript-based segmentation
++# ---------------------------------------------------------------------------
++def _baysor_command(executable: str | Sequence[str]) -> list[str]:
++    if isinstance(executable, (list, tuple)):
++        return list(executable)
++    found = shutil.which(executable)
++    if found is None:
++        raise FileNotFoundError(
++            f"Baysor executable {executable!r} was not found on PATH. Install Baysor "
++            "(https://kharchenkolab.github.io/Baysor/ — a prebuilt Linux binary or "
++            "`julia -e 'using Pkg; Pkg.add(\"Baysor\")'`) or pass executable='/path/to/baysor'."
++        )
++    return [found]
++
++
++def _run_baysor(tx, *, x, y, z, gene, prior, prior_confidence, scale, scale_std,
++                min_molecules_per_cell, n_clusters, config, executable, extra_args,
++                workdir, verbose):
++    cols = [c for c in (x, y, z, gene, prior) if c is not None]
++    tmp = None
++    if workdir is None:
++        tmp = tempfile.mkdtemp(prefix="ov_baysor_")
++        workdir = tmp
++    workdir = Path(workdir)
++    workdir.mkdir(parents=True, exist_ok=True)
++    try:
++        inp = workdir / "molecules.csv"
++        out = workdir / "segmentation.csv"
++        frame = tx[cols].copy()
++        if prior is not None:
++            frame[prior] = np.where(_unassigned(frame[prior]), 0, pd.factorize(frame[prior])[0] + 1)
++        frame.to_csv(inp, index=False)
++
++        cmd = _baysor_command(executable) + ["run", "-x", x, "-y", y, "-g", gene,
++                                             "-m", str(int(min_molecules_per_cell)),
++                                             "-o", str(out)]
++        if z is not None:
++            cmd += ["-z", z]
++        if scale is not None:
++            cmd += ["-s", str(scale)]
++        if scale_std is not None:
++            cmd += ["--scale-std", str(scale_std)]
++        if n_clusters is not None:
++            cmd += ["--n-clusters", str(int(n_clusters))]
++        if config is not None:
++            cmd += ["-c", str(config)]
++        if prior is not None:
++            cmd += ["--prior-segmentation-confidence", str(prior_confidence)]
++        cmd += list(extra_args or ())
++        cmd += [str(inp)]
++        if prior is not None:
++            cmd += [f":{prior}"]
++
++        proc = subprocess.run(cmd, cwd=str(workdir), capture_output=not verbose, text=True)
++        if proc.returncode != 0:
++            tail = (proc.stderr or proc.stdout or "")[-2000:] if not verbose else ""
++            raise RuntimeError(f"Baysor failed (exit {proc.returncode}): {' '.join(cmd)}\n{tail}")
++        if not out.exists():
++            raise RuntimeError(f"Baysor finished but wrote no {out}")
++        return pd.read_csv(out)
++    finally:
++        if tmp is not None:
++            shutil.rmtree(tmp, ignore_errors=True)
++
++
++@register_function(
++    aliases=["转录本分割", "segment_transcripts", "baysor", "基于转录本的细胞分割", "无图像分割"],
++    category="space",
++    description="Segment cells from the transcript table itself with Baysor (optionally using an image segmentation as a prior); returns the molecules with a cell column.",
++    examples=[
++        "tx = ov.space.seg.segment_transcripts(tx, method='baysor', gene='feature_name', scale=8)",
++        "tx['nucleus'] = ov.space.seg.assign_transcripts(tx, nuclei, pixel_size=0.2125)",
++        "tx = ov.space.seg.segment_transcripts(tx, method='baysor', prior='nucleus', prior_confidence=0.5)",
++    ],
++    related=["space.seg.aggregate", "space.seg.assign_transcripts", "space.seg.segment"],
++)
++def segment_transcripts(
++    transcripts: pd.DataFrame,
++    method: Literal["baysor"] = "baysor",
++    *,
++    x: str = "x",
++    y: str = "y",
++    z: str | None = None,
++    gene: str = "gene",
++    prior: str | None = None,
++    prior_confidence: float = 0.2,
++    scale: float | None = None,
++    scale_std: str | float | None = "25%",
++    min_molecules_per_cell: int = 30,
++    n_clusters: int | None = None,
++    config: str | None = None,
++    executable: str | Sequence[str] = "baysor",
++    extra_args: Sequence[str] = (),
++    workdir: str | os.PathLike | None = None,
++    key_added: str = "cell",
++    verbose: bool = False,
++) -> pd.DataFrame:
++    """Segment cells from molecule positions and gene identities.
++
++    Baysor (Petukhov et al., Nat. Biotechnol. 2022) fits a Markov random field
++    mixture of cells over the molecules; it needs no image, and can refine an
++    image segmentation given as a ``prior`` column. In the Nature Methods 2026
++    benchmark it ranked among the best for coverage-adjusted performance.
++
++    Parameters
++    ----------
++    transcripts
++        One row per molecule.
++    method
++        ``'baysor'``.
++    x, y, z, gene
++        Column names (``z`` optional).
++    prior
++        Column with prior cell ids per molecule (0 / NaN = none), e.g. from
++        :func:`assign_transcripts` on a nucleus segmentation.
++    prior_confidence
++        Baysor ``--prior-segmentation-confidence`` (0-1).
++    scale, scale_std
++        Expected cell radius in transcript units and its allowed spread.
++        Baysor estimates ``scale`` when it is ``None`` and a prior is given.
++    min_molecules_per_cell, n_clusters, config
++        Baysor ``-m``, ``--n-clusters``, ``-c config.toml``.
++    executable
++        Baysor binary name/path, or a command list such as
++        ``['julia', '--project=env', '-e', 'using Baysor; Baysor.command_main()', '--']``.
++    extra_args
++        Additional CLI arguments.
++    workdir
++        Keep Baysor's inputs and outputs here (a temporary directory otherwise).
++    key_added
++        Name of the output cell column.
++
++    Returns
++    -------
++    pandas.DataFrame
++        Copy of ``transcripts`` with ``key_added`` (int, 0 = unassigned or
++        noise), ``f'{key_added}_confidence'`` and ``'is_noise'``.
++    """
++    if method != "baysor":
++        raise ValueError(f"Unknown transcript method {method!r}; available: 'baysor'")
++    if scale is None and prior is None:
++        raise ValueError("Baysor needs `scale` (expected cell radius) unless a `prior` is given")
++    seg = _run_baysor(transcripts, x=x, y=y, z=z, gene=gene, prior=prior,
++                      prior_confidence=prior_confidence, scale=scale, scale_std=scale_std,
++                      min_molecules_per_cell=min_molecules_per_cell, n_clusters=n_clusters,
++                      config=config, executable=executable, extra_args=extra_args,
++                      workdir=workdir, verbose=verbose)
++    if len(seg) != len(transcripts):
++        if "molecule_id" not in seg.columns:
++            raise RuntimeError(f"Baysor returned {len(seg)} rows for {len(transcripts)} molecules")
++        seg = seg.set_index("molecule_id").reindex(np.arange(1, len(transcripts) + 1)).reset_index()
++    noise = (seg["is_noise"].astype(str).str.lower() == "true").to_numpy() \
++        if "is_noise" in seg.columns else np.zeros(len(seg), dtype=bool)
++    unassigned = _unassigned(seg["cell"]) | noise
++    codes = pd.factorize(seg["cell"].where(~unassigned))[0].astype(np.int64) + 1
++    codes[unassigned] = 0
++
++    out = transcripts.copy()
++    out[key_added] = codes
++    if "assignment_confidence" in seg.columns:
++        out[f"{key_added}_confidence"] = seg["assignment_confidence"].to_numpy()
++    out["is_noise"] = noise
++    return out
+diff --git a/pyproject.toml b/pyproject.toml
+index 338346280..d0b2607bf 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -205,6 +205,20 @@ histo = [
+   'shapely>=2.0; python_version >= "3.10"',
+ ]
+ 
++# Cell segmentation backends for ``ov.space.seg`` (methods from the Nat.
++# Methods 2026 spatial segmentation benchmark). The watershed baseline needs
++# none of these. StarDist (TensorFlow), micro-SAM (conda-forge only), CellSAM
++# (GitHub) and Baysor (Julia CLI) are installed separately; see
++# ``ov.space.seg.methods()``. SAM 2 needs Python >= 3.10.
++# Install via: pip install omicverse[seg]
++seg = [
++  "cellpose>=3.0",
++  "segment-anything>=1.0",
++  'sam2>=1.0; python_version >= "3.10"',
++  "huggingface_hub>=0.24",
++  "shapely>=2.0",
++]
++
+ # Trajectory inference zoo — Python ports of the dynbenchmark methods
+ # (Saelens et al. 2019). Pulls one wrapper per method that registers as a
+ # backend for ``ov.single.TrajInfer(method=...)``. Slingshot is bundled in
+diff --git a/tests/space/test_seg.py b/tests/space/test_seg.py
+new file mode 100644
+index 000000000..ae8599d05
+--- /dev/null
++++ b/tests/space/test_seg.py
+@@ -0,0 +1,428 @@
++"""``ov.space.seg`` on synthetic images and molecule tables.
++
++Ground truth is drawn, not borrowed: discs of known centre and radius, some
++pairs touching, molecules scattered inside known discs. Deep-learning backends
++are exercised through stand-ins with their real call signatures; the tiling,
++stitching, assignment, counting and metrics code is all real.
++"""
++from __future__ import annotations
++
++import importlib.util
++import sys
++import textwrap
++import types
++
++import numpy as np
++import pandas as pd
++import pytest
++from scipy import sparse
++from skimage.measure import label
++
++from omicverse.space import seg
++from omicverse.space.seg._backends import BACKENDS, _masks_to_labels
++
++
++def _discs(H, W, centres, radius):
++    yy, xx = np.mgrid[:H, :W]
++    truth = np.zeros((H, W), np.int32)
++    for i, (cy, cx) in enumerate(centres, start=1):
++        truth[(yy - cy) ** 2 + (xx - cx) ** 2 <= radius ** 2] = i
++    return truth
++
++
++def _grid(H, W, spacing, offset):
++    return [(y, x) for y in range(offset, H - offset + 1, spacing)
++            for x in range(offset, W - offset + 1, spacing)]
++
++
++def _one_label_per_object(truth, labels):
++    """Every true object is covered by exactly one label, and no label spans two."""
++    labels = labels.toarray() if sparse.issparse(labels) else labels
++    bad = 0
++    for i in range(1, truth.max() + 1):
++        ids = np.unique(labels[truth == i])
++        if len(ids) != 1 or ids[0] == 0:
++            bad += 1
++    owners = pd.Series(truth[labels > 0]).groupby(labels[labels > 0]).nunique()
++    return bad, int((owners > 1).sum())
++
++
++def _majority_matches(truth, labels):
++    """True objects whose majority label is a distinct, non-background label."""
++    labels = labels.toarray() if sparse.issparse(labels) else labels
++    major = [int(np.bincount(labels[truth == i]).argmax()) for i in range(1, truth.max() + 1)]
++    major = [m for m in major if m]
++    return len(set(major)), len(major) - len(set(major))
++
++
++# ---------------------------------------------------------------------------
++# tiling engine
++# ---------------------------------------------------------------------------
++def test_tiled_stitching_keeps_every_object_whole():
++    truth = _discs(1200, 1100, _grid(1200, 1100, 40, 20), 12)
++    image = (truth > 0).astype(np.float32)
++    calls = []
++
++    def threshold_segmenter(tile):
++        calls.append(tile.shape)
++        return label(tile > 0.5)
++
++    dense = seg.segment_tiled(image, threshold_segmenter, tile_size=256, context=32,
++                              show_progress=False)
++    assert len(calls) == 5 * 5  # ceil(1200/256) x ceil(1100/256)
++    assert dense.max() == truth.max()
++    assert set(np.unique(dense)) == set(range(truth.max() + 1))
++    assert _one_label_per_object(truth, dense) == (0, 0)
++
++    sp = seg.segment_tiled(image, threshold_segmenter, tile_size=256, context=32,
++                           sparse=True, show_progress=False)
++    assert sparse.issparse(sp)
++    np.testing.assert_array_equal(sp.toarray(), dense)
++
++
++def test_tiled_min_size_and_empty_tiles():
++    truth = _discs(300, 300, [(50, 50), (200, 200)], 10)
++    truth[150, 150] = 99  # a one-pixel speck
++    out = seg.segment_tiled(truth, lambda t: label(t > 0), tile_size=128, context=24,
++                            min_size=5, show_progress=False)
++    assert out.max() == 2
++    blank = seg.segment_tiled(np.zeros((100, 100)), lambda t: np.zeros(t.shape, int),
++                              tile_size=64, context=8, show_progress=False)
++    assert blank.max() == 0 and blank.dtype == np.int32
++
++
++def test_bin2cell_cellseg_has_no_seam_artifacts(tmp_path, monkeypatch):
++    """Regression: the old IoU paste summed label ids where tiles overlapped."""
++    import tifffile
++
++    truth = _discs(1200, 1200, _grid(1200, 1200, 40, 20), 12)
++    tifffile.imwrite(tmp_path / "img.tiff", ((truth > 0) * 200).astype(np.uint8))
++    seen = {}
++
++    class FakeCellpose:
++        def __init__(self, gpu=False, pretrained_model="cpsam", **kw):
++            seen["init"] = dict(gpu=gpu, pretrained_model=pretrained_model)
++
++        def eval(self, x, diameter=None, flow_threshold=0.4, cellprob_threshold=0.0,
++                 normalize=True, channel_axis=None):
++            seen["eval"] = dict(flow_threshold=flow_threshold,
++                                cellprob_threshold=cellprob_threshold, normalize=normalize)
++            return label(x > 0.5), None, None
++
++    fake = types.ModuleType("cellpose")
++    fake.models = types.SimpleNamespace(CellposeModel=FakeCellpose)
++    monkeypatch.setitem(sys.modules, "cellpose", fake)
++    monkeypatch.setitem(sys.modules, "cellpose.models", fake.models)
++
++    from omicverse.external.bin2cell import cellseg
++    cellseg(str(tmp_path / "img.tiff"), str(tmp_path / "labels.npz"),
++            stardist_model="2D_versatile_fluo", block_size=512, min_overlap=128,
++            context=32, prob_thresh=0.01, flow_threshold=0.3, show_progress=False)
++    labels = sparse.load_npz(tmp_path / "labels.npz")
++    assert labels.shape == truth.shape
++    assert labels.max() == truth.max()
++    assert _one_label_per_object(truth, labels) == (0, 0)
++    assert seen["eval"] == dict(flow_threshold=0.3, cellprob_threshold=0.01, normalize=False)
++
++
++# ---------------------------------------------------------------------------
++# watershed backend (no extra dependency, runs for real)
++# ---------------------------------------------------------------------------
++def _touching_scene(seed=0):
++    rng = np.random.default_rng(seed)
++    centres = [(y + rng.integers(-3, 4), x + rng.integers(-3, 4))
++               for y, x in _grid(600, 600, 60, 40)]
++    # every third object gets a neighbour it touches
++    centres += [(y, x + 20) for y, x in centres[::3]]
++    truth = _discs(600, 620, centres, 11)
++    return truth, len(centres)
++
++
++def test_watershed_fluorescence_splits_touching_nuclei():
++    from scipy.ndimage import gaussian_filter
++
++    truth, n = _touching_scene()
++    rng = np.random.default_rng(1)
++    yy, xx = np.mgrid[:truth.shape[0], :truth.shape[1]]
++    img = np.zeros(truth.shape, np.float32)
++    from skimage.measure import regionprops
++    for r in regionprops(truth):  # dome-shaped nuclei: brightest at the centre
++        cy, cx = r.centroid
++        d2 = (yy - cy) ** 2 + (xx - cx) ** 2
++        img = np.maximum(img, np.where(truth == r.label, 1.0 - d2 / (2 * 11 ** 2), 0))
++    img = gaussian_filter(img, 1.0) + rng.normal(0, 0.03, img.shape)
++    img = (np.clip(img, 0, 1) * 4000).astype(np.uint16)
++
++    labels = seg.segment(img, method="watershed", diameter=22, show_progress=False)
++    assert labels.shape == truth.shape and labels.dtype == np.int32
++    assert abs(labels.max() - n) <= 0.05 * n
++    distinct, shared = _majority_matches(truth, labels)
++    assert distinct >= 0.9 * n and shared <= 0.05 * n  # touching pairs are split, not merged
++
++
++def test_watershed_on_he_uses_the_haematoxylin_channel():
++    truth, n = _touching_scene(seed=3)
++    rgb = np.empty(truth.shape + (3,), np.uint8)
++    rgb[:] = (236, 196, 214)                       # eosin-pink background
++    rgb[truth > 0] = (88, 58, 142)                 # haematoxylin-purple nuclei
++    rgb = np.clip(rgb + np.random.default_rng(2).normal(0, 6, rgb.shape), 0, 255).astype(np.uint8)
++
++    labels = seg.segment(rgb, method="watershed", image_type="auto", diameter=22,
++                         show_progress=False)
++    assert abs(labels.max() - n) <= 0.1 * n
++    assert (labels[truth == 0] > 0).mean() < 0.02  # background stays background
++
++
++def test_segment_tiles_large_images_and_expands(tmp_path):
++    import tifffile
++
++    truth = _discs(900, 900, _grid(900, 900, 50, 25), 10)
++    img = ((truth > 0) * 3000).astype(np.uint16)
++    tifffile.imwrite(tmp_path / "dapi.tif", img)
++    small = seg.segment(str(tmp_path / "dapi.tif"), method="watershed", diameter=20,
++                        tile_size=200, show_progress=False)
++    assert small.max() == truth.max()
++    assert _majority_matches(truth, small) == (truth.max(), 0)  # no seam splits or merges
++    grown = seg.segment(img, method="watershed", diameter=20, tile_size=200, expand=5,
++                        sparse=True, show_progress=False)
++    assert sparse.issparse(grown)
++    assert grown.nnz > (small > 0).sum()
++
++
++def test_unknown_method_and_missing_dependency(monkeypatch):
++    with pytest.raises(ValueError, match="Unknown method"):
++        seg.segment(np.zeros((32, 32)), method="baysor")
++    monkeypatch.setitem(sys.modules, "stardist", None)
++    with pytest.raises(ImportError, match="pip install stardist"):
++        seg.segment(np.zeros((64, 64)), method="stardist", show_progress=False)
++
++
++def test_methods_table_lists_every_backend():
++    table = seg.methods()
++    assert set(BACKENDS) | {"baysor"} == set(table.index)
++    assert table.loc["watershed", "installed"]
++    assert {"input", "needs", "gpu", "installed", "reference"} <= set(table.columns)
++
++
++# ---------------------------------------------------------------------------
++# SAM-family mask painting
++# ---------------------------------------------------------------------------
++def test_masks_to_labels_drops_background_and_keeps_small_over_large():
++    H = W = 64
++    yy, xx = np.mgrid[:H, :W]
++    tissue = np.ones((H, W), bool)
++    blob = (yy - 30) ** 2 + (xx - 30) ** 2 <= 15 ** 2
++    nucleus = (yy - 30) ** 2 + (xx - 30) ** 2 <= 5 ** 2
++    other = (yy - 55) ** 2 + (xx - 55) ** 2 <= 4 ** 2
++    masks = [{"segmentation": m, "area": int(m.sum())} for m in (tissue, blob, nucleus, other)]
++    out = _masks_to_labels(masks, min_area=10, max_area=1000)
++    assert out.max() == 3
++    assert len(np.unique(out[nucleus])) == 1 and out[30, 30] != out[30, 42]
++    assert out[0, 0] == 0  # the whole-tile mask was dropped
++    assert _masks_to_labels([]) is None
++
++
++def test_sam_backend_uses_generator_output(monkeypatch):
++    class FakeAMG:
++        def __init__(self, model, **kw):
++            self.kw = kw
++
++        def generate(self, rgb):
++            assert rgb.dtype == np.uint8 and rgb.shape[-1] == 3
++            m = np.zeros(rgb.shape[:2], bool)
++            m[10:20, 10:20] = True
++            return [{"segmentation": m, "area": 100}]
++
++    fake = types.ModuleType("segment_anything")
++    fake.SamAutomaticMaskGenerator = FakeAMG
++    fake.sam_model_registry = {"vit_b": lambda checkpoint: types.SimpleNamespace(to=lambda d: None)}
++    monkeypatch.setitem(sys.modules, "segment_anything", fake)
++    labels = seg.segment(np.random.default_rng(0).random((64, 64)), method="sam",
++                         model="vit_b", checkpoint="unused.pth", max_area=1000,
++                         show_progress=False)
++    assert labels.max() == 1 and (labels > 0).sum() == 100
++
++
++# ---------------------------------------------------------------------------
++# molecules
++# ---------------------------------------------------------------------------
++def _molecules(truth, pixel_size, offset, per_cell=40, background=300, seed=0):
++    """Molecules inside each disc; cell type (odd/even label) decides the genes."""
++    rng = np.random.default_rng(seed)
++    rows = []
++    for i in range(1, truth.max() + 1):
++        ys, xs = np.nonzero(truth == i)
++        pick = rng.integers(0, len(ys), per_cell)
++        genes = rng.choice(["A1", "A2", "A3"] if i % 2 else ["B1", "B2", "B3"], per_cell)
++        rows.append(pd.DataFrame({
++            "x": (xs[pick] + rng.random(per_cell)) * pixel_size + offset[0],
++            "y": (ys[pick] + rng.random(per_cell)) * pixel_size + offset[1],
++            "gene": genes, "true_cell": i}))
++    ys, xs = np.nonzero(truth == 0)
++    pick = rng.integers(0, len(ys), background)
++    rows.append(pd.DataFrame({
++        "x": (xs[pick] + rng.random(background)) * pixel_size + offset[0],
++        "y": (ys[pick] + rng.random(background)) * pixel_size + offset[1],
++        "gene": rng.choice(["A1", "B1", "N1"], background), "true_cell": 0}))
++    return pd.concat(rows, ignore_index=True)
++
++
++def test_assign_and_aggregate_round_trip():
++    truth = _discs(200, 240, _grid(200, 240, 40, 20), 12)
++    px, off = 0.5, (100.0, -20.0)
++    tx = _molecules(truth, px, off)
++    tx.loc[len(tx)] = [1e6, 1e6, "A1", 0]   # far outside the image
++
++    cell = seg.assign_transcripts(tx, truth, pixel_size=px, offset=off)
++    np.testing.assert_array_equal(cell, tx["true_cell"].to_numpy())
++    np.testing.assert_array_equal(
++        seg.assign_transcripts(tx, sparse.csr_matrix(truth), pixel_size=px, offset=off), cell)
++    affine = np.array([[1 / px, 0, -off[0] / px], [0, 1 / px, -off[1] / px], [0, 0, 1]])
++    np.testing.assert_array_equal(seg.assign_transcripts(tx, truth, transform=affine), cell)
++
++    adata = seg.aggregate(tx.assign(cell=cell), labels=truth, pixel_size=px, offset=off)
++    assert adata.n_obs == truth.max()
++    assert adata.obs["n_transcripts"].eq(40).all()
++    assert set(adata.var_names) == {"A1", "A2", "A3", "B1", "B2", "B3"}
++    odd = adata.obs_names.astype(int) % 2 == 1
++    assert adata[odd, ["B1", "B2", "B3"]].X.sum() == 0
++    np.testing.assert_allclose(adata.obs["area"], np.bincount(truth.ravel())[1:] * px ** 2)
++
++    assert "seg" in adata.uns["spatial"]
++
++    if importlib.util.find_spec("shapely") is None:
++        assert "geometry" not in adata.obs  # outlines are optional
++        return
++    from shapely import wkt
++    from shapely.geometry import Point
++    for (cx, cy), poly in zip(adata.obsm["spatial"], adata.obs["geometry"]):
++        shape = wkt.loads(poly)
++        assert shape.contains(Point(cx, cy))
++        assert abs(shape.area - np.pi * (12 * px) ** 2) < 0.15 * np.pi * (12 * px) ** 2
++
++
++def test_aggregate_geometry_needs_shapely(monkeypatch):
++    truth = _discs(60, 60, [(30, 30)], 8)
++    tx = _molecules(truth, 1.0, (0.0, 0.0))
++    monkeypatch.setitem(sys.modules, "shapely", None)
++    cell = seg.assign_transcripts(tx, truth)
++    adata = seg.aggregate(tx.assign(cell=cell), labels=truth, geometry=False)
++    assert "geometry" not in adata.obs and adata.obs["area"].gt(0).all()
++    with pytest.raises(ImportError, match="pip install shapely"):
++        seg.aggregate(tx.assign(cell=cell), labels=truth, geometry=True)
++
++
++def test_aggregate_with_counts_and_string_cells():
++    tx = pd.DataFrame({"x": [0, 1, 2, 3, 4], "y": [0, 0, 0, 0, 0],
++                       "gene": ["g1", "g1", "g2", "g2", "g1"],
++                       "cell": ["c1", "c1", "c2", "", np.nan],
++                       "MIDCount": [2, 3, 1, 5, 5]})
++    adata = seg.aggregate(tx, count="MIDCount")
++    assert list(adata.obs_names) == ["c1", "c2"]
++    assert adata["c1", "g1"].X.toarray().item() == 5
++    assert adata.obs.loc["c2", "n_transcripts"] == 1
++    with pytest.raises(ValueError, match="not integer label ids"):
++        seg.aggregate(tx, labels=np.zeros((5, 5), int))
++
++
++def test_evaluate_and_compare_rank_a_better_segmentation_first():
++    from scipy.ndimage import binary_erosion
++    from skimage.morphology import disk
++
++    truth = _discs(240, 240, _grid(240, 240, 40, 20), 12)
++    tx = _molecules(truth, 1.0, (0.0, 0.0), per_cell=60, background=0)
++    eroded = truth * binary_erosion(truth > 0, disk(5))      # under-segmented cells
++    res = {}
++    for name, lab in {"good": truth, "eroded": eroded}.items():
++        res[name] = seg.evaluate(lab, tx.assign(cell=seg.assign_transcripts(tx, lab)))
++
++    good = res["good"]
++    assert good.attrs["pct_assigned"] == pytest.approx(100.0)
++    assert good["n_transcripts"].eq(60).all() and good["n_genes"].le(3).all()
++    assert good["circularity"].median() > 0.85 and good["solidity"].min() > 0.9
++    assert good["elongation"].max() < 1.1 and good["sphericity"].median() > 0.85
++    assert res["eroded"].attrs["pct_assigned"] < 80
++
++    table = seg.compare(res, min_transcripts=20, min_genes=1)
++    assert list(table.index) == ["good", "eroded"]
++    assert table.loc["good", "rank"] == 1
++    assert {"n_cells", "n_hq_cells", "pct_assigned", "area", "circularity", "overall"} <= set(table)
++
++    morph_only = seg.evaluate(truth)
++    assert "n_transcripts" not in morph_only and len(morph_only) == truth.max()
++
++
++FAKE_BAYSOR = textwrap.dedent("""\
++    #!{python}
++    import sys, json, pandas as pd
++    args = sys.argv[1:]
++    json.dump(args, open("argv.json", "w"))
++    out = args[args.index("-o") + 1]
++    csv = [a for a in args if a.endswith(".csv") and a != out][0]
++    tx = pd.read_csv(csv)
++    tx["molecule_id"] = range(1, len(tx) + 1)
++    tx["cell"] = ["CRx-" + str(int(v) // 10) if v % 10 else "" for v in tx["x"]]
++    tx["is_noise"] = (tx["x"] % 10 == 0)
++    tx["assignment_confidence"] = 0.9
++    tx.to_csv(out, index=False)
++""")
++
++
++def test_segment_transcripts_with_baysor_cli(tmp_path):
++    exe = tmp_path / "baysor"
++    exe.write_text(FAKE_BAYSOR.format(python=sys.executable))
++    exe.chmod(0o755)
++    tx = pd.DataFrame({"x": np.arange(40, dtype=float), "y": 0.0,
++                       "gene": ["g%d" % (i % 3) for i in range(40)],
++                       "nucleus": [i // 10 if i % 2 else 0 for i in range(40)]})
++    work = tmp_path / "work"
++    out = seg.segment_transcripts(tx, gene="gene", prior="nucleus", prior_confidence=0.6,
++                                  scale=5, executable=str(exe), workdir=work)
++    argv = pd.read_json(work / "argv.json", typ="series").tolist()
++    assert argv[0] == "run" and argv[-1] == ":nucleus"
++    assert argv[argv.index("-s") + 1] == "5" and argv[argv.index("-g") + 1] == "gene"
++    assert argv[argv.index("--prior-segmentation-confidence") + 1] == "0.6"
++    assert out["cell"].dtype.kind == "i"
++    assert (out.loc[out["x"] % 10 == 0, "cell"] == 0).all()
++    assert out.loc[out["x"] % 10 != 0, "cell"].nunique() == 4
++    assert out["is_noise"].sum() == 4 and "cell_confidence" in out
++    adata = seg.aggregate(out)
++    assert adata.n_obs == 4 and adata.obs["n_transcripts"].eq(9).all()
++
++    with pytest.raises(ValueError, match="needs `scale`"):
++        seg.segment_transcripts(tx, executable=str(exe))
++    with pytest.raises(FileNotFoundError, match="Baysor executable"):
++        seg.segment_transcripts(tx, scale=5, executable="definitely-not-baysor")
++
++
++# ---------------------------------------------------------------------------
++# Visium HD wrappers route method + method-aware thresholds
++# ---------------------------------------------------------------------------
++@pytest.mark.parametrize("method, he_expected, gex_expected", [
++    ("cellpose", {"prob_thresh": 0, "flow_threshold": 0.2}, {"prob_thresh": 0.01}),
++    ("stardist", {"prob_thresh": 0.01}, {"prob_thresh": 0.05, "nms_thresh": 0.5}),
++    ("sam2", {}, {}),
++])
++def test_visium_hd_wrappers_forward_method(monkeypatch, tmp_path, method, he_expected,
++                                           gex_expected):
++    import anndata as ad
++    import omicverse.external.bin2cell as b2c
++    import omicverse as ov
++
++    calls = []
++    monkeypatch.setattr(b2c, "cellseg", lambda **kw: calls.append(kw))
++    for name in ("destripe", "scaled_he_image", "insert_labels", "grid_image"):
++        monkeypatch.setattr(b2c, name, lambda *a, **k: None)
++    adata = ad.AnnData(np.zeros((3, 2)))
++    adata.obs["n_counts_adjusted"] = 1.0
++    he = tmp_path / "he.tiff"
++    gex = tmp_path / "gex.tiff"
++    ov.space.visium_10x_hd_cellpose_he(adata, he_save_path=str(he), method=method)
++    ov.space.visium_10x_hd_cellpose_gex(adata, gex_save_path=str(gex), method=method)
++    he_call, gex_call = calls
++    keys = {"prob_thresh", "flow_threshold", "nms_thresh"}
++    assert he_call["backend"] == gex_call["backend"] == method
++    assert {k: v for k, v in he_call.items() if k in keys} == he_expected
++    assert {k: v for k, v in gex_call.items() if k in keys} == gex_expected
++    assert he_call["stardist_model"] == "2D_versatile_he"
++    assert gex_call["stardist_model"] == "2D_versatile_fluo"

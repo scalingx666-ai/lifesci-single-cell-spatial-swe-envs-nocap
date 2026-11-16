@@ -1,0 +1,553 @@
+diff --git a/docs/plan-crosswalk.json b/docs/plan-crosswalk.json
+index ca41c5f9b..21ac08292 100644
+--- a/docs/plan-crosswalk.json
++++ b/docs/plan-crosswalk.json
+@@ -204,7 +204,7 @@
+       "tests": "tests/test_producer_output_budgets.py,tests/test_workspace_streaming_budgets.py",
+       "browser_evidence": "",
+       "external_evidence": "",
+-      "evidence_digest": "8987487f897a29cad6fc5f2118beb58d24030b719495b85a6b585b36be928f9f"
++      "evidence_digest": "020fd1b58b536b66fac30623caf19609c3916e2826c379a21b82706151ab2fb2"
+     },
+     {
+       "source": "R2",
+@@ -383,7 +383,7 @@
+       "tests": "tests/test_producer_output_budgets.py",
+       "browser_evidence": "",
+       "external_evidence": "",
+-      "evidence_digest": "e24f18625e37a6cc5d6e26ce790aefcfc60886ee3e42b75d945aa4fb626dbba5"
++      "evidence_digest": "11d513a8c00d5b22e574fe9e25f51c268756ba9ed2988d34b0a70dde35ea3ae2"
+     },
+     {
+       "source": "R4",
+diff --git a/harness/smoke/linux_bwrap_interrupt.py b/harness/smoke/linux_bwrap_interrupt.py
+index 931daf5c0..7ad9ff621 100644
+--- a/harness/smoke/linux_bwrap_interrupt.py
++++ b/harness/smoke/linux_bwrap_interrupt.py
+@@ -306,6 +306,17 @@ def main() -> int:
+     os.environ["OPENAI4S_KERNEL_SANDBOX"] = "enforce"
+     os.environ["OPENAI4S_KERNEL_ALLOW_RAW_NETWORK"] = "1"
+ 
++    # Run the whole smoke with SIGINT ignored, the disposition a daemon
++    # launched as a shell background job (`./start.sh &`, nohup) actually has.
++    # SIG_IGN survives exec through bwrap and sh into Rscript, and R installs
++    # its interrupt handler only when the inherited disposition is not
++    # SIG_IGN — so before kernel/transport.py reset dispositions at the spawn
++    # boundary, this exact configuration silently dropped every R interrupt
++    # delivered over the pidfd path this smoke exists to prove. Spawning under
++    # SIG_IGN makes the smoke cover the backgrounded-daemon chain end to end;
++    # delivery itself is unaffected (pidfd_send_signal targets the worker).
++    signal.signal(signal.SIGINT, signal.SIG_IGN)
++
+     home = Path.home().resolve()
+     root = Path(tempfile.mkdtemp(prefix="openai4s-bwrap-interrupt-", dir=home))
+     python_workspace = root / "agent-workspaces" / "python"
+diff --git a/openai4s/kernel/manager.py b/openai4s/kernel/manager.py
+index aa53ddea2..c227749f1 100644
+--- a/openai4s/kernel/manager.py
++++ b/openai4s/kernel/manager.py
+@@ -180,6 +180,60 @@ def __bool__(self) -> bool:
+         return self.delivered
+ 
+ 
++# tgkill(2)'s syscall numbers, per architecture. Linux syscall numbers are
++# stable ABI -- these values cannot change -- and an architecture missing from
++# this table simply keeps the process-directed kill() below.
++_TGKILL_NR = {"x86_64": 234, "aarch64": 131}
++
++
++def _signal_worker_main_thread(pid: int, signum: int) -> bool:
++    """Deliver ``signum`` to the worker's MAIN thread on Linux, via tgkill(2).
++
++    A process-directed signal may be handed to ANY thread that has it
++    unblocked. The worker is not single-threaded in practice: the guard
++    phase's ``import matplotlib`` pulls in OpenBLAS, whose pool threads
++    inherit the main thread's empty signal mask. When one of those consumes
++    the SIGINT, CPython's C trampoline only sets a flag -- the Python-level
++    handler runs on the main thread alone -- and a main thread blocked in
++    ``clock_nanosleep`` (``time.sleep``) is never woken by a flag another
++    thread set. Observed on a CI runner as a cell that slept its remaining
++    30 s with ``SigPnd: 0`` on every thread and the main thread parked in
++    ``hrtimer_nanosleep``, then reported ``interrupted=True`` at wall=30.0005
++    -- the stop arrived, was consumed by a BLAS thread, and did nothing until
++    the sleep expired on its own.
++
++    tgkill directs the signal at one thread; the main thread's tid equals the
++    pid, so it is addressable without reading /proc. R workers ride the same
++    path: the ``sh -c 'exec ...'`` spawn keeps pid == R's main thread.
++
++    False means "not attempted or not delivered here" -- the caller falls
++    back to the process-directed ``Popen.send_signal`` it always used, so a
++    non-Linux host, an unlisted architecture, or a failed syscall keep
++    exactly the previous behaviour.
++    """
++    if sys.platform != "linux":
++        return False
++    try:
++        nr = _TGKILL_NR.get(os.uname().machine)
++    except (AttributeError, OSError):
++        return False
++    if nr is None:
++        return False
++    try:
++        import ctypes
++
++        libc = ctypes.CDLL(None, use_errno=True)
++        result = libc.syscall(
++            ctypes.c_long(nr),
++            ctypes.c_long(pid),
++            ctypes.c_long(pid),
++            ctypes.c_long(signum),
++        )
++    except (OSError, AttributeError, TypeError):
++        return False
++    return result == 0
++
++
+ class Kernel:
+     def __init__(
+         self,
+@@ -806,6 +860,14 @@ def interrupt(self) -> "InterruptDelivery":
+             return InterruptDelivery(
+                 False, "local-process", "the worker had already exited"
+             )
++        # Aim at the MAIN thread first. A process-directed signal may be
++        # consumed by any helper thread (OpenBLAS's pool, spawned by the guard
++        # phase's matplotlib import, has SIGINT unblocked), and a main thread
++        # blocked in `time.sleep` is then never woken -- the cell runs its
++        # sleep out and only then reports the interrupt. tgkill removes the
++        # race instead of narrowing it; see _signal_worker_main_thread.
++        if _signal_worker_main_thread(proc.pid, int(signal.SIGINT)):
++            return InterruptDelivery(True, "local-process")
+         try:
+             # Popen owns the direct child identity and synchronizes its poll /
+             # signal path. Bubblewrap's numeric grandchild never reaches here;
+diff --git a/openai4s/kernel/r_kernel.py b/openai4s/kernel/r_kernel.py
+index c2bebbff7..a134714ab 100644
+--- a/openai4s/kernel/r_kernel.py
++++ b/openai4s/kernel/r_kernel.py
+@@ -15,7 +15,13 @@
+ - fd 1 is aliased to stderr so stray C-level prints never corrupt the wire,
+ - `exec` keeps the shell child's pid == R's pid, so Kernel.interrupt()'s SIGINT
+   lands in R directly (including when bubblewrap supervises that child) and is
+-  caught there as an interrupt condition with `interrupted=True`.
++  caught there as an interrupt condition with `interrupted=True`. R only
++  installs that handler when the disposition it inherits is not SIG_IGN, and a
++  backgrounded daemon (`./start.sh &`, nohup) passes SIG_IGN through every
++  exec in this chain — kernel/transport.py's spawn boundary resets SIGINT to
++  SIG_DFL in the child so the guarantee holds regardless of launch mode (the
++  reset cannot live in _SH_WRAP: POSIX forbids a non-interactive shell from
++  resetting a signal ignored on entry, so `trap - INT` would be a no-op).
+ 
+ The R kernel is an ANALYSIS kernel: it never emits host_call frames and has no
+ `host` object — completion (host.submit_output) stays on the python control
+diff --git a/openai4s/kernel/transport.py b/openai4s/kernel/transport.py
+index b5a9cbe05..39678573b 100644
+--- a/openai4s/kernel/transport.py
++++ b/openai4s/kernel/transport.py
+@@ -91,6 +91,36 @@ def stderr_tail(self) -> Any:
+         ...
+ 
+ 
++def _reset_inherited_signal_dispositions() -> None:
++    """Runs in the forked child, between fork and exec (Popen preexec_fn).
++
++    A POSIX shell starts background jobs (`./start.sh &`, `nohup openai4s
++    serve`) with SIGINT and SIGQUIT set to SIG_IGN, and SIG_IGN — unlike a
++    handler — survives every exec in the chain: daemon → [bwrap] → sh →
++    Rscript. R follows the classic Unix idiom and installs its interrupt
++    handler only when the inherited disposition is not SIG_IGN, so a worker
++    descended from a backgrounded daemon is born uninterruptible:
++    `Kernel.interrupt()`'s SIGINT is discarded in the child (verified with
++    lldb — sigaction(SIGINT)=SIG_IGN, R_interrupts_pending stays 0) and the
++    cell runs to completion while the caller reports a delivered stop. The
++    python worker survives the same inheritance only because worker.py calls
++    `signal.signal()` unconditionally.
++
++    Resetting to SIG_DFL here makes every kernel worker start as if launched
++    from a foreground shell, without touching the daemon's own disposition —
++    an operator who backgrounded the daemon keeps its terminal semantics. The
++    reset cannot live in r_kernel's sh wrapper instead: POSIX forbids a
++    non-interactive shell from trapping or resetting a signal that was
++    ignored on entry, so `trap - INT` is a no-op exactly when it is needed.
++
++    `signal.signal` is legal in this child even when the Popen ran on a
++    daemon request thread: with a preexec_fn CPython runs
++    `PyOS_AfterFork_Child()` first, which re-mains the surviving thread.
++    """
++    signal.signal(signal.SIGINT, signal.SIG_DFL)
++    signal.signal(signal.SIGQUIT, signal.SIG_DFL)
++
++
+ class PipeTransport:
+     """The local worker: a child process over three pipes.
+ 
+@@ -137,6 +167,12 @@ def __init__(
+             # replace it, and `kill()` below gains the group ladder every other
+             # long-lived child in this repository already has.
+             options["start_new_session"] = True
++            # And it starts with foreground signal dispositions, whatever the
++            # daemon's own launch mode left behind: an inherited SIG_IGN on
++            # SIGINT survives exec and R honours it, so without this reset a
++            # backgrounded daemon's R kernels silently drop every interrupt.
++            # See `_reset_inherited_signal_dispositions` for the full chain.
++            options["preexec_fn"] = _reset_inherited_signal_dispositions
+         self._proc = subprocess.Popen(command, **options)
+         # Read at spawn, from the pid, not later from `os.getpgid`: once the
+         # leader is reaped the lookup fails, which is exactly when a surviving
+diff --git a/tests/fixtures/fake_rscript.py b/tests/fixtures/fake_rscript.py
+index d917c7f4d..d1c5f03d0 100755
+--- a/tests/fixtures/fake_rscript.py
++++ b/tests/fixtures/fake_rscript.py
+@@ -16,7 +16,14 @@
+     FLOOD    -> writes 200KB to real stderr before responding (proves the
+                 manager drains the stderr pipe: >64KB used to deadlock)
+     DIE      -> exits 1 without responding (worker-death path)
+-    SLEEP    -> sleeps 30s; SIGINT -> interrupted=True response
++    SLEEP    -> emits a "sleep-started" stdout_chunk frame, then sleeps 30s;
++                SIGINT -> interrupted=True response. The chunk lets a test arm
++                its interrupt from Kernel.execute's on_chunk (the pattern the
++                real-R interrupt tests use) instead of a tuned delay. Faithful
++                to R in the way that matters: CPython, like R, installs its
++                default SIGINT handler only when the inherited disposition is
++                not SIG_IGN, so a SLEEP spawned from a process that ignores
++                SIGINT reproduces the backgrounded-daemon interrupt drop.
+     ENV:name -> stdout is the child environment value or "<missing>"
+     anything -> stdout "ran:<code>"
+ """
+@@ -106,7 +113,17 @@ def respond(frame_id, stdout="", stderr="", error=None, interrupted=False):
+         respond(rid, stdout=str(counter))
+         continue
+     if code == "SLEEP":
++        # The whole branch sits inside the try: a SIGINT racing the window
++        # between the chunk's flush and the sleep must still produce the
++        # interrupted response, not kill the fake mid-loop.
+         try:
++            out.write(
++                json.dumps(
++                    {"type": "stdout_chunk", "id": rid, "text": "sleep-started"}
++                )
++                + "\n"
++            )
++            out.flush()
+             time.sleep(30)
+             respond(rid, stdout="woke")
+         except KeyboardInterrupt:
+diff --git a/tests/test_kernel.py b/tests/test_kernel.py
+index 4ee15f250..4aeda69cb 100644
+--- a/tests/test_kernel.py
++++ b/tests/test_kernel.py
+@@ -739,6 +739,83 @@ def run():
+         assert k.execute("print(marker)")["stdout"].strip() == "still-here"
+ 
+ 
++def test_interrupt_stops_a_cell_whose_helper_threads_could_eat_the_signal():
++    """A worker with unblocked helper threads must still stop promptly.
++
++    The worker is not single-threaded in practice: the guard phase's
++    matplotlib import starts OpenBLAS's pool, and those threads inherit an
++    empty signal mask. Linux may hand a process-directed SIGINT to any of
++    them; CPython's Python-level handler runs only on the main thread, and a
++    main thread blocked in `time.sleep` is never woken by a flag another
++    thread set. Observed on a CI runner (run 32735586388, round 15): every
++    thread with SigPnd 0, the main thread parked in hrtimer_nanosleep, and
++    the cell reporting interrupted=True only at wall=30.0005 -- the stop was
++    consumed by a BLAS thread and did nothing until the sleep ran out. The
++    interrupt path now aims tgkill at the main thread, which this asserts
++    with explicitly spawned stand-ins for the BLAS pool.
++    """
++    reached = threading.Event()
++
++    def dispatcher(method, args):
++        if method == "ping":
++            reached.set()
++        return _echo_dispatcher(method, args)
++
++    with Kernel(dispatcher=dispatcher) as k:
++        result = {}
++
++        def run():
++            result["r"] = k.execute(
++                "import threading, time\n"
++                "for _ in range(6):\n"
++                "    threading.Thread(target=time.sleep, args=(60,), "
++                "daemon=True).start()\n"
++                "host._call('ping', [])\n"
++                "time.sleep(60)"
++            )
++
++        t = threading.Thread(target=run, daemon=True)
++        t.start()
++        assert reached.wait(60), "the cell never reached its host call"
++        k.interrupt()
++        # Well under the cell's own 60s sleep: a signal eaten by a helper
++        # thread leaves the sleep running and fails here, rather than being
++        # indistinguishable from a slow runner at the sleep's full length.
++        t.join(timeout=15)
++        assert not t.is_alive(), _interrupt_diagnosis(k)
++
++        r = result["r"]
++        assert r["interrupted"] is True
++        assert r["error"] == "Interrupted"
++
++
++def test_tgkill_helper_reaches_the_calling_threads_own_process():
++    """The syscall-number table and argument order, proven by delivery.
++
++    On Linux the helper signals THIS process's main thread with SIGUSR1 and
++    the installed handler must observe it -- a wrong syscall number or a
++    swapped tgid/tid argument fails here, not in a hung CI cell. Elsewhere
++    the helper must decline so the caller keeps the process-directed path.
++    """
++    import sys as _sys
++
++    if _sys.platform != "linux":
++        assert (
++            manager_mod._signal_worker_main_thread(os.getpid(), signal.SIGUSR1) is False
++        )
++        return
++
++    seen = threading.Event()
++    previous = signal.signal(signal.SIGUSR1, lambda s, f: seen.set())
++    try:
++        assert manager_mod._signal_worker_main_thread(
++            os.getpid(), signal.SIGUSR1
++        ), "tgkill failed on a platform whose syscall number is in the table"
++        assert seen.wait(5), "tgkill reported success but the signal never arrived"
++    finally:
++        signal.signal(signal.SIGUSR1, previous)
++
++
+ def _interrupt_diagnosis(kernel) -> str:
+     """What a failing interrupt looked like, instead of `assert not True`.
+ 
+@@ -768,6 +845,65 @@ def _interrupt_diagnosis(kernel) -> str:
+     return "\n".join(lines)
+ 
+ 
++@pytest.mark.skipif(os.name != "posix", reason="POSIX signal dispositions")
++def test_kernel_children_start_with_default_sigint_even_when_spawner_ignores_it():
++    """The spawn boundary undoes an inherited SIG_IGN on SIGINT/SIGQUIT.
++
++    A shell backgrounds `./start.sh &` (and nohup) with both set to SIG_IGN,
++    which survives every exec: daemon → [bwrap] → sh → Rscript. R installs its
++    interrupt handler only when the inherited disposition is not SIG_IGN, so a
++    backgrounded daemon's R kernels silently dropped every Kernel.interrupt()
++    while the python worker — which calls signal.signal unconditionally —
++    kept working. PipeTransport is the one local spawn site for both, so the
++    probe here covers Python, R and the bwrap-wrapped argv alike.
++
++    The probe reads what CPython concluded from the inherited disposition:
++    `default_int_handler` installed means the child was born with SIGINT not
++    ignored (the reset worked); SIG_IGN means the legacy leaked through.
++
++    The second spawn runs on a non-main thread because that is where the
++    daemon actually spawns kernels — it pins that the preexec reset (which
++    calls `signal.signal` in the forked child) stays legal off-main-thread.
++    """
++    import sys
++
++    from openai4s.kernel.transport import PipeTransport
++
++    probe = (
++        "import signal, sys\n"
++        "sys.stdout.write('int_reset=%s quit_reset=%s\\n' % (\n"
++        "    signal.getsignal(signal.SIGINT) is signal.default_int_handler,\n"
++        "    signal.getsignal(signal.SIGQUIT) is signal.SIG_DFL))\n"
++    )
++    command = [sys.executable, "-c", probe]
++
++    def spawn_and_read() -> str:
++        transport = PipeTransport(command, cwd=None, env=dict(os.environ))
++        try:
++            line = transport.read_line()
++            transport.process.wait(timeout=10)
++        finally:
++            transport.close(graceful=False)
++        return line.strip()
++
++    old_int = signal.signal(signal.SIGINT, signal.SIG_IGN)
++    old_quit = signal.signal(signal.SIGQUIT, signal.SIG_IGN)
++    try:
++        assert spawn_and_read() == "int_reset=True quit_reset=True"
++
++        box: dict[str, str] = {}
++        thread = threading.Thread(
++            target=lambda: box.update(line=spawn_and_read()), daemon=True
++        )
++        thread.start()
++        thread.join(30)
++        assert not thread.is_alive(), "off-main-thread spawn never finished"
++        assert box["line"] == "int_reset=True quit_reset=True"
++    finally:
++        signal.signal(signal.SIGINT, old_int)
++        signal.signal(signal.SIGQUIT, old_quit)
++
++
+ def test_a_chunk_from_another_cell_is_not_this_cell_s_output(monkeypatch):
+     """`on_chunk` and the assembled stdout belong to the cell that was asked
+     for. A frame stamped with a different cell id used to satisfy both — so a
+diff --git a/tests/test_producer_output_budgets.py b/tests/test_producer_output_budgets.py
+index 83c856572..bf06c0ae2 100644
+--- a/tests/test_producer_output_budgets.py
++++ b/tests/test_producer_output_budgets.py
+@@ -764,22 +764,41 @@ def test_an_interrupted_cell_reports_what_the_host_had_drained(tmp_path):
+     what they had already taken is what the cell reports. Driving the frame
+     parser instead would prove the protocol and say nothing about whether the
+     drain survives its writer being killed.
+-    """
+-    import threading
+ 
++    The interrupt is armed by the first drained chunk, not by a timer: a conda
++    Rscript can take seconds to start, and a fixed delay that expires first
++    lands the SIGINT before the cell has streamed a byte — outside r_worker.R's
++    handler it halts the interpreter, inside it it interrupts a cell whose
++    `stdout_seen_bytes` is legitimately 0. Both are startup races, not the
++    mid-stream case. `on_chunk` fires on the drain thread after `seen` was
++    bumped, so the SIGINT is sent only when bytes have provably crossed the
++    fifo while the writer still has ~4 GB left to produce.
++    """
+     from openai4s.kernel.r_kernel import spawn_r_kernel
+ 
++    # This test once skipped when its own process had SIGINT set to SIG_IGN (a
++    # backgrounded `pytest &`): SIG_IGN survived exec into R, R honoured it,
++    # and no SIGINT could reach the worker. The spawn boundary in
++    # kernel/transport.py now resets the child's disposition, so the scenario
++    # runs instead of skipping — test_r_kernel.py pins that reset explicitly.
++
+     kernel = spawn_r_kernel(cwd=str(tmp_path), rscript=_REAL_R)
+     try:
+-        timer = threading.Timer(1.0, kernel.interrupt)
+-        timer.start()
+-        try:
+-            result = kernel.execute(
+-                "invisible(lapply(1:4000, function(i) cat(strrep('x', 1e6))))"
+-            )
+-        finally:
+-            timer.cancel()
++        fired = threading.Event()
++
++        def interrupt_once_streaming(_text: str) -> None:
++            # Exactly one SIGINT: the drain can keep delivering chunks after
++            # the first, and a second signal could land between cells.
++            if not fired.is_set():
++                fired.set()
++                kernel.interrupt()
++
++        result = kernel.execute(
++            "invisible(lapply(1:4000, function(i) cat(strrep('x', 1e6))))",
++            on_chunk=interrupt_once_streaming,
++        )
+ 
++        assert fired.is_set(), "the cell finished without streaming a chunk"
+         assert result.get("interrupted") is True, result
+         usage = result["usage"]
+         # The host drained real bytes before the interrupt landed, and the
+diff --git a/tests/test_r_kernel.py b/tests/test_r_kernel.py
+index 19c96ba4b..1f185f47b 100644
+--- a/tests/test_r_kernel.py
++++ b/tests/test_r_kernel.py
+@@ -10,6 +10,7 @@
+ """
+ 
+ import os
++import signal
+ import stat
+ import subprocess
+ import threading
+@@ -192,6 +193,48 @@ def test_interrupt_returns_interrupted_result_and_keeps_worker(fake_rscript, tmp
+         k.shutdown()
+ 
+ 
++@pytest.mark.skipif(os.name != "posix", reason="POSIX signal dispositions")
++def test_interrupt_reaches_r_even_when_the_spawning_process_ignores_sigint(
++    fake_rscript, tmp_path
++):
++    """A backgrounded daemon (`./start.sh &`, nohup) runs with SIGINT set to
++    SIG_IGN; SIG_IGN survives the sh wrapper's exec, and R — exactly like the
++    CPython running this fake — installs its interrupt handler only when the
++    inherited disposition is not SIG_IGN. Before the spawn-boundary reset in
++    kernel/transport.py the worker was therefore born uninterruptible:
++    Kernel.interrupt()'s SIGINT was discarded in the child and the cell ran to
++    completion while the caller reported a delivered stop. The fake reproduces
++    that faithfully (revert the reset and this test fails by sleeping out the
++    full 30s), so the regression stays covered on machines without R.
++
++    The interrupt is armed by the cell's first drained chunk, not a delay —
++    the same pattern as the real-R interrupt tests — so the signal cannot land
++    before the fake has entered its interruptible sleep.
++    """
++    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
++    try:
++        k = spawn_r_kernel(cwd=str(tmp_path), rscript=fake_rscript)
++        try:
++            fired = threading.Event()
++
++            def interrupt_once_streaming(_text: str) -> None:
++                if not fired.is_set():
++                    fired.set()
++                    k.interrupt()
++
++            r = k.execute("SLEEP", on_chunk=interrupt_once_streaming)
++            assert fired.is_set(), "the cell finished without streaming a chunk"
++            assert r["interrupted"] is True, r
++            assert r["error"] == "Interrupted"
++            # and the worker survived, as the interrupt contract promises
++            assert k.is_alive()
++            assert k.execute("COUNT")["stdout"] == "1"
++        finally:
++            k.shutdown()
++    finally:
++        signal.signal(signal.SIGINT, old)
++
++
+ # --- interpreter resolution ---------------------------------------------------
+ 
+ 
+@@ -587,3 +630,46 @@ def test_real_r_error_lineno_survives_streaming(tmp_path):
+         assert result["trace"]["error_lineno"] == 3
+     finally:
+         kernel.shutdown()
++
++
++@pytest.mark.skipif(_REAL_R is None, reason="no Rscript resolvable on this machine")
++@pytest.mark.skipif(os.name != "posix", reason="POSIX signal dispositions")
++def test_real_r_interrupt_survives_a_spawning_process_that_ignores_sigint(tmp_path):
++    """The real-R half of the backgrounded-daemon regression.
++
++    SIG_IGN on SIGINT survives exec through sh into Rscript, and R honours an
++    inherited ignore instead of installing its interrupt handler (verified
++    with lldb against the stuck child: sigaction(SIGINT)=SIG_IGN,
++    R_interrupts_pending stayed 0) — so before kernel/transport.py reset the
++    disposition at the spawn boundary, a daemon launched as a shell
++    background job dropped every R interrupt while Python kernels kept
++    working. Spawning under SIG_IGN here proves the reset with the real
++    interpreter; the fake-based sibling covers machines without R.
++    """
++    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
++    try:
++        kernel = spawn_r_kernel(cwd=str(tmp_path), rscript=_REAL_R)
++        try:
++            fired = threading.Event()
++
++            def interrupt_once_streaming(_text: str) -> None:
++                # One SIGINT, armed by the first drained chunk: the drain keeps
++                # delivering after the first, and a conda Rscript can take
++                # seconds to start — a timed signal lands in that window.
++                if not fired.is_set():
++                    fired.set()
++                    kernel.interrupt()
++
++            result = kernel.execute(
++                "invisible(lapply(1:4000, function(i) cat(strrep('x', 1e6))))",
++                on_chunk=interrupt_once_streaming,
++            )
++            assert fired.is_set(), "the cell finished without streaming a chunk"
++            assert result.get("interrupted") is True, result
++            assert kernel.is_alive()
++            after = kernel.execute("cat('still here\n')")
++            assert after["stdout"] == "still here\n"
++        finally:
++            kernel.shutdown()
++    finally:
++        signal.signal(signal.SIGINT, old)

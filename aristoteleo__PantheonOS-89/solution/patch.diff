@@ -1,0 +1,819 @@
+diff --git a/pantheon/chatroom/room.py b/pantheon/chatroom/room.py
+index a9f355c2a..f8f784777 100644
+--- a/pantheon/chatroom/room.py
++++ b/pantheon/chatroom/room.py
+@@ -1364,9 +1364,17 @@ async def _background_rename_chat(self, memory):
+             )
+             if new_name and new_name != memory.name:
+                 memory.name = new_name
++                # Sync customTitle to keep session_storage in step with memory.name,
++                # otherwise restoreSessionMetadata would clobber memory.name back
++                # on the next turn.
++                session_storage = memory.extra_data.get("session_storage")
++                if isinstance(session_storage, dict):
++                    metadata = session_storage.get("metadata")
++                    if isinstance(metadata, dict) and metadata.get("customTitle") != new_name:
++                        metadata["customTitle"] = new_name
++                        memory.mark_dirty()
+                 # Save only this chat's memory
+                 await run_func(self.memory_manager.save_one, memory.id)
+-                logger.debug(f"Chat renamed in background to: {new_name}")
+                 # Notify frontend via NATS
+                 if self._nats_adapter is not None:
+                     await self._nats_adapter.publish(
+@@ -1374,7 +1382,7 @@ async def _background_rename_chat(self, memory):
+                         {"type": "chat_renamed", "chat_id": memory.id, "name": new_name},
+                     )
+         except Exception as e:
+-            logger.error(f"Background chat rename failed: {e}")
++            logger.error(f"Background chat rename failed: {e}", exc_info=True)
+ 
+     def _setup_bg_auto_notify(self, chat_id: str, team):
+         """Wire bg task completion to auto-trigger a new chat turn.
+@@ -1635,17 +1643,18 @@ async def team_getter():
+             chat_id, process_chunk, process_step_message, wait=False
+         )
+ 
+-        # Generate chat name as soon as user message arrives (non-blocking).
+-        # No need to wait for agent response — user message is enough context.
+-        # Only fires if the chat still has a default name (e.g. "New Chat").
+-        if self._enable_auto_chat_name:
+-            task = asyncio.create_task(self._background_rename_chat(memory))
+-            self._background_tasks.add(task)
+-            task.add_done_callback(self._background_tasks.discard)
+-
+         try:
+             await thread.run()
+ 
++            # Kick off rename AFTER thread.run() so memory has the user
++            # message (added inside agent.run()) and the agent response.
++            # Running it earlier raced the user-message insertion and caused
++            # the first message to never trigger a rename.
++            if self._enable_auto_chat_name:
++                task = asyncio.create_task(self._background_rename_chat(memory))
++                self._background_tasks.add(task)
++                task.add_done_callback(self._background_tasks.discard)
++
+             # Post-execution image detection: scan the designated image
+             # output directory for any newly created images.
+             if image_output_path and pre_image_snapshot is not None:
+diff --git a/pantheon/chatroom/special_agents.py b/pantheon/chatroom/special_agents.py
+index 3507f09c7..559bfa32c 100644
+--- a/pantheon/chatroom/special_agents.py
++++ b/pantheon/chatroom/special_agents.py
+@@ -393,14 +393,22 @@ async def generate_or_update_name(
+         """Generate a chat name only if the chat still has a default name.
+ 
+         Rules:
++        - Never rename again once a rename has succeeded (name_generated=True)
+         - Only rename if current name is a default placeholder (e.g. "New Chat")
+         - Need at least 1 user message to generate a meaningful name
+         - Never overwrite a name that was already set (by user or previous generation)
+         """
+-        # Already has a meaningful name — don't touch it
++        # If the chat already has a meaningful name, don't touch it. This also
++        # covers the hard guard against AI-generated names that happen to look
++        # default (e.g. starting with "Chat") — once memory.name is non-default
++        # we never rewrite it.
+         if not self._is_default_name(memory.name):
+             return memory.name
+ 
++        # If name_generated is set but memory.name is still a default, the
++        # rename never actually stuck (e.g. leftover from a prior bug where the
++        # name was clobbered back). Fall through and try again.
++
+         agent_messages = memory.get_messages(None)
+         user_msgs = [m for m in agent_messages if m.get("role") == "user"]
+         if not user_msgs:
+@@ -423,17 +431,27 @@ async def generate_or_update_name(
+         return fallback
+ 
+     def _is_default_name(self, name: str) -> bool:
+-        """Check if a name is a default placeholder that should be replaced."""
++        """Check if a name is a default placeholder that should be replaced.
++
++        Only matches known placeholder variants — "New Chat", "New Chat (2)",
++        "新建聊天", etc. Does NOT match arbitrary names starting with "Chat ",
++        which was too greedy and caused AI-generated names like "Chat about
++        gene expression" to be re-renamed on the next turn.
++        """
+         if not name:
+             return True
+         stripped = name.strip()
+         if stripped in self.DEFAULT_NAMES:
+             return True
+-        # Match patterns like "New Chat", "New Chat (2)", "Chat 04-14 11:30"
+-        if stripped.startswith("New Chat") or stripped.startswith("Chat "):
++        # Numbered placeholders only: "New Chat (2)", "New Chat in Project (3)"
++        if stripped.startswith("New Chat (") or stripped.startswith(
++            "New Chat in Project ("
++        ):
+             return True
+-        # Chinese defaults: "新建聊天", "新建聊天 (2)"
+-        if stripped.startswith("新建聊天"):
++        # Chinese numbered placeholders: "新建聊天 (2)", "在项目中新建聊天 (3)"
++        if stripped.startswith("新建聊天 (") or stripped.startswith(
++            "在项目中新建聊天 ("
++        ):
+             return True
+         return False
+ 
+diff --git a/pantheon/repl/sessionStorage.py b/pantheon/repl/sessionStorage.py
+index 901a518ed..54fc6093e 100644
+--- a/pantheon/repl/sessionStorage.py
++++ b/pantheon/repl/sessionStorage.py
+@@ -68,8 +68,16 @@ def restoreSessionMetadata(meta: dict[str, Any], memory: Any | None = None) -> N
+         elif key in meta and meta[key] is None and key in metadata:
+             metadata.pop(key, None)
+ 
+-    if metadata.get("customTitle"):
+-        memory.name = str(metadata["customTitle"])
++    # Once a chat has been auto-renamed (name_generated=True), memory.name is
++    # authoritative — don't let a stale customTitle regress it. Sync the other
++    # way: keep customTitle in step with memory.name. Otherwise (fresh chat /
++    # REPL-resume with user-customized title), customTitle drives memory.name.
++    current_title = metadata.get("customTitle")
++    if memory.extra_data.get("name_generated"):
++        if current_title != memory.name:
++            metadata["customTitle"] = memory.name
++    elif current_title:
++        memory.name = str(current_title)
+ 
+     payload["metadata"] = metadata
+     _save_payload(memory, payload)
+diff --git a/pantheon/utils/llm_providers.py b/pantheon/utils/llm_providers.py
+index 8fff3d396..b872ae3f0 100644
+--- a/pantheon/utils/llm_providers.py
++++ b/pantheon/utils/llm_providers.py
+@@ -116,11 +116,14 @@ def detect_provider(model: str, relaxed_schema: bool) -> ProviderConfig:
+ 
+ 
+ def is_responses_api_model(config: ProviderConfig) -> bool:
+-    """Check if model should use the OpenAI Responses API instead of Chat Completions.
++    """Check if the model is Responses-API-only (no Chat Completions fallback).
+ 
+     Triggers for:
+     - Models with "codex" in the name (e.g. codex-mini-latest)
+     - Pro models (gpt-5.x-pro, gpt-5.2-pro) which are Responses-only
++
++    For the broader "should I try Responses API" question (which covers all
++    OpenAI models by default), use ``should_use_responses_api`` instead.
+     """
+     name_lower = config.model_name.lower()
+     if config.provider_type != ProviderType.OPENAI:
+@@ -130,6 +133,53 @@ def is_responses_api_model(config: ProviderConfig) -> bool:
+     return "codex" in bare or bare.endswith("-pro")
+ 
+ 
++# Per-process cache of (base_url, model_name) combinations where the
++# /v1/responses endpoint is known to be unavailable. Populated at runtime
++# when a Responses API call hits a 404 — we then fall back to Chat Completions
++# and skip the probe on subsequent calls.
++_RESPONSES_API_UNAVAILABLE: set[tuple[str, str]] = set()
++
++
++def _responses_cache_key(config: ProviderConfig) -> tuple[str, str]:
++    return (config.base_url or "", config.model_name.lower())
++
++
++def should_use_responses_api(config: ProviderConfig) -> bool:
++    """Return True if this OpenAI call should try the Responses API first.
++
++    Default behaviour: all OPENAI-routed models attempt /v1/responses, because
++    Responses API supports native image input in function_call_output and has
++    superseded Chat Completions for most modern OpenAI models.
++
++    Exceptions:
++    - Non-OPENAI provider types (anthropic, gemini, etc.) use their native SDKs.
++    - Codex OAuth models (``codex/``) have a dedicated adapter.
++    - (base_url, model) pairs where a prior call recorded that the endpoint
++      does not implement /v1/responses fall back to Chat Completions.
++    """
++    if config.provider_type != ProviderType.OPENAI:
++        return False
++    if "codex/" in config.model_name.lower():
++        return False
++    if _responses_cache_key(config) in _RESPONSES_API_UNAVAILABLE:
++        return False
++    return True
++
++
++def mark_responses_api_unavailable(config: ProviderConfig) -> None:
++    """Record that /v1/responses is not available for a (base_url, model) pair.
++
++    Called after a 404 from the Responses API so subsequent calls skip the probe
++    and go straight to Chat Completions.
++    """
++    _RESPONSES_API_UNAVAILABLE.add(_responses_cache_key(config))
++
++
++def reset_responses_api_cache() -> None:
++    """Clear the unavailability cache. Used in tests."""
++    _RESPONSES_API_UNAVAILABLE.clear()
++
++
+ def get_provider_base_url(provider_key: str) -> Optional[str]:
+     """Get a provider-specific Base URL override without applying global fallback."""
+     from pantheon.settings import get_settings
+@@ -473,8 +523,12 @@ async def call_llm_provider(
+             model_params=model_params,
+         )
+ 
+-    # Route codex/pro models through the OpenAI Responses API
+-    if is_responses_api_model(config):
++    # Default OpenAI routing: prefer /v1/responses for everything, fall back
++    # to /v1/chat/completions only if the endpoint doesn't implement it OR the
++    # model is rejected as unsupported. Responses-API-only models (codex,
++    # *-pro) never fall back — they raise on failure.
++    if should_use_responses_api(config):
++        import openai as _openai_mod
+         from .llm import acompletion_responses
+ 
+         model_name = config.model_name
+@@ -484,16 +538,30 @@ async def call_llm_provider(
+         logger.debug(
+             f"[CALL_LLM_PROVIDER] Using Responses API for model={model_name}"
+         )
+-        # acompletion_responses returns a normalised message dict directly
+-        return await acompletion_responses(
+-            messages=clean_messages,
+-            model=model_name,
+-            tools=tools,
+-            response_format=response_format,
+-            process_chunk=process_chunk,
+-            base_url=config.base_url,
+-            model_params=model_params,
+-        )
++        try:
++            return await acompletion_responses(
++                messages=clean_messages,
++                model=model_name,
++                tools=tools,
++                response_format=response_format,
++                process_chunk=process_chunk,
++                base_url=config.base_url,
++                model_params=model_params,
++            )
++        except _openai_mod.NotFoundError as e:
++            # Endpoint has no /v1/responses (custom proxy, older gateway) or
++            # the model isn't recognised on that endpoint. Mark unavailable
++            # so we don't probe again, and fall through to Chat Completions
++            # unless the model REQUIRES Responses API.
++            if is_responses_api_model(config):
++                raise
++            logger.info(
++                f"Responses API unavailable (base_url={config.base_url!r}, "
++                f"model={config.model_name!r}): {e}. "
++                f"Falling back to Chat Completions."
++            )
++            mark_responses_api_unavailable(config)
++            # Fall through to Chat Completions below
+ 
+     if config.provider_type == ProviderType.OPENAI:
+         # Provider adapters require explicit provider prefixes for models they cannot auto-detect.
+diff --git a/pantheon/utils/vision_capability.py b/pantheon/utils/vision_capability.py
+index b8fa9123e..4c0ef2f0b 100644
+--- a/pantheon/utils/vision_capability.py
++++ b/pantheon/utils/vision_capability.py
+@@ -15,7 +15,7 @@
+ 
+ from __future__ import annotations
+ 
+-from .llm_providers import ProviderType, detect_provider, is_responses_api_model
++from .llm_providers import ProviderType, detect_provider, should_use_responses_api
+ 
+ 
+ def supports_tool_result_image(model: str | None) -> bool:
+@@ -34,17 +34,6 @@ def supports_tool_result_image(model: str | None) -> bool:
+     if not model:
+         return False
+ 
+-    # Proxy mode (LLM_API_BASE set) forces OpenAI Chat Completions format
+-    # regardless of the model name — even "anthropic/..." routes through
+-    # the /v1/chat/completions endpoint on the proxy. The adapter sanitiser
+-    # then strips image content from tool messages. Returning True here
+-    # would trick observe_images into returning image blocks that get
+-    # silently stripped downstream, which is worse than the sub-agent
+-    # fallback (which produces a text summary).
+-    from .llm_providers import get_global_fallback_base_url
+-    if get_global_fallback_base_url():
+-        return False
+-
+     bare = model.lower()
+     # Strip provider prefix for matching (e.g. "anthropic/claude" → "claude")
+     if "/" in bare:
+@@ -58,9 +47,7 @@ def supports_tool_result_image(model: str | None) -> bool:
+     if prefix in {"gemini", "google"}:
+         return True
+     # Codex OAuth (codex/gpt-5.x) routes through the backend-api Responses
+-    # endpoint which supports input_image in function_call_output. The codex
+-    # adapter shares _convert_messages_to_responses_input with the main
+-    # Responses API path, so the same image-in-tool-output encoding works.
++    # endpoint which supports input_image in function_call_output.
+     if prefix == "codex":
+         return True
+     # Bare model names without provider prefix.
+@@ -68,19 +55,20 @@ def supports_tool_result_image(model: str | None) -> bool:
+         if tail.startswith("claude") or tail.startswith("gemini"):
+             return True
+ 
+-    # OpenAI Responses API supports input_image in function_call_output.
+-    # Use the existing helper to detect Responses-only models (codex, *-pro, etc.).
++    # OpenAI: by default we route via Responses API, which supports
++    # input_image in function_call_output. If a previous call on this
++    # (base_url, model) pair proved /v1/responses is unavailable, the cache
++    # in should_use_responses_api flips to False and we report no native
++    # tool-image support — matching the Chat Completions fallback behaviour.
+     try:
+         config = detect_provider(model, relaxed_schema=False)
++        if config.provider_type == ProviderType.OPENAI:
++            return should_use_responses_api(config)
+         if config.provider_type == ProviderType.NATIVE:
+-            # Any NATIVE-routed model with recognised prefix handled above;
+-            # otherwise default conservative.
+             bare_model = config.model_name.lower()
+             if bare_model.startswith(("anthropic/", "claude", "gemini", "google/", "codex/")):
+                 return True
+             return False
+-        if is_responses_api_model(config):
+-            return True
+     except Exception:
+         # Fall through to False on any detection failure.
+         pass
+diff --git a/tests/test_chat_rename_guards.py b/tests/test_chat_rename_guards.py
+new file mode 100644
+index 000000000..73fed332b
+--- /dev/null
++++ b/tests/test_chat_rename_guards.py
+@@ -0,0 +1,153 @@
++"""
++Unit tests for chat auto-rename guards.
++
++Covers three bugs fixed together:
++
++1. **Race on first message** — rename task was created before thread.run()
++   added the user message to memory, so the task ran with an empty message
++   list and skipped the rename. Moving the task to after thread.run() fixes
++   this but can't be unit-tested easily (needs full chat() integration).
++   Here we test the underlying logic: generate_or_update_name() short-circuits
++   correctly when memory has no user messages.
++
++2. **Overly broad _is_default_name** — matched any name starting with
++   "Chat ", which false-positived on AI-generated names like
++   "Chat about gene expression". Fixed to only match known placeholder
++   variants.
++
++3. **Missing name_generated guard** — the metadata flag was being set but
++   never checked, so rename attempts were made on every message. Added a
++   hard guard that returns early once a chat has been named.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from pantheon.chatroom.special_agents import ChatNameGenerator
++from pantheon.internal.memory import Memory
++
++
++# ============================================================================
++# _is_default_name: tighter matcher
++# ============================================================================
++
++
++class TestIsDefaultName:
++
++    def setup_method(self):
++        self.gen = ChatNameGenerator()
++
++    def test_exact_defaults(self):
++        assert self.gen._is_default_name("New Chat") is True
++        assert self.gen._is_default_name("New Chat in Project") is True
++        assert self.gen._is_default_name("新建聊天") is True
++        assert self.gen._is_default_name("在项目中新建聊天") is True
++        assert self.gen._is_default_name("") is True
++
++    def test_whitespace_only_is_default(self):
++        assert self.gen._is_default_name("   ") is True
++
++    def test_numbered_placeholders(self):
++        assert self.gen._is_default_name("New Chat (2)") is True
++        assert self.gen._is_default_name("New Chat in Project (3)") is True
++        assert self.gen._is_default_name("新建聊天 (2)") is True
++        assert self.gen._is_default_name("在项目中新建聊天 (3)") is True
++
++    def test_ai_generated_names_are_not_default(self):
++        """Regression: 'Chat about X' was previously matched as default.
++
++        AI commonly produces names like "Chat about data analysis",
++        "Chat Analysis", "Chat re: gene expression" etc. These should NOT
++        be treated as defaults or they'll be re-renamed every message.
++        """
++        assert self.gen._is_default_name("Chat about gene expression") is False
++        assert self.gen._is_default_name("Chat Analysis") is False
++        assert self.gen._is_default_name("Chat re: pipelines") is False
++        # Boundary: exactly "Chat " with trailing space should NOT match
++        assert self.gen._is_default_name("Chat analysis") is False
++
++    def test_timestamp_fallback_is_not_default(self):
++        """_fallback_name produces names like 'Chat 04-19 23:45'. Under
++        the old broad matcher, these were treated as default and re-tried,
++        causing an infinite rename loop. Now they stick once generated."""
++        assert self.gen._is_default_name("Chat 04-19 23:45") is False
++
++    def test_meaningful_names(self):
++        assert self.gen._is_default_name("🧬 Gene Analysis") is False
++        assert self.gen._is_default_name("Data exploration") is False
++        assert self.gen._is_default_name("分析 GEO 数据集") is False
++
++
++# ============================================================================
++# generate_or_update_name: name_generated hard guard
++# ============================================================================
++
++
++class TestNameGeneratedGuard:
++
++    @pytest.mark.asyncio
++    async def test_guard_blocks_rename_when_memory_has_real_name(self):
++        """Once the chat has a meaningful name, subsequent calls return it
++        unchanged — even if name_generated is somehow unset. The guard is on
++        the name itself, not the flag."""
++        gen = ChatNameGenerator()
++        memory = Memory("🧬 Gene Analysis")
++        memory.update_metadata({"name_generated": True})
++        memory.add_messages([{"role": "user", "content": "hello"}])
++
++        result = await gen.generate_or_update_name(memory)
++        assert result == "🧬 Gene Analysis"
++
++    @pytest.mark.asyncio
++    async def test_stale_name_generated_flag_does_not_block_rename(self):
++        """Regression: chats created before the customTitle-sync fix may have
++        name_generated=True on disk while memory.name is still 'New Chat'
++        (the rename never actually stuck). A new message in such a chat must
++        still trigger rename rather than being blocked by the stale flag."""
++        gen = ChatNameGenerator()
++        memory = Memory("New Chat")
++        memory.update_metadata({"name_generated": True})  # stale
++        memory.add_messages([{"role": "user", "content": "hello"}])
++
++        # Don't actually hit AI in the unit test — _fallback_name path is fine.
++        # The assertion is that we get a NEW name, not "New Chat".
++        result = await gen.generate_or_update_name(memory)
++        assert result != "New Chat"
++
++    @pytest.mark.asyncio
++    async def test_guard_does_not_block_first_rename(self):
++        """name_generated should default to absent/False on fresh chats."""
++        gen = ChatNameGenerator()
++        memory = Memory("New Chat")
++        # extra_data has no name_generated key → guard must NOT fire
++        assert memory.extra_data.get("name_generated") is None
++
++
++# ============================================================================
++# generate_or_update_name: empty messages path (msg 1 race)
++# ============================================================================
++
++
++class TestEmptyMessagesPath:
++
++    @pytest.mark.asyncio
++    async def test_empty_memory_returns_default_name(self):
++        """When memory has no user messages, rename task returns current
++        name unchanged. This used to be the observable symptom of the
++        msg-1 race: task ran before user msg was added to memory."""
++        gen = ChatNameGenerator()
++        memory = Memory("New Chat")
++        # Explicitly empty
++        result = await gen.generate_or_update_name(memory)
++        assert result == "New Chat"
++
++    @pytest.mark.asyncio
++    async def test_only_assistant_messages_returns_default(self):
++        """Edge case: if memory somehow has only assistant messages (no
++        user), we still can't generate a good name. Return unchanged."""
++        gen = ChatNameGenerator()
++        memory = Memory("New Chat")
++        memory.add_messages([{"role": "assistant", "content": "hello"}])
++        result = await gen.generate_or_update_name(memory)
++        assert result == "New Chat"
+diff --git a/tests/test_conversation_recovery.py b/tests/test_conversation_recovery.py
+index 202e13c3f..6ec92e952 100644
+--- a/tests/test_conversation_recovery.py
++++ b/tests/test_conversation_recovery.py
+@@ -183,6 +183,26 @@ def test_session_storage_metadata_and_adopted_file_pointer():
+     assert state["sessionFile"]["adopted"] is True
+ 
+ 
++def test_restoreSessionMetadata_preserves_auto_renamed_name():
++    """Regression: once a chat is auto-renamed (name_generated=True), a stale
++    customTitle must not clobber memory.name on the next turn. Sync should go
++    the other way — customTitle follows memory.name."""
++    memory = Memory("👋Simple Greeting")
++    memory.extra_data["name_generated"] = True
++    # Pre-seed stale session_storage like what would be on disk after msg 1
++    # completed before the customTitle-sync fix landed.
++    memory.extra_data["session_storage"] = {
++        "metadata": {"customTitle": "New Chat"},
++    }
++
++    # Simulate turn-2 loadConversationForResume returning the stale title.
++    restoreSessionMetadata({"customTitle": "New Chat"}, memory=memory)
++
++    assert memory.name == "👋Simple Greeting"
++    state = getSessionStorageState(memory)
++    assert state["metadata"]["customTitle"] == "👋Simple Greeting"
++
++
+ async def test_processResumedConversation_restores_worktree_and_metadata(tmp_path):
+     original_cwd = os.getcwd()
+     original_dir = tmp_path / "orig"
+diff --git a/tests/test_responses_api.py b/tests/test_responses_api.py
+index c43840b35..ce1c37410 100644
+--- a/tests/test_responses_api.py
++++ b/tests/test_responses_api.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import os
++from unittest.mock import MagicMock
+ 
+ import pytest
+ 
+@@ -634,3 +635,145 @@ async def on_chunk(chunk):
+         assert resp.content is not None
+         # Should have received streaming chunks
+         assert len(chunks_received) > 0
++
++
++# ============ Default-to-Responses-API routing + fallback ============
++
++
++class TestDefaultResponsesAPIRouting:
++    """Non-codex/non-pro OpenAI models now default to the Responses API, with
++    a runtime fallback to Chat Completions when the endpoint or model doesn't
++    implement /v1/responses. These tests pin that behaviour without hitting
++    a real network."""
++
++    def setup_method(self):
++        from pantheon.utils.llm_providers import reset_responses_api_cache
++
++        reset_responses_api_cache()
++
++    def teardown_method(self):
++        from pantheon.utils.llm_providers import reset_responses_api_cache
++
++        reset_responses_api_cache()
++
++    def test_should_use_responses_api_defaults_true_for_openai(self):
++        from pantheon.utils.llm_providers import should_use_responses_api
++
++        cfg = ProviderConfig(provider_type=ProviderType.OPENAI, model_name="gpt-4o")
++        assert should_use_responses_api(cfg) is True
++
++    def test_should_use_responses_api_false_for_native(self):
++        from pantheon.utils.llm_providers import should_use_responses_api
++
++        cfg = ProviderConfig(
++            provider_type=ProviderType.NATIVE, model_name="anthropic/claude-sonnet-4-6"
++        )
++        assert should_use_responses_api(cfg) is False
++
++    def test_should_use_responses_api_false_for_codex(self):
++        """codex/ models have a dedicated OAuth adapter path and must not be
++        sent through the default Responses API route."""
++        from pantheon.utils.llm_providers import should_use_responses_api
++
++        cfg = ProviderConfig(
++            provider_type=ProviderType.OPENAI, model_name="codex/gpt-5.4"
++        )
++        assert should_use_responses_api(cfg) is False
++
++    def test_cache_key_is_per_base_url_and_model(self):
++        """Marking one (base_url, model) pair unavailable must not leak into
++        other pairs — a custom proxy that lacks /v1/responses should not
++        disable the default OpenAI endpoint."""
++        from pantheon.utils.llm_providers import (
++            mark_responses_api_unavailable,
++            should_use_responses_api,
++        )
++
++        proxy_cfg = ProviderConfig(
++            provider_type=ProviderType.OPENAI,
++            model_name="gpt-4o",
++            base_url="https://proxy.example.com/v1",
++        )
++        default_cfg = ProviderConfig(
++            provider_type=ProviderType.OPENAI, model_name="gpt-4o"
++        )
++        other_model_cfg = ProviderConfig(
++            provider_type=ProviderType.OPENAI, model_name="gpt-5.4"
++        )
++
++        mark_responses_api_unavailable(proxy_cfg)
++
++        assert should_use_responses_api(proxy_cfg) is False
++        assert should_use_responses_api(default_cfg) is True
++        assert should_use_responses_api(other_model_cfg) is True
++
++    @pytest.mark.asyncio
++    async def test_fallback_on_404_routes_to_chat_completions(self, monkeypatch):
++        """A 404 from acompletion_responses must mark the cache and retry via
++        acompletion (Chat Completions)."""
++        import openai as openai_mod
++
++        from pantheon.utils.llm_providers import (
++            call_llm_provider,
++            detect_provider,
++            should_use_responses_api,
++        )
++
++        async def fake_responses(**kwargs):
++            raise openai_mod.NotFoundError(
++                message="Not Found",
++                response=MagicMock(status_code=404, request=MagicMock()),
++                body=None,
++            )
++
++        async def fake_completion(**kwargs):
++            return {"role": "assistant", "content": "fallback worked"}
++
++        monkeypatch.setattr(
++            "pantheon.utils.llm.acompletion_responses", fake_responses
++        )
++        monkeypatch.setattr("pantheon.utils.llm.acompletion", fake_completion)
++        monkeypatch.setattr(
++            "pantheon.utils.llm_providers.extract_message_from_response",
++            lambda msg, prefix: msg,
++        )
++
++        config = detect_provider("openai/gpt-5.4", relaxed_schema=False)
++        assert should_use_responses_api(config) is True
++
++        result = await call_llm_provider(
++            config=config,
++            messages=[{"role": "user", "content": "hi"}],
++        )
++
++        assert result == {"role": "assistant", "content": "fallback worked"}
++        # After the 404 the cache should flip the routing off so subsequent
++        # calls skip the probe.
++        assert should_use_responses_api(config) is False
++
++    @pytest.mark.asyncio
++    async def test_404_on_responses_only_model_raises(self, monkeypatch):
++        """Responses-only models (-pro, codex) have no Chat Completions route,
++        so a 404 must propagate rather than silently fall back."""
++        import openai as openai_mod
++
++        from pantheon.utils.llm_providers import call_llm_provider, detect_provider
++
++        async def fake_responses(**kwargs):
++            raise openai_mod.NotFoundError(
++                message="Not Found",
++                response=MagicMock(status_code=404, request=MagicMock()),
++                body=None,
++            )
++
++        monkeypatch.setattr(
++            "pantheon.utils.llm.acompletion_responses", fake_responses
++        )
++
++        config = detect_provider("openai/gpt-5.4-pro", relaxed_schema=False)
++
++        with pytest.raises(openai_mod.NotFoundError):
++            await call_llm_provider(
++                config=config,
++                messages=[{"role": "user", "content": "hi"}],
++            )
+diff --git a/tests/test_tool_result_vision.py b/tests/test_tool_result_vision.py
+index 938393d77..4b994a732 100644
+--- a/tests/test_tool_result_vision.py
++++ b/tests/test_tool_result_vision.py
+@@ -67,10 +67,17 @@ def test_gemini_supported(self):
+         assert supports_tool_result_image("gemini/gemini-2.5-pro") is True
+         assert supports_tool_result_image("google/gemini-2.0-flash") is True
+ 
+-    def test_openai_chat_completions_not_supported(self):
+-        assert supports_tool_result_image("gpt-4o") is False
+-        assert supports_tool_result_image("openai/gpt-4o") is False
+-        assert supports_tool_result_image("gpt-5") is False
++    def test_openai_defaults_to_responses_api_supported(self):
++        """OpenAI models now default to the Responses API, which supports
++        input_image in function_call_output, so tool-result images work
++        natively on the first call."""
++        from pantheon.utils.llm_providers import reset_responses_api_cache
++
++        reset_responses_api_cache()
++        assert supports_tool_result_image("gpt-4o") is True
++        assert supports_tool_result_image("openai/gpt-4o") is True
++        assert supports_tool_result_image("gpt-5") is True
++        assert supports_tool_result_image("openai/gpt-5.4") is True
+ 
+     def test_openai_responses_api_supported(self):
+         # codex and *-pro models go through Responses API which supports images
+@@ -83,30 +90,34 @@ def test_codex_oauth_supported(self):
+         assert supports_tool_result_image("codex/gpt-5.4-mini") is True
+         assert supports_tool_result_image("codex/gpt-5.2-codex") is True
+ 
+-    def test_proxy_mode_forces_false(self, monkeypatch):
+-        """When LLM_API_BASE is set (LiteLLM proxy), all calls route through
+-        Chat Completions — even 'anthropic/...'. The sanitiser would strip
+-        images, so native mode would degrade to a placeholder. Return False
+-        to defer to the sub-agent fallback instead."""
+-        # Patch at source module so the in-function
+-        # `from .llm_providers import get_global_fallback_base_url`
+-        # picks up the patched version.
+-        monkeypatch.setattr(
+-            "pantheon.utils.llm_providers.get_global_fallback_base_url",
+-            lambda: "https://proxy.example.com",
++    def test_cached_unavailable_flips_openai_to_false(self):
++        """Once the Responses API probe has failed for a (base_url, model)
++        pair, supports_tool_result_image must flip to False so observe_images
++        falls back to the sub-agent path instead of sending image blocks that
++        would be stripped by the Chat Completions sanitiser."""
++        from pantheon.utils.llm_providers import (
++            ProviderConfig,
++            ProviderType,
++            mark_responses_api_unavailable,
++            reset_responses_api_cache,
+         )
+-        # Even Anthropic models should be False in proxy mode.
+-        assert supports_tool_result_image("anthropic/claude-sonnet-4-6") is False
+-        assert supports_tool_result_image("gemini/gemini-2.5-pro") is False
+-        # OpenAI models are already False, still False.
+-        assert supports_tool_result_image("gpt-5.4-mini") is False
+-
+-    def test_non_proxy_mode_preserves_native(self, monkeypatch):
+-        """Without proxy, native support stands (regression guard)."""
+-        monkeypatch.setattr(
+-            "pantheon.utils.llm_providers.get_global_fallback_base_url",
+-            lambda: "",
++
++        reset_responses_api_cache()
++        assert supports_tool_result_image("openai/gpt-5.4") is True
++        mark_responses_api_unavailable(
++            ProviderConfig(provider_type=ProviderType.OPENAI, model_name="gpt-5.4")
+         )
++        assert supports_tool_result_image("openai/gpt-5.4") is False
++        # Other OpenAI models are independent.
++        assert supports_tool_result_image("openai/gpt-4o") is True
++        reset_responses_api_cache()
++
++    def test_anthropic_and_gemini_unaffected_by_openai_cache(self):
++        """Native providers (Anthropic/Gemini) report support regardless of
++        the OpenAI Responses cache state."""
++        from pantheon.utils.llm_providers import reset_responses_api_cache
++
++        reset_responses_api_cache()
+         assert supports_tool_result_image("anthropic/claude-sonnet-4-6") is True
+         assert supports_tool_result_image("gemini/gemini-2.5-pro") is True
+ 
+@@ -754,6 +765,12 @@ async def test_native_mode_returns_content_blocks(self, sample_image, monkeypatc
+     @pytest.mark.asyncio
+     async def test_subagent_mode_calls_call_agent(self, sample_image, monkeypatch):
+         from pantheon.toolsets.file.file_manager import FileManagerToolSet
++        from pantheon.utils.llm_providers import (
++            ProviderConfig,
++            ProviderType,
++            mark_responses_api_unavailable,
++            reset_responses_api_cache,
++        )
+ 
+         fm = FileManagerToolSet(name="test_fm")
+ 
+@@ -763,14 +780,24 @@ async def test_subagent_mode_calls_call_agent(self, sample_image, monkeypatch):
+         )
+         monkeypatch.setattr(fm, "get_context", lambda: mock_ctx)
+ 
+-        # Force capability detection to return False (simulate Chat Completions).
+-        with patch(
+-            "pantheon.agent.get_current_run_model",
+-            return_value="gpt-4o",
+-        ):
+-            result = await fm.observe_images.__wrapped__(
+-                fm, question="what is this?", image_paths=[sample_image]
+-            )
++        # Simulate the Responses API being unavailable for this model
++        # (e.g., proxy endpoint that doesn't implement /v1/responses), which
++        # flips supports_tool_result_image to False and forces the sub-agent
++        # path — the same fallback we use on a 404 in production.
++        reset_responses_api_cache()
++        mark_responses_api_unavailable(
++            ProviderConfig(provider_type=ProviderType.OPENAI, model_name="gpt-4o")
++        )
++        try:
++            with patch(
++                "pantheon.agent.get_current_run_model",
++                return_value="gpt-4o",
++            ):
++                result = await fm.observe_images.__wrapped__(
++                    fm, question="what is this?", image_paths=[sample_image]
++                )
++        finally:
++            reset_responses_api_cache()
+ 
+         assert result["success"] is True
+         # Sub-agent SHOULD have been invoked

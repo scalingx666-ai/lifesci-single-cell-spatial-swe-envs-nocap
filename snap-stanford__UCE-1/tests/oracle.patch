@@ -1,0 +1,2053 @@
+diff --git a/README.md b/README.md
+index 4e2db6a..b2c9da7 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,76 @@
+-**Universal Cell Embeddings**
++# Universal Cell Embeddings
++
++This repo includes a PyTorch [HuggingFace Accelerator](https://huggingface.co/docs/accelerate/package_reference/accelerator) implementation of the UCE model, to be used to embed individual anndata datasets.
++
++To evaluate an anndata dataset, use the `eval_single_anndata.py` script.
++
++To run the script, you need the following files:
++
++- An AnnData h5ad file:
++  
++- The pretrained UCE model's weights, in a `.torch` file
++- The token embeddings for the UCE model, in a `.torch` file
++- A `.pkl` file containing information that links each species to the corresponding tokens in the token embedding file.
++- A csv containing information about the chromosomes for each species
++
++
++## Setting up UCE
++
++### Protein Embeddings
++To run UCE you will need protein embeddings. We will provide a download link to a protein embeddings directory.
++
++
++### Requirements
++
++UCE requires installation of a number of python modules. Please install them via:
++
++```
++pip install -r requirements.txt
++```
++
++## Running UCE
++
++To run UCE, use the `eval_single_anndata.py` file.
++
++`eval_single_anndata.py` accepts a number of required arguments:
++
++- `adata_path`: a h5ad file.
++The `.X` slot of the file should be scRNA-seq counts. The `.var_names` slot should correspond to gene names, *not ENSEMBLIDs*.
++
++- `dir`: the working directory in which intermediate and final output files will be saved. This directory is checked for existing temp files, which can be used to skip repeated processing of the same dataset.
++- `species`: the species of the dataset you are embedding.
++- `batch_size`: the per GPU batch size. For the 33 layer model, on a 80GB GPU, you should use 25. For a 4 layer model on the same GPU, you can use 100.
++- `nlayers`: the number of layers of the model. This should be specified even if you are loading a specific model file already.
++- `model_loc`: the location of the model weights `.torch` file.
++
++
++There are also a few file paths you need to specify. You might want to edit the source code to make these the default locations instead of specifiying these everytime.
++
++- `spec_chrom_csv_path`:  This is a csv file mapping genes from each species to their respective chromosomes and genomic start positions.
++- `token_file`: This is a `.torch` file containing protein embeddings for all tokens.
++- `protein_embeddings_dir`: This directory contains protein embedding `.pt` files for all species. 
++- `offset_pkl_path`: This `.pkl` file maps between species and their gene's locations in the `token_file`.
++
++- `accelerator_dir`: This directory should just be an existing directory somewhere on the machine. It's required for accelerator to work, but since we're not doing any model training it's not useful.
++
++
++## UCE Output
++
++`eval_single_anndata.py` will output a number of files.
++
++All of these files will be in the same directory, the `dir` directory.
++
++The name of the dataset, `{dataset_name}` you are evaluating will be taken as the file name from `adata_path`, minus the `.h5ad` suffix.
++
++**AnnDatas:**
++- Final evaluated AnnData: `dir/{dataset_name}.h5ad`
++
++This AnnData will be identical to the proccessed input anndata, but have UCE embeddings added in the `.obsm["X_uce"]` slot.
++
++**Proccessed Files:**
++- `dir/{dataset_name}_proc.h5ad`: the proccessed anndata. Proccessing the anndata means subsetting it to genes which have protein embeddings and then refiltering the dataset by minimum counts. 
++- `dir/{dataset_name}_chroms.pkl`: This file maps the genes in the dataset to their corresponding chromosome idxs.
++- `dir/{dataset_name}_counts.npz`: This file contains the counts of the anndata in a easy to access format.
++- `dir/{dataset_name}_shapes_dict.pkl`: This file contains the shape (ncell x ngene) of the anndata, used to read the `.npz` file.
++- `dir/{dataset_name}_pe_idx.torch`: This file maps between the genes in the dataset and their index in the tokens file.
++- `dir/{dataset_name}_starts.pkl`: This file maps between the genes in the dataset and their genomic start locations.
+\ No newline at end of file
+diff --git a/data_proc/__pycache__/data_utils.cpython-38.pyc b/data_proc/__pycache__/data_utils.cpython-38.pyc
+new file mode 100644
+index 0000000..9fb92ef
+Binary files /dev/null and b/data_proc/__pycache__/data_utils.cpython-38.pyc differ
+diff --git a/data_proc/__pycache__/gene_embeddings.cpython-38.pyc b/data_proc/__pycache__/gene_embeddings.cpython-38.pyc
+new file mode 100644
+index 0000000..ddf59a8
+Binary files /dev/null and b/data_proc/__pycache__/gene_embeddings.cpython-38.pyc differ
+diff --git a/data_proc/data_utils.py b/data_proc/data_utils.py
+new file mode 100644
+index 0000000..178a4d5
+--- /dev/null
++++ b/data_proc/data_utils.py
+@@ -0,0 +1,271 @@
++import warnings
++warnings.filterwarnings("ignore")
++
++import scanpy as sc
++import torch
++
++from torch import nn, Tensor
++import torch.nn.functional as F
++import torch.utils.data as data
++import torch.optim as optim
++import numpy as np
++import pickle
++import os
++import argparse
++import logging
++import time
++
++from tqdm.auto import tqdm
++import pandas as pd
++
++import math
++import anndata
++from pathlib import Path
++
++
++from torch.utils.data import dataset
++from torch.utils.data import DataLoader, TensorDataset, dataset
++from scipy.stats import binom
++from typing import Dict, List, Optional, Tuple
++from scanpy import AnnData
++
++
++from data_proc.gene_embeddings import load_gene_embeddings_adata
++
++def data_to_torch_X(X):
++    if isinstance(X, sc.AnnData):
++        X = X.X
++    if not isinstance(X, np.ndarray):
++            X = X.toarray()
++    return torch.from_numpy(X).float()
++
++class SincleCellDataset(data.Dataset):
++    def __init__(self,
++                expression: torch.tensor, # Subset to hv genes, count data! cells x genes
++                protein_embeddings: torch.tensor, # same order as expression, also subset genes x pe
++                labels: None, # optional, tensor of labels
++                covar_vals: None, # tensor of covar values or none
++                ) -> None:
++        super(SincleCellDataset, self).__init__()
++        
++        # Set expression
++        self.expression = expression
++        
++        row_sums = self.expression.sum(1) # UMI Counts
++        log_norm_count_adj = torch.log1p(self.expression / (self.expression.sum(1)).unsqueeze(1) * torch.tensor(1000))       
++        
++        # Set log norm and count adjusted expression
++        max_vals, max_idx = torch.max(log_norm_count_adj, dim=0)
++        self.expression_mod =  log_norm_count_adj / max_vals
++        
++        # Calculate dropout likliehoods of each gene
++        self.dropout_vec = (self.expression == 0).float().mean(0) # per gene dropout percentages
++        
++        # Set data info
++        self.num_cells = self.expression.shape[0]
++        self.num_genes = self.expression.shape[1]
++        
++        # Set optional label info, including categorical covariate index
++        self.covar_vals = covar_vals
++        self.labels = labels
++        
++        # Set protein embeddings
++        self.protein_embeddings = protein_embeddings
++        
++        self.item_mode = "expression"
++        if self.covar_vals is not None:
++            self.item_mode = "expression+covar"
++        
++        
++    def __getitem__(self, idx):
++        if self.item_mode == "expression":
++            if isinstance(idx, int):
++                if idx < self.num_cells:
++                    return self.expression[idx, :]
++                else:
++                    raise IndexError
++            else:
++                raise NotImplementedError
++        elif self.item_mode == "expression+covar":
++            if isinstance(idx, int):
++                if idx < self.num_cells:
++                    return self.expression[idx, :], self.covar_vals[idx]
++                else:
++                    raise IndexError
++            else:
++                raise NotImplementedError
++            
++
++    def __len__(self) -> int:
++        return self.num_cells
++
++    def get_dim(self) -> Dict[str, int]:
++        return self.num_genes
++
++
++def data_to_torch_X(X):
++    if isinstance(X, sc.AnnData):
++        X = X.X
++    if not isinstance(X, np.ndarray):
++            X = X.toarray()
++    return torch.from_numpy(X).float()
++
++
++def anndata_to_sc_dataset(adata:sc.AnnData, 
++                                 species:str="human", 
++                                 labels:list=[],
++                                 covar_col:str=None,
++                                 hv_genes=None,
++                                 embedding_model="ESM1b",
++                                ) -> (SincleCellDataset, AnnData):
++    
++    # Subset to just genes we have embeddings for
++    adata, protein_embeddings = load_gene_embeddings_adata(
++        adata=adata,
++        species=[species],
++        embedding_model=embedding_model
++    )
++    
++    if hv_genes is not None:
++        sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=hv_genes)  # Expects Count Data
++    
++        hv_index = adata.var["highly_variable"]
++        adata = adata[:, hv_index] # Subset to hv genes only
++    
++        protein_embeddings = protein_embeddings[species][hv_index]
++    else:
++        protein_embeddings = protein_embeddings[species]
++    expression = data_to_torch_X(adata.X)
++    
++    covar_vals = None
++    if len(labels) > 0:
++        assert covar_col is None or covar_col in labels, "Covar needs to be in labels" # make sure you keep track of covar column!
++        labels = adata.obs.loc[:, labels].values
++        
++        if covar_col is not None:
++            # we have a categorical label to use as covariate
++            covar_vals = torch.tensor(pd.Categorical(adata.obs[covar_col]).codes)
++    return SincleCellDataset(
++        expression=expression,
++        protein_embeddings=protein_embeddings,
++        labels=labels,
++        covar_vals=covar_vals
++    ), adata    
++    
++def adata_path_to_prot_chrom_starts(adata, dataset_species, spec_pe_genes, gene_to_chrom_pos, offset):
++    """
++        Given a :path: to an h5ad, 
++    """    
++    pe_row_idxs = torch.tensor([spec_pe_genes.index(k.upper()) + offset for k in adata.var_names]).long()
++    print(len(np.unique(pe_row_idxs)))
++    
++    spec_chrom = gene_to_chrom_pos[gene_to_chrom_pos["species"] == dataset_species].set_index("gene_symbol")
++
++    gene_chrom = spec_chrom.loc[[k.upper() for k in adata.var_names]]
++
++    dataset_chroms = gene_chrom["spec_chrom"].cat.codes # now this is correctely indexed by species and chromosome
++    print("Max Code:", max(dataset_chroms))
++    dataset_pos = gene_chrom["start"].values
++    return pe_row_idxs, dataset_chroms, dataset_pos
++
++
++
++def process_raw_anndata(row, h5_folder_path, npz_folder_path, scp, skip, additional_filter, root="/dfs/project/cross-species/yanay/uce_data/h5s"):
++        path = row.path
++        if not os.path.isfile(root + "/" + path):
++            print( "**********************************")
++            print(f"***********{path} ERROR***********")
++            print( "**********************************")
++            return None
++
++        name = path.replace(".h5ad", "")
++        proc_path = path.replace(".h5ad", "_proc.h5ad")
++        if skip:
++            if os.path.isfile(h5_folder_path + proc_path):
++                print(f"{name} already processed. Skipping")
++                return None, None, None
++
++        print(f"Proccessing {name}")
++
++        species = row.species
++        covar_col = row.covar_col
++
++        ad = sc.read(root + "/" + path)
++        labels = []
++        if "cell_type" in ad.obs.columns:
++            labels.append("cell_type")
++
++
++        if covar_col is np.nan or np.isnan(covar_col):
++            covar_col = None
++        else:
++            labels.append(covar_col)
++
++        if additional_filter:
++            sc.pp.filter_genes(ad, min_cells=10)
++            sc.pp.filter_cells(ad, min_genes=25)
++
++
++        dataset, adata = anndata_to_sc_dataset(ad, species=species, labels=labels, covar_col=covar_col, hv_genes=None)
++        adata = adata.copy()
++
++        if additional_filter:
++            sc.pp.filter_genes(ad, min_cells=10)
++            sc.pp.filter_cells(ad, min_genes=25)
++        
++        num_cells = adata.X.shape[0]
++        num_genes = adata.X.shape[1]
++
++        adata_path = h5_folder_path + proc_path
++        adata.write(adata_path)
++
++        arr = data_to_torch_X(adata.X).numpy()
++
++        print(arr.max()) # this is a nice check to make sure it's counts
++        filename = npz_folder_path + f"{name}_counts.npz"
++        shape = arr.shape
++        print(name, shape)
++        fp = np.memmap(filename, dtype='int64', mode='w+', shape=shape)
++        fp[:] = arr[:]
++        fp.flush()
++        
++        if scp != "":
++            subprocess.call(["scp", filename, f"{scp}:{filename}"])
++            subprocess.call(["scp", adata_path, f"{scp}:{adata_path}"])
++            
++        return adata, num_cells, num_genes
++    
++    
++def get_species_to_pe(EMBEDDING_DIR='/dfs/project/cross-species/yanay/data/proteome/embeddings'):
++    """
++    Given an embedding directory, return all embeddings as a dictionary coded by species.
++    Note: In the current form, this function is written such that the directory needs all of the following species embeddings.
++    """
++    EMBEDDING_DIR = Path(EMBEDDING_DIR)
++
++    embeddings_paths = {
++            'human': EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2.pt',
++            'mouse': EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_ESM2.pt',
++            'frog': EMBEDDING_DIR / 'Xenopus_tropicalis.Xenopus_tropicalis_v9.1.gene_symbol_to_embedding_ESM2.pt',
++            'zebrafish': EMBEDDING_DIR / 'Danio_rerio.GRCz11.gene_symbol_to_embedding_ESM2.pt',
++            "mouse_lemur": EMBEDDING_DIR / "Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM2.pt",
++            "pig": EMBEDDING_DIR / 'Sus_scrofa.Sscrofa11.1.gene_symbol_to_embedding_ESM2.pt',
++            "macaca_fascicularis": EMBEDDING_DIR / 'Macaca_fascicularis.Macaca_fascicularis_6.0.gene_symbol_to_embedding_ESM2.pt',
++            "macaca_mulatta": EMBEDDING_DIR / 'Macaca_mulatta.Mmul_10.gene_symbol_to_embedding_ESM2.pt',
++        }
++
++    species_to_pe = {
++        species:torch.load(pe_dir) for species, pe_dir in embeddings_paths.items()   
++    }
++
++    species_to_pe = {species:{k.upper(): v for k,v in pe.items()} for species, pe in species_to_pe.items()}
++    return species_to_pe
++
++
++def get_spec_chrom_csv(path="/dfs/project/cross-species/yanay/code/all_to_chrom_pos.csv"):
++    """
++    Get the species to chrom csv file
++    """
++    gene_to_chrom_pos = pd.read_csv(path)
++    gene_to_chrom_pos["spec_chrom"] = pd.Categorical(gene_to_chrom_pos["species"] + "_" +  gene_to_chrom_pos["chromosome"]) # add the spec_chrom list
++    return gene_to_chrom_pos
+\ No newline at end of file
+diff --git a/data_proc/download_proc_czi_cxg.py b/data_proc/download_proc_czi_cxg.py
+new file mode 100644
+index 0000000..637f956
+--- /dev/null
++++ b/data_proc/download_proc_czi_cxg.py
+@@ -0,0 +1,344 @@
++import os
++os.environ["OMP_NUM_THREADS"] = "20" # export OMP_NUM_THREADS=4
++os.environ["OPENBLAS_NUM_THREADS"] = "20" # export OPENBLAS_NUM_THREADS=4 
++os.environ["MKL_NUM_THREADS"] = "20" # export MKL_NUM_THREADS=6
++os.environ["VECLIB_MAXIMUM_THREADS"] = "20" # export VECLIB_MAXIMUM_THREADS=4
++os.environ["NUMEXPR_NUM_THREADS"] = "20"
++
++
++import warnings
++warnings.filterwarnings('ignore')
++
++import cellxgene_census
++from tqdm import tqdm
++import scanpy as sc
++
++from collections import defaultdict
++from typing import Dict, List, Optional, Tuple
++
++import torch
++import torch.utils.data as data
++import torch
++import numpy as np
++import scanpy as sc
++from numpy import array
++import os
++import pickle as pkl
++import glob
++
++def data_to_torch_X(X):
++    if isinstance(X, sc.AnnData):
++        X = X.X
++    if not isinstance(X, np.ndarray):
++            X = X.toarray()
++    return torch.from_numpy(X).float()
++    
++import sys
++sys.path.append('../')
++
++from gene_embeddings import load_gene_embeddings_adata
++import pandas as pd
++import numpy as np
++from scanpy import AnnData
++from multiprocessing import Pool, Process, Manager
++
++import multiprocessing.pool as mpp
++# https://stackoverflow.com/questions/57354700/starmap-combined-with-tqdm
++def istarmap(self, func, iterable, chunksize=1):
++    """starmap-version of imap
++    """
++    if self._state != mpp.RUN:
++        raise ValueError("Pool not running")
++
++    if chunksize < 1:
++        raise ValueError(
++            "Chunksize must be 1+, not {0:n}".format(
++                chunksize))
++
++    task_batches = mpp.Pool._get_tasks(func, iterable, chunksize)
++    result = mpp.IMapIterator(self._cache)
++    self._taskqueue.put(
++        (
++            self._guarded_task_generation(result._job,
++                                          mpp.starmapstar,
++                                          task_batches),
++            result._set_length
++        ))
++    return (item for chunk in result for item in chunk)
++
++
++mpp.Pool.istarmap = istarmap
++
++
++VERSION = "2023-04-25"
++N_TOP_GENES = 12000
++
++
++print(cellxgene_census.get_census_version_description(VERSION))
++
++census = cellxgene_census.open_soma(census_version=VERSION)
++census_datasets = census["census_info"]["datasets"].read().concat().to_pandas()
++
++# for convenience, indexing on the soma_joinid which links this to other census data.
++census_datasets = census_datasets.set_index("soma_joinid")
++
++species_to_readable = {
++    "Homo sapiens":"human",
++    "Mus musculus":"mouse"    
++}
++
++def process_row(row, num_genes, num_cells, paths, all_species, covar_cols, dataset_title, h5_root="/dfs/project/uce/cxg_data/anndatas/", npz_root="/dfs/project/uce/cxg_data/npzs/"):
++    dataset_id = row[1].dataset_id
++    #dataset_title = row[1].dataset_title.lower().replace(' ', '_').replace(",", "").replace("/", "")
++    
++    save_path = h5_root + f"{dataset_title}.h5ad"
++    no_primary_path = save_path.replace(".h5ad", "_no_primary.h5ad")
++    proc_path = save_path.replace(".h5ad", "_proc.h5ad")
++    npz_path = npz_root + f"{dataset_title}_counts.npz"
++    # Download the anndata
++    
++    if os.path.exists(no_primary_path):
++        print("No Primary, skipping")
++        return
++    
++    if not os.path.exists(save_path) and not os.path.exists(no_primary_path):
++        cellxgene_census.download_source_h5ad(
++            dataset_id, to_path=save_path
++        )
++    if os.path.exists(proc_path) and os.path.exists(npz_path):
++        print("Already Proc")
++        try:
++            ad = sc.read(proc_path)
++        except:
++            print()
++            print()
++            print("Error reading on:", dataset_title)
++            print()
++            print()
++            return
++        # Get organism
++        if "organism" in ad.obs.columns:
++            unique_organisms = list(ad.obs.organism.unique().categories)
++            unique_organism_str = ", ".join(unique_organisms)
++        else:
++            unique_organism_str = "human"
++        species = species_to_readable.get(unique_organism_str, "human")
++        # don't need to do hv if already proc
++        if "sample" in ad.obs.columns:
++            covar_cols[dataset_title] = "sample"
++        elif "batch" in ad.obs.columns:
++            covar_cols[dataset_title] = "batch"
++        else:
++            covar_cols[dataset_title] = ""
++
++
++        num_genes[dataset_title] = ad.X.shape[1]
++        num_cells[dataset_title] = ad.X.shape[0]
++        paths[dataset_title] = f"{dataset_title}.h5ad"
++        all_species[dataset_title] = species
++        
++        return # Skip everything else
++    # Read the raw AD
++    ad = sc.read(save_path)
++    
++    # Change to counts
++    if not sc._utils.check_nonnegative_integers(ad.X):
++        # don't have counts yet, need raw
++        if ad.raw is None:
++            print("Skipped, no counts")
++            return
++        ad.X = ad.raw.X.toarray()
++    if not sc._utils.check_nonnegative_integers(ad.X):
++        print("Skipped, no counts")
++        return
++        
++    # SUBSET TO primary data
++    if len(np.unique(ad.obs["is_primary_data"])) >= 1:
++        primary_data = ad.obs.is_primary_data.value_counts()
++        ad = ad[ad.obs.is_primary_data]
++    if ad.X.shape[0] == 0:
++        print("no primary data")
++        print(primary_data)
++        os.rename(save_path, no_primary_path)
++        return # No primary data
++    print("has primary data")
++    # Switch to gene symbols
++    ad.var["feature_id_orig"] = list(ad.var.index)
++    ad.var_names = list(ad.var.feature_name)
++
++    # Get organism
++    if "organism" in ad.obs.columns:
++        unique_organisms = list(ad.obs.organism.unique().categories)
++        unique_organism_str = ", ".join(unique_organisms)
++    else:
++        unique_organism_str = "human"
++    species = species_to_readable.get(unique_organism_str, "human")
++    # Filter to gene symbols with protein embeddings
++    ad, _ = load_gene_embeddings_adata(
++        adata=ad,
++        species=[species],
++        embedding_model="ESM2"
++    )
++    
++    ad = ad.copy()
++    # Simple filtering by counts
++    sc.pp.filter_cells(ad, min_genes=200)
++    sc.pp.filter_genes(ad, min_cells=10)
++    
++    #print(ad)
++    
++    if "sample" in ad.obs.columns:
++        try:
++            sc.pp.highly_variable_genes(ad, flavor="seurat_v3", n_top_genes=N_TOP_GENES, subset=True, batch_key="sample")
++        except:
++            try:
++                sc.pp.highly_variable_genes(ad, flavor="seurat_v3", n_top_genes=N_TOP_GENES, subset=True, batch_key="sample", span=1)
++            except:
++                print(f"can't hv gene subset {dataset_title}")
++        covar_cols[dataset_title] = "sample"
++    elif "batch" in ad.obs.columns:
++        try:
++            sc.pp.highly_variable_genes(ad, flavor="seurat_v3", n_top_genes=N_TOP_GENES, subset=True, batch_key="batch")
++        except:
++            try:
++                sc.pp.highly_variable_genes(ad, flavor="seurat_v3", n_top_genes=N_TOP_GENES, subset=True, batch_key="batch", span=1)
++            except:
++                print(f"can't hv gene subset {dataset_title}")
++        covar_cols[dataset_title] = "batch"
++    else:
++        try:
++            sc.pp.highly_variable_genes(ad, flavor="seurat_v3", n_top_genes=N_TOP_GENES, subset=True)
++        except:
++            try:
++                sc.pp.highly_variable_genes(ad, flavor="seurat_v3", n_top_genes=N_TOP_GENES, subset=True, span=1)
++            except:
++                print(f"can't hv gene subset {dataset_title}")
++        covar_cols[dataset_title] = ""
++        
++    num_genes[dataset_title] = ad.X.shape[1]
++    num_cells[dataset_title] = ad.X.shape[0]
++    paths[dataset_title] = f"{dataset_title}.h5ad"
++    all_species[dataset_title] = species
++    
++    print("writing proc")
++    ad.write(proc_path)
++    
++    arr = data_to_torch_X(ad.X).numpy()
++    
++    shape = arr.shape
++    
++    fp = np.memmap(npz_path, dtype='int64', mode='w+', shape=shape)
++    fp[:] = arr[:]
++    fp.flush()
++    
++    return
++    
++if __name__ == '__main__':
++    '''
++    manager = Manager()
++    num_genes = manager.dict()
++    num_cells = manager.dict()
++    paths = manager.dict()
++    all_species = manager.dict()
++    covar_cols = manager.dict()
++    '''
++    num_genes = {}
++    num_cells = {}
++    paths = {}
++    all_species = {}
++    covar_cols = {}
++
++    df = pd.DataFrame()
++    # Shuffle the dataset 
++    census_datasets = census_datasets#.iloc[270:]
++    iterrows = list(census_datasets.iterrows())
++    #p = Pool(8)
++    #for row in tqdm(iterrows, total=len(census_datasets)):
++    #    p.apply_async(process_row, args=(row, num_genes, num_cells, paths, all_species, covar_cols))            
++    #p.close()
++    #p.join()
++    '''
++    with Pool(1) as p:
++        nrows = len(iterrows)
++        inputs = zip(iterrows, [num_genes]*nrows, [num_cells]*nrows, [paths]*nrows, [all_species]*nrows, [covar_cols]*nrows)
++        for _ in tqdm(p.istarmap(process_row, inputs),
++                           total=nrows):
++            pass
++    
++    '''
++    
++    if os.path.exists("dataset_rows_mouse_fixed.pkl"):
++        dataset_rows = {}
++        for path in glob.glob("dataset_rows_mouse_fixed*.pkl"):
++            with open(path, "rb") as f:
++                dataset_rows_path = pkl.load(f)
++                dataset_rows.update(dataset_rows_path)
++                
++        print(f"{len(dataset_rows)} already counted")
++    else:
++        dataset_rows = {}
++    
++    
++    pbar = tqdm(iterrows)
++    all_errors = []
++    total_number_of_cells = 0
++    
++    duplicate_titles = ['Dissection: Body of hippocampus (HiB) - Rostral DG-CA4', 'Retina',
++       'Colon', 'Myeloid cells', 'Ileum', 'Airway']
++    duplicate_titles_2 = ['retina', 'airway', 'myeloid_cells', 'colon', 'ileum', 'immune_cells']
++    
++    for row in pbar:
++        dataset_title = row[1].dataset_title
++        if dataset_title in duplicate_titles:
++            dataset_title = row[1].collection_name + row[1].dataset_title
++
++        dataset_title = dataset_title.lower().replace(' ', '_').replace(",", "").replace("/", "")
++
++        if dataset_title in duplicate_titles_2:
++            dataset_title = (row[1].collection_name + "_" + dataset_title).lower().replace(' ', '_').replace(",", "").replace("/", "")
++        
++        print(f"{total_number_of_cells} cells done")
++        if dataset_title in dataset_rows:
++            paths[dataset_title] = dataset_rows[dataset_title][0]
++            all_species[dataset_title] = dataset_rows[dataset_title][1]
++            covar_cols[dataset_title] = dataset_rows[dataset_title][2]
++            num_cells[dataset_title] = dataset_rows[dataset_title][3]
++            num_genes[dataset_title] = dataset_rows[dataset_title][4]
++            #print("skipped read of proc")
++            
++            total_number_of_cells += dataset_rows[dataset_title][3]
++            continue # Skip!
++        else:
++            pbar.set_description(f"{dataset_title} proc")
++            try:
++                process_row(row, num_genes, num_cells, paths, all_species, covar_cols, dataset_title=dataset_title)
++            except:
++                print(f"****{dataset_title} ERROR****")
++                all_errors.append(dataset_title)
++                
++                
++            pbar.set_description(f"{dataset_title} done")
++            
++            if dataset_title in paths:
++                dataset_rows[dataset_title] = [paths[dataset_title], all_species[dataset_title], covar_cols[dataset_title], num_cells[dataset_title], num_genes[dataset_title], dataset_title]
++
++                total_number_of_cells += dataset_rows[dataset_title][3]
++
++                with open("dataset_rows_mouse_fixed.pkl", "wb") as f:
++                    pkl.dump(dataset_rows, f)
++                    print("wrote pkl")
++            
++    # path,species,covar_col,num_cells,names
++    
++    df["path"] = list(paths.values())
++    df["species"] = list(all_species.values())
++    df["covar_col"] = list(covar_cols.values())
++    df["num_cells"] = list(num_cells.values())
++    df["num_genes"] = list(num_genes.values())
++    df["names"] = list(paths.keys())
++
++    print(df.head(20))
++    print()
++    print("Errors:")
++    print(all_errors)
++    df.to_csv("cxg_datasets.csv", index=False)
+diff --git a/data_proc/gene_embeddings.py b/data_proc/gene_embeddings.py
+new file mode 100644
+index 0000000..17cb6ca
+--- /dev/null
++++ b/data_proc/gene_embeddings.py
+@@ -0,0 +1,124 @@
++"""Helper functions for loading pretrained gene embeddings."""
++from pathlib import Path
++from typing import Dict, Tuple
++
++import torch
++
++from scanpy import AnnData
++import numpy as np
++
++
++EMBEDDING_DIR = Path('/dfs/project/cross-species/data/proteome/embeddings')
++FZ_EMBEDDING_DIR = Path('/dfs/project/cross-species/yanay/data/proteome/embeddings')
++MODEL_TO_SPECIES_TO_GENE_EMBEDDING_PATH = {
++    'ESM1b': {
++        'human': EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM1b.pt',
++        'mouse': EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_ESM1b.pt',
++        'frog': FZ_EMBEDDING_DIR / 'Xenopus_tropicalis.Xenopus_tropicalis_v9.1.gene_symbol_to_embedding_ESM1b.pt',
++        #'frog': FZ_EMBEDDING_DIR / 'new_frog/xtropProtein.fasta.1.gene_symbol_to_embedding_ESM1b.pt',
++        'zebrafish': FZ_EMBEDDING_DIR / 'Danio_rerio.GRCz11.gene_symbol_to_embedding_ESM1b.pt',
++        'bat':  FZ_EMBEDDING_DIR / 'Rhinolophus_ferrumequinum.mRhiFer1_v1.gene_symbol_to_embedding_ESM1b.pt',
++        "mouse_lemur": FZ_EMBEDDING_DIR / "Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM1b.pt",
++        "sea_squirt": FZ_EMBEDDING_DIR / 'Ciona_intestinalis.KH.gene_symbol_to_embedding_ESM1b.pt',
++        "chicken": FZ_EMBEDDING_DIR / 'Gallus_gallus.GRCg6a.gene_symbol_to_embedding_ESM1b.pt',
++        "fly": FZ_EMBEDDING_DIR / 'Drosophila_melanogaster.BDGP6.32.gene_symbol_to_embedding_ESM1b.pt',
++        "pig": FZ_EMBEDDING_DIR / 'Sus_scrofa.Sscrofa11.1.gene_symbol_to_embedding_ESM1b.pt',
++        "macaca_fascicularis": FZ_EMBEDDING_DIR / 'Macaca_fascicularis.Macaca_fascicularis_6.0.gene_symbol_to_embedding_ESM1b.pt',
++        "macaca_mulatta": FZ_EMBEDDING_DIR / 'Macaca_mulatta.Mmul_10.gene_symbol_to_embedding_ESM1b.pt',
++        "rat": FZ_EMBEDDING_DIR / 'Rattus_norvegicus.mRatBN7.2.gene_symbol_to_embedding_ESM1b.pt',
++        "tree_shrew": FZ_EMBEDDING_DIR / 'Tupaia_belangeri.TREESHREW.gene_symbol_to_embedding_ESM1b.pt',
++        
++    },
++    'MSA1b': {
++        'human': EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_MSA1b.pt',
++        'mouse': EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_MSA1b.pt'
++    },
++    "protXL": {
++        'human': FZ_EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_protxl.pt',
++        'mouse': FZ_EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_protxl.pt',
++        'frog': FZ_EMBEDDING_DIR / 'Xenopus_tropicalis.Xenopus_tropicalis_v9.1.gene_symbol_to_embedding_protxl.pt',
++        #'frog': FZ_EMBEDDING_DIR / 'new_frog/xtropProtein.fasta.1.gene_symbol_to_embedding_ESM1b.pt',
++        'zebrafish': FZ_EMBEDDING_DIR / 'Danio_rerio.GRCz11.gene_symbol_to_embedding_protxl.pt',
++        #'bat':  FZ_EMBEDDING_DIR / 'Rhinolophus_ferrumequinum.mRhiFer1_v1.gene_symbol_to_embedding_ESM1b.pt',
++        #"mouse_lemur": FZ_EMBEDDING_DIR / "Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM1b.pt",
++        #"sea_squirt": FZ_EMBEDDING_DIR / 'Ciona_intestinalis.KH.gene_symbol_to_embedding_ESM1b.pt',
++        #"chicken": FZ_EMBEDDING_DIR / 'Gallus_gallus.GRCg6a.gene_symbol_to_embedding_ESM1b.pt',
++    },
++    "ESM1b_protref": {
++        'human': FZ_EMBEDDING_DIR / 'human.protref.gene_symbol_to_embedding_ESM1b.pt',
++        'mouse': FZ_EMBEDDING_DIR / 'mouse.protref.gene_symbol_to_embedding_ESM1b.pt',
++        'frog': FZ_EMBEDDING_DIR / 'frog.protref.gene_symbol_to_embedding_ESM1b.pt',
++        #'frog': FZ_EMBEDDING_DIR / 'new_frog/xtropProtein.fasta.1.gene_symbol_to_embedding_ESM1b.pt',
++        'zebrafish': FZ_EMBEDDING_DIR / 'zebrafish.protref.gene_symbol_to_embedding_ESM1b.pt',
++        #'bat':  FZ_EMBEDDING_DIR / 'Rhinolophus_ferrumequinum.mRhiFer1_v1.gene_symbol_to_embedding_ESM1b.pt',
++        #"mouse_lemur": FZ_EMBEDDING_DIR / "Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM1b.pt",
++        #"sea_squirt": FZ_EMBEDDING_DIR / 'Ciona_intestinalis.KH.gene_symbol_to_embedding_ESM1b.pt',
++        #"chicken": FZ_EMBEDDING_DIR / 'Gallus_gallus.GRCg6a.gene_symbol_to_embedding_ESM1b.pt',
++    },
++    'ESM2': {
++        'human': FZ_EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2.pt',
++        'mouse': FZ_EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_ESM2.pt',
++        'frog': FZ_EMBEDDING_DIR / 'Xenopus_tropicalis.Xenopus_tropicalis_v9.1.gene_symbol_to_embedding_ESM2.pt',
++        
++        'zebrafish': FZ_EMBEDDING_DIR / 'Danio_rerio.GRCz11.gene_symbol_to_embedding_ESM2.pt',
++        "mouse_lemur": FZ_EMBEDDING_DIR / "Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM2.pt",
++        "pig": FZ_EMBEDDING_DIR / 'Sus_scrofa.Sscrofa11.1.gene_symbol_to_embedding_ESM2.pt',
++        "macaca_fascicularis": FZ_EMBEDDING_DIR / 'Macaca_fascicularis.Macaca_fascicularis_6.0.gene_symbol_to_embedding_ESM2.pt',
++        "macaca_mulatta": FZ_EMBEDDING_DIR / 'Macaca_mulatta.Mmul_10.gene_symbol_to_embedding_ESM2.pt',
++    },
++}
++
++
++
++def load_gene_embeddings_adata(adata: AnnData, species: list, embedding_model: str) -> Tuple[AnnData, Dict[str, torch.FloatTensor]]:
++    """Loads gene embeddings for all the species/genes in the provided data.
++
++    :param data: An AnnData object containing gene expression data for cells.
++    :param species: Species corresponding to this adata
++    
++    :param embedding_model: The gene embedding model whose embeddings will be loaded.
++    :return: A tuple containing:
++               - A subset of the data only containing the gene expression for genes with embeddings in all species.
++               - A dictionary mapping species name to the corresponding gene embedding matrix (num_genes, embedding_dim).
++    """
++    # Get species names
++    species_names = species
++    species_names_set = set(species_names)
++
++    # Get embedding paths for the model
++    species_to_gene_embedding_path = MODEL_TO_SPECIES_TO_GENE_EMBEDDING_PATH[embedding_model]
++    available_species = set(species_to_gene_embedding_path)
++
++    # Ensure embeddings are available for all species
++    if not (species_names_set <= available_species):
++        raise ValueError(f'The following species do not have gene embeddings: {species_names_set - available_species}')
++
++    # Load gene embeddings for desired species (and convert gene symbols to lower case)
++    species_to_gene_symbol_to_embedding = {
++        species: {
++            gene_symbol.lower(): gene_embedding
++            for gene_symbol, gene_embedding in torch.load(species_to_gene_embedding_path[species]).items()
++        }
++        for species in species_names
++    }
++
++    # Determine which genes to include based on gene expression and embedding availability
++    genes_with_embeddings = set.intersection(*[
++        set(gene_symbol_to_embedding)
++        for gene_symbol_to_embedding in species_to_gene_symbol_to_embedding.values()
++    ])
++    genes_to_use = {gene for gene in adata.var_names if gene.lower() in genes_with_embeddings}
++
++    # Subset data to only use genes with embeddings
++    adata = adata[:, adata.var_names.isin(genes_to_use)]
++
++    # Set up dictionary mapping species to gene embedding matrix (num_genes, embedding_dim)
++    species_to_gene_embeddings = {
++        species_name: torch.stack([
++            species_to_gene_symbol_to_embedding[species_name][gene_symbol.lower()]
++            for gene_symbol in adata.var_names
++        ])
++        for species_name in species_names
++    }
++
++    return adata, species_to_gene_embeddings
+diff --git a/data_proc/generate_reduced_chrom_files.py b/data_proc/generate_reduced_chrom_files.py
+new file mode 100644
+index 0000000..3fb6795
+--- /dev/null
++++ b/data_proc/generate_reduced_chrom_files.py
+@@ -0,0 +1,292 @@
++import os
++os.environ["OMP_NUM_THREADS"] = "4" # export OMP_NUM_THREADS=4
++os.environ["OPENBLAS_NUM_THREADS"] = "4" # export OPENBLAS_NUM_THREADS=4 
++os.environ["MKL_NUM_THREADS"] = "4" # export MKL_NUM_THREADS=6
++os.environ["VECLIB_MAXIMUM_THREADS"] = "4" # export VECLIB_MAXIMUM_THREADS=4
++os.environ["NUMEXPR_NUM_THREADS"] = "4"
++
++
++import warnings
++warnings.filterwarnings("ignore")
++
++import scanpy as sc
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import torch.optim as optim
++import numpy as np
++import pickle
++import os
++import argparse
++import logging
++import time
++
++from tqdm.auto import tqdm
++import matplotlib.pyplot as plt
++import pandas as pd
++
++#sc._settings.ScanpyConfig.n_jobs = 6
++
++import math
++from typing import Tuple
++
++import torch
++from torch import nn, Tensor
++import torch.nn.functional as F
++from torch.nn import TransformerEncoder, TransformerEncoderLayer
++from torch.utils.data import dataset
++
++
++from accelerate import Accelerator
++import anndata
++from data_utils import adata_path_to_prot_chrom_starts, get_spec_chrom_csv
++
++
++
++from torch.utils.data import dataset
++from torch.utils.data import DataLoader, TensorDataset
++from scipy.stats import binom
++
++
++
++
++def padding_tensor(sequences):
++    """
++    :param sequences: list of tensors
++    :return:
++    """
++    num = len(sequences)
++    max_len = max([s.size(0) for s in sequences])
++    out_dims = (num, max_len, 1280)
++    
++    
++    out_tensor = sequences[0].data.new(*out_dims).fill_(0)
++    out_dims2 = (num, max_len)
++    
++    mask = sequences[0].data.new(*out_dims2).fill_(float('-inf'))
++    for i, tensor in enumerate(sequences):
++        length = tensor.size(0)
++        out_tensor[i, :length] = tensor
++        mask[i, :length] = 1
++    return out_tensor.permute(1, 0, 2), mask
++
++
++from pathlib import Path
++# ESM1b
++'''
++EMBEDDING_DIR = Path('/dfs/project/cross-species/data/proteome/embeddings')
++human_pe_dir =  EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM1b.pt'
++mouse_pe_dir =  EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_ESM1b.pt'
++lemur_pe_dir =  Path("/dfs/project/cross-species/yanay/data/proteome/embeddings/") / 'Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM1b.pt'
++
++'''
++
++# Upgrade to ESM2
++EMBEDDING_DIR = Path('/dfs/project/cross-species/data/proteome/embeddings')
++EMBEDDING_DIR = Path('/dfs/project/cross-species/yanay/data/proteome/embeddings')
++
++embeddings_paths = {
++        'human': EMBEDDING_DIR / 'Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2.pt',
++        'mouse': EMBEDDING_DIR / 'Mus_musculus.GRCm39.gene_symbol_to_embedding_ESM2.pt',
++        'frog': EMBEDDING_DIR / 'Xenopus_tropicalis.Xenopus_tropicalis_v9.1.gene_symbol_to_embedding_ESM2.pt',
++        'zebrafish': EMBEDDING_DIR / 'Danio_rerio.GRCz11.gene_symbol_to_embedding_ESM2.pt',
++        "mouse_lemur": EMBEDDING_DIR / "Microcebus_murinus.Mmur_3.0.gene_symbol_to_embedding_ESM2.pt",
++        "pig": EMBEDDING_DIR / 'Sus_scrofa.Sscrofa11.1.gene_symbol_to_embedding_ESM2.pt',
++        "macaca_fascicularis": EMBEDDING_DIR / 'Macaca_fascicularis.Macaca_fascicularis_6.0.gene_symbol_to_embedding_ESM2.pt',
++        "macaca_mulatta": EMBEDDING_DIR / 'Macaca_mulatta.Mmul_10.gene_symbol_to_embedding_ESM2.pt',
++    }
++
++species_to_pe = {
++    species:torch.load(pe_dir) for species, pe_dir in embeddings_paths.items()   
++}
++
++species_to_pe = {species:{k.upper(): v for k,v in pe.items()} for species, pe in species_to_pe.items()}
++
++#species_to_keys = {species:list(pe.keys()) for species, pe in species_to_pe.items()}
++#species_to_keys = {species:dict(zip(keys, np.arange(len(keys)))) for species, keys in species_to_keys.items()}
++
++
++#datasets_df = pd.read_csv("/dfs/project/cross-species/yanay/code/UCE/data_proc/full_train_datasets.csv")
++datasets_df = pd.read_csv("tissue_datasets.csv")
++datasets_df = pd.read_csv("perturb_datasets.csv")
++datasets_df = pd.read_csv("../new_perturb_datasets.csv")
++
++
++#pd.concat((#pd.read_csv("new_datasets.csv"),
++                             #pd.read_csv("pbmcs_nohvg.csv"), 
++                             #pd.read_csv("lung_nohvg.csv"),
++                             #pd.read_csv("new_tabula_datasets.csv"),
++                             #pd.read_csv("updated_datasets.csv"),
++  #                           #pd.read_csv("sanger_heart_atlas_datasets.csv"),
++ #                            pd.read_csv("tissue_datasets.csv")
++ #                       ))
++
++
++
++
++#datasets_df = pd.read_csv("cell_cycle_datasets.csv")
++#datasets_df = pd.read_csv("spatial_datasets.csv")
++#datasets_df = pd.read_csv("perturb_datasets.csv")
++#datasets_df = pd.read_csv("ccle_datasets.csv")
++#datasets_df = pd.read_csv("pancreas_datasets.csv")
++
++
++
++sorted_dataset_names = sorted(datasets_df["names"])
++with open("dataset_shapes.pkl", "rb") as f:
++    shapes_dict = pickle.load(f)
++    
++
++shapes_dict.update({
++ "madissoon_novel_lung":(190728, 8000),   
++ 'flores_cerebellum_human': (20232, 8000),
++ 'osuch_gut_human': (272310, 8000),
++ 'msk_ovarian_human': (929690, 8000),
++ 'htan_vmuc_dis_epi_human': (65084, 8000),
++ 'htan_vmuc_val_epi_human': (57564, 8000),
++ 'htan_vmuc_non_epi_human': (9099, 8000),
++ 'hao_pbmc_3p_human': (161764, 8000),
++ 'hao_pbmc_5p_human': (49147, 8000),
++ 'gao_tumors_human': (36111, 8000),
++ 'swabrick_breast_human': (92427, 8000),
++ 'wu_cryo_tumors_human': (105662, 8000),
++ 'cell_line_het_human': (53513, 8000),
++ 'bi_allen_metastasis_human': (27787, 8000),
++ 'zheng68k_human': (68579, 8000),
++ 'zheng68k_12k_human': (68579, 12000),
++ 'mouse_embryo_ct': (153597, 12000),
++ "regev_gtex_heart": (36574, 8000),
++ "tabula_sapiens_heart": (11505, 8000),
++ "10k_pbmcs":(11990, 12000),
++ "epo_ido":(35834,12000),
++ 'tabula_sapiens_kidney': (9641, 8000),
++ 'tabula_microcebus_kidney': (14592, 8000),
++ 'tabula_muris_kidney': (2781, 8000),
++ 'tabula_muris_senis_kidney': (19610, 8000),
++  'immune_human': (33506, 8000)
++                   })
++
++for row in datasets_df.iterrows():
++    ngenes = row[1].num_genes
++    ncells = row[1].num_cells
++    name = row[1].names
++    if not np.isnan(ngenes):
++        shapes_dict[name] = (int(ncells), int(ngenes))
++                   
++#with open("dataset_shapes.pkl", "wb") as f:
++#    pickle.dump(shapes_dict, f)
++token_dim = 5120
++mmap_dict = {}
++
++root_dir = "/lfs/local/0/yanay/uce_h5s/"
++root_dir_census = "/lfs/local/0/yanay/cxg_h5s/"
++
++dataset_to_paths = {r[1]["names"]:root_dir + r[1]["path"].replace(".h5ad", "_proc.h5ad") for r in datasets_df.iterrows()}
++for row in datasets_df.iterrows():
++    name = row[1].names
++    census = row[1].census
++    
++    if census == "yes":
++        dataset_to_paths[name] = dataset_to_paths[name].replace(root_dir, root_dir_census)
++
++
++datasets_to_species = {r[1]["names"]:r[1]["species"] for r in datasets_df.iterrows()}
++
++#species_to_pe = {"mouse":mouse_pe, "human":human_pe, "mouse_lemur":lemur_pe}
++
++#dataset_to_protein_embeddings_all = {k:species_to_pe[v] for k, v in datasets_to_species.items()}
++
++dataset_to_protein_embeddings = {}
++
++
++#dataset_to_protein_embeddings_all["madissoon_novel_lung"] = species_to_pe["human"]
++datasets_to_species["madissoon_novel_lung"] = "human"
++#dataset_to_paths["madissoon_novel_lung"] = "/lfs/local/0/yanay/uce_h5s/madissoon_novel_lung_proc.h5ad"
++
++
++
++# New Chrom Based Code
++gene_to_chrom_pos = get_spec_chrom_csv()
++species_to_chrom_categories = {}
++
++for species in np.unique(gene_to_chrom_pos["species"]):
++    species_to_chrom_categories[species] = pd.Categorical(gene_to_chrom_pos["chromosome"]).categories
++
++    
++dataset_to_chroms = {}
++dataset_to_starts = {}
++
++sorted_species_names = sorted(species_to_pe.keys())
++print(sorted_species_names)
++
++if os.path.exists(f"/dfs/project/uce/all_species_pe_tokens.torch"):
++    all_pe = torch.load(f"/dfs/project/uce/all_species_pe_tokens.torch")
++    with open("/dfs/project/uce/all_species_offsets.pkl", "rb") as f:
++        species_to_offsets = pickle.load(f)
++    print("Loaded PE", all_pe.shape)
++else:
++    torch.manual_seed(8)
++    MASK_TENSOR = torch.zeros((1, token_dim)) # this is the padding token
++    CHROM_TENSOR_LEFT = torch.normal(mean=0, std=1, size=(1, token_dim))
++    CHROM_TENSOR_RIGHT = torch.normal(mean=0, std=1, size=(1, token_dim))
++    CLS_TENSOR = torch.normal(mean=0, std=1, size=(1, token_dim))
++    species_to_offsets = {}
++
++    all_pe = [MASK_TENSOR, CHROM_TENSOR_LEFT, CHROM_TENSOR_RIGHT, CLS_TENSOR]
++    offset = len(all_pe) # special tokens at the top!
++    for species in sorted_species_names:
++        pe_stacked = torch.stack(list(species_to_pe[species].values()))
++        all_pe.append(pe_stacked)
++        species_to_offsets[species] = offset
++        offset += pe_stacked.shape[0]
++
++    all_pe = torch.vstack(all_pe)
++    print(all_pe.shape)
++    torch.save(all_pe, f"/dfs/project/uce/all_species_pe_tokens.torch")
++    with open("/dfs/project/uce/all_species_offsets.pkl", "wb+") as f:
++        pickle.dump(species_to_offsets, f)
++    print("Saved PE")
++
++# Load in already saved!
++if os.path.exists(f"/lfs/local/0/yanay/reduced_datasets_to_pe_chrom_{token_dim}_new.torch"):
++    dataset_to_protein_embeddings = torch.load(f"/lfs/local/0/yanay/reduced_datasets_to_pe_chrom_{token_dim}_new.torch")
++
++    with open("/lfs/local/0/yanay/dataset_to_chroms_new.pkl", "rb") as f:
++        dataset_to_chroms = pickle.load(f)
++    with open("/lfs/local/0/yanay/dataset_to_starts_new.pkl", "rb") as f:
++        dataset_to_starts = pickle.load(f)
++else:
++    dataset_to_protein_embeddings = {}
++    dataset_to_chroms = {}
++    dataset_to_starts = {}
++
++
++# Add the new ones
++print("creating reduced size protein embeddings file")
++
++redo = True
++
++for dataset, path in tqdm(list(dataset_to_paths.items())):
++    if dataset in dataset_to_protein_embeddings.keys() and not redo:
++        continue # skip since already procced
++    print(dataset)
++    adata = sc.read(path)
++    dataset_species = datasets_to_species[dataset]
++    spec_pe_genes = list(species_to_pe[dataset_species].keys())
++    offset = species_to_offsets[dataset_species]
++    
++    # Get proper idxs
++    pe_row_idxs, dataset_chroms, dataset_pos = adata_path_to_prot_chrom_starts(adata, dataset_species, spec_pe_genes, gene_to_chrom_pos, offset)
++    # Add to dicts
++    dataset_to_chroms[dataset] = dataset_chroms
++    dataset_to_starts[dataset] = dataset_pos
++    dataset_to_protein_embeddings[dataset] = pe_row_idxs
++    
++    del adata
++# save Dicts and idxs
++torch.save(dataset_to_protein_embeddings, f"/lfs/local/0/yanay/reduced_datasets_to_pe_chrom_{token_dim}_new.torch")
++
++with open("/lfs/local/0/yanay/dataset_to_chroms_new.pkl", "wb+") as f:
++    pickle.dump(dataset_to_chroms, f)
++with open("/lfs/local/0/yanay/dataset_to_starts_new.pkl", "wb+") as f:
++    pickle.dump(dataset_to_starts, f)        
+\ No newline at end of file
+diff --git a/data_proc/preproc_many_dataset.py b/data_proc/preproc_many_dataset.py
+new file mode 100644
+index 0000000..22888dd
+--- /dev/null
++++ b/data_proc/preproc_many_dataset.py
+@@ -0,0 +1,201 @@
++import os
++os.environ["OMP_NUM_THREADS"] = "10" # export OMP_NUM_THREADS=4
++os.environ["OPENBLAS_NUM_THREADS"] = "10" # export OPENBLAS_NUM_THREADS=4 
++os.environ["MKL_NUM_THREADS"] = "10" # export MKL_NUM_THREADS=6
++os.environ["VECLIB_MAXIMUM_THREADS"] = "10" # export VECLIB_MAXIMUM_THREADS=4
++os.environ["NUMEXPR_NUM_THREADS"] = "10"
++
++
++
++from collections import defaultdict
++from typing import Dict, List, Optional, Tuple
++
++import torch
++import torch.utils.data as data
++import numpy as np
++import scanpy as sc
++from numpy import array
++import subprocess
++import os
++from tqdm import tqdm
++import warnings
++warnings.filterwarnings("ignore")
++
++
++from gene_embeddings import load_gene_embeddings_adata
++import pandas as pd
++import numpy as np
++from scanpy import AnnData
++from data_utils import process_raw_anndata
++
++def data_to_torch_X(X):
++    if isinstance(X, sc.AnnData):
++        X = X.X
++    if not isinstance(X, np.ndarray):
++            X = X.toarray()
++    return torch.from_numpy(X).float()
++
++class SincleCellDataset(data.Dataset):
++    def __init__(self,
++                expression: torch.tensor, # Subset to hv genes, count data! cells x genes
++                protein_embeddings: torch.tensor, # same order as expression, also subset genes x pe
++                labels: None, # optional, tensor of labels
++                covar_vals: None, # tensor of covar values or none
++                ) -> None:
++        super(SincleCellDataset, self).__init__()
++        
++        # Set expression
++        self.expression = expression
++        
++        row_sums = self.expression.sum(1) # UMI Counts
++        log_norm_count_adj = torch.log1p(self.expression / (self.expression.sum(1)).unsqueeze(1) * torch.tensor(1000))       
++        
++        # Set log norm and count adjusted expression
++        max_vals, max_idx = torch.max(log_norm_count_adj, dim=0)
++        self.expression_mod =  log_norm_count_adj / max_vals
++        
++        # Calculate dropout likliehoods of each gene
++        self.dropout_vec = (self.expression == 0).float().mean(0) # per gene dropout percentages
++        
++        # Set data info
++        self.num_cells = self.expression.shape[0]
++        self.num_genes = self.expression.shape[1]
++        
++        # Set optional label info, including categorical covariate index
++        self.covar_vals = covar_vals
++        self.labels = labels
++        
++        # Set protein embeddings
++        self.protein_embeddings = protein_embeddings
++        
++        self.item_mode = "expression"
++        if self.covar_vals is not None:
++            self.item_mode = "expression+covar"
++        
++        
++    def __getitem__(self, idx):
++        if self.item_mode == "expression":
++            if isinstance(idx, int):
++                if idx < self.num_cells:
++                    return self.expression[idx, :]
++                else:
++                    raise IndexError
++            else:
++                raise NotImplementedError
++        elif self.item_mode == "expression+covar":
++            if isinstance(idx, int):
++                if idx < self.num_cells:
++                    return self.expression[idx, :], self.covar_vals[idx]
++                else:
++                    raise IndexError
++            else:
++                raise NotImplementedError
++            
++
++    def __len__(self) -> int:
++        return self.num_cells
++
++    def get_dim(self) -> Dict[str, int]:
++        return self.num_genes
++
++
++def data_to_torch_X(X):
++    if isinstance(X, sc.AnnData):
++        X = X.X
++    if not isinstance(X, np.ndarray):
++            X = X.toarray()
++    return torch.from_numpy(X).float()
++
++
++def anndata_to_sc_dataset(adata:sc.AnnData, 
++                                 species:str="human", 
++                                 labels:list=[],
++                                 covar_col:str=None,
++                                 hv_genes:int=12000,
++                                 embedding_model="ESM1b",
++                                ) -> (SincleCellDataset, AnnData):
++    
++    # Subset to just genes we have embeddings for
++    adata, protein_embeddings = load_gene_embeddings_adata(
++        adata=adata,
++        species=[species],
++        embedding_model=embedding_model
++    )
++    
++    if DO_HVG:
++        sc.pp.highly_variable_genes(adata, flavor='seurat_v3', n_top_genes=hv_genes)  # Expects Count Data
++    
++        hv_index = adata.var["highly_variable"]
++        adata = adata[:, hv_index] # Subset to hv genes only
++    
++        protein_embeddings = protein_embeddings[species][hv_index]
++    else:
++        protein_embeddings = protein_embeddings[species]
++    expression = data_to_torch_X(adata.X)
++    
++    covar_vals = None
++    if len(labels) > 0:
++        assert covar_col is None or covar_col in labels, "Covar needs to be in labels" # make sure you keep track of covar column!
++        labels = adata.obs.loc[:, labels].values
++        
++        if covar_col is not None:
++            # we have a categorical label to use as covariate
++            covar_vals = torch.tensor(pd.Categorical(adata.obs[covar_col]).codes)
++    return SincleCellDataset(
++        expression=expression,
++        protein_embeddings=protein_embeddings,
++        labels=labels,
++        covar_vals=covar_vals
++    ), adata    
++    
++def proc(args):
++    datasets_df = pd.read_csv(args.datasets_df)
++    datasets_df["covar_col"] = np.nan
++    skip = args.skip
++    additional_filter = args.filter
++    DO_HVG = args.DO_HVG
++    
++    num_genes = {}
++    num_cells = {}
++    
++    ir = list(datasets_df.iterrows())
++    for i, row in tqdm(ir, total=len(datasets_df)):
++        _, ncells, ngenes = process_raw_anndata(row, h5_folder_path, npz_folder_path, scp, skip, additional_filter, root=args.file_root_path)
++        if (ncells is not None) and (ngenes is not None):
++            num_genes[path] = adata.X.shape[1]
++            num_cells[path] = ngenes
++        
++    if "num_cells" not in datasets_df.columns:
++        datasets_df["num_cells"] = 0
++    if "num_genes" not in datasets_df.columns:
++        datasets_df["num_genes"] = 0
++    for k in num_genes.keys():
++        ng = num_genes[k]
++        nc = num_cells[k]
++        datasets_df.loc[datasets_df["path"] == k, "num_cells"] = nc
++        datasets_df.loc[datasets_df["path"] == k, "num_genes"] = ng
++    # Write with the cells and genes info back to the original path
++    datasets_df.to_csv(args.datasets_df, index=False)
++if __name__=="__main__":
++    # Parse command-line arguments
++    
++    parser = argparse.ArgumentParser(description='Preproc datasets h5ad datasets.')
++
++    # Define command-line arguments
++    parser.add_argument('--scp', type=str, default="", help='Name of a SNAP server to SCP the results to. It should have the same folders as the script is already saving to.')
++    parser.add_argument('--h5_folder_path', type=str, default="/lfs/local/0/yanay/uce_h5s/", help='Folder to save H5s to.')
++    parser.add_argument('--npz_folder_path', type=str, default="/lfs/local/0/yanay/uce_proc/", help='Folder to save NPZs to.')
++    
++    
++    parser.add_argument('--datasets_df', type=str, default="/dfs/project/uce/new_perturb_datasets.csv", help='Path to datasets csv. Will be overwritten to have the correct num cells and num genes for each dataset.')
++    
++    parser.add_argument('--filter', type=bool, default=True, help='Should you do an additional gene/cell filtering? This can be a good step since even if you have already done it, subsetting to protein embeddings can make some cells sparser.')
++    parser.add_argument('--skip', type=bool, default=True, help='Should you skip datasets that appear to have already been created in the h5 folder?')
++    
++    parser.add_argument('--DO_HVG', type=bool, default=False, help='Should a HVG subset be done.')
++    
++    
++    parse
++    args = parser.parse_args()
++    main(args)
++    
+\ No newline at end of file
+diff --git a/eval_data.py b/eval_data.py
+new file mode 100644
+index 0000000..26acb5e
+--- /dev/null
++++ b/eval_data.py
+@@ -0,0 +1,176 @@
++"""
++Dataloaders
++
++"""
++
++import warnings
++warnings.filterwarnings("ignore")
++import sys
++sys.path.append('../')
++from typing import Dict, List, Optional, Tuple, Any
++import torch
++import numpy as np
++import pickle
++import torch.utils.data as data
++
++
++class MultiDatasetSentences(data.Dataset):
++    def __init__(self, sorted_dataset_names, shapes_dict, args, 
++                 dataset_to_protein_embeddings_path= "/lfs/local/0/yanay/reduced_datasets_to_pe_chrom_5120_new.torch",
++                 datasets_to_chroms_path="/lfs/local/0/yanay/dataset_to_chroms_new.pkl",
++                 datasets_to_starts_path="/lfs/local/0/yanay/dataset_to_starts_new.pkl",
++                 npzs_dir="/lfs/local/0/yanay/uce_proc/") -> None:
++        super(MultiDatasetSentences, self).__init__()
++        # self.xs = {}
++        self.num_cells = {}
++        self.num_genes = {}
++        self.shapes_dict = shapes_dict
++        self.args = args
++
++        self.total_num_cells = 0
++        for name in sorted_dataset_names:
++            num_cells, num_genes = self.shapes_dict[name]
++            # self.xs[name] = X
++            self.num_cells[name] = num_cells
++            self.num_genes[name] = num_genes
++
++            self.total_num_cells += num_cells
++
++        self.datasets = sorted_dataset_names
++
++        # TODO: preferably not hard-coded here
++        self.dataset_to_protein_embeddings = torch.load(dataset_to_protein_embeddings_path)
++        with open(datasets_to_chroms_path, "rb") as f:
++            self.dataset_to_chroms = pickle.load(f)
++        with open(datasets_to_starts_path, "rb") as f:
++            self.dataset_to_starts = pickle.load(f)
++        
++        self.npzs_dir = npzs_dir
++
++    def __getitem__(self, idx):
++        if isinstance(idx, int):
++            for dataset in sorted(self.datasets):
++                if idx < self.num_cells[dataset]:
++                    #cts = np.memmap(f"/lfs/local/0/yanay/cxg_npzs/" + f"{dataset}_counts.npz",
++                    #        dtype='int64', mode='r', shape=self.shapes_dict[dataset])
++                    cts = np.memmap(self.npzs_dir + f"{dataset}_counts.npz", dtype='int64', mode='r', shape=self.shapes_dict[dataset])
++                    counts = cts[idx]
++                    counts = torch.tensor(counts).unsqueeze(0)
++                    weights = torch.log1p(counts)
++                    weights = (weights / torch.sum(weights))
++                    batch_sentences, mask, seq_len, cell_sentences = \
++                        sample_cell_sentences(counts, weights, dataset, self.args,
++                            dataset_to_protein_embeddings= self.dataset_to_protein_embeddings,
++                            dataset_to_chroms=self.dataset_to_chroms,
++                            dataset_to_starts=self.dataset_to_starts)
++                    return batch_sentences, mask, idx, seq_len, cell_sentences
++                else:
++                    idx -= self.num_cells[dataset]
++            raise IndexError
++        else:
++            raise NotImplementedError
++
++    def __len__(self) -> int:
++        return self.total_num_cells
++
++    def get_dim(self) -> Dict[str, int]:
++        return self.num_genes
++
++
++class MultiDatasetSentenceCollator(object):
++    def __init__(self, args):
++        self.pad_length = args.pad_length
++
++
++    def __call__(self, batch):
++        batch_size = len(batch)
++        batch_sentences = torch.zeros((batch_size, self.pad_length))
++        mask = torch.zeros((batch_size, self.pad_length))
++        cell_sentences = torch.zeros((batch_size, self.pad_length))
++
++        idxs = torch.zeros(batch_size)
++
++        i = 0
++        max_len = 0
++        for bs, msk, idx, seq_len, cs in batch:
++            batch_sentences[i, :] = bs
++            cell_sentences[i, :] = cs
++            max_len = max(max_len, seq_len)
++            mask[i, :] = msk
++            idxs[i] = idx
++
++            i += 1
++
++        return batch_sentences[:, :max_len] , mask[:, :max_len], idxs, cell_sentences
++
++
++
++def sample_cell_sentences(counts, batch_weights, dataset, args,
++                          dataset_to_protein_embeddings,
++                          dataset_to_chroms,
++                          dataset_to_starts):
++
++    dataset_idxs = dataset_to_protein_embeddings[dataset] # get the dataset specific protein embedding idxs
++    cell_sentences = torch.zeros((counts.shape[0], args.pad_length)) # init the cell representation as 0s
++    mask = torch.zeros((counts.shape[0], args.pad_length)) # start of masking the whole sequence
++    chroms = dataset_to_chroms[dataset] # get the dataset specific chroms for each gene
++    starts = dataset_to_starts[dataset] # get the dataset specific genomic start locations for each gene
++
++    longest_seq_len = 0 # we need to keep track of this so we can subset the batch at the end
++
++    for c, cell in enumerate(counts):
++        weights = batch_weights[c].numpy()
++        weights = weights / sum(weights)  # RE NORM after mask
++        
++        # randomly choose the genes that will make up the sample, weighted by expression, with replacement
++        choice_idx = np.random.choice(np.arange(len(weights)),
++                                      size=args.sample_size, p=weights,
++                                      replace=True)
++        choosen_chrom = chroms[choice_idx] # get the sampled genes chromosomes
++        # order the genes by chromosome
++        chrom_sort = np.argsort(choosen_chrom)  
++        choice_idx = choice_idx[chrom_sort]
++
++        # sort the genes by start
++        new_chrom = chroms[choice_idx]
++        choosen_starts = starts[choice_idx]
++
++        ordered_choice_idx = np.full((args.pad_length),
++                                     args.cls_token_idx)  # start with cls
++        # i= 0 first token is CLS
++        i = 1  # continue on to the rest of the sequence with left bracket being assumed.
++        # Shuffle the chroms now, there's no natural order to chromosomes
++        uq_chroms = np.unique(new_chrom)
++        np.random.shuffle(uq_chroms) # shuffle
++        
++        # This loop is actually just over one cell
++        for chrom in uq_chroms:
++            # Open Chrom token
++            ordered_choice_idx[i] = int(chrom) + args.CHROM_TOKEN_OFFSET # token of this chromosome # i = 1 next token is a chrom open
++            i += 1
++            # now sort the genes by start order within the chroms
++            loc = np.where(new_chrom == chrom)[0]
++            sort_by_start = np.argsort(
++                choosen_starts[loc])  # start locations for this chromsome
++
++            to_add = choice_idx[loc[sort_by_start]]
++            ordered_choice_idx[i:(i + len(to_add))] = dataset_idxs[to_add]
++            i += len(to_add)
++            ordered_choice_idx[i] = args.chrom_token_right_idx # add the chrom sep again
++            i += 1  # add the closing token again
++
++        longest_seq_len = max(longest_seq_len, i)
++        remainder_len = (args.pad_length - i)
++
++        cell_mask = torch.concat((torch.ones(i),
++                                  # pay attention to all of these tokens, ignore the rest!
++                                  torch.zeros(remainder_len)))
++
++        mask[c, :] = cell_mask
++
++        ordered_choice_idx[i:] = args.pad_token_idx # the remainder of the sequence
++        cell_sentences[c, :] = torch.from_numpy(ordered_choice_idx)
++        
++    cell_sentences_pe = cell_sentences.long() # token indices
++    
++    return cell_sentences_pe, mask, longest_seq_len, cell_sentences
+\ No newline at end of file
+diff --git a/eval_single_anndata.py b/eval_single_anndata.py
+new file mode 100644
+index 0000000..a6e055b
+--- /dev/null
++++ b/eval_single_anndata.py
+@@ -0,0 +1,300 @@
++import os
++#os.environ["NCCL_DEBUG"] = "INFO"
++os.environ["OMP_NUM_THREADS"] = "12" # export OMP_NUM_THREADS=4
++os.environ["OPENBLAS_NUM_THREADS"] = "12" # export OPENBLAS_NUM_THREADS=4 
++os.environ["MKL_NUM_THREADS"] = "12" # export MKL_NUM_THREADS=6
++os.environ["VECLIB_MAXIMUM_THREADS"] = "12" # export VECLIB_MAXIMUM_THREADS=4
++os.environ["NUMEXPR_NUM_THREADS"] = "12"
++
++
++import warnings
++warnings.filterwarnings("ignore")
++
++import scanpy as sc
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++import torch.optim as optim
++import numpy as np
++import pickle
++import os
++import argparse
++import logging
++import time
++
++from tqdm.auto import tqdm
++import pandas as pd
++from glob import glob
++
++#sc._settings.ScanpyConfig.n_jobs = 6
++
++import math
++from typing import Tuple
++
++import torch
++from torch import nn, Tensor
++import torch.nn.functional as F
++from torch.nn import TransformerEncoder, TransformerEncoderLayer
++from torch.utils.data import dataset
++
++
++from accelerate import Accelerator
++import anndata
++
++from model import TransformerModel
++from eval_data import MultiDatasetSentences, MultiDatasetSentenceCollator
++
++from torch.utils.data import dataset
++from torch.utils.data import DataLoader, TensorDataset
++from scipy.stats import binom
++
++from data_proc.data_utils import adata_path_to_prot_chrom_starts, get_spec_chrom_csv, process_raw_anndata, get_species_to_pe
++from pathlib import Path
++
++
++
++def get_ESM2_embeddings(args):
++    # Load in ESM2 embeddings and special tokens
++    all_pe = torch.load(args.token_file)
++    if all_pe.shape[0] == 143574:
++        torch.manual_seed(23)
++        #MASK_TENSOR = torch.normal(mean=0, std=1, size=(1, args.token_dim))
++        CHROM_TENSORS = torch.normal(mean=0, std=1, size=(1895, args.token_dim))
++        # 1895 is the total number of chromosome choices, it is hardcoded for now
++        all_pe = torch.vstack((all_pe, CHROM_TENSORS)) # Add the chrom tensors to the end
++        all_pe.requires_grad = False
++
++    return all_pe
++
++def padding_tensor(sequences):
++    """
++    :param sequences: list of tensors
++    :return:
++    """
++    num = len(sequences)
++    max_len = max([s.size(0) for s in sequences])
++    out_dims = (num, max_len, 1280)
++    
++    
++    out_tensor = sequences[0].data.new(*out_dims).fill_(0)
++    out_dims2 = (num, max_len)
++    
++    mask = sequences[0].data.new(*out_dims2).fill_(float('-inf'))
++    for i, tensor in enumerate(sequences):
++        length = tensor.size(0)
++        out_tensor[i, :length] = tensor
++        mask[i, :length] = 1
++    return out_tensor.permute(1, 0, 2), mask
++
++
++    
++MASK_TOKEN_IDX = 0
++CHROM_TOKEN_LEFT_IDX = 1
++CHROM_TOKEN_RIGHT_IDX = 2
++CLS_TOKEN_IDX = 3
++
++
++def run_eval(adata, name, pe_idx_path, chroms_path, starts_path, shapes_dict, accelerator, args):
++    #### Load Files ####
++    dataset_to_protein_embeddings = torch.load(pe_idx_path)
++    with open(chroms_path, "rb") as f:
++        dataset_to_chroms = pickle.load(f)
++    with open(starts_path, "rb") as f:
++        dataset_to_starts = pickle.load(f)    
++    #### Load the model ####
++    sample_size = args.sample_size # 256
++    num_samples = 1
++    output_dim = args.output_dim # 768
++     
++    token_dim = args.token_dim  # size of vocabulary
++    emsize = 1280  # embedding dimension
++    d_hid = args.d_hid  # dimension of the feedforward network model in nn.TransformerEncoder
++    nlayers = args.nlayers  # number of nn.TransformerEncoderLayer in nn.TransformerEncoder
++    nhead = 20  # number of heads in nn.MultiheadAttention
++    dropout = 0.05  # dropout probability    
++    model = TransformerModel(token_dim=token_dim, d_model=emsize, nhead=nhead, d_hid=d_hid, 
++                             nlayers=nlayers, dropout=dropout, output_dim=args.output_dim)
++    if args.model_loc is None:
++        model_loc = f"/dfs/project/cross-species/yanay/code/state_dicts/unwrapped_chrom_model_state_dict_step_{args.step_num}_epoch_{args.epoch_num}_nlayers_{args.nlayers}_sample_size_{args.sample_size}_CLS.torch"
++        if args.CXG:
++            model_loc += "_CXG"
++    else:
++        model_loc = args.model_loc
++    
++    all_pe = get_ESM2_embeddings(args)
++    all_pe.requires_grad= False
++    model.pe_embedding = nn.Embedding.from_pretrained(all_pe)
++    model.load_state_dict(torch.load(model_loc, map_location="cpu"), strict=True)
++    print(f"Loaded model:\n{model_loc}")
++    model = model.eval()
++    model = accelerator.prepare(model)
++    token = -1 * torch.ones(token_dim)
++    batch_size = args.batch_size
++    
++    #### Run the model ####
++    # Dataloaders
++    dataset = MultiDatasetSentences(sorted_dataset_names=[name], shapes_dict=shapes_dict, 
++                                    args=args, npzs_dir=args.dir,
++                                    dataset_to_protein_embeddings_path=pe_idx_path,
++                                    datasets_to_chroms_path=chroms_path,
++                                    datasets_to_starts_path=starts_path
++                                   )
++    multi_dataset_sentence_collator = MultiDatasetSentenceCollator(args)
++    
++    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=multi_dataset_sentence_collator, num_workers=0)
++    dataloader = accelerator.prepare(dataloader)
++    pbar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
++    dataset_embeds = []
++    with torch.no_grad():
++        for batch in pbar:
++            batch_sentences, mask, idxs= batch[0], batch[1], batch[2]
++            batch_sentences = batch_sentences.permute(1, 0)
++            #print(batch_sentences.squeeze(2).shape)
++            batch_sentences = model.module.pe_embedding(batch_sentences.long())
++            batch_sentences = nn.functional.normalize(batch_sentences, dim=2) # Normalize token outputs now
++            cell_sentences = batch[3]
++
++            _, embedding = model.forward(batch_sentences, mask=mask)
++            # Fix for duplicates in last batch
++            accelerator.wait_for_everyone()
++            embeddings  = accelerator.gather_for_metrics((embedding))
++            if accelerator.is_main_process: 
++                dataset_embeds.append(embeddings.detach().cpu().numpy())
++
++    accelerator.wait_for_everyone()
++    if accelerator.is_main_process:
++        dataset_embeds = np.vstack(dataset_embeds)
++        adata.obsm["X_uce"] = dataset_embeds 
++        write_path = args.dir + f"{name}_ep_{args.epoch_num}_sn_{args.step_num}_nlayers_{args.nlayers}_sample_size_{args.sample_size}.h5ad"
++        adata.write(write_path)
++        
++        print("*****Wrote Anndata to:*****")
++        print(write_path)
++    
++def main(args, accelerator):
++    
++    # Step 0 Establish Paths
++    adata_name = args.adata_path.split("/")[-1]
++    adata_root_path = args.adata_path.replace(adata_name, "")
++    h5_folder_path = args.dir # just write these to the same directory
++    
++    npz_folder_path = args.dir
++    scp = ""
++    row = pd.Series()
++    row.path = adata_name
++    row.covar_col = np.nan
++    row.species = args.species
++    name = adata_name.replace(".h5ad", "")
++    proc_h5_path = h5_folder_path + f"{name}_proc.h5ad"
++    
++    pe_idx_path = args.dir + f"{name}_pe_idx.torch"
++    chroms_path = args.dir + f"{name}_chroms.pkl"
++    starts_path = args.dir +  f"{name}_starts.pkl"
++    shapes_dict_path = args.dir + f"{name}_shapes_dict.pkl"
++    adata = None
++    
++    # STEP 1: Pre Proc the anndata
++    if accelerator.is_main_process:
++        adata, num_cells, num_genes = process_raw_anndata(row, h5_folder_path, npz_folder_path, 
++                                                          scp, args.skip, args.filter, 
++                                                          root=adata_root_path)
++        # save the shapes dict
++        shapes_dict = {name:(num_cells, num_genes)}
++        if (num_cells is not None) and (num_genes is not None):
++            with open(shapes_dict_path, "wb+") as f:
++                pickle.dump(shapes_dict, f)
++                print("Wrote Shapes Dict")
++            
++    # Re read in the anndata if we skipped processing it
++    if accelerator.is_main_process:
++        if adata is None:
++            adata = sc.read(proc_h5_path)
++    # STEP 2: Generate the correct idxs
++    if accelerator.is_main_process:
++        if os.path.exists(pe_idx_path) and os.path.exists(chroms_path) and os.path.exists(starts_path):
++            # these have already been created, just read them in
++            print("PE Idx, Chrom and Starts files already created")
++        else:
++            # otherwise, create them first
++            species_to_pe = get_species_to_pe(args.protein_embeddings_dir)
++            with open(args.offset_pkl_path, "rb") as f:
++                species_to_offsets = pickle.load(f)
++
++            gene_to_chrom_pos = get_spec_chrom_csv(args.spec_chrom_csv_path)
++            dataset_species = args.species
++            spec_pe_genes = list(species_to_pe[dataset_species].keys())
++            offset = species_to_offsets[dataset_species]
++            pe_row_idxs, dataset_chroms, dataset_pos = adata_path_to_prot_chrom_starts(adata, dataset_species, spec_pe_genes, gene_to_chrom_pos, offset)
++
++            # Save to the temp dict
++            torch.save({name:pe_row_idxs}, pe_idx_path)
++            with open(chroms_path, "wb+") as f:
++                pickle.dump({name:dataset_chroms}, f)
++            with open(starts_path, "wb+") as f:
++                pickle.dump({name:dataset_pos}, f)    
++    
++    # STEP 3: Run Evaluation of the model
++    accelerator.wait_for_everyone()
++    with open(shapes_dict_path, "rb") as f:
++        shapes_dict = pickle.load(f)
++    run_eval(adata, name, pe_idx_path, chroms_path, starts_path, shapes_dict, accelerator, args)
++
++
++
++if __name__=="__main__":
++    # Parse command-line arguments
++    
++    parser = argparse.ArgumentParser(description='Embed a single anndata that has not been processed before using UCE.')
++    # Define command-line arguments
++    parser.add_argument('--adata_path', type=str, default="/lfs/local/0/yanay/10k_pbmcs.h5ad", help='Full path to the anndata you want to embed.')
++    parser.add_argument('--dir', type=str, default="/lfs/local/0/yanay/uce_temp/", help='Working folder where all files will be saved.')
++    parser.add_argument('--species', type=str, default="human", help='Species of the anndata.')
++    parser.add_argument('--filter', type=bool, default=True, help='Should you do an additional gene/cell filtering on the anndata? This can be a good step since even if you have already done it, subsetting to protein embeddings can make some cells sparser.')
++    parser.add_argument('--skip', type=bool, default=True, help='Should you skip datasets that appear to have already been created in the h5 folder?')
++        
++
++    # MODEL ARGUMENTS
++    parser.add_argument('--batch_size', type=int, help='Set GPU Number')
++    parser.add_argument('--CXG', type=bool, help='Use CXG model')    
++    parser.add_argument('--epoch_num', type=int, help='Set epoch number')
++    parser.add_argument('--step_num', type=int, help='Set Step Number')    
++    parser.add_argument('--nlayers', type=int, help='Set Number of layers of transformer')
++    parser.add_argument('--output_dim', type=int, help='Set output dim')
++    parser.add_argument('--d_hid', type=int, help='Set output dim')
++    parser.add_argument('--sample_size', type=int, help='Set sample size of genes')
++    parser.add_argument('--token_dim', type=int, help='Set sample size of genes')
++    parser.add_argument("--pad_length", type=int, default=None, help="PAD length")
++    parser.add_argument("--pad_token_idx", type=int, default=0, help="PAD token index")
++    parser.add_argument("--chrom_token_left_idx", type=int, default=1, help="Chrom token left index")
++    parser.add_argument("--chrom_token_right_idx", type=int, default=2, help="Chrom token right index")
++    parser.add_argument("--cls_token_idx", type=int, default=3, help="CLS token index")
++    parser.add_argument("--CHROM_TOKEN_OFFSET", type=int, default=143574, help="Offset index, tokens after this mark are chromosome identifiers")
++    
++    parser.add_argument('--model_loc', type=str, default="model_files/4layer_model.torch", help='Specific location of the model if you want to pass a path. Make sure to set all the other model parameters as well as this argument.')    
++    
++    
++    # MISC ARGUMENTS
++    parser.add_argument("--spec_chrom_csv_path", default="model_files/species_chrom.csv", type=str, help="CSV Path for species genes to chromosomes and start locations.")
++    parser.add_argument("--token_file", default="model_files/all_tokens.torch", type=str, help="Path for token embeddings, torch file.")
++    parser.add_argument("--protein_embeddings_dir", default="model_files/protein_embeddings/", type=str, help="Directory where protein embedding .pt files are stored.")
++    parser.add_argument("--offset_pkl_path", default="model_files/species_offsets.pkl", type=str, help="PKL file which contains offsets for each species.")
++    parser.add_argument("--accelerator_dir", default="model_files", type=str, help="Accelerator Dir, not really used.")
++    
++    
++    
++    parser.set_defaults(
++        epoch_num=8,
++        step_num=251656,
++        batch_size=25,
++        output_dim=1280,
++        d_hid=5120,
++        nlayers=4,
++        sample_size=1024,
++        token_dim=5120,
++        pad_length=1536,
++        CXG=True
++    )
++    
++    args = parser.parse_args()
++    accelerator = Accelerator(project_dir=args.accelerator_dir)
++    main(args, accelerator)
+\ No newline at end of file
+diff --git a/model.py b/model.py
+new file mode 100644
+index 0000000..dc32f2a
+--- /dev/null
++++ b/model.py
+@@ -0,0 +1,115 @@
++"""
++Model class
++
++"""
++
++import warnings
++warnings.filterwarnings("ignore")
++import math
++from torch import nn, Tensor
++from torch.nn import TransformerEncoder, TransformerEncoderLayer
++
++import sys
++sys.path.append('../')
++from typing import Any
++import torch
++
++
++def full_block(in_features, out_features, p_drop=0.1):
++    return nn.Sequential(
++        nn.Linear(in_features, out_features, bias=True),
++        nn.LayerNorm(out_features),
++        nn.GELU(),
++        nn.Dropout(p=p_drop),
++    )
++
++
++class PositionalEncoding(nn.Module):
++
++    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1536):
++        super().__init__()
++        self.dropout = nn.Dropout(p=dropout)
++
++        position = torch.arange(max_len).unsqueeze(1)
++        div_term = torch.exp \
++            (torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
++        pe = torch.zeros(max_len, 1, d_model)
++        pe[:, 0, 0::2] = torch.sin(position * div_term)
++        pe[:, 0, 1::2] = torch.cos(position * div_term)
++        self.register_buffer('pe', pe)
++
++    def forward(self, x: Tensor) -> Tensor:
++        """
++        Args:
++            x: Tensor, shape [seq_len, batch_size, embedding_dim]
++        """
++        x = x + self.pe[:x.size(0)]
++        return self.dropout(x)
++
++
++class TransformerModel(nn.Module):
++
++    def __init__(self, token_dim: int, d_model: int, nhead: int, d_hid: int,
++                 nlayers: int, output_dim:int, dropout: float = 0.05):
++        super().__init__()
++        self.model_type = 'Transformer'
++        self.pos_encoder = PositionalEncoding(d_model, dropout)
++        self.d_model = d_model
++
++        self.encoder = nn.Sequential(nn.Linear(token_dim, d_model),
++                                     nn.GELU(),
++                                     nn.LayerNorm(d_model))
++
++
++
++        encoder_layers = TransformerEncoderLayer(d_model, nhead, d_hid, dropout)
++        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
++
++
++        self.d_model = d_model
++        self.dropout = dropout
++
++
++        self.decoder = nn.Sequential(full_block(d_model, 1024, self.dropout),
++                                     full_block(1024, output_dim, self.dropout),
++                                     full_block(output_dim, output_dim, self.dropout),
++                                     nn.Linear(output_dim, output_dim)
++                                     )
++
++        self.binary_decoder = nn.Sequential(
++            full_block(output_dim + 1280, 2048, self.dropout),
++            full_block(2048, 512, self.dropout),
++            full_block(512, 128, self.dropout),
++            nn.Linear(128, 1)
++        )
++
++        self.gene_embedding_layer = nn.Sequential(nn.Linear(token_dim, d_model),
++                                                  nn.GELU(),
++                                                  nn.LayerNorm(d_model))
++
++        self.pe_embedding = None
++
++    def forward(self, src: Tensor, mask: Tensor):
++        """
++        Args:
++            src: Tensor, shape [seq_len, batch_size]
++        Returns:
++            output Tensor of shape [seq_len, batch_size, ntoken]
++        """
++        src = self.encoder(src) * math.sqrt(self.d_model)
++        src = self.pos_encoder(src)
++        output = self.transformer_encoder(src, src_key_padding_mask=( 1 -mask))
++        gene_output = self.decoder(output) # batch x seq_len x 128
++        # embedding = torch.mul(gene_output, mask.t().unsqueeze(2)).sum(0) # average over non zero genes
++        # In the new format, the cls token, which is at the 0 index mark, is the output.
++        embedding = gene_output[0, :, :] # select only the CLS token.
++        embedding = nn.functional.normalize(embedding, dim=1) # Normalize.
++        return gene_output, embedding
++
++
++    def predict(self, cell_embedding, gene_embeddings):
++        gene_embeddings = self.gene_embedding_layer(gene_embeddings)
++        dec = self.binary_decoder \
++            (torch.hstack((cell_embedding, gene_embeddings)))
++        return dec
++
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..ec56c52
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,7 @@
++numpy
++scipy
++pandas
++tqdm
++torch
++scanpy
++accelerator
+\ No newline at end of file
+diff --git a/utils.py b/utils.py
+new file mode 100644
+index 0000000..ad2910e
+--- /dev/null
++++ b/utils.py
+@@ -0,0 +1,66 @@
++"""
++Utils
++
++"""
++
++import warnings
++warnings.filterwarnings("ignore")
++import pandas as pd
++import sys
++import numpy as np
++
++
++def get_shapes_dict(dataset_path):
++    shapes_dict = {}
++    datasets_df = pd.read_csv(dataset_path)
++    sorted_dataset_names = sorted(datasets_df["names"])
++
++    for name in sorted_dataset_names:
++        shapes_dict[name] = (int(datasets_df.set_index("names").loc[name]["num_cells"]), 8000)
++
++    shapes_dict["dev_immune_mouse"] = (443697, 4786)
++    shapes_dict["dev_immune_human"] = (34009, 5566)
++    shapes_dict["intestinal_tract_human"] =  (69668, 5192)
++    shapes_dict["gtex_human"] =  (18511, 7109)
++    shapes_dict["gut_endoderm_mouse"] =  (113043, 6806)
++    shapes_dict["luca"] =  (249591, 7196)
++    shapes_dict.update({
++     "madissoon_novel_lung":(190728, 8000),
++     'flores_cerebellum_human': (20232, 8000),
++     'osuch_gut_human': (272310, 8000),
++     'msk_ovarian_human': (929690, 8000),
++     'htan_vmuc_dis_epi_human': (65084, 8000),
++     'htan_vmuc_val_epi_human': (57564, 8000),
++     'htan_vmuc_non_epi_human': (9099, 8000),
++     'hao_pbmc_3p_human': (161764, 8000),
++     'hao_pbmc_5p_human': (49147, 8000),
++     'gao_tumors_human': (36111, 8000),
++     'swabrick_breast_human': (92427, 8000),
++     'wu_cryo_tumors_human': (105662, 8000),
++     'cell_line_het_human': (53513, 8000),
++     'bi_allen_metastasis_human': (27787, 8000),
++     'zheng68k_human': (68579, 8000),
++     'zheng68k_12k_human': (68579, 12000),
++     'mouse_embryo_ct': (153597, 12000),
++     "regev_gtex_heart": (36574, 8000),
++     "tabula_sapiens_heart": (11505, 8000),
++     "10k_pbmcs":(11990, 12000),
++     "epo_ido":(35834,12000),
++     'tabula_sapiens_kidney': (9641, 8000),
++     'tabula_microcebus_kidney': (14592, 8000),
++     'tabula_muris_kidney': (2781, 8000),
++     'tabula_muris_senis_kidney': (19610, 8000),
++      'immune_human': (33506, 8000)
++                       })
++
++    shapes_dict["zyl_sanes_glaucoma_pig"] = (5901, 6819)
++    shapes_dict["parkinsons_macaF"] = (1062, 5103)
++
++    for row in datasets_df.iterrows():
++        ngenes = row[1].num_genes
++        ncells = row[1].num_cells
++        name = row[1].names
++        if not np.isnan(ngenes):
++            shapes_dict[name] = (int(ncells), int(ngenes))
++
++    return shapes_dict

@@ -1,0 +1,221 @@
+diff --git a/docs/release-notes/0.17.0.md b/docs/release-notes/0.17.0.md
+index fd9c4a533..1a9144c32 100644
+--- a/docs/release-notes/0.17.0.md
++++ b/docs/release-notes/0.17.0.md
+@@ -4,6 +4,8 @@
+ ```
+ * Make the ``lanczos`` SVD breakdown check scale-aware; the previous fixed threshold never triggered in float32. {pr}`755` {smaller}`S Dicks`
+ * Fix {func}`~rapids_singlecell.pp.harmony_integrate` with RMM managed memory by making multi-key clustering arrays optional and allocating them only when needed. {pr}`766` {smaller}`A Holly & S Dicks`
++* Make {func}`~rapids_singlecell.pp.regress_out` numerically robust {pr}`767` {smaller}`S Dicks`
++
+ ```{rubric} Features
+ ```
+ * Split {func}`~rapids_singlecell.gr.calculate_niche` into {func}`~rapids_singlecell.gr.calculate_niche_neighborhood`, {func}`~rapids_singlecell.gr.calculate_niche_utag` and {func}`~rapids_singlecell.gr.calculate_niche_cellcharter`, with ``mask``, ``library_key`` and cross-flavor ``min_niche_size``, following {mod}`squidpy` {pr}`758` {smaller}`S Dicks`
+diff --git a/src/rapids_singlecell/preprocessing/_regress_out.py b/src/rapids_singlecell/preprocessing/_regress_out.py
+index 5d494cc28..8baf60cf0 100644
+--- a/src/rapids_singlecell/preprocessing/_regress_out.py
++++ b/src/rapids_singlecell/preprocessing/_regress_out.py
+@@ -5,6 +5,7 @@
+ 
+ import cupy as cp
+ import dask.array as da
++import numpy as np
+ from anndata import AnnData
+ from cuml.linear_model import LinearRegression
+ from cupyx.scipy import sparse
+@@ -123,15 +124,33 @@ def _regress_out_categorical(X, categorical_series):
+     return X
+ 
+ 
+-def _regress_out_continuous(X, adata, keys, batchsize):
+-    """Regress out continuous variables using linear regression."""
++def _prepare_regressors(adata, keys, *, n_obs, dtype, order):
++    """Build the design matrix ``[1, *keys]`` and its Gram matrix.
++
++    Centring the columns and scaling them to unit length leaves the column
++    space -- and so the result -- unchanged, but keeps ``cond(R.T @ R)`` at
++    O(1) rather than the ~1e11 that covariates on very different scales give,
++    which float32 cannot carry. The Gram matrix is accumulated in float64 too.
++    """
+     dim_regressor = len(keys) + 1
++    regressors = cp.ones((n_obs, dim_regressor), dtype=cp.float64, order=order)
++    for i, key in enumerate(keys):
++        regressors[:, i + 1] = cp.array(adata.obs[key]).ravel()
++    regressors[:, 1:] -= regressors[:, 1:].mean(axis=0)
++    norms = cp.linalg.norm(regressors, axis=0)
++    regressors /= cp.where(norms > 0, norms, 1.0)  # a constant covariate stays 0
++
++    # k gemv calls: cuBLAS is ~20x slower on the (k, n_obs) @ (n_obs, k) gemm
++    cols = [regressors.T @ regressors[:, j] for j in range(dim_regressor)]
++    gram = cp.stack(cols, axis=1)
++    return regressors.astype(dtype, order=order, copy=False), gram
++
+ 
+-    regressors = cp.ones(X.shape[0] * dim_regressor, dtype=X.dtype).reshape(
+-        (X.shape[0], dim_regressor), order="F"
++def _regress_out_continuous(X, adata, keys, batchsize):
++    """Regress out continuous variables using linear regression."""
++    regressors, gram = _prepare_regressors(
++        adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="F"
+     )
+-    for i in range(len(keys)):
+-        regressors[:, i + 1] = cp.array(adata.obs[keys[i]], dtype=X.dtype).ravel()
+ 
+     # Set default batch size based on the number of samples in X
+     DEFAULT_GENE_BATCH = 100
+@@ -141,7 +160,7 @@ def _regress_out_continuous(X, adata, keys, batchsize):
+ 
+     # Validate the choice of "all" batch size
+     if batchsize == "all":
+-        if cp.linalg.det(regressors.T @ regressors) == 0:
++        if np.linalg.det(cp.asnumpy(gram)) == 0:
+             batchsize = DEFAULT_GENE_BATCH
+ 
+     # Do regression
+@@ -150,8 +169,9 @@ def _regress_out_continuous(X, adata, keys, batchsize):
+             X = _sparse_to_dense(X, order="C")
+         else:
+             X = cp.ascontiguousarray(X)
+-        inv_gram_matrix = cp.linalg.inv(regressors.T @ regressors)
+-        coeff = inv_gram_matrix @ (regressors.T @ X)
++        # gram is float64, so the solve is too: it is what keeps near-collinear
++        # covariates from losing the coefficients to float32 rounding
++        coeff = cp.linalg.solve(gram, regressors.T @ X).astype(X.dtype, copy=False)
+         cp.cublas.gemm("N", "N", regressors, coeff, alpha=-1, beta=1, out=X)
+ 
+     else:
+@@ -237,27 +257,25 @@ def _regress_out_continuous_dask(X, adata, keys):
+     dim_regressor = len(keys) + 1
+     n_genes = X.shape[1]
+ 
+-    # Build full regressors array on GPU (use X.dtype, matching non-dask path)
+-    regressors = cp.ones((X.shape[0], dim_regressor), dtype=X.dtype)
+-    for i, key in enumerate(keys):
+-        regressors[:, i + 1] = cp.array(adata.obs[key], dtype=X.dtype).ravel()
++    # Build full regressors array on GPU (matching the non-dask path)
++    regressors, gram = _prepare_regressors(
++        adata, keys, n_obs=X.shape[0], dtype=X.dtype, order="C"
++    )
+ 
+     # Check Gram matrix is invertible
+-    gram = regressors.T @ regressors
+-    if cp.linalg.det(gram) == 0:
++    if np.linalg.det(cp.asnumpy(gram)) == 0:
+         raise ValueError(
+             "The Gram matrix (R^T R) is singular. "
+             "The regressor variables are linearly dependent."
+         )
+ 
+-    inv_gram = cp.linalg.inv(gram)
+-
+     # Build a dask array of regressors aligned with X's row chunks
+     regressors_dask = da.from_array(regressors, chunks=(X.chunks[0], (dim_regressor,)))
+ 
+-    # Phase 1: Compute partial R^T @ X per chunk
++    # Phase 1: Compute partial R^T @ X per chunk, widened so that summing the
++    # blocks does not make the result depend on how X is chunked
+     def _partial_rtx(X_part, R_part):
+-        return (R_part.T @ X_part)[None, ...]  # (1, dim_regressor, n_genes)
++        return (R_part.T @ X_part).astype(cp.float64)[None, ...]
+ 
+     n_blocks = len(X.chunks[0])
+     partial_rtx = da.map_blocks(
+@@ -266,13 +284,13 @@ def _partial_rtx(X_part, R_part):
+         regressors_dask,
+         new_axis=(1,),
+         chunks=((1,) * n_blocks, (dim_regressor,), (n_genes,)),
+-        dtype=X.dtype,
++        dtype=cp.float64,
+         meta=cp.array([]),
+     )
+     global_rtx = partial_rtx.sum(axis=0).compute()
+ 
+-    # Solve for coefficients: coeff = inv(R^T R) @ R^T X
+-    coeff = inv_gram @ global_rtx
++    # Solve the normal equations for the coefficients
++    coeff = cp.linalg.solve(gram, global_rtx).astype(X.dtype, copy=False)
+ 
+     # Phase 2: Subtract R @ coeff per chunk
+     def _subtract_fit(X_part, R_part):
+diff --git a/tests/dask/test_dask_regress_out.py b/tests/dask/test_dask_regress_out.py
+index 8fdcfe1ad..ad73aa529 100644
+--- a/tests/dask/test_dask_regress_out.py
++++ b/tests/dask/test_dask_regress_out.py
+@@ -1,5 +1,7 @@
+ from __future__ import annotations
+ 
++from pathlib import Path
++
+ import cupy as cp
+ import numpy as np
+ import pandas as pd
+@@ -79,6 +81,41 @@ def test_regress_out_continuous_dask(client, data_kind, dtype):
+     cp.testing.assert_allclose(dask_X, ref.X, atol=atol)
+ 
+ 
++@pytest.mark.parametrize("dtype", ["float32", "float64"])
++@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
++def test_regress_out_reproducible_dask(client, data_kind, dtype):
++    import scanpy as sc
++
++    adata = sc.datasets.pbmc68k_reduced()
++    adata = adata.raw.to_adata()[:200, :200].copy()
++    adata.X = adata.X.astype(dtype)
++    if data_kind == "sparse":
++        adata.X = as_sparse_cupy_dask_array(adata.X)
++    else:
++        adata.X = as_dense_cupy_dask_array(adata.X)
++
++    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"])
++
++    # This file was generated for scanpy version 1.10.3
++    tester = np.load(Path(__file__).parent.parent / "_data/regress_test_small.npy")
++    atol = 1e-5 if dtype == "float32" else 1e-7
++    cp.testing.assert_allclose(adata.X.compute(), tester, atol=atol)
++
++
++@pytest.mark.parametrize("data_kind", ["sparse", "dense"])
++def test_regress_out_singular_dask(client, data_kind):
++    """Linearly dependent regressors have to be reported, not inverted anyway."""
++    adata = _make_adata()
++    adata.obs["n_counts_copy"] = adata.obs["n_counts"].to_numpy()
++    if data_kind == "sparse":
++        adata.X = as_sparse_cupy_dask_array(adata.X)
++    else:
++        adata.X = as_dense_cupy_dask_array(adata.X)
++
++    with pytest.raises(ValueError, match="singular"):
++        rsc.pp.regress_out(adata, keys=["n_counts", "n_counts_copy"])
++
++
+ @pytest.mark.parametrize("data_kind", ["sparse", "dense"])
+ def test_regress_out_inplace_false_dask(client, data_kind):
+     adata = _make_adata()
+diff --git a/tests/test_regressout.py b/tests/test_regressout.py
+index 25d543c33..29eb2dc52 100644
+--- a/tests/test_regressout.py
++++ b/tests/test_regressout.py
+@@ -96,6 +96,23 @@ def test_regress_out_categorical(dtype, sparse_format):
+         cp.testing.assert_allclose(adata.X, cp.array(adata_sc.X), atol=1e-7)
+ 
+ 
++@pytest.mark.parametrize("dtype", ["float32", "float64"])
++@pytest.mark.parametrize("batchsize", ["all", 100])
++def test_regress_out_covariate_scale(dtype, batchsize):
++    adata = sc.datasets.pbmc68k_reduced()
++    adata = adata.raw.to_adata()[:200, :200].copy()
++    adata.obs["n_counts"] = adata.obs["n_counts"].to_numpy() * 100
++    rsc.get.anndata_to_GPU(adata)
++    adata.X = adata.X.astype(dtype)
++    rsc.pp.regress_out(adata, keys=["n_counts", "percent_mito"], batchsize=batchsize)
++    # Same reference as test_regress_out_reproducible: scaling changes nothing.
++    tester = np.load(HERE / "_data/regress_test_small.npy")
++    if dtype == "float32":
++        cp.testing.assert_allclose(adata.X, tester, atol=1e-5)
++    else:
++        cp.testing.assert_allclose(adata.X, tester, atol=1e-7)
++
++
+ @pytest.mark.parametrize("dtype", ["float32", "float64"])
+ @pytest.mark.parametrize("batchsize", ["all", 100])
+ def test_regress_out_reproducible(dtype, batchsize):

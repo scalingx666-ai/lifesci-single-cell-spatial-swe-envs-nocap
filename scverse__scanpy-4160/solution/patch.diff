@@ -1,0 +1,552 @@
+diff --git a/docs/api/preprocessing.md b/docs/api/preprocessing.md
+index d8b01cfb41..7cfada2479 100644
+--- a/docs/api/preprocessing.md
++++ b/docs/api/preprocessing.md
+@@ -29,6 +29,7 @@ For visual quality control, see {func}`~scanpy.pl.highest_expr_genes` and
+    pp.log1p
+    pp.pca
+    pp.normalize_total
++   pp.normalize_shifted_clr
+    pp.regress_out
+    pp.scale
+    pp.sample
+diff --git a/docs/conf.py b/docs/conf.py
+index 3bda49a8a2..fc5dac2363 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -171,6 +171,7 @@
+     "pp.highly_variable_genes": (["np", "sp", "da"], ["da[sp[csc]]"]),
+     "pp.log1p": (["np", "sp", "da"], []),
+     "pp.neighbors": (["np", "sp"], []),
++    "pp.normalize_shifted_clr": (["np", "sp", "da"], []),
+     "pp.normalize_total": (["np", "sp[csr]", "da"], []),
+     "pp.pca": (["np", "sp", "da"], ["da[sp[csc]]"]),
+     "pp.regress_out": (["np"], []),
+diff --git a/docs/references.bib b/docs/references.bib
+index aa2261fe7b..0b1453f989 100644
+--- a/docs/references.bib
++++ b/docs/references.bib
+@@ -111,6 +111,16 @@ @article{Blondel2008
+   pages     = {P10008},
+ }
+ 
++@article{Booeshaghi2022,
++  author    = {Booeshaghi, A. Sina and Hallgrímsdóttir, Ingileif B. and Gálvez-Merchán, Ángel and Pachter, Lior},
++  title     = {Normalization for sampled count data},
++  year      = {2026},
++  url       = {https://doi.org/10.1101/2022.05.06.490859},
++  doi       = {10.1101/2022.05.06.490859},
++  publisher = {Cold Spring Harbor Laboratory},
++  journal   = {bioRxiv},
++}
++
+ @article{Burczynski2006,
+   author    = {Burczynski, Michael E. and Peterson, Ron L. and Twine, Natalie C. and Zuberek, Krystyna A. and Brodeur, Brendan J. and Casciotti, Lori and Maganti, Vasu and Reddy, Padma S. and Strahs, Andrew and Immermann, Fred and Spinelli, Walter and Schwertschlag, Ulrich and Slager, Anna M. and Cotreau, Monette M. and Dorner, Andrew J.},
+   title     = {Molecular Classification of Crohn’s Disease and Ulcerative Colitis Patients Using Transcriptional Profiles in Peripheral Blood Mononuclear Cells},
+diff --git a/docs/release-notes/4160.feat.md b/docs/release-notes/4160.feat.md
+new file mode 100644
+index 0000000000..18e3d5f0bb
+--- /dev/null
++++ b/docs/release-notes/4160.feat.md
+@@ -0,0 +1 @@
++Add {func}`scanpy.pp.normalize_shifted_clr` for PFlog shifted centered log-ratio normalization, a variance-stabilizing, depth-invariant and rank-preserving count transform {cite:p}`Booeshaghi2022`. By default, it estimates negative-binomial overdispersion and uses the Anscombe pseudocount. The complete centered result is stored in `X` or the selected layer. Because CLR centering generally maps zeros to non-zero values, the output is dense. {smaller}`R Baber`
+diff --git a/src/scanpy/preprocessing/__init__.py b/src/scanpy/preprocessing/__init__.py
+index 10641e730d..66c5dc7a86 100644
+--- a/src/scanpy/preprocessing/__init__.py
++++ b/src/scanpy/preprocessing/__init__.py
+@@ -9,7 +9,7 @@
+ from ._harmony import harmony_integrate
+ from ._hashsolo import hashsolo
+ from ._highly_variable_genes import highly_variable_genes
+-from ._normalization import normalize_total
++from ._normalization import normalize_shifted_clr, normalize_total
+ from ._pca import pca
+ from ._qc import calculate_qc_metrics
+ from ._recipes import recipe_seurat, recipe_weinreb17, recipe_zheng17
+@@ -37,6 +37,7 @@
+     "highly_variable_genes",
+     "log1p",
+     "neighbors",
++    "normalize_shifted_clr",
+     "normalize_total",
+     "pca",
+     "recipe_seurat",
+diff --git a/src/scanpy/preprocessing/_normalization.py b/src/scanpy/preprocessing/_normalization.py
+index 522f894c85..f12ef7eaa2 100644
+--- a/src/scanpy/preprocessing/_normalization.py
++++ b/src/scanpy/preprocessing/_normalization.py
+@@ -5,13 +5,15 @@
+ 
+ import numba
+ import numpy as np
+-from fast_array_utils import stats
++from fast_array_utils import conv, stats
+ from fast_array_utils.numba import njit
++from fast_array_utils.stats import mean_var
+ 
+ from .. import logging as logg
+ from .._compat import CSBase, CSCBase, CSRBase, DaskArray, warn
+ from .._utils import axis_mul_or_truediv, dematrix, view_to_actual
+ from ..get import _get_arr, _set_obs_rep
++from ._simple import log1p
+ 
+ if TYPE_CHECKING:
+     from anndata import AnnData
+@@ -304,3 +306,172 @@ def normalize_total(  # noqa: PLR0912
+     elif not inplace:
+         return dat
+     return None
++
++
++def _estimate_nb_overdispersion(x: np.ndarray | CSBase | DaskArray) -> float:
++    r"""Estimate the negative-binomial overdispersion :math:`α` from raw counts.
++
++    Fits :math:`\mathrm{Var}_g = μ_g + α \cdot μ_g^2` across genes, where
++    :math:`μ_g` and :math:`\mathrm{Var}_g` are the per-gene mean and (population)
++    variance over cells. The model is linear in :math:`α`, so the ordinary
++    least-squares solution is closed form
++
++    .. math::
++        α = \frac{\sum_g (\mathrm{Var}_g - μ_g) \, μ_g^2}{\sum_g μ_g^4},
++
++    which is exactly the minimizer a non-linear `curve_fit` would converge to,
++    but without the dependency. :func:`~fast_array_utils.stats.mean_var` is
++    dispatched for dense, sparse and dask input alike, so the only dask-specific
++    step is computing the two final scalar sums.
++    """
++    mu, var = mean_var(x, axis=0, correction=0)
++    mu2 = mu**2
++    numerator = np.sum((var - mu) * mu2)
++    denominator = np.sum(mu2 * mu2)
++    if isinstance(x, DaskArray):
++        import dask
++
++        numerator, denominator = dask.compute(numerator, denominator)
++    if denominator == 0.0:
++        msg = (
++            "Cannot estimate overdispersion: every gene has zero mean. "
++            "Pass a positive `alpha` explicitly."
++        )
++        raise ValueError(msg)
++    alpha = float(numerator / denominator)
++    if not alpha > 0:
++        msg = (
++            f"Estimated overdispersion is non-positive (alpha = {alpha}); "
++            "pass a positive `alpha` explicitly."
++        )
++        raise ValueError(msg)
++    return alpha
++
++
++def _normalize_shifted_clr_helper(
++    x: np.ndarray | CSBase | DaskArray,
++    *,
++    alpha: float | None,
++) -> tuple[np.ndarray | DaskArray, np.ndarray | DaskArray]:
++    """Compute the dense PFlog / shifted-CLR matrix and cell depths."""
++    # Keep the depths lazy for dask; `.ravel()` would otherwise materialize them.
++    cell_depths = stats.sum(x, axis=1)
++    if not isinstance(x, DaskArray):
++        cell_depths = np.asarray(cell_depths).ravel()
++
++    if alpha is None:
++        alpha = _estimate_nb_overdispersion(x)
++    elif not alpha > 0:
++        msg = (
++            f"`alpha` must be positive to compute PFlog, got {alpha}. "
++            "The data may be underdispersed."
++        )
++        raise ValueError(msg)
++
++    log_values = log1p(x * (4.0 * float(alpha)))
++
++    row_center = stats.sum(log_values, axis=1) / log_values.shape[1]
++    if not isinstance(row_center, DaskArray):
++        row_center = np.asarray(row_center).ravel()
++    log_values = conv.to_dense(log_values)
++    return log_values - row_center[:, None], cell_depths
++
++
++def normalize_shifted_clr(
++    adata: AnnData,
++    *,
++    alpha: float | None = None,
++    layer: str | None = None,
++    inplace: bool = True,
++    copy: bool = False,
++) -> AnnData | dict[str, np.ndarray | DaskArray] | None:
++    r"""Normalize counts with the shifted centered log-ratio (PFlog) transform.
++
++    If `alpha` is not provided, it is estimated from the input matrix. PFlog is
++    then computed as
++
++    .. math::
++        T(x)_i = \log(1 + 4 α x_i)
++            - \frac{1}{D} \sum_{j=1}^D \log(1 + 4 α x_j),
++
++    which is equivalent to centering
++    :math:`\log(x_i + 1 / (4 α))` because the constant :math:`\log(4 α)`
++    cancels during CLR centering.
++
++    .. array-support:: pp.normalize_shifted_clr
++
++    .. note::
++        CLR centering generally maps zeros to non-zero values, so the resulting
++        matrix is dense even when the input is sparse.
++
++    Parameters
++    ----------
++    adata
++        The annotated data matrix of shape `n_obs` × `n_vars`.
++        Rows correspond to cells and columns to genes.
++    alpha
++        Negative-binomial overdispersion of the dataset (``var = μ + α·μ²``).
++        If `None`, it is estimated from the input matrix. A positive numeric
++        value uses that value directly. PFlog applies
++        ``log1p(4 * alpha * x)`` before CLR centering.
++    layer
++        Layer to normalize instead of `X`.
++    inplace
++        Whether to update `adata` or return a dictionary with the normalized
++        matrix.
++    copy
++        Whether to modify a copied input object. Not compatible with
++        `inplace=False`.
++
++    Returns
++    -------
++    Returns a dictionary with the normalized matrix or updates `adata`, depending
++    on `inplace`.
++
++    Example
++    -------
++    >>> import numpy as np
++    >>> from anndata import AnnData
++    >>> import scanpy as sc
++    >>> adata = AnnData(np.array([[1, 2, 30], [4, 50, 6]], dtype="float32"))
++    >>> sc.pp.normalize_shifted_clr(adata, alpha=0.5)
++    >>> np.allclose(adata.X.sum(axis=1), 0, atol=1e-5)
++    True
++    """
++    if copy:
++        if not inplace:
++            msg = "`copy=True` cannot be used with `inplace=False`."
++            raise ValueError(msg)
++        adata = adata.copy()
++
++    view_to_actual(adata)
++
++    x = _get_arr(adata, layer=layer)
++    if isinstance(x, CSCBase):
++        x = x.tocsr()
++    if not inplace:
++        x = x.copy()
++    if issubclass(x.dtype.type, int | np.integer):
++        x = x.astype(np.float64)
++
++    start = logg.info("normalizing counts per cell via PFlog")
++
++    x, cell_depths = _normalize_shifted_clr_helper(x, alpha=alpha)
++
++    if not isinstance(cell_depths, DaskArray) and not np.all(cell_depths > 0):
++        warn("Some cells have zero counts", UserWarning)
++
++    dat = dict(X=x)
++    if inplace:
++        _set_obs_rep(adata, x, layer=layer)
++
++    logg.info(
++        "    finished ({time_passed})",
++        time=start,
++    )
++
++    if copy:
++        return adata
++    elif not inplace:
++        return dat
++    return None
+diff --git a/tests/test_normalization.py b/tests/test_normalization.py
+index 0cb544a743..9ec0c25c8e 100644
+--- a/tests/test_normalization.py
++++ b/tests/test_normalization.py
+@@ -11,7 +11,11 @@
+ from scipy import sparse
+ 
+ import scanpy as sc
+-from scanpy.preprocessing._normalization import _compute_nnz_median
++from scanpy._compat import CSBase, DaskArray
++from scanpy.preprocessing._normalization import (
++    _compute_nnz_median,
++    _estimate_nb_overdispersion,
++)
+ from testing.scanpy._helpers import (
+     _check_check_values_warnings,
+     check_rep_mutation,
+@@ -20,7 +24,11 @@
+ from testing.scanpy._pytest.marks import needs
+ 
+ # TODO: Add support for sparse-in-dask
+-from testing.scanpy._pytest.params import ARRAY_TYPES, ARRAY_TYPES_DENSE
++from testing.scanpy._pytest.params import (
++    ARRAY_TYPES,
++    ARRAY_TYPES_DENSE,
++    ARRAY_TYPES_MEM,
++)
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable
+@@ -357,3 +365,240 @@ def test_normalize_total_target_sum_ignores_zero_count_cells(array_type):
+     # median of the non-zero row sums (10, 20, 30) is 20, not 15
+     np.testing.assert_allclose(stats.sum(adata.X, axis=1)[1:], 20.0)
+     assert_equal(conv.to_dense(adata.X), conv.to_dense(expected.X))
++
++
++# ------------------------------------------------------------------------------
++# normalize_shifted_clr (PFlog)
++# ------------------------------------------------------------------------------
++
++# A small count matrix with no empty cells, used for the property tests.
++X_clr = np.array(
++    [[5, 0, 3, 2], [1, 1, 0, 4], [0, 7, 2, 1], [3, 3, 3, 3]], dtype="float32"
++)
++
++# Expected values worked out by hand, so they do not depend on the implementation.
++# Estimated alpha: each gene has mean 2 and variance 4, so alpha = (4 - 2) / 2**2
++# = 0.5. Then log1p(4 * 0.5 * [0, 4]) = [0, ln 9], centered on its mean ln 3.
++X_clr_estimated = np.array([[0, 4], [4, 0]], dtype="float32")
++X_clr_estimated_expected = np.log(3) * np.array([[-1.0, 1.0], [1.0, -1.0]])
++# Explicit alpha = 0.25: 4 * alpha = 1, so log1p([0, 1, 3]) = [0, ln 2, 2 ln 2],
++# centered on its mean ln 2.
++X_clr_explicit = np.array([[0, 1, 3]], dtype="float32")
++X_clr_explicit_expected = np.log(2) * np.array([[-1.0, 0.0, 1.0]])
++
++
++def _clr(x, **kwargs) -> np.ndarray:
++    """Run `normalize_shifted_clr` on a count matrix and return the dense result."""
++    adata = AnnData(np.asarray(x, dtype="float32"))
++    sc.pp.normalize_shifted_clr(adata, **kwargs)
++    return to_ndarray(adata.X)
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++@pytest.mark.parametrize("dtype", ["float32", "int64"])
++def test_normalize_shifted_clr_values(array_type, dtype):
++    """Check values with the estimated `alpha` against hand-computed results."""
++    adata = AnnData(array_type(X_clr_estimated).astype(dtype))
++    sc.pp.normalize_shifted_clr(adata)
++    np.testing.assert_allclose(
++        to_ndarray(adata.X), X_clr_estimated_expected, rtol=1e-5, atol=1e-6
++    )
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++def test_normalize_shifted_clr_explicit_alpha(array_type):
++    """Check values with an explicit `alpha` against hand-computed results."""
++    adata = AnnData(array_type(X_clr_explicit))
++    sc.pp.normalize_shifted_clr(adata, alpha=0.25)
++    np.testing.assert_allclose(
++        to_ndarray(adata.X), X_clr_explicit_expected, rtol=1e-5, atol=1e-6
++    )
++
++
++@pytest.mark.parametrize("alpha", [None, 0.5], ids=["estimated", "explicit"])
++def test_normalize_shifted_clr_zero_sum(alpha):
++    """Every cell lies on the zero-sum (Aitchison) hyperplane."""
++    result = _clr(X_clr, alpha=alpha)
++    np.testing.assert_allclose(result.sum(axis=1), 0.0, atol=1e-5)
++    # a cell with equal counts for every gene maps to all zeros
++    np.testing.assert_allclose(result[3], 0.0, atol=1e-6)
++
++
++def test_normalize_shifted_clr_within_cell_rank_order():
++    """Higher counts in a cell give higher values, and equal counts equal values."""
++    result = _clr(X_clr)
++    order = np.argsort(X_clr, axis=1, kind="stable")
++    count_steps = np.diff(np.take_along_axis(X_clr, order, axis=1), axis=1)
++    value_steps = np.diff(np.take_along_axis(result, order, axis=1), axis=1)
++    np.testing.assert_array_equal(np.sign(value_steps), np.sign(count_steps))
++
++
++@pytest.mark.parametrize("axis", [0, 1], ids=["cells", "genes"])
++def test_normalize_shifted_clr_permutation_equivariance(axis):
++    """Reordering cells or genes reorders the output the same way."""
++    perm = np.array([2, 0, 3, 1])
++    np.testing.assert_allclose(
++        _clr(np.take(X_clr, perm, axis=axis)),
++        np.take(_clr(X_clr), perm, axis=axis),
++        atol=1e-6,
++    )
++
++
++def test_normalize_shifted_clr_log_ratio():
++    """With fixed `alpha`, a within-cell log-ratio ignores the other genes' counts."""
++    changed = X_clr.copy()
++    changed[0, 3] = 50
++    result, result_changed = _clr(X_clr, alpha=0.5), _clr(changed, alpha=0.5)
++
++    np.testing.assert_allclose(
++        result_changed[0, 0] - result_changed[0, 2],
++        result[0, 0] - result[0, 2],
++        atol=1e-6,
++    )
++    # other cells are normalized independently
++    np.testing.assert_allclose(result_changed[1:], result[1:], atol=1e-6)
++
++
++def test_normalize_shifted_clr_alpha_scales_with_counts():
++    """Scaling counts by k and `alpha` by 1/k leaves the result unchanged."""
++    k = 3
++    np.testing.assert_allclose(
++        _clr(X_clr * k, alpha=0.5 / k), _clr(X_clr, alpha=0.5), atol=1e-6
++    )
++
++
++@pytest.mark.parametrize("alpha", [0.1, 0.3, 1.0])
++def test_estimate_nb_overdispersion_simulated(alpha):
++    """Recover a known `alpha` from negative-binomial counts."""
++    rng = np.random.default_rng(0)
++    mu = rng.uniform(0.5, 20, size=300)
++    n = 1 / alpha  # numpy's NB has var = mu + mu**2 / n
++    x = rng.negative_binomial(n, n / (n + mu), size=(5000, mu.size))
++    assert _estimate_nb_overdispersion(x.astype(np.float64)) == pytest.approx(
++        alpha, rel=0.05
++    )
++
++
++@pytest.mark.parametrize("alpha", [0.0, -0.5], ids=["zero", "negative"])
++def test_normalize_shifted_clr_nonpositive_alpha_raises(alpha):
++    """Raise for non-positive `alpha`."""
++    adata = AnnData(sparse.csr_matrix(X_clr))  # noqa: TID251
++    with pytest.raises(ValueError, match=r"alpha.*positive"):
++        sc.pp.normalize_shifted_clr(adata, alpha=alpha)
++
++
++def test_normalize_shifted_clr_estimated_alpha_zero_mean_raises():
++    """Alpha cannot be estimated when every gene mean is zero."""
++    adata = AnnData(np.zeros((3, 4), dtype="float32"))
++    with pytest.raises(ValueError, match="Cannot estimate overdispersion"):
++        sc.pp.normalize_shifted_clr(adata)
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++def test_normalize_shifted_clr_zero_cell(array_type):
++    """Keep an empty cell finite and all-zero."""
++    x = X_clr.copy()
++    x[1] = 0  # make the second cell empty
++    adata = AnnData(array_type(x))
++    with pytest.warns(UserWarning, match="Some cells have zero counts"):
++        sc.pp.normalize_shifted_clr(adata)
++    result = to_ndarray(adata.X)
++    assert np.isfinite(result).all()
++    np.testing.assert_allclose(result[1], 0.0, atol=1e-6)
++
++
++def test_normalize_shifted_clr_inplace_false():
++    adata = AnnData(sparse.csr_matrix(X_clr_estimated))  # noqa: TID251
++    x_before = to_ndarray(adata.X).copy()
++    out = sc.pp.normalize_shifted_clr(adata, inplace=False)
++
++    assert isinstance(out, dict)
++    np.testing.assert_allclose(
++        to_ndarray(out["X"]), X_clr_estimated_expected, rtol=1e-5, atol=1e-6
++    )
++    assert set(out) == {"X"}
++    # input is left untouched
++    assert isinstance(adata.X, CSBase)
++    np.testing.assert_array_equal(to_ndarray(adata.X), x_before)
++
++
++def test_normalize_shifted_clr_copy():
++    adata = AnnData(sparse.csr_matrix(X_clr_estimated))  # noqa: TID251
++    returned = sc.pp.normalize_shifted_clr(adata, copy=True)
++
++    assert isinstance(returned, AnnData)
++    assert returned is not adata
++    np.testing.assert_allclose(
++        returned.X, X_clr_estimated_expected, rtol=1e-5, atol=1e-6
++    )
++    # original is left untouched
++    assert isinstance(adata.X, CSBase)
++
++
++def test_normalize_shifted_clr_copy_inplace_error():
++    adata = AnnData(sparse.csr_matrix(X_clr))  # noqa: TID251
++    with pytest.raises(
++        ValueError, match="`copy=True` cannot be used with `inplace=False`"
++    ):
++        sc.pp.normalize_shifted_clr(adata, copy=True, inplace=False)
++
++
++def test_normalize_shifted_clr_layer():
++    """`layer` selects the input layer and leaves `X` untouched."""
++    adata = AnnData(
++        sparse.csr_matrix(X_clr_estimated),  # noqa: TID251
++        layers={"counts": sparse.csr_matrix(X_clr_estimated)},  # noqa: TID251
++    )
++    x_before = to_ndarray(adata.X).copy()
++    sc.pp.normalize_shifted_clr(adata, layer="counts")
++
++    np.testing.assert_array_equal(to_ndarray(adata.X), x_before)
++    np.testing.assert_allclose(
++        adata.layers["counts"], X_clr_estimated_expected, rtol=1e-5, atol=1e-6
++    )
++    assert isinstance(adata.layers["counts"], np.ndarray)
++
++
++def test_normalize_shifted_clr_densifies_sparse_input():
++    adata = AnnData(sparse.csr_matrix(X_clr_estimated))  # noqa: TID251
++    sc.pp.normalize_shifted_clr(adata)
++
++    assert isinstance(adata.X, np.ndarray)
++    np.testing.assert_allclose(adata.X, X_clr_estimated_expected, rtol=1e-5, atol=1e-6)
++
++
++@needs.dask
++@pytest.mark.parametrize(
++    ("x", "alpha", "expected"),
++    [
++        pytest.param(X_clr_estimated, None, X_clr_estimated_expected, id="estimated"),
++        pytest.param(X_clr_explicit, 0.25, X_clr_explicit_expected, id="explicit"),
++    ],
++)
++@pytest.mark.parametrize(
++    "block_type",
++    [np.asarray, sparse.csr_matrix, sparse.csc_matrix],  # noqa: TID251
++    ids=["dense_dask", "csr_dask", "csc_dask"],
++)
++def test_normalize_shifted_clr_dask(block_type, x, alpha, expected):
++    import dask.array as da
++
++    chunks = (1, x.shape[1])  # one cell per chunk
++    x = da.from_array(block_type(x), chunks=chunks, asarray=False)
++    adata = AnnData(x.astype("float32"))
++
++    sc.pp.normalize_shifted_clr(adata, alpha=alpha)
++
++    np.testing.assert_allclose(to_ndarray(adata.X), expected, rtol=1e-5, atol=1e-6)
++    assert isinstance(adata.X, DaskArray)
++    # `np.matrix` subclasses `np.ndarray`, so check exact types, including a real block
++    assert type(adata.X._meta) is np.ndarray
++    assert type(adata.X.blocks[0].compute()) is np.ndarray
++
++
++def test_normalize_shifted_clr_view():
++    adata = AnnData(X_clr.copy())
++    v = adata[:, :]
++    with pytest.warns(UserWarning, match=r"Received a view"):
++        sc.pp.normalize_shifted_clr(v)
++    assert not v.is_view
+diff --git a/tests/test_package_structure.py b/tests/test_package_structure.py
+index 6b2b3a69b8..2783e880d2 100644
+--- a/tests/test_package_structure.py
++++ b/tests/test_package_structure.py
+@@ -102,6 +102,9 @@ class ExpectedSig(TypedDict):
+ copy_sigs["sc.pp.scale"]["first_name"] = "data"
+ copy_sigs["sc.pp.sqrt"]["first_name"] = "data"
+ # other partial exceptions
++copy_sigs["sc.pp.normalize_shifted_clr"]["return_ann"] = (
++    "AnnData | dict[str, np.ndarray | DaskArray] | None"
++)
+ copy_sigs["sc.pp.normalize_total"]["return_ann"] = copy_sigs[
+     "sc.experimental.pp.normalize_pearson_residuals"
+ ]["return_ann"] = "AnnData | dict[str, np.ndarray] | None"

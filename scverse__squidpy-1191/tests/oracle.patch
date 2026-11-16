@@ -1,0 +1,908 @@
+diff --git a/docs/api.md b/docs/api.md
+index a7c1afd94..1bf4fdf92 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -150,4 +150,8 @@ See the {doc}`extensibility guide </extensibility>` for how to implement a custo
+     experimental.tl.calculate_tiling_qc
+     experimental.tl.TilingQCParams
+     experimental.pl.tiling_qc
+-```
+\ No newline at end of file
++    experimental.im.fit_stain_reference
++    experimental.im.apply_stain_normalization
++    experimental.im.StainReference
++    experimental.im.ReinhardParams
++```
+diff --git a/src/squidpy/experimental/im/__init__.py b/src/squidpy/experimental/im/__init__.py
+index 24f7cf6ee..1a661b53a 100644
+--- a/src/squidpy/experimental/im/__init__.py
++++ b/src/squidpy/experimental/im/__init__.py
+@@ -9,13 +9,23 @@
+ from ._make_tiles import make_tiles, make_tiles_from_spots
+ from ._qc_image import qc_image
+ from ._qc_metrics import QCMetric
++from ._stain import (
++    ReinhardParams,
++    StainReference,
++    apply_stain_normalization,
++    fit_stain_reference,
++)
+ 
+ __all__ = [
+     "BackgroundDetectionParams",
+     "FelzenszwalbParams",
+     "QCMetric",
++    "ReinhardParams",
++    "StainReference",
+     "WekaParams",
++    "apply_stain_normalization",
+     "detect_tissue",
++    "fit_stain_reference",
+     "make_tiles",
+     "make_tiles_from_spots",
+     "qc_image",
+diff --git a/src/squidpy/experimental/im/_stain/__init__.py b/src/squidpy/experimental/im/_stain/__init__.py
+index e130474a1..86024e4f8 100644
+--- a/src/squidpy/experimental/im/_stain/__init__.py
++++ b/src/squidpy/experimental/im/_stain/__init__.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from squidpy.experimental.im._stain._constants import (
++    DEFAULT_LUMINOSITY_THRESHOLD,
+     RUDERMAN_LAB_TO_LMS,
+     RUDERMAN_LMS_TO_LAB,
+     RUDERMAN_LMS_TO_RGB,
+@@ -14,18 +15,35 @@
+     rgb_to_sda,
+     sda_to_rgb,
+ )
++from squidpy.experimental.im._stain._mask import luminosity_foreground_mask
++from squidpy.experimental.im._stain._normalize import (
++    apply_stain_normalization,
++    fit_stain_reference,
++)
+ from squidpy.experimental.im._stain._reference import StainMethod, StainReference
++from squidpy.experimental.im._stain._reinhard import (
++    ReinhardParams,
++    apply_reinhard,
++    fit_reinhard,
++)
+ 
+ __all__ = [
++    "DEFAULT_LUMINOSITY_THRESHOLD",
+     "RUDERMAN_LAB_TO_LMS",
+     "RUDERMAN_LMS_TO_LAB",
+     "RUDERMAN_LMS_TO_RGB",
+     "RUDERMAN_RGB_TO_LMS",
+     "RUIFROK_HE",
+     "SDA_SCALE",
++    "ReinhardParams",
+     "StainMethod",
+     "StainReference",
++    "apply_reinhard",
++    "apply_stain_normalization",
++    "fit_reinhard",
++    "fit_stain_reference",
+     "lab_ruderman_to_rgb",
++    "luminosity_foreground_mask",
+     "rgb_to_lab_ruderman",
+     "rgb_to_sda",
+     "sda_to_rgb",
+diff --git a/src/squidpy/experimental/im/_stain/_constants.py b/src/squidpy/experimental/im/_stain/_constants.py
+index ddac2fd45..528ca1741 100644
+--- a/src/squidpy/experimental/im/_stain/_constants.py
++++ b/src/squidpy/experimental/im/_stain/_constants.py
+@@ -49,3 +49,9 @@ def _unit(v: np.ndarray) -> np.ndarray:
+ )
+ RUDERMAN_LMS_TO_LAB: np.ndarray = _DIAG @ _MIX
+ RUDERMAN_LAB_TO_LMS: np.ndarray = np.linalg.inv(RUDERMAN_LMS_TO_LAB)
++
++# Pixels whose Ruderman Lab-L luminosity (normalised to [0, 1]) exceeds this
++# are treated as near-white background and excluded when fitting stain
++# statistics. Semantics follow HistomicsTK's `reinhard` so luminosity
++# thresholds from the H&E literature transfer directly.
++DEFAULT_LUMINOSITY_THRESHOLD: float = 0.8
+diff --git a/src/squidpy/experimental/im/_stain/_mask.py b/src/squidpy/experimental/im/_stain/_mask.py
+new file mode 100644
+index 000000000..87b12e960
+--- /dev/null
++++ b/src/squidpy/experimental/im/_stain/_mask.py
+@@ -0,0 +1,76 @@
++"""Foreground (tissue) masking for stain fitting.
++
++Method-agnostic on purpose: Reinhard fits its channel statistics over tissue
++pixels only, and the Macenko/Vahadane fits added later need the same kind of
++mask. The luminosity variant lives here; the absorbance variant
++(``absorbance_foreground_mask``) is added beside it when decomposition lands,
++both returning the same ``(y, x)`` boolean contract so downstream statistics
++code stays mask-source-agnostic.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import xarray as xr
++
++from squidpy.experimental.im._stain._constants import (
++    RUDERMAN_LMS_TO_LAB,
++    RUDERMAN_RGB_TO_LMS,
++)
++from squidpy.experimental.im._stain._conversion import (
++    _check_channel_dim,
++    rgb_to_lab_ruderman,
++)
++
++
++def _white_luminosity() -> float:
++    """Ruderman Lab-L value of a pure-white pixel.
++
++    L is a positive sum of ``log(LMS + 1)`` and every LMS coefficient is
++    positive, so L is maximised at ``(255, 255, 255)``. Dividing the L
++    channel by this constant maps luminosity into ``[0, 1]`` (black -> 0,
++    white -> 1).
++    """
++    white = np.array([255.0, 255.0, 255.0], dtype=np.float64)
++    log_lms = np.log(white @ RUDERMAN_RGB_TO_LMS.T + 1.0)
++    return float((RUDERMAN_LMS_TO_LAB @ log_lms)[0])
++
++
++_L_WHITE: float = _white_luminosity()
++
++
++def foreground_mask_from_lab(lab: xr.DataArray, threshold: float) -> xr.DataArray:
++    """Tissue mask from an already-computed Ruderman Lab image.
++
++    Lets callers that have converted to Lab already (the fit/apply paths)
++    derive the mask without a second RGB->Lab conversion: both the mask and
++    the channel statistics then read from the same lazy ``lab`` graph, so
++    dask materialises the conversion once.
++    """
++    luminosity = lab.isel(c=0, drop=True) / _L_WHITE
++    return luminosity <= threshold
++
++
++def luminosity_foreground_mask(rgb: xr.DataArray, threshold: float) -> xr.DataArray:
++    """Boolean tissue mask from normalised Ruderman Lab luminosity.
++
++    Pixels darker than ``threshold`` are tissue; brighter (near-white)
++    pixels are background and excluded from stain-statistic fitting.
++
++    Parameters
++    ----------
++    rgb
++        Image with a ``"c"`` dimension of length 3. May be numpy- or
++        dask-backed; the operation stays lazy.
++    threshold
++        Cutoff on normalised luminosity in ``[0, 1]``. Pixels with
++        luminosity ``<= threshold`` are tissue. Semantics follow
++        HistomicsTK's ``reinhard`` so literature thresholds transfer.
++
++    Returns
++    -------
++    Boolean ``(y, x)`` DataArray: ``True`` = tissue, ``False`` =
++    background. Lazy if and only if ``rgb`` was lazy.
++    """
++    _check_channel_dim(rgb)
++    return foreground_mask_from_lab(rgb_to_lab_ruderman(rgb), threshold)
+diff --git a/src/squidpy/experimental/im/_stain/_normalize.py b/src/squidpy/experimental/im/_stain/_normalize.py
+new file mode 100644
+index 000000000..3178985b6
+--- /dev/null
++++ b/src/squidpy/experimental/im/_stain/_normalize.py
+@@ -0,0 +1,158 @@
++"""Public, ``sdata``-aware entry points for stain normalization.
++
++The single integration boundary for the stain module: the only file that
++reads ``sdata.images[...]``, writes back via :class:`Image2DModel`, and is
++re-exported publicly. Everything it calls is a pure DataArray-layer
++primitive (:mod:`._reinhard`, :mod:`._mask`, :mod:`._conversion`).
++
++Both entry points dispatch on the fitting ``method``. Only ``"reinhard"`` is
++implemented here; ``"macenko"``/``"vahadane"`` raise ``NotImplementedError``
++and are filled in without changing these signatures.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from typing import Any, Literal
++
++import spatialdata as sd
++import xarray as xr
++from spatialdata.models import Image2DModel
++from spatialdata.transformations import get_transformation
++
++from squidpy._utils import _get_scale_factors
++from squidpy.experimental.im._stain._conversion import _check_channel_dim
++from squidpy.experimental.im._stain._reference import StainMethod, StainReference
++from squidpy.experimental.im._stain._reinhard import (
++    ReinhardParams,
++    _resolve_reinhard_params,
++    apply_reinhard,
++    fit_reinhard,
++)
++from squidpy.experimental.im._utils import get_element_data
++
++_DECOMPOSITION_NOT_IMPLEMENTED = "macenko/vahadane decomposition is not yet implemented"
++
++
++def _resolve_image(
++    sdata: sd.SpatialData,
++    image_key: str,
++    scale: str,
++    *,
++    prefer: Literal["coarsest", "finest"],
++) -> xr.DataArray:
++    if image_key not in sdata.images:
++        raise ValueError(f"image_key {image_key!r} not found, valid keys: {list(sdata.images.keys())}")
++    node = sdata.images[image_key]
++    da = get_element_data(node, scale, "image", image_key, prefer=prefer)
++    _check_channel_dim(da)
++    return da
++
++
++def fit_stain_reference(
++    sdata: sd.SpatialData,
++    image_key: str,
++    *,
++    method: StainMethod = "reinhard",
++    scale: str | Literal["auto"] = "auto",
++    method_params: ReinhardParams | Mapping[str, Any] | None = None,
++) -> StainReference:
++    """Fit a stain reference from an image in a :class:`~spatialdata.SpatialData` object.
++
++    Parameters
++    ----------
++    sdata
++        SpatialData object containing the image.
++    image_key
++        Key of the RGB image in ``sdata.images`` to fit on.
++    method
++        Fitting method. Only ``"reinhard"`` is implemented; ``"macenko"`` and
++        ``"vahadane"`` raise :class:`NotImplementedError`.
++    scale
++        Scale level to fit on. ``"auto"`` (default) uses the coarsest level,
++        which is cheap and sufficient for colour statistics.
++    method_params
++        :class:`ReinhardParams` instance, a mapping of its fields, or ``None``
++        for defaults.
++
++    Returns
++    -------
++    The fitted :class:`StainReference`. Nothing is written to ``sdata``.
++    """
++    da = _resolve_image(sdata, image_key, scale, prefer="coarsest")
++    if method == "reinhard":
++        return fit_reinhard(da, _resolve_reinhard_params(method_params))
++    if method in {"macenko", "vahadane"}:
++        raise NotImplementedError(_DECOMPOSITION_NOT_IMPLEMENTED)
++    raise ValueError(f"Unknown method {method!r}; expected one of ['macenko', 'reinhard', 'vahadane'].")
++
++
++def apply_stain_normalization(
++    sdata: sd.SpatialData,
++    image_key: str,
++    reference: StainReference,
++    *,
++    scale: str | Literal["auto"] = "auto",
++    method_params: ReinhardParams | Mapping[str, Any] | None = None,
++    image_key_added: str | None = None,
++) -> xr.DataArray | None:
++    """Normalize an image to a fitted stain reference.
++
++    Parameters
++    ----------
++    sdata
++        SpatialData object containing the source image.
++    image_key
++        Key of the RGB image in ``sdata.images`` to normalize.
++    reference
++        A :class:`StainReference` fitted with :func:`fit_stain_reference`.
++        Dispatch is on ``reference.method``.
++    scale
++        Scale level to normalize. ``"auto"`` (default) uses the finest level
++        so the result is not downsampled; source statistics are reduced
++        lazily so memory stays bounded.
++    method_params
++        :class:`ReinhardParams` instance, a mapping of its fields, or ``None``
++        for defaults.
++    image_key_added
++        If ``None`` (default), return the lazy normalized DataArray and leave
++        ``sdata`` untouched. If given, write the result to
++        ``sdata.images[image_key_added]`` (rebuilding the pyramid for
++        multiscale sources, preserving transforms) and return ``None``.
++        Raises if the key already exists.
++
++    Returns
++    -------
++    The lazy normalized :class:`xarray.DataArray` if ``image_key_added`` is
++    ``None``, otherwise ``None``.
++    """
++    da = _resolve_image(sdata, image_key, scale, prefer="finest")
++    if reference.method == "reinhard":
++        normalized = apply_reinhard(da, reference, _resolve_reinhard_params(method_params))
++    elif reference.method in {"macenko", "vahadane"}:
++        raise NotImplementedError(_DECOMPOSITION_NOT_IMPLEMENTED)
++    else:  # pragma: no cover - StainReference validates method on construction
++        raise ValueError(f"Unknown reference method {reference.method!r}.")
++
++    if image_key_added is None:
++        return normalized
++    if image_key_added in sdata.images:
++        raise ValueError(f"image_key_added={image_key_added!r} already exists in sdata.images.")
++
++    node = sdata.images[image_key]
++    # Reconstruct the element explicitly from the underlying array: parse a
++    # DataArray would carry over the source's transform attr and collide with
++    # the transformations we pass, so we hand it the bare array plus the
++    # dims/channel coords/transforms we want to preserve (the same idiom as
++    # detect_tissue). `_get_scale_factors` returns [] for a single-scale
++    # source; parse needs None there (an empty list builds a degenerate
++    # single-level pyramid).
++    c_coords = normalized.coords["c"].values.tolist() if "c" in normalized.coords else None
++    sdata.images[image_key_added] = Image2DModel.parse(
++        normalized.data,
++        dims=normalized.dims,
++        c_coords=c_coords,
++        transformations=get_transformation(node, get_all=True),
++        scale_factors=_get_scale_factors(node) or None,
++    )
++    return None
+diff --git a/src/squidpy/experimental/im/_stain/_reinhard.py b/src/squidpy/experimental/im/_stain/_reinhard.py
+new file mode 100644
+index 000000000..a3f425c4a
+--- /dev/null
++++ b/src/squidpy/experimental/im/_stain/_reinhard.py
+@@ -0,0 +1,154 @@
++"""Reinhard (2001) colour transfer in Ruderman Lab space.
++
++Pure DataArray layer: every function takes and returns ``xr.DataArray`` (or
++numpy), stays lazy, touches no ``sdata``, and exposes no public surface. The
++thin ``sdata`` wrapper lives in :mod:`._normalize`.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import dataclass, fields
++from typing import Any
++
++import numpy as np
++import xarray as xr
++
++from squidpy.experimental.im._stain._constants import DEFAULT_LUMINOSITY_THRESHOLD
++from squidpy.experimental.im._stain._conversion import (
++    _apply_along_channel,
++    _check_channel_dim,
++    _working_dtype,
++    lab_ruderman_to_rgb,
++    rgb_to_lab_ruderman,
++)
++from squidpy.experimental.im._stain._mask import foreground_mask_from_lab
++from squidpy.experimental.im._stain._reference import StainReference
++
++# Numerical safeguard against divide-by-zero on flat (constant-colour)
++# channels. Not a tuning knob, so kept off the public ReinhardParams surface.
++_SIGMA_FLOOR: float = 1e-6
++
++
++@dataclass(slots=True, frozen=True)
++class ReinhardParams:
++    """Tuning knobs for Reinhard stain normalization.
++
++    Pass an instance (or a ``Mapping`` of field names to values) as
++    ``method_params``. Frozen so validation in ``__post_init__`` cannot be
++    silently bypassed by later mutation.
++    """
++
++    luminosity_threshold: float = DEFAULT_LUMINOSITY_THRESHOLD
++    """Normalised Ruderman Lab-L cutoff in ``(0, 1]``; pixels brighter than this are excluded from the fit."""
++
++    mask_background: bool = True
++    """If ``True``, fit channel statistics over tissue pixels only; if ``False``, use every pixel (vanilla Reinhard)."""
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "luminosity_threshold", float(self.luminosity_threshold))
++        object.__setattr__(self, "mask_background", bool(self.mask_background))
++        if not 0.0 < self.luminosity_threshold <= 1.0:
++            raise ValueError(f"`luminosity_threshold` must be in (0, 1], got {self.luminosity_threshold}.")
++
++
++_REINHARD_DEFAULTS = ReinhardParams()
++_REINHARD_FIELDS = frozenset(f.name for f in fields(ReinhardParams))
++
++
++def _resolve_reinhard_params(method_params: ReinhardParams | Mapping[str, Any] | None) -> ReinhardParams:
++    """Normalise the ``method_params`` argument to a :class:`ReinhardParams` instance."""
++    if method_params is None:
++        return _REINHARD_DEFAULTS
++    if isinstance(method_params, ReinhardParams):
++        return method_params
++    if isinstance(method_params, Mapping):
++        unknown = set(method_params) - _REINHARD_FIELDS
++        if unknown:
++            raise ValueError(
++                f"Unknown `method_params` field(s): {sorted(unknown)}; expected from {sorted(_REINHARD_FIELDS)}."
++            )
++        return ReinhardParams(**method_params)
++    raise TypeError(f"`method_params` must be ReinhardParams, Mapping, or None; got {type(method_params).__name__}.")
++
++
++def _masked_channel_stats(lab: xr.DataArray, mask: xr.DataArray | None) -> tuple[np.ndarray, np.ndarray]:
++    """Per-channel mean and std over the spatial dims, tissue pixels only.
++
++    Lazy: the masked mean and std are bundled into one dataset and computed
++    in a single pass, never materialising the full image. Returns two
++    shape-``(3,)`` float64 arrays in channel order.
++
++    Raises ``ValueError`` if the mask leaves no tissue pixels in any channel
++    (the mean would be NaN), with an actionable message.
++    """
++    masked = lab.where(mask) if mask is not None else lab
++    stats = xr.Dataset(
++        {
++            "mu": masked.mean(dim=("y", "x"), skipna=True),
++            "sigma": masked.std(dim=("y", "x"), skipna=True),
++        }
++    ).compute()
++    mu = np.asarray(stats["mu"].values, dtype=np.float64)
++    sigma = np.asarray(stats["sigma"].values, dtype=np.float64)
++    if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(sigma))):
++        raise ValueError(
++            "Foreground mask leaves zero tissue pixels in at least one channel; "
++            "the luminosity_threshold may be too low or the image may be blank."
++        )
++    return mu, sigma
++
++
++def _transfer_kernel(
++    x: np.ndarray,
++    *,
++    mu_src: np.ndarray,
++    sigma_src: np.ndarray,
++    mu_ref: np.ndarray,
++    sigma_ref: np.ndarray,
++    dtype: np.dtype,
++) -> np.ndarray:
++    x = x.astype(dtype, copy=False)
++    return ((x - mu_src) / sigma_src * sigma_ref + mu_ref).astype(dtype, copy=False)
++
++
++def fit_reinhard(image_rgb: xr.DataArray, params: ReinhardParams) -> StainReference:
++    """Fit Reinhard channel statistics on a reference image.
++
++    Converts to Ruderman Lab, computes per-channel ``mu``/``sigma`` over
++    tissue pixels (or all pixels when ``mask_background=False``), and packs
++    them into a ``StainReference(method="reinhard")``.
++    """
++    _check_channel_dim(image_rgb)
++    lab = rgb_to_lab_ruderman(image_rgb)
++    mask = foreground_mask_from_lab(lab, params.luminosity_threshold) if params.mask_background else None
++    mu, sigma = _masked_channel_stats(lab, mask)
++    return StainReference(method="reinhard", mu=mu, sigma=sigma)
++
++
++def apply_reinhard(image_rgb: xr.DataArray, reference: StainReference, params: ReinhardParams) -> xr.DataArray:
++    """Apply a Reinhard reference to a source image.
++
++    Standardises by the source's own tissue statistics, rescales to the
++    reference statistics, and converts back to RGB. The transform is applied
++    to every pixel (the map is global); only the statistics that define it
++    are tissue-only. Lazy if and only if the input is lazy.
++    """
++    _check_channel_dim(image_rgb)
++    lab = rgb_to_lab_ruderman(image_rgb)
++    mask = foreground_mask_from_lab(lab, params.luminosity_threshold) if params.mask_background else None
++    mu_src, sigma_src = _masked_channel_stats(lab, mask)
++    sigma_src = np.maximum(sigma_src, _SIGMA_FLOOR)
++
++    dtype = _working_dtype(lab)
++    lab_out = _apply_along_channel(
++        lab,
++        _transfer_kernel,
++        out_dtype=dtype,
++        mu_src=mu_src.astype(dtype, copy=False),
++        sigma_src=sigma_src.astype(dtype, copy=False),
++        mu_ref=np.asarray(reference.mu, dtype=dtype),
++        sigma_ref=np.asarray(reference.sigma, dtype=dtype),
++        dtype=dtype,
++    )
++    return lab_ruderman_to_rgb(lab_out)
+diff --git a/src/squidpy/experimental/im/_utils.py b/src/squidpy/experimental/im/_utils.py
+index 11467da49..b58dea1bf 100644
+--- a/src/squidpy/experimental/im/_utils.py
++++ b/src/squidpy/experimental/im/_utils.py
+@@ -102,6 +102,8 @@ def get_element_data(
+     scale: str | Literal["auto"],
+     element_type: str = "element",
+     element_key: str = "",
++    *,
++    prefer: Literal["coarsest", "finest"] = "coarsest",
+ ) -> xr.DataArray:
+     """
+     Extract data array from a spatialdata element (image or label) node.
+@@ -112,11 +114,15 @@ def get_element_data(
+     element_node
+         The element node from sdata.images[key] or sdata.labels[key]
+     scale
+-        Scale level to use, or "auto" for images (picks coarsest).
++        Scale level to use, or "auto" to pick a level according to ``prefer``.
+     element_type
+         Type of element for error messages (e.g., "image", "label").
+     element_key
+         Key of the element for error messages.
++    prefer
++        Which level ``scale="auto"`` resolves to on a multiscale element:
++        ``"coarsest"`` (smallest, cheapest) or ``"finest"`` (full resolution).
++        Ignored for explicit scales and single-scale elements.
+ 
+     Returns
+     -------
+@@ -133,7 +139,7 @@ def _idx(k: str) -> int:
+                 num = "".join(ch for ch in k if ch.isdigit())
+                 return int(num) if num else -1
+ 
+-            chosen = max(available, key=_idx)
++            chosen = min(available, key=_idx) if prefer == "finest" else max(available, key=_idx)
+         elif scale not in available:
+             logger.warning(f"Scale {scale!r} not found. Available: {available}")
+             # Try scale0 as fallback, otherwise use first available
+diff --git a/tests/_images/StainNormalizationVisual_reinhard_before_after.png b/tests/_images/StainNormalizationVisual_reinhard_before_after.png
+new file mode 100644
+index 000000000..e6a5e7940
+Binary files /dev/null and b/tests/_images/StainNormalizationVisual_reinhard_before_after.png differ
+diff --git a/tests/experimental/test_stain_mask.py b/tests/experimental/test_stain_mask.py
+new file mode 100644
+index 000000000..3f87116f0
+--- /dev/null
++++ b/tests/experimental/test_stain_mask.py
+@@ -0,0 +1,45 @@
++from __future__ import annotations
++
++import dask.array as da
++import numpy as np
++import pytest
++import xarray as xr
++
++from squidpy.experimental.im._stain._mask import luminosity_foreground_mask
++
++
++def _rgb_dataarray(values: np.ndarray, *, chunked: bool) -> xr.DataArray:
++    data = da.from_array(values, chunks=(3, 8, 8)) if chunked else values
++    return xr.DataArray(data, dims=("c", "y", "x"))
++
++
++class TestLuminosityForegroundMask:
++    @pytest.mark.parametrize("chunked", [False, True])
++    def test_all_white_is_background(self, chunked: bool) -> None:
++        white = np.full((3, 16, 16), 255.0)
++        mask = luminosity_foreground_mask(_rgb_dataarray(white, chunked=chunked), 0.8)
++        assert mask.dims == ("y", "x")
++        assert not bool(mask.values.any())
++
++    @pytest.mark.parametrize("chunked", [False, True])
++    def test_all_black_is_tissue(self, chunked: bool) -> None:
++        black = np.zeros((3, 16, 16))
++        mask = luminosity_foreground_mask(_rgb_dataarray(black, chunked=chunked), 0.8)
++        assert bool(mask.values.all())
++
++    def test_half_split(self) -> None:
++        values = np.zeros((3, 8, 16))
++        values[:, :, 8:] = 255.0  # right half white
++        mask = luminosity_foreground_mask(_rgb_dataarray(values, chunked=False), 0.8)
++        assert bool(mask.values[:, :8].all())
++        assert not bool(mask.values[:, 8:].any())
++
++    def test_lazy_in_lazy_out(self) -> None:
++        values = np.full((3, 16, 16), 100.0)
++        mask = luminosity_foreground_mask(_rgb_dataarray(values, chunked=True), 0.8)
++        assert isinstance(mask.data, da.Array)
++
++    def test_non_three_channel_raises(self) -> None:
++        values = np.zeros((2, 8, 8))
++        with pytest.raises(ValueError, match="length 3"):
++            luminosity_foreground_mask(xr.DataArray(values, dims=("c", "y", "x")), 0.8)
+diff --git a/tests/experimental/test_stain_normalize.py b/tests/experimental/test_stain_normalize.py
+new file mode 100644
+index 000000000..e8aaa6e55
+--- /dev/null
++++ b/tests/experimental/test_stain_normalize.py
+@@ -0,0 +1,152 @@
++from __future__ import annotations
++
++import dask.array as da
++import matplotlib.pyplot as plt
++import numpy as np
++import pytest
++import spatialdata as sd
++import spatialdata_plot as sdp
++import xarray as xr
++from spatialdata.models import Image2DModel
++from spatialdata.transformations import Scale, get_transformation, set_transformation
++
++import squidpy as sq
++from squidpy.experimental.im import (
++    ReinhardParams,
++    StainReference,
++    apply_stain_normalization,
++    fit_stain_reference,
++)
++from squidpy.experimental.im._utils import get_element_data
++from tests.conftest import PlotTester, PlotTesterMeta
++
++_ = sdp  # registers the `.pl` spatialdata accessor
++
++
++def _make_sdata(values: np.ndarray, *, scale_factors: list[int] | None = None) -> sd.SpatialData:
++    img = Image2DModel.parse(values, dims=("c", "y", "x"), scale_factors=scale_factors)
++    return sd.SpatialData(images={"img": img})
++
++
++@pytest.fixture
++def rgb_values() -> np.ndarray:
++    rng = np.random.default_rng(3)
++    return rng.uniform(40.0, 200.0, size=(3, 64, 64)).astype(np.float32)
++
++
++class TestFitStainReference:
++    def test_end_to_end(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        ref = fit_stain_reference(sdata, "img")
++        assert isinstance(ref, StainReference)
++        assert ref.method == "reinhard"
++
++    def test_missing_image_key_raises(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        with pytest.raises(ValueError, match="not found, valid keys"):
++            fit_stain_reference(sdata, "nope")
++
++    def test_macenko_not_implemented(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        with pytest.raises(NotImplementedError, match="decomposition is not yet implemented"):
++            fit_stain_reference(sdata, "img", method="macenko")
++
++    def test_unknown_method_raises(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        with pytest.raises(ValueError, match="Unknown method"):
++            fit_stain_reference(sdata, "img", method="bogus")
++
++
++class TestApplyStainNormalization:
++    def test_returns_lazy_and_leaves_sdata_untouched(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        ref = fit_stain_reference(sdata, "img")
++        out = apply_stain_normalization(sdata, "img", ref)
++        assert isinstance(out, xr.DataArray)
++        assert isinstance(out.data, da.Array)
++        assert list(sdata.images.keys()) == ["img"]
++
++    def test_writes_and_preserves_transform_and_dims(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        ref = fit_stain_reference(sdata, "img")
++        result = apply_stain_normalization(sdata, "img", ref, image_key_added="norm")
++        assert result is None
++        assert "norm" in sdata.images
++        out = sdata.images["norm"]
++        assert out.dims == ("c", "y", "x")
++        assert out.shape == rgb_values.shape
++        assert (
++            get_transformation(out, get_all=True).keys() == get_transformation(sdata.images["img"], get_all=True).keys()
++        )
++
++    def test_multiscale_rebuilds_pyramid(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values, scale_factors=[2])
++        ref = fit_stain_reference(sdata, "img")
++        apply_stain_normalization(sdata, "img", ref, image_key_added="norm")
++        src, out = sdata.images["img"], sdata.images["norm"]
++        assert hasattr(out, "keys")
++        src_shapes = [src[k].image.shape for k in src]
++        out_shapes = [out[k].image.shape for k in out]
++        assert out_shapes == src_shapes
++
++    def test_preserves_channel_coords_and_nonidentity_transform(self, rgb_values: np.ndarray) -> None:
++        img = Image2DModel.parse(rgb_values, dims=("c", "y", "x"), c_coords=["r", "g", "b"])
++        set_transformation(img, Scale([2.0, 2.0], axes=("y", "x")), to_coordinate_system="global")
++        sdata = sd.SpatialData(images={"img": img})
++        ref = fit_stain_reference(sdata, "img")
++        apply_stain_normalization(sdata, "img", ref, image_key_added="norm")
++        out = sdata.images["norm"]
++        assert list(out.coords["c"].values) == ["r", "g", "b"]
++        assert get_transformation(out, get_all=True) == get_transformation(img, get_all=True)
++
++    def test_existing_key_raises(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        ref = fit_stain_reference(sdata, "img")
++        with pytest.raises(ValueError, match="already exists"):
++            apply_stain_normalization(sdata, "img", ref, image_key_added="img")
++
++    def test_decomposition_reference_not_implemented(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        ref = StainReference(
++            method="macenko",
++            stain_matrix=np.eye(3),
++            background_intensity=np.array([255.0, 255.0, 255.0]),
++        )
++        with pytest.raises(NotImplementedError, match="decomposition is not yet implemented"):
++            apply_stain_normalization(sdata, "img", ref)
++
++    def test_method_params_mapping(self, rgb_values: np.ndarray) -> None:
++        sdata = _make_sdata(rgb_values)
++        ref = fit_stain_reference(sdata, "img", method_params={"mask_background": False})
++        out = apply_stain_normalization(sdata, "img", ref, method_params=ReinhardParams(mask_background=False))
++        assert isinstance(out, xr.DataArray)
++
++
++class TestStainNormalizationOnHnE:
++    def test_fit_apply_smoke(self, sdata_hne) -> None:
++        image_key = next(iter(sdata_hne.images))
++        ref = sq.experimental.im.fit_stain_reference(sdata_hne, image_key)
++        assert ref.method == "reinhard"
++        out = sq.experimental.im.apply_stain_normalization(sdata_hne, image_key, ref)
++        assert "c" in out.dims
++        assert out.sizes["c"] == 3
++
++
++class TestStainNormalizationVisual(PlotTester, metaclass=PlotTesterMeta):
++    def test_plot_reinhard_before_after(self, sdata_hne) -> None:
++        """Visual: a re-stained source (left) normalized back to the H&E reference (right)."""
++        image_key = next(iter(sdata_hne.images))
++        reference = fit_stain_reference(sdata_hne, image_key)
++
++        # Deterministically warm/cool the channels to simulate a different
++        # staining batch, so the before/after panels are visibly distinct.
++        da_rgb = get_element_data(sdata_hne.images[image_key], "auto", "image", image_key).astype("float32")
++        weights = xr.DataArray([1.4, 1.0, 0.6], dims="c", coords={"c": da_rgb.coords["c"]})
++        shifted = (da_rgb * weights).clip(0, 255)
++        sdata_hne.images["hne_shifted"] = Image2DModel.parse(shifted.data, dims=shifted.dims)
++
++        apply_stain_normalization(sdata_hne, "hne_shifted", reference, image_key_added="hne_normalized")
++
++        _, axes = plt.subplots(1, 2, figsize=(8, 4))
++        sdata_hne.pl.render_images("hne_shifted").pl.show(ax=axes[0], title="before")
++        sdata_hne.pl.render_images("hne_normalized").pl.show(ax=axes[1], title="after")
+diff --git a/tests/experimental/test_stain_reinhard.py b/tests/experimental/test_stain_reinhard.py
+new file mode 100644
+index 000000000..169c24fe8
+--- /dev/null
++++ b/tests/experimental/test_stain_reinhard.py
+@@ -0,0 +1,139 @@
++from __future__ import annotations
++
++import dask.array as da
++import numpy as np
++import pytest
++import xarray as xr
++
++from squidpy.experimental.im._stain._reference import StainReference
++from squidpy.experimental.im._stain._reinhard import (
++    _SIGMA_FLOOR,
++    ReinhardParams,
++    _masked_channel_stats,
++    _resolve_reinhard_params,
++    apply_reinhard,
++    fit_reinhard,
++)
++
++
++def _da(values: np.ndarray, *, chunked: bool) -> xr.DataArray:
++    data = da.from_array(values, chunks=(3, 8, 8)) if chunked else values
++    return xr.DataArray(data, dims=("c", "y", "x"))
++
++
++@pytest.fixture
++def rgb_a() -> np.ndarray:
++    rng = np.random.default_rng(0)
++    return rng.uniform(60.0, 190.0, size=(3, 32, 32))
++
++
++@pytest.fixture
++def rgb_b() -> np.ndarray:
++    rng = np.random.default_rng(1)
++    return rng.uniform(60.0, 190.0, size=(3, 32, 32))
++
++
++class TestMaskedChannelStats:
++    @pytest.mark.parametrize("chunked", [False, True])
++    def test_matches_numpy(self, chunked: bool) -> None:
++        rng = np.random.default_rng(7)
++        values = rng.uniform(0.0, 10.0, size=(3, 16, 16))
++        mask_np = rng.random((16, 16)) > 0.3
++        lab = _da(values, chunked=chunked)
++        mask = xr.DataArray(mask_np, dims=("y", "x"))
++
++        mu, sigma = _masked_channel_stats(lab, mask)
++
++        sel = values[:, mask_np]
++        np.testing.assert_allclose(mu, sel.mean(axis=1), atol=1e-6)
++        np.testing.assert_allclose(sigma, sel.std(axis=1), atol=1e-6)
++
++    def test_numpy_dask_identical(self) -> None:
++        rng = np.random.default_rng(8)
++        values = rng.uniform(0.0, 10.0, size=(3, 16, 16))
++        mu_n, sigma_n = _masked_channel_stats(_da(values, chunked=False), None)
++        mu_d, sigma_d = _masked_channel_stats(_da(values, chunked=True), None)
++        np.testing.assert_allclose(mu_n, mu_d, atol=1e-6)
++        np.testing.assert_allclose(sigma_n, sigma_d, atol=1e-6)
++
++    def test_empty_mask_raises(self) -> None:
++        lab = _da(np.ones((3, 8, 8)), chunked=False)
++        mask = xr.DataArray(np.zeros((8, 8), dtype=bool), dims=("y", "x"))
++        with pytest.raises(ValueError, match="zero tissue pixels"):
++            _masked_channel_stats(lab, mask)
++
++
++class TestFitReinhard:
++    def test_returns_valid_reference(self, rgb_a: np.ndarray) -> None:
++        ref = fit_reinhard(_da(rgb_a, chunked=False), ReinhardParams())
++        assert ref.method == "reinhard"
++        assert ref.mu.shape == (3,)
++        assert ref.sigma.shape == (3,)
++        assert np.all(np.isfinite(ref.mu))
++        assert np.all(ref.sigma > 0)
++
++
++class TestApplyReinhard:
++    def test_idempotent_when_source_is_reference(self, rgb_a: np.ndarray) -> None:
++        params = ReinhardParams()
++        src = _da(rgb_a, chunked=False)
++        ref = fit_reinhard(src, params)
++        out = apply_reinhard(src, ref, params)
++        np.testing.assert_allclose(out.values, rgb_a, atol=1e-4)
++
++    def test_transfer_matches_reference_stats(self, rgb_a: np.ndarray, rgb_b: np.ndarray) -> None:
++        params = ReinhardParams(mask_background=False)
++        ref = fit_reinhard(_da(rgb_a, chunked=False), params)
++        normalized = apply_reinhard(_da(rgb_b, chunked=False), ref, params)
++        refit = fit_reinhard(normalized, params)
++        np.testing.assert_allclose(refit.mu, ref.mu, atol=1e-4)
++        np.testing.assert_allclose(refit.sigma, ref.sigma, atol=1e-4)
++
++    def test_lazy_in_lazy_out(self, rgb_a: np.ndarray, rgb_b: np.ndarray) -> None:
++        params = ReinhardParams()
++        ref = fit_reinhard(_da(rgb_a, chunked=False), params)
++        out = apply_reinhard(_da(rgb_b, chunked=True), ref, params)
++        assert isinstance(out.data, da.Array)
++
++    def test_degenerate_channel_no_nan(self, rgb_a: np.ndarray) -> None:
++        params = ReinhardParams(mask_background=False)
++        ref = fit_reinhard(_da(rgb_a, chunked=False), params)
++        flat = rgb_a.copy()
++        flat[0] = 128.0  # constant channel -> sigma_src == 0
++        out = apply_reinhard(_da(flat, chunked=False), ref, params)
++        assert np.all(np.isfinite(out.values))
++
++    def test_sigma_floor_is_small(self) -> None:
++        assert 0 < _SIGMA_FLOOR < 1e-3
++
++
++class TestResolveReinhardParams:
++    def test_none_returns_defaults(self) -> None:
++        assert _resolve_reinhard_params(None) == ReinhardParams()
++
++    def test_instance_passthrough(self) -> None:
++        p = ReinhardParams(luminosity_threshold=0.5)
++        assert _resolve_reinhard_params(p) is p
++
++    def test_mapping(self) -> None:
++        p = _resolve_reinhard_params({"luminosity_threshold": 0.6, "mask_background": False})
++        assert p.luminosity_threshold == 0.6
++        assert p.mask_background is False
++
++    def test_unknown_key_raises(self) -> None:
++        with pytest.raises(ValueError, match="Unknown `method_params`"):
++            _resolve_reinhard_params({"nope": 1})
++
++    def test_bad_type_raises(self) -> None:
++        with pytest.raises(TypeError, match="must be ReinhardParams"):
++            _resolve_reinhard_params(5)
++
++    @pytest.mark.parametrize("bad", [0.0, -0.1, 1.5])
++    def test_threshold_bounds(self, bad: float) -> None:
++        with pytest.raises(ValueError, match="luminosity_threshold"):
++            ReinhardParams(luminosity_threshold=bad)
++
++
++def test_reference_is_stainreference(rgb_a: np.ndarray) -> None:
++    ref = fit_reinhard(_da(rgb_a, chunked=False), ReinhardParams())
++    assert isinstance(ref, StainReference)

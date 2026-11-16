@@ -1,0 +1,490 @@
+diff --git a/crates/salmon-align/src/bam_rad.rs b/crates/salmon-align/src/bam_rad.rs
+index 9256263b..5ab3930a 100644
+--- a/crates/salmon-align/src/bam_rad.rs
++++ b/crates/salmon-align/src/bam_rad.rs
+@@ -189,7 +189,7 @@ pub fn write_alignment_rad(
+         // Pass A — train the counting error model + FLD + naive-eq (records not
+         // written yet; scores aren't final). Per-worker counting models are
+         // merged by integer add, so the total is partition-independent.
+-        let models = stream_grouped(&opts.bam, nthreads, || {
++        let (models, _) = stream_grouped(&opts.bam, nthreads, || {
+             TrainWorker::new(error_bins, &fld, naive.as_ref(), ref_bytes, discard_orphans)
+         })?;
+         let mut counting = CountingAlignmentModel::new(error_bins);
+@@ -198,14 +198,14 @@ pub fn write_alignment_rad(
+         }
+         let fixed = counting.finalize(ERROR_MODEL_ALPHA);
+         // Pass B — score each placement against the fixed model and write records.
+-        let sums = stream_grouped(&opts.bam, nthreads, || {
++        let (sums, unmapped_reads) = stream_grouped(&opts.bam, nthreads, || {
+             ScoreWriteWorker::new(&writer, ref_bytes, &fixed, discard_orphans)
+         })?;
+         writer.set_score_kind(salmon_rad::SCORE_KIND_LOGWEIGHT);
+-        reduce_summary(sums)
++        reduce_summary(sums, unmapped_reads)
+     } else {
+         // One pass — write records carrying the BAM `AS` score + FLD + naive-eq.
+-        let sums = stream_grouped(&opts.bam, nthreads, || {
++        let (sums, unmapped_reads) = stream_grouped(&opts.bam, nthreads, || {
+             WriteWorker::new(&writer, &fld, naive.as_ref(), discard_orphans)
+         })?;
+         // The scores these records carry are only as good as the tags they came
+@@ -221,7 +221,7 @@ pub fn write_alignment_rad(
+         if let Some(text) = &complaint {
+             tracing::warn!("{text}");
+         }
+-        let mut summary = reduce_summary(plain);
++        let mut summary = reduce_summary(plain, unmapped_reads);
+         summary.score_tag_warning = complaint;
+         summary
+     };
+@@ -361,8 +361,10 @@ impl ScoreTagTally {
+     }
+ }
+ 
+-fn reduce_summary(parts: Vec<(u64, u64)>) -> AlignRadSummary {
+-    let (mut num_processed, mut num_mapped) = (0u64, 0u64);
++/// Sum the workers' (processed, mapped) counts, plus the reads the reader saw
++/// with no mapped record.
++fn reduce_summary(parts: Vec<(u64, u64)>, unmapped_reads: u64) -> AlignRadSummary {
++    let (mut num_processed, mut num_mapped) = (unmapped_reads, 0u64);
+     for (p, m) in parts {
+         num_processed += p;
+         num_mapped += m;
+@@ -780,12 +782,12 @@ impl GroupWorker for ScoreWriteWorker<'_> {
+ 
+ /// Dispatch the grouped pass over SAM or BAM (chosen by extension), mirroring
+ /// [`crate::stream_online_pass`]'s decoder setup, driving one `make_worker()`
+-/// per thread.
++/// per thread. See [`run_grouped`] for what it returns.
+ fn stream_grouped<MK, W>(
+     bam_path: &Path,
+     nthreads: usize,
+     make_worker: MK,
+-) -> Result<Vec<W::Output>>
++) -> Result<(Vec<W::Output>, u64)>
+ where
+     MK: Fn() -> W + Sync + Send,
+     W: GroupWorker,
+@@ -813,13 +815,14 @@ where
+ }
+ 
+ /// One reader thread groups consecutive same-canonical-name records into
+-/// minibatches; a worker pool consumes them. Returns each worker's `finish()`.
++/// minibatches; a worker pool consumes them. Returns each worker's `finish()`,
++/// and the number of reads with no mapped record, which no worker sees.
+ fn run_grouped<R, I, MK, W>(
+     records: I,
+     header: &Header,
+     nthreads: usize,
+     make_worker: MK,
+-) -> Result<Vec<W::Output>>
++) -> Result<(Vec<W::Output>, u64)>
+ where
+     R: sam::alignment::Record + Send + Sync,
+     I: Iterator<Item = std::io::Result<R>> + Send,
+@@ -828,42 +831,29 @@ where
+ {
+     let (tx, rx) = bounded::<Vec<Vec<R>>>(2 * nthreads + 1);
+ 
+-    std::thread::scope(|scope| -> Result<Vec<W::Output>> {
++    std::thread::scope(|scope| -> Result<(Vec<W::Output>, u64)> {
+         // Reader/parser thread: group consecutive same-canonical-name records.
+-        let reader = scope.spawn(move || -> Result<()> {
+-            let mut cur_name: Vec<u8> = Vec::new();
+-            let mut have = false;
+-            let mut group: Vec<R> = Vec::new();
++        let reader = scope.spawn(move || -> Result<u64> {
++            let mut reads = crate::ReadGrouper::new();
+             let mut batch: Vec<Vec<R>> = Vec::with_capacity(MINIBATCH);
+             for result in records {
+                 let rec = result.context("reading alignment record")?;
+-                if rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++                let Some(group) = reads.push(rec) else {
+                     continue;
+-                }
+-                let Some(name) = rec.name() else { continue };
+-                let cname = crate::canonical_name(name.as_ref()).to_vec();
+-                if !have {
+-                    cur_name = cname;
+-                    have = true;
+-                } else if cname != cur_name {
+-                    batch.push(std::mem::take(&mut group));
+-                    cur_name = cname;
+-                    if batch.len() >= MINIBATCH {
+-                        if tx.send(std::mem::take(&mut batch)).is_err() {
+-                            return Ok(()); // all workers gone
+-                        }
+-                        batch = Vec::with_capacity(MINIBATCH);
++                };
++                batch.push(group);
++                if batch.len() >= MINIBATCH {
++                    if tx.send(std::mem::take(&mut batch)).is_err() {
++                        return Ok(reads.unmapped_reads); // all workers gone
+                     }
++                    batch = Vec::with_capacity(MINIBATCH);
+                 }
+-                group.push(rec);
+-            }
+-            if have && !group.is_empty() {
+-                batch.push(group);
+             }
++            batch.extend(reads.finish());
+             if !batch.is_empty() {
+                 let _ = tx.send(batch);
+             }
+-            Ok(())
++            Ok(reads.unmapped_reads)
+         });
+ 
+         // Worker pool.
+@@ -883,7 +873,7 @@ where
+         }
+         drop(rx);
+ 
+-        reader
++        let unmapped_reads = reader
+             .join()
+             .map_err(|_| anyhow::anyhow!("alignment reader thread panicked"))??;
+ 
+@@ -894,6 +884,6 @@ where
+                     .map_err(|_| anyhow::anyhow!("alignment worker thread panicked"))??,
+             );
+         }
+-        Ok(outs)
++        Ok((outs, unmapped_reads))
+     })
+ }
+diff --git a/crates/salmon-align/src/genome_project.rs b/crates/salmon-align/src/genome_project.rs
+index eb48a416..634cffb7 100644
+--- a/crates/salmon-align/src/genome_project.rs
++++ b/crates/salmon-align/src/genome_project.rs
+@@ -633,40 +633,27 @@ where
+     let codec = writer.codec();
+ 
+     std::thread::scope(|scope| -> Result<(u64, u64)> {
+-        let reader = scope.spawn(move || -> Result<()> {
+-            let mut cur_name: Vec<u8> = Vec::new();
+-            let mut have = false;
+-            let mut group: Vec<R> = Vec::new();
++        let reader = scope.spawn(move || -> Result<u64> {
++            let mut reads = crate::ReadGrouper::new();
+             let mut batch: Vec<Vec<R>> = Vec::with_capacity(MINIBATCH);
+             for result in records {
+                 let rec = result.context("reading alignment record")?;
+-                if rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++                let Some(group) = reads.push(rec) else {
+                     continue;
+-                }
+-                let Some(name) = rec.name() else { continue };
+-                let cname = crate::canonical_name(name.as_ref()).to_vec();
+-                if !have {
+-                    cur_name = cname;
+-                    have = true;
+-                } else if cname != cur_name {
+-                    batch.push(std::mem::take(&mut group));
+-                    cur_name = cname;
+-                    if batch.len() >= MINIBATCH {
+-                        if tx.send(std::mem::take(&mut batch)).is_err() {
+-                            return Ok(());
+-                        }
+-                        batch = Vec::with_capacity(MINIBATCH);
++                };
++                batch.push(group);
++                if batch.len() >= MINIBATCH {
++                    if tx.send(std::mem::take(&mut batch)).is_err() {
++                        return Ok(reads.unmapped_reads);
+                     }
++                    batch = Vec::with_capacity(MINIBATCH);
+                 }
+-                group.push(rec);
+-            }
+-            if have && !group.is_empty() {
+-                batch.push(group);
+             }
++            batch.extend(reads.finish());
+             if !batch.is_empty() {
+                 let _ = tx.send(batch);
+             }
+-            Ok(())
++            Ok(reads.unmapped_reads)
+         });
+ 
+         let mut workers = Vec::with_capacity(nthreads);
+@@ -733,11 +720,11 @@ where
+         }
+         drop(rx);
+ 
+-        reader
++        let unmapped_reads = reader
+             .join()
+             .map_err(|_| anyhow::anyhow!("genome-BAM reader thread panicked"))??;
+ 
+-        let mut num_processed = 0u64;
++        let mut num_processed = unmapped_reads;
+         let mut num_mapped = 0u64;
+         for w in workers {
+             let (p, m) = w
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index f4a06f9b..e16680d5 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -839,6 +839,68 @@ fn canonical_name(name: &[u8]) -> &[u8] {
+     }
+ }
+ 
++/// Groups an alignment stream's consecutive records by read, for the reader
++/// threads. Only mapped records are kept: a read with none is counted here and
++/// never reaches the workers, so it costs no more than its decode, and the
++/// minibatches hold the same reads they would without it.
++pub(crate) struct ReadGrouper<R> {
++    name: Vec<u8>,
++    group: Vec<R>,
++    started: bool,
++    /// Reads seen with no mapped record: processed, never mapped.
++    pub(crate) unmapped_reads: u64,
++}
++
++impl<R: sam::alignment::Record> ReadGrouper<R> {
++    pub(crate) fn new() -> Self {
++        Self {
++            name: Vec::new(),
++            group: Vec::new(),
++            started: false,
++            unmapped_reads: 0,
++        }
++    }
++
++    /// Add the next record. Returns the previous read's mapped records when this
++    /// record starts a new read.
++    pub(crate) fn push(&mut self, rec: R) -> Option<Vec<R>> {
++        let name = rec.name()?;
++        let name = canonical_name(name.as_ref());
++        let mut done = None;
++        if !self.started || name != self.name.as_slice() {
++            if self.started {
++                done = self.close();
++            }
++            self.name.clear();
++            self.name.extend_from_slice(name);
++            self.started = true;
++        }
++        if !rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++            self.group.push(rec);
++        }
++        done
++    }
++
++    /// The last read's mapped records, at the end of the stream.
++    pub(crate) fn finish(&mut self) -> Option<Vec<R>> {
++        if self.started {
++            self.started = false;
++            self.close()
++        } else {
++            None
++        }
++    }
++
++    fn close(&mut self) -> Option<Vec<R>> {
++        if self.group.is_empty() {
++            self.unmapped_reads += 1;
++            None
++        } else {
++            Some(std::mem::take(&mut self.group))
++        }
++    }
++}
++
+ /// Map a noodles CIGAR op kind to our `AlnOp`.
+ fn kind_to_op(k: Kind) -> AlnOp {
+     match k {
+@@ -1100,42 +1162,29 @@ where
+ 
+     std::thread::scope(|scope| -> Result<()> {
+         // Reader/parser thread.
+-        let reader = scope.spawn(move || -> Result<()> {
+-            let mut cur_name: Vec<u8> = Vec::new();
+-            let mut have = false;
+-            let mut group: Vec<R> = Vec::new();
++        let reader = scope.spawn(move || -> Result<u64> {
++            let mut reads = ReadGrouper::new();
+             let mut batch: Vec<Vec<R>> = Vec::with_capacity(minibatch);
+             for result in records {
+                 let rec = result.context("reading alignment record")?;
+-                if rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++                let Some(group) = reads.push(rec) else {
+                     continue;
+-                }
+-                let Some(name) = rec.name() else { continue };
+-                let cname = canonical_name(name.as_ref()).to_vec();
+-                if !have {
+-                    cur_name = cname;
+-                    have = true;
+-                } else if cname != cur_name {
+-                    batch.push(std::mem::take(&mut group));
+-                    cur_name = cname;
+-                    if batch.len() >= minibatch {
+-                        let fm = online_reader.map(|o| o.next_log_fm()).unwrap_or(0.0);
+-                        if tx.send((fm, std::mem::take(&mut batch))).is_err() {
+-                            return Ok(()); // all workers gone
+-                        }
+-                        batch = Vec::with_capacity(minibatch);
++                };
++                batch.push(group);
++                if batch.len() >= minibatch {
++                    let fm = online_reader.map(|o| o.next_log_fm()).unwrap_or(0.0);
++                    if tx.send((fm, std::mem::take(&mut batch))).is_err() {
++                        return Ok(reads.unmapped_reads); // all workers gone
+                     }
++                    batch = Vec::with_capacity(minibatch);
+                 }
+-                group.push(rec);
+-            }
+-            if have && !group.is_empty() {
+-                batch.push(group);
+             }
++            batch.extend(reads.finish());
+             if !batch.is_empty() {
+                 let fm = online_reader.map(|o| o.next_log_fm()).unwrap_or(0.0);
+                 let _ = tx.send((fm, batch));
+             }
+-            Ok(())
++            Ok(reads.unmapped_reads)
+         });
+ 
+         // Persistent worker pool: each pulls minibatches until the queue closes.
+@@ -1270,7 +1319,7 @@ where
+         }
+         drop(rx); // workers hold their own clones; lets the queue disconnect
+ 
+-        reader
++        let unmapped_reads = reader
+             .join()
+             .map_err(|_| anyhow::anyhow!("alignment reader thread panicked"))??;
+ 
+@@ -1284,7 +1333,7 @@ where
+             cfg.gc_bins,
+             cfg.pos_bias,
+         );
+-        let mut total = 0u64;
++        let mut total = unmapped_reads;
+         let mut total_mapped = 0u64;
+         let mut total_orphan = 0u64;
+         let mut total_compat = 0u64;
+@@ -1308,9 +1357,9 @@ where
+         acc.seq_obs = merged.seq_obs;
+         acc.gc_obs = merged.gc_obs;
+         acc.pos_obs = merged.pos_obs;
+-        // num_processed = every aligned fragment in the BAM; num_mapped = those
+-        // with a surviving strand-compatible placement (assigned to an eq-class).
+-        // They differ only for stranded libraries; matches reads-mode (#1025).
++        // num_processed = every fragment in the BAM, aligned or not; num_mapped =
++        // those with a surviving strand-compatible placement (assigned to an
++        // eq-class). Matches reads-mode (#1025).
+         acc.num_processed = total;
+         acc.num_mapped = total_mapped;
+         acc.num_orphan = total_orphan;
+@@ -3266,10 +3315,9 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+             .context("writing bias_models.txt")?;
+     }
+     std::fs::create_dir_all(dir.join("logs")).context("creating logs")?;
+-    // In alignment mode the input records are already aligned, so `num_processed`
+-    // is the count of aligned fragments and `num_mapped` is those with a strand-
+-    // compatible placement that were quantified; label them accordingly so a
+-    // <100% rate on a stranded library is not read as lost alignments.
++    // In alignment mode `num_processed` is every fragment in the input, aligned or
++    // not, and `num_mapped` is those with a strand-compatible placement that were
++    // quantified; label them accordingly.
+     // This writer serves every RAD-based driver, so the log must describe the run
+     // the *user* asked for. It used to hard-code "alignment mode" and alignment
+     // wording, so a default reads run — the 2.6.0 default — was labelled as
+@@ -3293,8 +3341,8 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         ("observed fragments", "mapped fragments", "mapping rate")
+     } else {
+         (
+-            "aligned fragments",
+-            "strand-compatible (quantified)",
++            "observed fragments",
++            "aligned and strand-compatible (quantified)",
+             "compatible rate",
+         )
+     };
+diff --git a/crates/salmon-align/tests/stranded_num_mapped.rs b/crates/salmon-align/tests/stranded_num_mapped.rs
+index bc0a5608..f213b4f2 100644
+--- a/crates/salmon-align/tests/stranded_num_mapped.rs
++++ b/crates/salmon-align/tests/stranded_num_mapped.rs
+@@ -295,3 +295,43 @@ fn align_auto_library_type_detects_from_alignments() {
+     let bias = v["strand_mapping_bias"].as_f64().unwrap();
+     assert!((bias - 0.96).abs() < 1e-12, "bias {bias} != 0.96");
+ }
++
++/// Unmapped records (bowtie2's default, STAR's `--outSAMunmapped Within`) are
++/// fragments the aligner saw and could not place, so they count against the
++/// mapping rate. Dropped at the reader, a 25% library reported 100%, on both the
++/// default path and `--online`.
++#[test]
++fn unmapped_fragments_count_against_the_mapping_rate() {
++    let tmp = tempfile::tempdir().unwrap();
++    let path = tmp.path().join("aln.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:unsorted").unwrap();
++    writeln!(f, "@SQ\tSN:tx0\tLN:5000").unwrap();
++    for i in 0..2 {
++        let (l, r) = (1 + i * 400, 201 + i * 400);
++        writeln!(f, "m{i}\t99\ttx0\t{l}\t60\t100M\t=\t{r}\t300\t*\t*").unwrap();
++        writeln!(f, "m{i}\t147\ttx0\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*").unwrap();
++    }
++    for i in 0..6 {
++        writeln!(f, "u{i}\t77\t*\t0\t0\t*\t*\t0\t0\t*\t*").unwrap();
++        writeln!(f, "u{i}\t141\t*\t0\t0\t*\t*\t0\t0\t*\t*").unwrap();
++    }
++    drop(f);
++
++    let online = run(&path, &tmp.path().join("online"), "IU");
++    assert_eq!(
++        (online.num_processed, online.num_mapped),
++        (8, 2),
++        "--online"
++    );
++
++    let mut opts = AlignQuantOptions::new(path, tmp.path().join("rad_out"));
++    opts.lib_type = "IU".to_string();
++    opts.no_error_model = true;
++    let rad = tmp.path().join("a.rad");
++    let summary =
++        salmon_align::write_alignment_rad(&opts, &rad, salmon_rad::ChunkCodec::None).unwrap();
++    assert_eq!((summary.num_processed, summary.num_mapped), (8, 2), "RAD");
++    let res = salmon_align::quantify_rad(&opts, &rad).unwrap();
++    assert_eq!((res.num_processed, res.num_mapped), (8, 2), "requant");
++}
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index 42db8a26..c76b865a 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -1677,7 +1677,7 @@ fn run_deterministic_align(
+         0.0
+     };
+     tracing::info!(
+-        "deterministic: wrote {} / {} aligned fragments ({:.2}%) to the intermediate RAD; quantifying",
++        "deterministic: wrote {} / {} fragments ({:.2}%) to the intermediate RAD; quantifying",
+         summary.num_mapped,
+         summary.num_processed,
+         pct
+@@ -2477,7 +2477,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         // stranded library reads as "strand-incompatible", not "lost alignments".
+         if res.num_processed > res.num_mapped {
+             tracing::info!(
+-                "{} aligned fragments; {} strand-compatible and quantified ({:.2}%); \
++                "{} fragments; {} aligned, strand-compatible and quantified ({:.2}%); \
+                  {} dropped as incompatible with library type {}; {} equivalence classes",
+                 res.num_processed,
+                 res.num_mapped,
+@@ -2488,7 +2488,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             );
+         } else {
+             tracing::info!(
+-                "{} aligned fragments, all strand-compatible and quantified; {} equivalence classes",
++                "{} fragments, all aligned, strand-compatible and quantified; {} equivalence classes",
+                 res.num_processed,
+                 res.num_eq_classes
+             );

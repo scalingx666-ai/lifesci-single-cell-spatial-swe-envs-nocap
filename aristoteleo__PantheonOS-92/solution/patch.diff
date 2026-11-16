@@ -1,0 +1,281 @@
+diff --git a/pantheon/chatroom/room.py b/pantheon/chatroom/room.py
+index ab68dab0c..8c555ac98 100644
+--- a/pantheon/chatroom/room.py
++++ b/pantheon/chatroom/room.py
+@@ -2385,6 +2385,7 @@ async def get_installed_store_packages(self) -> dict:
+             logger.error(f"Error reading store installs: {e}")
+             return {"success": False, "installs": {}, "error": str(e)}
+ 
++    @tool
+     async def reload_settings(self) -> dict:
+         """Reload configuration settings from .env file and settings.json.
+ 
+diff --git a/pantheon/utils/adapters/gemini_adapter.py b/pantheon/utils/adapters/gemini_adapter.py
+index ed8073384..1ead33217 100644
+--- a/pantheon/utils/adapters/gemini_adapter.py
++++ b/pantheon/utils/adapters/gemini_adapter.py
+@@ -390,13 +390,35 @@ async def acompletion(
+                         text = ""
+                         thinking_text = ""
+                         tool_calls_data = []
++                        inline_images: list[dict] = []
+ 
+                         for candidate in data.get("candidates", []):
++                            # Log non-normal finish reasons (SAFETY, RECITATION,
++                            # IMAGE_SAFETY, OTHER) so empty responses from blocked
++                            # generation don't look like silent adapter failures.
++                            fr = candidate.get("finishReason")
++                            if fr and fr not in ("STOP", "MAX_TOKENS", None):
++                                logger.warning(
++                                    f"[gemini] candidate finishReason={fr!r} model={model} — "
++                                    f"response may be truncated or blocked"
++                                )
+                             for part in candidate.get("content", {}).get("parts", []):
+                                 if part.get("thought") and part.get("text"):
+                                     thinking_text += part["text"]
+                                 elif "text" in part and part["text"]:
+                                     text += part["text"]
++                                elif "inlineData" in part or "inline_data" in part:
++                                    # Image (or other binary) output — common for
++                                    # image-generation models (gemini-*-image-*).
++                                    # Wrap as a data URI so downstream code sees
++                                    # the same shape as OpenAI-style image output.
++                                    inline = part.get("inlineData") or part.get("inline_data") or {}
++                                    mime = inline.get("mimeType") or inline.get("mime_type") or "image/png"
++                                    b64 = inline.get("data", "")
++                                    if b64:
++                                        inline_images.append({
++                                            "image_url": {"url": f"data:{mime};base64,{b64}"},
++                                        })
+                                 elif "functionCall" in part:
+                                     fc = part["functionCall"]
+                                     tc_data = {
+@@ -475,6 +497,18 @@ async def acompletion(
+                             }
+                             collected_chunks.append(chunk_dict)
+ 
++                        if inline_images:
++                            collected_chunks.append({
++                                "choices": [{
++                                    "index": 0,
++                                    "delta": {
++                                        "role": "assistant",
++                                        "images": inline_images,
++                                    },
++                                    "finish_reason": None,
++                                }],
++                            })
++
+                         # Extract usage if available
+                         usage = data.get("usageMetadata", {})
+                         if usage:
+diff --git a/pantheon/utils/llm.py b/pantheon/utils/llm.py
+index cc65efcb0..474bd22d0 100644
+--- a/pantheon/utils/llm.py
++++ b/pantheon/utils/llm.py
+@@ -517,6 +517,7 @@ def stream_chunk_builder(chunks: list[dict]) -> Any:
+ 
+     full_content = ""
+     full_reasoning = ""
++    full_images: list = []
+     tool_calls_map: dict[int, dict] = {}  # index → tool_call dict
+     finish_reason = None
+     usage = {}
+@@ -550,6 +551,11 @@ def stream_chunk_builder(chunks: list[dict]) -> Any:
+             elif "reasoning" in delta and delta["reasoning"]:
+                 full_reasoning += delta["reasoning"]
+ 
++            # Accumulate generated images (Gemini image models emit these via
++            # the gemini adapter; downstream image_gen reads message.images).
++            if "images" in delta and delta["images"]:
++                full_images.extend(delta["images"])
++
+             # Accumulate role
+             if "role" in delta and delta["role"]:
+                 role = delta["role"]
+@@ -612,12 +618,15 @@ def stream_chunk_builder(chunks: list[dict]) -> Any:
+         content=effective_content,
+         tool_calls=final_tool_calls,
+         reasoning_content=full_reasoning or None,
++        images=full_images or None,
+     )
+ 
+     def message_model_dump():
+         d = {"role": message.role, "content": message.content, "tool_calls": message.tool_calls}
+         if message.reasoning_content:
+             d["reasoning_content"] = message.reasoning_content
++        if message.images:
++            d["images"] = message.images
+         return d
+     message.model_dump = message_model_dump
+ 
+diff --git a/tests/test_gemini_image_output.py b/tests/test_gemini_image_output.py
+new file mode 100644
+index 000000000..4f7b6afa0
+--- /dev/null
++++ b/tests/test_gemini_image_output.py
+@@ -0,0 +1,164 @@
++"""Regression tests for Gemini image-generation response parsing.
++
++Two bugs made multimodal image generation silently return empty image lists:
++
++1. The Gemini SSE adapter ignored `inlineData` parts in the response — the
++   image bytes were dropped on the floor.
++2. ``stream_chunk_builder`` didn't aggregate per-chunk ``images`` deltas into
++   the final assembled message, so even if (1) were fixed the downstream
++   ImageGenerationToolSet would see ``message.images == None``.
++
++These tests exercise the fixed code paths end-to-end in-process without
++hitting a real Gemini endpoint.
++"""
++
++from __future__ import annotations
++
++from pantheon.utils.llm import stream_chunk_builder
++
++
++_TINY_PNG_B64 = (
++    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABXvMqOgAAAABJRU5ErkJggg=="
++)
++
++
++def test_stream_chunk_builder_aggregates_images_delta():
++    """images deltas emitted by the gemini adapter must land on message.images."""
++    chunks = [
++        {
++            "choices": [{
++                "index": 0,
++                "delta": {
++                    "role": "assistant",
++                    "images": [
++                        {"image_url": {"url": f"data:image/png;base64,{_TINY_PNG_B64}"}},
++                    ],
++                },
++                "finish_reason": None,
++            }],
++        },
++        {
++            "choices": [{
++                "index": 0,
++                "delta": {"content": "Here is the image."},
++                "finish_reason": None,
++            }],
++        },
++        {
++            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
++        },
++    ]
++
++    response = stream_chunk_builder(chunks)
++    msg = response.choices[0].message
++
++    assert msg.content == "Here is the image."
++    assert msg.images is not None
++    assert len(msg.images) == 1
++    assert msg.images[0]["image_url"]["url"].startswith("data:image/png;base64,")
++
++    dumped = msg.model_dump()
++    assert dumped["images"] == msg.images
++
++
++def test_stream_chunk_builder_no_images_leaves_attribute_none():
++    """For text-only streams message.images stays None — not an empty list —
++    so downstream ``or []`` fallbacks keep working."""
++    chunks = [
++        {"choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}]},
++        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
++    ]
++    response = stream_chunk_builder(chunks)
++    assert response.choices[0].message.images is None
++
++
++def test_gemini_adapter_extracts_inline_data_part():
++    """Verify the SSE part parser turns an inlineData part into an images
++    delta. Runs the adapter's stream loop over a fake httpx response body.
++    """
++    import asyncio
++    import json
++    import os
++    from unittest.mock import AsyncMock, MagicMock, patch
++
++    # Two SSE frames: one text part, one inlineData part.
++    sse_frames = [
++        "data: " + json.dumps({
++            "candidates": [{
++                "content": {
++                    "parts": [{"text": "Here you go:"}],
++                },
++                "finishReason": None,
++            }],
++        }),
++        "",
++        "data: " + json.dumps({
++            "candidates": [{
++                "content": {
++                    "parts": [{
++                        "inlineData": {
++                            "mimeType": "image/png",
++                            "data": _TINY_PNG_B64,
++                        },
++                    }],
++                },
++                "finishReason": "STOP",
++            }],
++            "usageMetadata": {
++                "promptTokenCount": 5,
++                "candidatesTokenCount": 2,
++            },
++        }),
++        "",
++    ]
++
++    class _FakeResponse:
++        status_code = 200
++
++        async def aiter_lines(self):
++            for line in sse_frames:
++                yield line
++
++        async def aread(self):
++            return b""
++
++    class _FakeStreamCM:
++        def __init__(self, *_a, **_kw):
++            pass
++
++        async def __aenter__(self):
++            return _FakeResponse()
++
++        async def __aexit__(self, *_a):
++            return False
++
++    class _FakeClientCM:
++        async def __aenter__(self):
++            fake_client = MagicMock()
++            fake_client.stream = _FakeStreamCM
++            return fake_client
++
++        async def __aexit__(self, *_a):
++            return False
++
++    from pantheon.utils.adapters import gemini_adapter as mod
++
++    async def run():
++        with patch.dict(os.environ, {"GEMINI_API_KEY": "dummy"}, clear=False):
++            with patch.object(mod.httpx, "AsyncClient", lambda **_kw: _FakeClientCM()):
++                adapter = mod.GeminiAdapter()
++                chunks = await adapter.acompletion(
++                    messages=[{"role": "user", "content": "make an image"}],
++                    model="gemini-3.1-flash-image-preview",
++                    modalities=["text", "image"],
++                )
++                return chunks
++
++    chunks = asyncio.run(run())
++    response = stream_chunk_builder(chunks)
++    msg = response.choices[0].message
++
++    assert msg.content == "Here you go:"
++    assert msg.images and len(msg.images) == 1
++    url = msg.images[0]["image_url"]["url"]
++    assert url == f"data:image/png;base64,{_TINY_PNG_B64}"

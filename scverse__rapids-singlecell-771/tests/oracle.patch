@@ -1,0 +1,888 @@
+diff --git a/docs/release-notes/0.17.0.md b/docs/release-notes/0.17.0.md
+index 79123e59b..35a6daff2 100644
+--- a/docs/release-notes/0.17.0.md
++++ b/docs/release-notes/0.17.0.md
+@@ -12,6 +12,7 @@
+ 
+ ```{rubric} Features
+ ```
++* Route multi-GPU copies through host memory when P2P validation fails. {pr}`771` {smaller}`S Dicks`
+ * Split {func}`~rapids_singlecell.gr.calculate_niche` into {func}`~rapids_singlecell.gr.calculate_niche_neighborhood`, {func}`~rapids_singlecell.gr.calculate_niche_utag` and {func}`~rapids_singlecell.gr.calculate_niche_cellcharter`, with ``mask``, ``library_key`` and cross-flavor ``min_niche_size``, following {mod}`squidpy` {pr}`758` {smaller}`S Dicks`
+ * Speed up {func}`~rapids_singlecell.pp.harmony_integrate` and make it reproducible by seeding k-means from a deterministic `float64` fit on a bounded, batch-stratified random subsample instead of a non-reproducible `float32` fit over all cells. `dtype` now defaults to `numpy.float32` {pr}`756` {smaller}`S Dicks`
+ * Derive unset {func}`~rapids_singlecell.pp.harmony_integrate` stopping rules from `flavor`: `harmony2` follows Harmony2 defaults, `harmony1` still follows harmony-pytorch {pr}`756` {smaller}`S Dicks`
+diff --git a/src/rapids_singlecell/_utils/__init__.py b/src/rapids_singlecell/_utils/__init__.py
+index 0d7677953..5c50d76b6 100644
+--- a/src/rapids_singlecell/_utils/__init__.py
++++ b/src/rapids_singlecell/_utils/__init__.py
+@@ -9,6 +9,7 @@
+ 
+ from ._multi_gpu import (
+     _calculate_blocks_per_pair,
++    _copy_to_device,
+     _create_category_index_mapping,
+     _get_device_attrs,
+     _split_pairs,
+@@ -17,6 +18,7 @@
+ 
+ __all__ = [
+     "_calculate_blocks_per_pair",
++    "_copy_to_device",
+     "_create_category_index_mapping",
+     "_get_device_attrs",
+     "_split_pairs",
+diff --git a/src/rapids_singlecell/_utils/_multi_gpu.py b/src/rapids_singlecell/_utils/_multi_gpu.py
+index baafd75c6..6e26929b2 100644
+--- a/src/rapids_singlecell/_utils/_multi_gpu.py
++++ b/src/rapids_singlecell/_utils/_multi_gpu.py
+@@ -12,11 +12,73 @@
+ 
+ from __future__ import annotations
+ 
++from functools import cache
++
+ import cupy as cp
++import numpy as np
+ 
+ # Cache for device attributes per device (lazy initialization)
+ _DEVICE_ATTRS_CACHE: dict[int, dict] = {}
+ 
++_CANARY = np.arange(1, 9, dtype=np.float64)
++_CANARY_POISON = -_CANARY
++_CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217
++_CUDA_ERROR_PEER_ACCESS_NOT_ENABLED = 705
++_CUDA_ERROR_TOO_MANY_PEERS = 711
++_PEER_ERRORS = {
++    _CUDA_ERROR_PEER_ACCESS_UNSUPPORTED,
++    _CUDA_ERROR_PEER_ACCESS_NOT_ENABLED,
++    _CUDA_ERROR_TOO_MANY_PEERS,
++}
++
++
++@cache
++def _peer_copy_works(destination: int, source: int) -> bool:
++    """Return whether a peer copy arrives intact."""
++    if destination == source:
++        return True
++    if not cp.cuda.runtime.deviceCanAccessPeer(destination, source):
++        return False
++
++    try:
++        with cp.cuda.Device(source):
++            expected = cp.asarray(_CANARY, blocking=True)
++        with cp.cuda.Device(destination):
++            actual = cp.asarray(_CANARY_POISON, blocking=True)
++            with cp.cuda.Stream(non_blocking=True) as stream:
++                cp.copyto(actual, expected)
++                stream.synchronize()
++            actual = cp.asnumpy(actual)
++    except cp.cuda.runtime.CUDARuntimeError as error:
++        if error.status in _PEER_ERRORS:
++            return False
++        raise
++    return bool(np.array_equal(actual, _CANARY))
++
++
++def _copy_to_device_p2p(array: cp.ndarray, destination: int) -> cp.ndarray:
++    """Copy an array directly to another GPU."""
++    with cp.cuda.Device(destination):
++        return cp.asarray(array)
++
++
++def _copy_to_device_via_host(array: cp.ndarray, destination: int) -> cp.ndarray:
++    """Copy an array to another GPU through host memory."""
++    with cp.cuda.Device(array.device.id):
++        host = array.get(order="A")
++    with cp.cuda.Device(destination):
++        return cp.asarray(host, blocking=True)
++
++
++def _copy_to_device(array: cp.ndarray, destination: int) -> cp.ndarray:
++    """Copy an array using P2P when it works, otherwise through the host."""
++    source = array.device.id
++    if source == destination:
++        return array
++    if _peer_copy_works(destination, source):
++        return _copy_to_device_p2p(array, destination)
++    return _copy_to_device_via_host(array, destination)
++
+ 
+ def parse_device_ids(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
+     """Parse multi_gpu parameter into a list of device IDs.
+diff --git a/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py b/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py
+index 91d6e0b28..53c54bda3 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py
++++ b/src/rapids_singlecell/pertpy_gpu/_metrics/_edistance.py
+@@ -14,6 +14,7 @@
+ from rapids_singlecell._cuda import _edistance_cuda as _ed
+ from rapids_singlecell._utils import (
+     _calculate_blocks_per_pair,
++    _copy_to_device,
+     _split_pairs,
+ )
+ from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
+@@ -771,6 +772,7 @@ def _launch_distance_kernel(
+         group_sizes = cp.diff(cat_offsets).astype(cp.int64)
+ 
+         is_sparse = isinstance(embedding, _CSRData)
++        result_device = cat_offsets.device.id
+ 
+         # Split pairs across devices with load balancing
+         pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
+@@ -793,28 +795,26 @@ def _launch_distance_kernel(
+                 continue
+ 
+             n_chunk_pairs = len(chunk_left)
+-            # cp.asarray is a no-op when the array already lives on the current
+-            # device (the source arrays are on the first device) and copies it
+-            # across otherwise, so the same call handles every device.
++            # Reuse local arrays; route remote copies through P2P or host memory.
+             with cp.cuda.Device(device_id):
+                 streams[device_id] = cp.cuda.Stream(non_blocking=True)
+ 
+                 with streams[device_id]:
+                     data = {
+-                        "off": cp.asarray(cat_offsets),
+-                        "idx": cp.asarray(cell_indices),
+-                        "pair_left": cp.asarray(chunk_left),
+-                        "pair_right": cp.asarray(chunk_right),
++                        "off": _copy_to_device(cat_offsets, device_id),
++                        "idx": _copy_to_device(cell_indices, device_id),
++                        "pair_left": _copy_to_device(chunk_left, device_id),
++                        "pair_right": _copy_to_device(chunk_right, device_id),
+                         "sums": cp.zeros(n_chunk_pairs, dtype=embedding.dtype),
+                         "n_pairs": n_chunk_pairs,
+                         "device_id": device_id,
+                     }
+                     if is_sparse:
+-                        data["data"] = cp.asarray(embedding.data)
+-                        data["indices"] = cp.asarray(embedding.indices)
+-                        data["indptr"] = cp.asarray(embedding.indptr)
++                        data["data"] = _copy_to_device(embedding.data, device_id)
++                        data["indices"] = _copy_to_device(embedding.indices, device_id)
++                        data["indptr"] = _copy_to_device(embedding.indptr, device_id)
+                     else:
+-                        data["emb"] = cp.asarray(embedding)
++                        data["emb"] = _copy_to_device(embedding, device_id)
+                     device_data.append(data)
+ 
+         # Phase 2: Synchronize data transfers, then launch kernels
+@@ -878,12 +878,12 @@ def _launch_distance_kernel(
+                 with cp.cuda.Device(data["device_id"]):
+                     cp.cuda.Stream.null.synchronize()
+ 
+-        # Phase 4: Aggregate on GPU 0
+-        with cp.cuda.Device(device_ids[0]):
++        # Phase 4: Aggregate on the input device
++        with cp.cuda.Device(result_device):
+             total_sums = cp.zeros(n_total_pairs, dtype=embedding.dtype)
+             for i, data in enumerate(device_data):
+                 if data is not None:
+-                    sums = cp.asarray(data["sums"])
++                    sums = _copy_to_device(data["sums"], result_device)
+                     start = chunk_offsets[i]
+                     total_sums[start : start + len(sums)] = sums
+ 
+@@ -1133,8 +1133,8 @@ def _pairwise_means_bootstrap(
+             )
+             all_results.append(pairwise_means.get())
+ 
+-        # Compute statistics on first GPU
+-        with cp.cuda.Device(device_ids[0]):
++        # Compute statistics on the input device
++        with cp.cuda.Device(cat_offsets.device.id):
+             bootstrap_stack = cp.array(all_results)  # [n_bootstrap, k, k]
+             means = cp.mean(bootstrap_stack, axis=0)
+             variances = cp.var(bootstrap_stack, axis=0)
+@@ -1214,8 +1214,8 @@ def _onesided_means_bootstrap(
+             all_cross.append(cross_means.get())
+             all_diag.append(diag_means.get())
+ 
+-        # Compute statistics on first GPU
+-        with cp.cuda.Device(device_ids[0]):
++        # Compute statistics on the input device
++        with cp.cuda.Device(cat_offsets.device.id):
+             cross_stack = cp.array(all_cross)
+             diag_stack = cp.array(all_diag)
+             cross_mean = cp.mean(cross_stack, axis=0)
+diff --git a/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py b/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py
+index a9c856c2f..afd9c0ecf 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py
++++ b/src/rapids_singlecell/pertpy_gpu/_metrics/_wasserstein.py
+@@ -14,6 +14,7 @@
+ import pandas as pd
+ 
+ from rapids_singlecell._cuda import _sinkhorn_cuda as _sk
++from rapids_singlecell._utils import _copy_to_device
+ from rapids_singlecell.squidpy_gpu._utils import _assert_categorical_obs
+ 
+ from ._base_metric import BaseMetric, parse_device_ids
+@@ -346,7 +347,7 @@ def _solve_pairs(
+         plans = _plan_device_batches(n_row, n_col, itemsize, len(device_ids))
+ 
+         out = cp.empty(n_pairs, dtype=dtype)
+-        home = device_ids[0]
++        output_device = out.device.id
+ 
+         # Move the shared inputs to each participating device once.
+         streams: dict[int, cp.cuda.Stream] = {}
+@@ -358,9 +359,9 @@ def _solve_pairs(
+                 streams[dev] = cp.cuda.Stream(non_blocking=True)
+                 with streams[dev]:
+                     inputs[dev] = (
+-                        cp.ascontiguousarray(cp.asarray(embedding)),
+-                        cp.asarray(cat_offsets),
+-                        cp.asarray(cell_indices),
++                        cp.ascontiguousarray(_copy_to_device(embedding, dev)),
++                        _copy_to_device(cat_offsets, dev),
++                        _copy_to_device(cell_indices, dev),
+                     )
+ 
+         # Grow-only per-device cost buffers, reused across rounds (avoids a fresh
+@@ -438,9 +439,11 @@ def _solve_pairs(
+             for u in units:
+                 with cp.cuda.Device(u["dev"]):
+                     u["stream"].synchronize()
+-            with cp.cuda.Device(home):
++            with cp.cuda.Device(output_device):
+                 for u in units:
+-                    out[u["start"] : u["stop"]] = cp.asarray(u["reg"])
++                    out[u["start"] : u["stop"]] = _copy_to_device(
++                        u["reg"], output_device
++                    )
+             for u in units:
+                 with cp.cuda.Device(u["dev"]):
+                     converged = converged and bool(u["state"]["conv"].all().get())
+@@ -477,9 +480,9 @@ def _bootstrap_solve(
+             empty = cp.zeros(0, dtype=dtype)
+             return empty, empty
+         with cp.cuda.Device(device):
+-            emb = cp.ascontiguousarray(cp.asarray(embedding))
+-            offs = cp.asarray(cat_offsets)
+-            cidx = cp.asarray(cell_indices)
++            emb = cp.ascontiguousarray(_copy_to_device(embedding, device))
++            offs = _copy_to_device(cat_offsets, device)
++            cidx = _copy_to_device(cell_indices, device)
+             # Sizes/orientation on the host so the per-chunk build never syncs.
+             co_h = cp.asnumpy(offs)
+             sizes_h = np.diff(co_h)
+@@ -635,6 +638,7 @@ def _to_matrix(flat: cp.ndarray, name: str) -> pd.DataFrame:
+             if pair_left:
+                 il = cp.asarray(pair_left, dtype=cp.intp)
+                 jr = cp.asarray(pair_right, dtype=cp.intp)
++                flat = _copy_to_device(flat, mat.device.id)
+                 mat[il, jr] = flat
+                 mat[jr, il] = flat
+             df = pd.DataFrame(mat.get(), index=groups_list, columns=groups_list)
+diff --git a/src/rapids_singlecell/squidpy_gpu/_co_oc.py b/src/rapids_singlecell/squidpy_gpu/_co_oc.py
+index 7f1b3462e..8d6066549 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_co_oc.py
++++ b/src/rapids_singlecell/squidpy_gpu/_co_oc.py
+@@ -9,6 +9,7 @@
+ from rapids_singlecell._cuda import _cooc_cuda as _co
+ from rapids_singlecell._utils import (
+     _calculate_blocks_per_pair,
++    _copy_to_device,
+     _create_category_index_mapping,
+     _split_pairs,
+     parse_device_ids,
+@@ -322,14 +323,14 @@ def _co_occurrence_gpu(
+                     dev_cat_offsets = cat_offsets
+                     dev_cell_indices = cell_indices
+                 else:
+-                    dev_spatial = cp.asarray(spatial)
+-                    dev_thresholds = cp.asarray(thresholds)
+-                    dev_cat_offsets = cp.asarray(cat_offsets)
+-                    dev_cell_indices = cp.asarray(cell_indices)
++                    dev_spatial = _copy_to_device(spatial, device_id)
++                    dev_thresholds = _copy_to_device(thresholds, device_id)
++                    dev_cat_offsets = _copy_to_device(cat_offsets, device_id)
++                    dev_cell_indices = _copy_to_device(cell_indices, device_id)
+ 
+                 # Copy pair indices to this device
+-                dev_pair_left = cp.asarray(chunk_left)
+-                dev_pair_right = cp.asarray(chunk_right)
++                dev_pair_left = _copy_to_device(chunk_left, device_id)
++                dev_pair_right = _copy_to_device(chunk_right, device_id)
+ 
+                 # Initialize local counts array
+                 dev_counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
+@@ -387,12 +388,11 @@ def _co_occurrence_gpu(
+             with cp.cuda.Device(data["device_id"]):
+                 streams[data["device_id"]].synchronize()
+ 
+-    # Phase 4: Aggregate counts on first device
+-    with cp.cuda.Device(device_ids[0]):
++    # Phase 4: Aggregate counts on the input device
++    with cp.cuda.Device(source_device_id):
+         counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
+         for data in device_data:
+             if data is not None:
+-                dev0_counts = cp.asarray(data["counts"])
+-                counts += dev0_counts
++                counts += _copy_to_device(data["counts"], source_device_id)
+ 
+     return counts, True
+diff --git a/src/rapids_singlecell/squidpy_gpu/_gearysc.py b/src/rapids_singlecell/squidpy_gpu/_gearysc.py
+index 118ef754a..8312b4a2b 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_gearysc.py
++++ b/src/rapids_singlecell/squidpy_gpu/_gearysc.py
+@@ -6,7 +6,7 @@
+ from cupyx.scipy import sparse
+ 
+ from rapids_singlecell._cuda import _autocorr_cuda as _ac
+-from rapids_singlecell._utils import parse_device_ids
++from rapids_singlecell._utils import _copy_to_device, parse_device_ids
+ 
+ from ._utils import _check_precision_issues
+ 
+@@ -86,6 +86,7 @@ def _run_permutations_dense(
+ 
+     # Each device runs perms_per_device iterations
+     perms_per_device = (n_permutations + n_devices - 1) // n_devices
++    source_device = data.device.id
+ 
+     # Phase 1: Create streams and transfer data to all devices
+     for device_id in device_ids:
+@@ -94,21 +95,21 @@ def _run_permutations_dense(
+ 
+             with streams[device_id]:
+                 # Copy data to this device
+-                if device_id == device_ids[0]:
++                if device_id == source_device:
+                     dev_data = data
+                     dev_adj = adj_matrix_cupy
+                     dev_den = den
+                 else:
+-                    dev_data = cp.asarray(data)
++                    dev_data = _copy_to_device(data, device_id)
+                     dev_adj = sparse.csr_matrix(
+                         (
+-                            cp.asarray(adj_matrix_cupy.data),
+-                            cp.asarray(adj_matrix_cupy.indices),
+-                            cp.asarray(adj_matrix_cupy.indptr),
++                            _copy_to_device(adj_matrix_cupy.data, device_id),
++                            _copy_to_device(adj_matrix_cupy.indices, device_id),
++                            _copy_to_device(adj_matrix_cupy.indptr, device_id),
+                         ),
+                         shape=adj_matrix_cupy.shape,
+                     )
+-                    dev_den = cp.asarray(den)
++                    dev_den = _copy_to_device(den, device_id)
+ 
+                 # Allocate output array for this device
+                 dev_perms = cp.zeros((perms_per_device, n_features), dtype=dtype)
+@@ -151,9 +152,9 @@ def _run_permutations_dense(
+             with cp.cuda.Device(dd["device_id"]):
+                 streams[dd["device_id"]].synchronize()
+ 
+-    # Phase 3: Gather results on first device and cut to exact size
+-    with cp.cuda.Device(device_ids[0]):
+-        all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
++    # Phase 3: Gather results on the input device and cut to exact size
++    with cp.cuda.Device(source_device):
++        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
+         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
+ 
+     return gearys_C_permutations
+@@ -246,6 +247,7 @@ def _run_permutations_sparse(
+ 
+     # Each device runs perms_per_device iterations
+     perms_per_device = (n_permutations + n_devices - 1) // n_devices
++    source_device = data.data.device.id
+ 
+     # Phase 1: Create streams and transfer data to all devices
+     for device_id in device_ids:
+@@ -254,28 +256,28 @@ def _run_permutations_sparse(
+ 
+             with streams[device_id]:
+                 # Copy data to this device
+-                if device_id == device_ids[0]:
++                if device_id == source_device:
+                     dev_data = data
+                     dev_adj = adj_matrix_cupy
+                     dev_den = den
+                 else:
+                     dev_data = sparse.csr_matrix(
+                         (
+-                            cp.asarray(data.data),
+-                            cp.asarray(data.indices),
+-                            cp.asarray(data.indptr),
++                            _copy_to_device(data.data, device_id),
++                            _copy_to_device(data.indices, device_id),
++                            _copy_to_device(data.indptr, device_id),
+                         ),
+                         shape=data.shape,
+                     )
+                     dev_adj = sparse.csr_matrix(
+                         (
+-                            cp.asarray(adj_matrix_cupy.data),
+-                            cp.asarray(adj_matrix_cupy.indices),
+-                            cp.asarray(adj_matrix_cupy.indptr),
++                            _copy_to_device(adj_matrix_cupy.data, device_id),
++                            _copy_to_device(adj_matrix_cupy.indices, device_id),
++                            _copy_to_device(adj_matrix_cupy.indptr, device_id),
+                         ),
+                         shape=adj_matrix_cupy.shape,
+                     )
+-                    dev_den = cp.asarray(den)
++                    dev_den = _copy_to_device(den, device_id)
+ 
+                 # Allocate output array for this device
+                 dev_perms = cp.zeros((perms_per_device, n_features), dtype=dtype)
+@@ -320,9 +322,9 @@ def _run_permutations_sparse(
+             with cp.cuda.Device(dd["device_id"]):
+                 streams[dd["device_id"]].synchronize()
+ 
+-    # Phase 3: Gather results on first device and cut to exact size
+-    with cp.cuda.Device(device_ids[0]):
+-        all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
++    # Phase 3: Gather results on the input device and cut to exact size
++    with cp.cuda.Device(source_device):
++        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
+         gearys_C_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
+ 
+     return gearys_C_permutations
+diff --git a/src/rapids_singlecell/squidpy_gpu/_moransi.py b/src/rapids_singlecell/squidpy_gpu/_moransi.py
+index 5c3e6d96a..c05f0b083 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_moransi.py
++++ b/src/rapids_singlecell/squidpy_gpu/_moransi.py
+@@ -6,7 +6,7 @@
+ from cupyx.scipy import sparse
+ 
+ from rapids_singlecell._cuda import _autocorr_cuda as _ac
+-from rapids_singlecell._utils import parse_device_ids
++from rapids_singlecell._utils import _copy_to_device, parse_device_ids
+ 
+ from ._utils import _check_precision_issues
+ 
+@@ -85,6 +85,7 @@ def _run_permutations_dense(
+ 
+     # Each device runs perms_per_device iterations
+     perms_per_device = (n_permutations + n_devices - 1) // n_devices
++    source_device = data_centered_cupy.device.id
+ 
+     # Phase 1: Create streams and transfer data to all devices
+     for device_id in device_ids:
+@@ -93,21 +94,21 @@ def _run_permutations_dense(
+ 
+             with streams[device_id]:
+                 # Copy data to this device
+-                if device_id == device_ids[0]:
++                if device_id == source_device:
+                     dev_data = data_centered_cupy
+                     dev_adj = adj_matrix_cupy
+                     dev_den = den
+                 else:
+-                    dev_data = cp.asarray(data_centered_cupy)
++                    dev_data = _copy_to_device(data_centered_cupy, device_id)
+                     dev_adj = sparse.csr_matrix(
+                         (
+-                            cp.asarray(adj_matrix_cupy.data),
+-                            cp.asarray(adj_matrix_cupy.indices),
+-                            cp.asarray(adj_matrix_cupy.indptr),
++                            _copy_to_device(adj_matrix_cupy.data, device_id),
++                            _copy_to_device(adj_matrix_cupy.indices, device_id),
++                            _copy_to_device(adj_matrix_cupy.indptr, device_id),
+                         ),
+                         shape=adj_matrix_cupy.shape,
+                     )
+-                    dev_den = cp.asarray(den)
++                    dev_den = _copy_to_device(den, device_id)
+ 
+                 # Allocate output array for this device
+                 dev_perms = cp.zeros((perms_per_device, n_features), dtype=dtype)
+@@ -150,9 +151,9 @@ def _run_permutations_dense(
+             with cp.cuda.Device(dd["device_id"]):
+                 streams[dd["device_id"]].synchronize()
+ 
+-    # Phase 3: Gather results on first device and cut to exact size
+-    with cp.cuda.Device(device_ids[0]):
+-        all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
++    # Phase 3: Gather results on the input device and cut to exact size
++    with cp.cuda.Device(source_device):
++        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
+         morans_I_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
+ 
+     return morans_I_permutations
+@@ -246,6 +247,7 @@ def _run_permutations_sparse(
+ 
+     # Each device runs perms_per_device iterations
+     perms_per_device = (n_permutations + n_devices - 1) // n_devices
++    source_device = data.data.device.id
+ 
+     # Phase 1: Create streams and transfer data to all devices
+     for device_id in device_ids:
+@@ -254,7 +256,7 @@ def _run_permutations_sparse(
+ 
+             with streams[device_id]:
+                 # Copy data to this device
+-                if device_id == device_ids[0]:
++                if device_id == source_device:
+                     dev_data = data
+                     dev_adj = adj_matrix_cupy
+                     dev_means = means
+@@ -262,22 +264,22 @@ def _run_permutations_sparse(
+                 else:
+                     dev_data = sparse.csr_matrix(
+                         (
+-                            cp.asarray(data.data),
+-                            cp.asarray(data.indices),
+-                            cp.asarray(data.indptr),
++                            _copy_to_device(data.data, device_id),
++                            _copy_to_device(data.indices, device_id),
++                            _copy_to_device(data.indptr, device_id),
+                         ),
+                         shape=data.shape,
+                     )
+                     dev_adj = sparse.csr_matrix(
+                         (
+-                            cp.asarray(adj_matrix_cupy.data),
+-                            cp.asarray(adj_matrix_cupy.indices),
+-                            cp.asarray(adj_matrix_cupy.indptr),
++                            _copy_to_device(adj_matrix_cupy.data, device_id),
++                            _copy_to_device(adj_matrix_cupy.indices, device_id),
++                            _copy_to_device(adj_matrix_cupy.indptr, device_id),
+                         ),
+                         shape=adj_matrix_cupy.shape,
+                     )
+-                    dev_means = cp.asarray(means)
+-                    dev_den = cp.asarray(den)
++                    dev_means = _copy_to_device(means, device_id)
++                    dev_den = _copy_to_device(den, device_id)
+ 
+                 # Allocate output array for this device
+                 dev_perms = cp.zeros((perms_per_device, n_features), dtype=dtype)
+@@ -324,9 +326,9 @@ def _run_permutations_sparse(
+             with cp.cuda.Device(dd["device_id"]):
+                 streams[dd["device_id"]].synchronize()
+ 
+-    # Phase 3: Gather results on first device and cut to exact size
+-    with cp.cuda.Device(device_ids[0]):
+-        all_perms = [cp.asarray(dd["perms"]) for dd in device_data]
++    # Phase 3: Gather results on the input device and cut to exact size
++    with cp.cuda.Device(source_device):
++        all_perms = [_copy_to_device(dd["perms"], source_device) for dd in device_data]
+         morans_I_permutations = cp.concatenate(all_perms, axis=0)[:n_permutations]
+ 
+     return morans_I_permutations
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py b/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py
+index 6445dc187..63ba6f642 100644
+--- a/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py
+@@ -17,9 +17,7 @@
+ import scipy.sparse as sp
+ 
+ from rapids_singlecell._cuda import _rank_stream_cuda as _rss
+-from rapids_singlecell._utils import parse_device_ids
+-
+-from ._wilcoxon_host import _copy_gpu_array_to_device
++from rapids_singlecell._utils import _copy_to_device, parse_device_ids
+ 
+ if TYPE_CHECKING:
+     from ._core import _RankGenes
+@@ -78,16 +76,16 @@ def _shard_view(X, b0: int, b1: int):
+ 
+ def _sum_to_device(parts: list[cp.ndarray], device_id: int) -> cp.ndarray:
+     with cp.cuda.Device(device_id):
+-        total = _copy_gpu_array_to_device(parts[0], device_id).copy()
++        total = _copy_to_device(parts[0], device_id).copy()
+         for part in parts[1:]:
+-            total += _copy_gpu_array_to_device(part, device_id)
++            total += _copy_to_device(part, device_id)
+         cp.cuda.runtime.deviceSynchronize()
+     return total
+ 
+ 
+ def _concat_to_device(parts: list[cp.ndarray], device_id: int, axis: int) -> cp.ndarray:
+     with cp.cuda.Device(device_id):
+-        local = [_copy_gpu_array_to_device(part, device_id) for part in parts]
++        local = [_copy_to_device(part, device_id) for part in parts]
+         out = cp.concatenate(local, axis=axis)
+         cp.cuda.runtime.deviceSynchronize()
+     return out
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_host.py b/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_host.py
+index d654de97d..49dc917f3 100644
+--- a/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_host.py
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_host.py
+@@ -4,7 +4,6 @@
+ from contextlib import contextmanager
+ from copy import copy
+ from dataclasses import dataclass
+-from functools import cache
+ from typing import TYPE_CHECKING
+ 
+ import cupy as cp
+@@ -13,7 +12,7 @@
+ 
+ from rapids_singlecell._cuda import _wilcoxon_cuda as _wc
+ from rapids_singlecell._cuda import _wilcoxon_sparse_cuda as _wcs
+-from rapids_singlecell._utils import parse_device_ids
++from rapids_singlecell._utils import _copy_to_device, parse_device_ids
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable
+@@ -23,9 +22,6 @@
+     from ._core import _RankGenes
+ 
+ CUDA_HOST_REGISTER_PORTABLE = 1
+-CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217
+-CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED = 704
+-CUDA_ERROR_TOO_MANY_PEERS = 711
+ MIN_SPARSE_GENE_WORK = 1
+ MAX_SPARSE_SPLIT_SAMPLES = 10_000_000
+ SPARSE_SPLIT_SAMPLE_BLOCKS = 32
+@@ -233,52 +229,6 @@ def _concat_shard_stat(workers: list[_RankGenes], name: str) -> NDArray | None:
+     return np.concatenate(arrays, axis=1)
+ 
+ 
+-@cache
+-def _enable_peer_access(device_id: int, source_device: int) -> bool:
+-    """Enable destination-to-source peer access."""
+-    with cp.cuda.Device(device_id):
+-        if not cp.cuda.runtime.deviceCanAccessPeer(device_id, source_device):
+-            return False
+-        try:
+-            cp.cuda.runtime.deviceEnablePeerAccess(source_device)
+-        except cp.cuda.runtime.CUDARuntimeError as error:
+-            if error.status == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED:
+-                return True
+-            if error.status in {
+-                CUDA_ERROR_PEER_ACCESS_UNSUPPORTED,
+-                CUDA_ERROR_TOO_MANY_PEERS,
+-            }:
+-                return False
+-            raise
+-    return True
+-
+-
+-def _copy_gpu_array_to_device(array: cp.ndarray, device_id: int) -> cp.ndarray:
+-    if array.device.id == device_id:
+-        return array
+-    source_device = array.device.id
+-    with cp.cuda.Device(device_id):
+-        copied = cp.empty_like(array)
+-        if array.nbytes == 0:
+-            return copied
+-        if _enable_peer_access(device_id, source_device):
+-            # Do not hide peer-copy errors; they may report earlier async failures.
+-            cp.cuda.runtime.memcpyPeer(
+-                copied.data.ptr,
+-                device_id,
+-                array.data.ptr,
+-                source_device,
+-                array.nbytes,
+-            )
+-            return copied
+-
+-    with cp.cuda.Device(array.device.id):
+-        host = array.get()
+-    with cp.cuda.Device(device_id):
+-        copied.set(host)
+-    return copied
+-
+-
+ def _device_sparse_from_arrays(X, data, indices, indptr, shape):
+     result = type(X)((data, indices, indptr), shape=shape, copy=False)
+     # CuPyX may narrow int64 metadata; restore the validated source dtype.
+@@ -291,9 +241,9 @@ def _device_sparse_from_arrays(X, data, indices, indptr, shape):
+ def _copy_device_sparse_to_device(X, device_id: int):
+     if X.data.device.id == device_id:
+         return X
+-    data = _copy_gpu_array_to_device(X.data, device_id)
+-    indices = _copy_gpu_array_to_device(X.indices, device_id)
+-    indptr = _copy_gpu_array_to_device(X.indptr, device_id)
++    data = _copy_to_device(X.data, device_id)
++    indices = _copy_to_device(X.indices, device_id)
++    indptr = _copy_to_device(X.indptr, device_id)
+     with cp.cuda.Device(device_id):
+         return _device_sparse_from_arrays(X, data, indices, indptr, X.shape)
+ 
+@@ -362,7 +312,7 @@ def _device_column_shard(X, start: int, stop: int, device_id: int):
+             local = _device_csr_column_shard(X, start, stop)
+ 
+     result = (
+-        _copy_gpu_array_to_device(local, device_id)
++        _copy_to_device(local, device_id)
+         if isinstance(local, cp.ndarray)
+         else _copy_device_sparse_to_device(local, device_id)
+     )
+@@ -401,7 +351,7 @@ def _prepare_device_column_shards(X, ranges, device_ids):
+ def _concat_gpu_shards(arrays: list[cp.ndarray], device_id: int) -> cp.ndarray:
+     if len(arrays) == 1:
+         return arrays[0]
+-    local_arrays = [_copy_gpu_array_to_device(array, device_id) for array in arrays]
++    local_arrays = [_copy_to_device(array, device_id) for array in arrays]
+     result = cp.concatenate(local_arrays, axis=1)
+     # Keep peer-copy buffers alive until concatenation finishes.
+     cp.cuda.runtime.deviceSynchronize()
+diff --git a/tests/test_multi_gpu_utils.py b/tests/test_multi_gpu_utils.py
+index 0f85c77b2..19a91604f 100644
+--- a/tests/test_multi_gpu_utils.py
++++ b/tests/test_multi_gpu_utils.py
+@@ -3,8 +3,9 @@
+ from __future__ import annotations
+ 
+ import cupy as cp
++import pytest
+ 
+-from rapids_singlecell._utils import _split_pairs, parse_device_ids
++from rapids_singlecell._utils import _multi_gpu, _split_pairs, parse_device_ids
+ 
+ 
+ class TestSplitPairs:
+@@ -274,3 +275,78 @@ def test_single_gpu_always_device_0(self):
+             assert parse_device_ids(multi_gpu=None) == [0]
+             assert parse_device_ids(multi_gpu=True) == [0]
+             assert parse_device_ids(multi_gpu=False) == [0]
++
++
++class TestDeviceCopy:
++    @pytest.fixture(autouse=True)
++    def _clear_cache(self):
++        _multi_gpu._peer_copy_works.cache_clear()
++        yield
++        _multi_gpu._peer_copy_works.cache_clear()
++
++    def test_check_is_cached_per_direction(self, monkeypatch):
++        checked = []
++
++        def cannot_access(*pair):
++            checked.append(pair)
++            return False
++
++        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", cannot_access)
++        monkeypatch.setattr(
++            cp,
++            "copyto",
++            lambda *_: pytest.fail("a non-P2P pair must not run the canary"),
++        )
++
++        assert not _multi_gpu._peer_copy_works(1, 0)
++        assert not _multi_gpu._peer_copy_works(1, 0)
++        assert not _multi_gpu._peer_copy_works(0, 1)
++        assert checked == [(1, 0), (0, 1)]
++
++    def test_silent_copy_failure_is_detected(self, monkeypatch):
++        if cp.cuda.runtime.getDeviceCount() < 2:
++            pytest.skip("requires two GPUs")
++        monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
++        monkeypatch.setattr(cp, "copyto", lambda *_: None)
++
++        assert not _multi_gpu._peer_copy_works(1, 0)
++
++    @pytest.mark.parametrize(
++        ("works", "selected", "unused"),
++        [
++            (True, "_copy_to_device_p2p", "_copy_to_device_via_host"),
++            (False, "_copy_to_device_via_host", "_copy_to_device_p2p"),
++        ],
++    )
++    def test_copy_route(self, monkeypatch, works, selected, unused):
++        source = cp.arange(4)
++        copied = object()
++        destination = source.device.id + 1
++        monkeypatch.setattr(_multi_gpu, "_peer_copy_works", lambda *_: works)
++        monkeypatch.setattr(_multi_gpu, selected, lambda *_: copied)
++        monkeypatch.setattr(
++            _multi_gpu, unused, lambda *_: pytest.fail("wrong copy route")
++        )
++
++        assert _multi_gpu._copy_to_device(source, destination) is copied
++
++    def test_same_device_returns_original(self, monkeypatch):
++        source = cp.arange(4)
++        monkeypatch.setattr(
++            _multi_gpu,
++            "_peer_copy_works",
++            lambda *_: pytest.fail("same-device copies must not check P2P"),
++        )
++
++        assert _multi_gpu._copy_to_device(source, source.device.id) is source
++
++    def test_host_copy(self):
++        if cp.cuda.runtime.getDeviceCount() < 2:
++            pytest.skip("requires two GPUs")
++        with cp.cuda.Device(0):
++            source = cp.arange(8)
++
++        copied = _multi_gpu._copy_to_device_via_host(source, 1)
++
++        assert copied.device.id == 1
++        assert copied.get().tolist() == list(range(8))
+diff --git a/tests/test_rank_genes_groups_wilcoxon.py b/tests/test_rank_genes_groups_wilcoxon.py
+index ae93b1584..f5220f33a 100644
+--- a/tests/test_rank_genes_groups_wilcoxon.py
++++ b/tests/test_rank_genes_groups_wilcoxon.py
+@@ -2278,72 +2278,6 @@ def _assert_multi_gpu_wilcoxon_equal(actual, expected):
+             )
+ 
+ 
+-@pytest.mark.parametrize(
+-    "peer_case",
+-    [
+-        pytest.param((False, None, False), id="inaccessible"),
+-        pytest.param((True, None, True), id="enabled"),
+-        pytest.param(
+-            (True, _wilcoxon_host.CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED, True),
+-            id="already_enabled",
+-        ),
+-        pytest.param(
+-            (True, _wilcoxon_host.CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, False),
+-            id="unsupported",
+-        ),
+-        pytest.param(
+-            (True, _wilcoxon_host.CUDA_ERROR_TOO_MANY_PEERS, False),
+-            id="too_many_peers",
+-        ),
+-    ],
+-)
+-def test_wilcoxon_enable_peer_access_expected_outcomes(monkeypatch, peer_case):
+-    can_access, error_status, expected = peer_case
+-    calls = {"can_access": 0, "enable": 0}
+-
+-    def device_can_access_peer(device_id, source_device):
+-        calls["can_access"] += 1
+-        return can_access
+-
+-    def device_enable_peer_access(source_device):
+-        calls["enable"] += 1
+-        if error_status is not None:
+-            raise cp.cuda.runtime.CUDARuntimeError(error_status)
+-
+-    monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", device_can_access_peer)
+-    monkeypatch.setattr(
+-        cp.cuda.runtime, "deviceEnablePeerAccess", device_enable_peer_access
+-    )
+-    _wilcoxon_host._enable_peer_access.cache_clear()
+-    try:
+-        assert _wilcoxon_host._enable_peer_access(0, 0) is expected
+-        assert _wilcoxon_host._enable_peer_access(0, 0) is expected
+-    finally:
+-        _wilcoxon_host._enable_peer_access.cache_clear()
+-
+-    assert calls["can_access"] == 1
+-    assert calls["enable"] == int(can_access)
+-
+-
+-def test_wilcoxon_enable_peer_access_reraises_unexpected_error(monkeypatch):
+-    unexpected_status = 999
+-
+-    monkeypatch.setattr(cp.cuda.runtime, "deviceCanAccessPeer", lambda *_: True)
+-
+-    def raise_unexpected(source_device):
+-        raise cp.cuda.runtime.CUDARuntimeError(unexpected_status)
+-
+-    monkeypatch.setattr(cp.cuda.runtime, "deviceEnablePeerAccess", raise_unexpected)
+-    _wilcoxon_host._enable_peer_access.cache_clear()
+-    try:
+-        with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as error:
+-            _wilcoxon_host._enable_peer_access(0, 0)
+-    finally:
+-        _wilcoxon_host._enable_peer_access.cache_clear()
+-
+-    assert error.value.status == unexpected_status
+-
+-
+ @pytest.mark.parametrize(
+     "route_case",
+     [

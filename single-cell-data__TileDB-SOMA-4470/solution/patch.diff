@@ -1,0 +1,1071 @@
+diff --git a/apis/r/DESCRIPTION b/apis/r/DESCRIPTION
+index 2d6bdc46e6..8b9177bf50 100644
+--- a/apis/r/DESCRIPTION
++++ b/apis/r/DESCRIPTION
+@@ -6,7 +6,7 @@ Description: Interface for working with 'TileDB'-based Stack of Matrices,
+     like those commonly used for single cell data analysis. It is documented at
+     <https://github.com/single-cell-data>; a formal specification available is at
+     <https://github.com/single-cell-data/SOMA/blob/main/abstract_specification.md>.
+-Version: 2.3.99.5
++Version: 2.3.99.6
+ Authors@R: c(
+     person(given = "Paul", family = "Hoffman",
+            role = c("cre", "aut"), email = "tiledb-r@tiledb.com",
+diff --git a/apis/r/NEWS.md b/apis/r/NEWS.md
+index 85d655eeed..3771fecab1 100644
+--- a/apis/r/NEWS.md
++++ b/apis/r/NEWS.md
+@@ -31,6 +31,7 @@
+ - Use stored handle to read and write to `SOMASparseNDArray`, `SOMADenseNDArray`, and `SOMADataFrame` rather than re-opening the SOMA oobjects for each read/write. ([#4414](https://github.com/single-cell-data/TileDB-SOMA/pull/4414))
+ - Properly close `ms` collection handle in `write_soma.SummarizedExperiment()`, ensuring that new measurements added to the `ms` collection are persisted to disk. ([#4452](https://github.com/single-cell-data/TileDB-SOMA/pull/4452))
+ - Fix handling of empty arrays when calling `write_soma()` with `ingest_mode = "resume"`. ([#4443](https://github.com/single-cell-data/TileDB-SOMA/pull/4453))
++- Fix `SOMASparseNDArrayRead$blockwise()` dropping coordinate restrictions on non-iterated axes. Sparse matrix blocks are now shaped the same way as in the Python API. ([#4470](https://github.com/single-cell-data/TileDB-SOMA/pull/4470))
+ 
+ ## Security
+ 
+diff --git a/apis/r/R/BlockwiseIter.R b/apis/r/R/BlockwiseIter.R
+index 840ad7b691..f2942a374a 100644
+--- a/apis/r/R/BlockwiseIter.R
++++ b/apis/r/R/BlockwiseIter.R
+@@ -92,19 +92,18 @@ BlockwiseReadIterBase <- R6::R6Class(
+         ))
+       }
+       private$.reindex_disable_on_axis <- reindex_disable_on_axis
++      # Build re-indexers for the minor axes over the *requested* coordinates
++      # (or the full domain when the axis is unrestricted), so re-indexed
++      # coordinates are compacted to `0:(n - 1)` where `n` is the number of
++      # requested coordinates, matching the Python API
+       axes_to_reindex <- self$axes_to_reindex
+       private$.reindexers <- vector("list", length = length(axes_to_reindex))
+-      shape <- self$array$shape()
+       dnames <- self$array$dimnames()
+       for (i in seq_along(axes_to_reindex)) {
+         ax <- as.numeric(axes_to_reindex[i]) + 1L
+-        coords <- as.list(CoordsStrider$new(start = 0L, end = shape[ax] - 1L))
+-        coords <- if (length(coords) == 1L) {
+-          coords[[1L]]
+-        } else {
+-          unlist64(coords)
+-        }
+-        private$.reindexers[[i]] <- IntIndexer$new(coords)
++        private$.reindexers[[i]] <- IntIndexer$new(
++          private$.axis_strider(ax)$full_coords
++        )
+         names(private$.reindexers)[i] <- dnames[ax]
+       }
+     },
+@@ -130,10 +129,15 @@ BlockwiseReadIterBase <- R6::R6Class(
+       if (self$read_complete()) {
+         return(private$.readComplete())
+       }
++      # `reset()` rebuilds the query from scratch and discards *every*
++      # coordinate restriction, so re-apply the restrictions on all
++      # non-iterated axes along with this block's coordinates on the
++      # iterated axis
+       private$reset()
+       dimnam <- self$array$dimnames()[self$axis + 1L]
+       private$.nextelems <- self$coords_axis$next_element()
+       private$set_dim_points(dimnam, private$.nextelems)
++      private$.restore_minor_axes()
+       return(private$.read_next())
+     }
+   ),
+@@ -193,6 +197,37 @@ BlockwiseReadIterBase <- R6::R6Class(
+         class = "notConcatenatableError"
+       ))
+     },
++    # @description Get the strider for a given (1-based) axis; axes without
++    # an explicit strider are treated as spanning their full domain
++    .axis_strider = function(ax) {
++      dname <- self$array$dimnames()[ax]
++      strider <- self$coords[[dname]]
++      if (is.null(strider)) {
++        strider <- CoordsStrider$new(
++          start = 0L,
++          end = self$array$shape()[ax] - 1L
++        )
++      }
++      return(strider)
++    },
++    # @description Re-apply the coordinate restrictions for every axis other
++    # than the iterated axis; axes spanning their full domain are skipped
++    # since they impose no restriction
++    .restore_minor_axes = function() {
++      dnames <- self$array$dimnames()
++      shape <- self$array$shape()
++      for (i in seq_along(dnames)) {
++        if (i == self$axis + 1L) {
++          next
++        }
++        strider <- private$.axis_strider(i)
++        if (strider$is_full_domain(shape[i])) {
++          next
++        }
++        private$set_dim_points(dnames[i], strider$full_coords)
++      }
++      return(invisible(NULL))
++    },
+     # @description Reset internal state of SOMA Reader while keeping array open
+     reset = function() {
+       if (is.null(private$soma_reader_pointer)) {
+@@ -233,7 +268,7 @@ BlockwiseReadIterBase <- R6::R6Class(
+       }
+       for (dname in names(private$.reindexers)) {
+         if (!dname %in% names(tbl)) {
+-          ""
++          next
+         }
+         indexer <- private$.reindexers[[dname]]
+         tbl[[dname]] <- indexer$get_indexer(
+@@ -373,7 +408,20 @@ BlockwiseSparseReadIter <- R6::R6Class(
+         if (!bit64::as.integer64(1L) %in% self$reindex_disable_on_axis) "C"
+       )
+       private$.repr <- match.arg(repr, choices = reprs)
+-      private$.shape <- sapply(coords, length)
++      # Matrix shape follows the Python API: a re-indexed axis has its
++      # coordinates compacted to `0:(n - 1)` so its extent is the number of
++      # requested coordinates; a non-re-indexed axis keeps its global
++      # coordinates so its extent is the full array extent. The iterated
++      # axis is sized per block in `soma_reader_transform()`
++      shape <- self$array$shape()
++      for (i in seq_along(shape)) {
++        ax <- bit64::as.integer64(i - 1L)
++        if (ax == self$axis || ax %in% self$reindex_disable_on_axis) {
++          next
++        }
++        shape[i] <- private$.axis_strider(i)$length()
++      }
++      private$.shape <- shape
+     },
+     #' @description Concatenate the remainder of the blockwise iterator.
+     #'
+@@ -400,19 +448,11 @@ BlockwiseSparseReadIter <- R6::R6Class(
+       tbl <- private$reindex_arrow_table(soma_array_to_arrow_table(x))
+       shape <- private$.shape
+       axis <- as.integer(self$axis)
+-      axname <- sprintf("soma_dim_%i", axis)
+-      stride <- self$coords[[axname]]$stride
+-      # For re-indexed blockwise iterators, shape should reflect the re-indexed
+-      # axes; this can generally be the stride of the iterator, but for the end
+-      # of each iterator this needs to be the remainder (see ?`%%`).
+-      # Note: this only applies to the major axis, minor axes always return
+-      # the full domain.
+-      if (self$reindexable && shape[axis + 1L] > stride) {
+-        shape[axis + 1L] <- if (self$coords[[axname]]$has_next()) {
+-          as.numeric(stride)
+-        } else {
+-          as.numeric(self$coords[[axname]]$end %% stride) + 1L
+-        }
++      # When the iterated axis is re-indexed, this block's coordinates are
++      # compacted to `0:(n - 1)`, so the extent is the number of coordinates
++      # in the block (the stride, or the remainder for the final block)
++      if (!bit64::as.integer64(axis) %in% self$reindex_disable_on_axis) {
++        shape[axis + 1L] <- length(private$.nextelems)
+       }
+       mat <- arrow_table_to_sparse(
+         tbl,
+diff --git a/apis/r/R/CoordsStrider.R b/apis/r/R/CoordsStrider.R
+index 976113dfe4..45ebec5f5b 100644
+--- a/apis/r/R/CoordsStrider.R
++++ b/apis/r/R/CoordsStrider.R
+@@ -112,14 +112,21 @@ CoordsStrider <- R6::R6Class(
+     #'
+     length = function() {
+       if (is.null(self$coords)) {
+-        len <- as.numeric(abs(self$end - self$start))
+-        if (!self$start) {
+-          len <- len + 1L
+-        }
+-        return(len)
++        return(as.numeric(abs(self$end - self$start)) + 1L)
+       }
+       return(length(self$coords))
+     },
++    #' @description Determine if this strider covers the full domain
++    #' \code{[0, extent)} of a dimension
++    #'
++    #' @param extent The extent (shape) of the dimension
++    #'
++    #' @return \code{TRUE} if the strider is a range strider spanning
++    #' \code{0:(extent - 1)}, otherwise \code{FALSE}
++    #'
++    is_full_domain = function(extent) {
++      return(is.null(self$coords) && self$start == 0L && self$end == extent - 1L)
++    },
+     #' @description Determine if there are more coordinates to yield
+     #'
+     #' @return \code{TRUE} if there are more coordinates to yield or
+@@ -164,6 +171,19 @@ CoordsStrider <- R6::R6Class(
+     #'
+     coords = function() private$.coords,
+ 
++    #' @field full_coords Every coordinate covered by the strider, without
++    #' advancing it
++    #'
++    full_coords = function() {
++      if (!is.null(self$coords)) {
++        return(self$coords)
++      }
++      if (self$start == self$end) {
++        return(bit64::as.integer64(self$start))
++      }
++      return(seq(from = bit64::as.integer64(self$start), to = self$end, by = 1L))
++    },
++
+     #' @field start If set, the starting point of the iterated coordinates;
+     #' otherwise the minimum value of \code{self$coords}
+     #'
+@@ -223,10 +243,7 @@ CoordsStrider <- R6::R6Class(
+     .stride = NULL,
+     .index = NULL,
+     .stopIteration = function() {
+-      stop(errorCondition(
+-        "StopIteration",
+-        class = "stopIteration"
+-      ))
++      stop(errorCondition("StopIteration", class = "stopIteration"))
+     }
+   )
+ )
+diff --git a/apis/r/R/SOMASparseNDArrayRead.R b/apis/r/R/SOMASparseNDArrayRead.R
+index 0634297f62..8a3e63565b 100644
+--- a/apis/r/R/SOMASparseNDArrayRead.R
++++ b/apis/r/R/SOMASparseNDArrayRead.R
+@@ -22,18 +22,7 @@ SOMASparseNDArrayReadBase <- R6::R6Class(
+           "SOMASparseNDArray"
+         )
+       )
+-      if (is.null(coords)) {
+-        private$.coords <- vector(mode = "list", length = array$ndim())
+-        shape <- array$shape()
+-        for (i in seq_along(private$.coords)) {
+-          private$.coords[[i]] <- CoordsStrider$new(
+-            start = 0L,
+-            end = shape[i] - 1L,
+-            stride = .Machine$integer.max
+-          )
+-        }
+-        names(private$.coords) <- array$dimnames()
+-      } else {
++      if (!is.null(coords)) {
+         stopifnot(
+           "'coords' must be a list of integer64 values" = is.list(coords) &&
+             all(vapply_lgl(
+@@ -47,17 +36,28 @@ SOMASparseNDArrayReadBase <- R6::R6Class(
+           ) &&
+             all(names(coords) %in% array$dimnames())
+         )
+-        if (all(vapply_lgl(coords, inherits, what = "CoordsStrider"))) {
+-          private$.coords <- coords
+-        } else {
+-          private$.coords <- vector(mode = "list", length = length(coords))
+-          names(private$.coords) <- names(coords)
+-          for (i in names(coords)) {
+-            private$.coords[[i]] <- CoordsStrider$new(
+-              coords[[i]],
+-              stride = .Machine$integer.max
+-            )
++      }
++      # Build one strider per dimension; dimensions without a coordinate
++      # restriction get a strider spanning their full domain so downstream
++      # code (e.g. blockwise iterators) can rely on every dimension being present
++      shape <- array$shape()
++      dnames <- array$dimnames()
++      private$.coords <- vector(mode = "list", length = length(dnames))
++      names(private$.coords) <- dnames
++      for (i in seq_along(dnames)) {
++        dname <- dnames[i]
++        private$.coords[[i]] <- if (dname %in% names(coords)) {
++          if (inherits(coords[[dname]], "CoordsStrider")) {
++            coords[[dname]]
++          } else {
++            CoordsStrider$new(coords[[dname]], stride = .Machine$integer.max)
+           }
++        } else {
++          CoordsStrider$new(
++            start = 0L,
++            end = shape[i] - 1L,
++            stride = .Machine$integer.max
++          )
+         }
+       }
+       private$.sr <- sr
+diff --git a/apis/r/man/BlockwiseReadIterBase.Rd b/apis/r/man/BlockwiseReadIterBase.Rd
+index 403319b92f..5938905e53 100644
+--- a/apis/r/man/BlockwiseReadIterBase.Rd
++++ b/apis/r/man/BlockwiseReadIterBase.Rd
+@@ -13,76 +13,70 @@ Derived classes: \code{\link{BlockwiseTableReadIter}},
+ }
+ \keyword{internal}
+ \section{Super class}{
+-\code{\link[tiledbsoma:ReadIter]{tiledbsoma::ReadIter}} -> \code{BlockwiseReadIterBase}
++\code{\link[tiledbsoma:ReadIter]{ReadIter}} -> \code{BlockwiseReadIterBase}
+ }
+ \section{Active bindings}{
+-\if{html}{\out{<div class="r6-active-bindings">}}
+-\describe{
+-\item{\code{array}}{The underlying SOMA array.}
++  \if{html}{\out{<div class="r6-active-bindings">}}
++  \describe{
++    \item{\code{array}}{The underlying SOMA array.}
+ 
+-\item{\code{axis}}{The axis to iterate over in a blockwise fashion.}
++    \item{\code{axis}}{The axis to iterate over in a blockwise fashion.}
+ 
+-\item{\code{axes_to_reindex}}{The axes to re-index.}
++    \item{\code{axes_to_reindex}}{The axes to re-index.}
+ 
+-\item{\code{coords}}{A list of \code{\link{CoordsStrider}} objects.}
++    \item{\code{coords}}{A list of \code{\link{CoordsStrider}} objects.}
+ 
+-\item{\code{coords_axis}}{The \code{\link{CoordsStrider}} for \code{axis}.}
++    \item{\code{coords_axis}}{The \code{\link{CoordsStrider}} for \code{axis}.}
+ 
+-\item{\code{reindex_disable_on_axis}}{Additional axes that will not be
++    \item{\code{reindex_disable_on_axis}}{Additional axes that will not be
+ re-indexed.}
+ 
+-\item{\code{reindexable}}{Shorthand to see if this iterator is poised to be
++    \item{\code{reindexable}}{Shorthand to see if this iterator is poised to be
+ re-indexed or not.}
+-}
+-\if{html}{\out{</div>}}
++  }
++  \if{html}{\out{</div>}}
+ }
+ \section{Methods}{
+ \subsection{Public methods}{
+-\itemize{
+-\item \href{#method-BlockwiseReadIterBase-new}{\code{BlockwiseReadIterBase$new()}}
+-\item \href{#method-BlockwiseReadIterBase-read_complete}{\code{BlockwiseReadIterBase$read_complete()}}
+-\item \href{#method-BlockwiseReadIterBase-read_next}{\code{BlockwiseReadIterBase$read_next()}}
+-\item \href{#method-BlockwiseReadIterBase-clone}{\code{BlockwiseReadIterBase$clone()}}
+-}
+-}
+-\if{html}{\out{
+-<details open><summary>Inherited methods</summary>
++  \itemize{
++    \item \href{#method-BlockwiseReadIterBase-initialize}{\code{BlockwiseReadIterBase$new()}}
++    \item \href{#method-BlockwiseReadIterBase-read_complete}{\code{BlockwiseReadIterBase$read_complete()}}
++    \item \href{#method-BlockwiseReadIterBase-read_next}{\code{BlockwiseReadIterBase$read_next()}}
++    \item \href{#method-BlockwiseReadIterBase-clone}{\code{BlockwiseReadIterBase$clone()}}
++  }
++}
++\if{html}{\out{<details open><summary>Inherited methods</summary>
+ <ul>
+-<li><span class="pkg-link" data-pkg="tiledbsoma" data-topic="ReadIter" data-id="concat"><a href='../../tiledbsoma/html/ReadIter.html#method-ReadIter-concat'><code>tiledbsoma::ReadIter$concat()</code></a></span></li>
++  <li><span class="pkg-link" data-pkg="tiledbsoma" data-topic="ReadIter" data-id="concat"><a href='../../tiledbsoma/html/ReadIter.html#method-ReadIter-concat'><code>ReadIter$concat()</code></a></span></li>
+ </ul>
+-</details>
+-}}
++</details>}}
+ \if{html}{\out{<hr>}}
+-\if{html}{\out{<a id="method-BlockwiseReadIterBase-new"></a>}}
+-\if{latex}{\out{\hypertarget{method-BlockwiseReadIterBase-new}{}}}
+-\subsection{Method \code{new()}}{
+-Create.
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{BlockwiseReadIterBase$new(
++\if{html}{\out{<a id="method-BlockwiseReadIterBase-initialize"></a>}}
++\if{latex}{\out{\hypertarget{method-BlockwiseReadIterBase-initialize}{}}}
++\subsection{\code{BlockwiseReadIterBase$new()}}{
++  Create.
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{BlockwiseReadIterBase$new(
+   sr,
+   array,
+   coords,
+   axis,
+   ...,
+   reindex_disable_on_axis = NA
+-)}\if{html}{\out{</div>}}
+-}
+-
+-\subsection{Arguments}{
+-\if{html}{\out{<div class="arguments">}}
+-\describe{
+-\item{\code{sr}}{SOMA read pointer}
+-
+-\item{\code{array}}{Underlying \code{\link{SOMASparseNDArray}}}
+-
+-\item{\code{coords}}{Named list of \code{\link{CoordsStrider}} objects; must be
++)}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Arguments}{
++    \if{html}{\out{<div class="arguments">}}
++    \describe{
++      \item{\code{sr}}{SOMA read pointer}
++      \item{\code{array}}{Underlying \code{\link{SOMASparseNDArray}}}
++      \item{\code{coords}}{Named list of \code{\link{CoordsStrider}} objects; must be
+ named after \code{array$dimnames()}}
+-
+-\item{\code{axis}}{Axis to iterate over in a blockwise manner}
+-
+-\item{\code{...}}{Ignored}
+-
+-\item{\code{reindex_disable_on_axis}}{Additional axes that will not be re-indexed;
++      \item{\code{axis}}{Axis to iterate over in a blockwise manner}
++      \item{\code{...}}{Ignored}
++      \item{\code{reindex_disable_on_axis}}{Additional axes that will not be re-indexed;
+ the following values may be used as shorthands for common settings:
+ \itemize{
+ \item \dQuote{\code{TRUE}}: disable re-indexing on all axes
+@@ -91,53 +85,60 @@ re-indexing on all others
+ \item \dQuote{\code{FALSE}}: re-index on \emph{all} axes, do \strong{not}
+ disable re-indexing
+ }}
++    }
++    \if{html}{\out{</div>}}
++  }
+ }
+-\if{html}{\out{</div>}}
+-}
+-}
++
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-BlockwiseReadIterBase-read_complete"></a>}}
+ \if{latex}{\out{\hypertarget{method-BlockwiseReadIterBase-read_complete}{}}}
+-\subsection{Method \code{read_complete()}}{
+-Check if the iterated read is complete or not.
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{BlockwiseReadIterBase$read_complete()}\if{html}{\out{</div>}}
++\subsection{\code{BlockwiseReadIterBase$read_complete()}}{
++  Check if the iterated read is complete or not.
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{BlockwiseReadIterBase$read_complete()}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Returns}{
++    \code{TRUE} if read is complete, otherwise \code{FALSE}.
++  }
+ }
+ 
+-\subsection{Returns}{
+-\code{TRUE} if read is complete, otherwise \code{FALSE}.
+-}
+-}
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-BlockwiseReadIterBase-read_next"></a>}}
+ \if{latex}{\out{\hypertarget{method-BlockwiseReadIterBase-read_next}{}}}
+-\subsection{Method \code{read_next()}}{
+-Read the next chunk of the iterated read. If read
++\subsection{\code{BlockwiseReadIterBase$read_next()}}{
++  Read the next chunk of the iterated read. If read
+ is complete, throws an \code{iterationCompleteWarning} warning and
+ returns \code{NULL}.
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{BlockwiseReadIterBase$read_next()}\if{html}{\out{</div>}}
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{BlockwiseReadIterBase$read_next()}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Returns}{
++    \code{NULL} or the next blockwise chunk of the iterated read.
++  }
+ }
+ 
+-\subsection{Returns}{
+-\code{NULL} or the next blockwise chunk of the iterated read.
+-}
+-}
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-BlockwiseReadIterBase-clone"></a>}}
+ \if{latex}{\out{\hypertarget{method-BlockwiseReadIterBase-clone}{}}}
+-\subsection{Method \code{clone()}}{
+-The objects of this class are cloneable with this method.
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{BlockwiseReadIterBase$clone(deep = FALSE)}\if{html}{\out{</div>}}
++\subsection{\code{BlockwiseReadIterBase$clone()}}{
++  The objects of this class are cloneable with this method.
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{BlockwiseReadIterBase$clone(deep = FALSE)}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Arguments}{
++    \if{html}{\out{<div class="arguments">}}
++    \describe{
++      \item{\code{deep}}{Whether to make a deep clone.}
++    }
++    \if{html}{\out{</div>}}
++  }
+ }
+ 
+-\subsection{Arguments}{
+-\if{html}{\out{<div class="arguments">}}
+-\describe{
+-\item{\code{deep}}{Whether to make a deep clone.}
+-}
+-\if{html}{\out{</div>}}
+-}
+-}
+ }
+diff --git a/apis/r/man/CoordsStrider.Rd b/apis/r/man/CoordsStrider.Rd
+index 224dc586bc..ac6b4c329b 100644
+--- a/apis/r/man/CoordsStrider.Rd
++++ b/apis/r/man/CoordsStrider.Rd
+@@ -49,108 +49,142 @@ while (itertools::hasNext(strider)) {
+ }
+ \keyword{internal}
+ \section{Active bindings}{
+-\if{html}{\out{<div class="r6-active-bindings">}}
+-\describe{
+-\item{\code{coords}}{If set, the coordinates to iterate over}
++  \if{html}{\out{<div class="r6-active-bindings">}}
++  \describe{
++    \item{\code{coords}}{If set, the coordinates to iterate over}
+ 
+-\item{\code{start}}{If set, the starting point of the iterated coordinates;
++    \item{\code{full_coords}}{Every coordinate covered by the strider, without
++advancing it}
++
++    \item{\code{start}}{If set, the starting point of the iterated coordinates;
+ otherwise the minimum value of \code{self$coords}}
+ 
+-\item{\code{end}}{If set, the end point of the iterated coordinates;
++    \item{\code{end}}{If set, the end point of the iterated coordinates;
+ otherwise the maximum value of \code{self$coords}}
+ 
+-\item{\code{stride}}{The stride, or how many coordinates to generate per
++    \item{\code{stride}}{The stride, or how many coordinates to generate per
+ iteration; note: this field is settable, which will reset the iterator}
+-}
+-\if{html}{\out{</div>}}
++  }
++  \if{html}{\out{</div>}}
+ }
+ \section{Methods}{
+ \subsection{Public methods}{
+-\itemize{
+-\item \href{#method-CoordsStrider-new}{\code{CoordsStrider$new()}}
+-\item \href{#method-CoordsStrider-print}{\code{CoordsStrider$print()}}
+-\item \href{#method-CoordsStrider-length}{\code{CoordsStrider$length()}}
+-\item \href{#method-CoordsStrider-has_next}{\code{CoordsStrider$has_next()}}
+-\item \href{#method-CoordsStrider-next_element}{\code{CoordsStrider$next_element()}}
+-}
++  \itemize{
++    \item \href{#method-CoordsStrider-initialize}{\code{CoordsStrider$new()}}
++    \item \href{#method-CoordsStrider-print}{\code{CoordsStrider$print()}}
++    \item \href{#method-CoordsStrider-length}{\code{CoordsStrider$length()}}
++    \item \href{#method-CoordsStrider-is_full_domain}{\code{CoordsStrider$is_full_domain()}}
++    \item \href{#method-CoordsStrider-has_next}{\code{CoordsStrider$has_next()}}
++    \item \href{#method-CoordsStrider-next_element}{\code{CoordsStrider$next_element()}}
++  }
+ }
+ \if{html}{\out{<hr>}}
+-\if{html}{\out{<a id="method-CoordsStrider-new"></a>}}
+-\if{latex}{\out{\hypertarget{method-CoordsStrider-new}{}}}
+-\subsection{Method \code{new()}}{
+-Create a coordinate strider
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{CoordsStrider$new(coords, ..., stride = NULL, start = NULL, end = NULL)}\if{html}{\out{</div>}}
+-}
+-
+-\subsection{Arguments}{
+-\if{html}{\out{<div class="arguments">}}
+-\describe{
+-\item{\code{coords}}{An integer vector of coordinates}
+-
+-\item{\code{...}}{Ignored}
+-
+-\item{\code{stride}}{The stride of how many coordinates to yield per iteration;
++\if{html}{\out{<a id="method-CoordsStrider-initialize"></a>}}
++\if{latex}{\out{\hypertarget{method-CoordsStrider-initialize}{}}}
++\subsection{\code{CoordsStrider$new()}}{
++  Create a coordinate strider
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{CoordsStrider$new(coords, ..., stride = NULL, start = NULL, end = NULL)}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Arguments}{
++    \if{html}{\out{<div class="arguments">}}
++    \describe{
++      \item{\code{coords}}{An integer vector of coordinates}
++      \item{\code{...}}{Ignored}
++      \item{\code{stride}}{The stride of how many coordinates to yield per iteration;
+ by default, will try to yield all coordinates per iteration}
+-
+-\item{\code{start}}{If \code{coords} is missing, the starting coordinate
++      \item{\code{start}}{If \code{coords} is missing, the starting coordinate
+ to generate}
+-
+-\item{\code{end}}{If \code{coords} is missing, the ending coordinate
++      \item{\code{end}}{If \code{coords} is missing, the ending coordinate
+ to generate}
++    }
++    \if{html}{\out{</div>}}
++  }
+ }
+-\if{html}{\out{</div>}}
+-}
+-}
++
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-CoordsStrider-print"></a>}}
+ \if{latex}{\out{\hypertarget{method-CoordsStrider-print}{}}}
+-\subsection{Method \code{print()}}{
+-Print the coordinate strider to the screen
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{CoordsStrider$print()}\if{html}{\out{</div>}}
++\subsection{\code{CoordsStrider$print()}}{
++  Print the coordinate strider to the screen
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{CoordsStrider$print()}
++    \if{html}{\out{</div>}}
++  }
+ }
+ 
+-}
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-CoordsStrider-length"></a>}}
+ \if{latex}{\out{\hypertarget{method-CoordsStrider-length}{}}}
+-\subsection{Method \code{length()}}{
+-Get the length (span) of the coordinates within the strider
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{CoordsStrider$length()}\if{html}{\out{</div>}}
++\subsection{\code{CoordsStrider$length()}}{
++  Get the length (span) of the coordinates within the strider
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{CoordsStrider$length()}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Returns}{
++    The length (span) of the coordinate strider
++  }
+ }
+ 
+-\subsection{Returns}{
+-The length (span) of the coordinate strider
+-}
++\if{html}{\out{<hr>}}
++\if{html}{\out{<a id="method-CoordsStrider-is_full_domain"></a>}}
++\if{latex}{\out{\hypertarget{method-CoordsStrider-is_full_domain}{}}}
++\subsection{\code{CoordsStrider$is_full_domain()}}{
++  Determine if this strider covers the full domain
++\code{[0, extent)} of a dimension
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{CoordsStrider$is_full_domain(extent)}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Arguments}{
++    \if{html}{\out{<div class="arguments">}}
++    \describe{
++      \item{\code{extent}}{The extent (shape) of the dimension}
++    }
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Returns}{
++    \code{TRUE} if the strider is a range strider spanning
++\code{0:(extent - 1)}, otherwise \code{FALSE}
++  }
+ }
++
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-CoordsStrider-has_next"></a>}}
+ \if{latex}{\out{\hypertarget{method-CoordsStrider-has_next}{}}}
+-\subsection{Method \code{has_next()}}{
+-Determine if there are more coordinates to yield
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{CoordsStrider$has_next()}\if{html}{\out{</div>}}
+-}
+-
+-\subsection{Returns}{
+-\code{TRUE} if there are more coordinates to yield or
++\subsection{\code{CoordsStrider$has_next()}}{
++  Determine if there are more coordinates to yield
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{CoordsStrider$has_next()}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Returns}{
++    \code{TRUE} if there are more coordinates to yield or
+ \code{FALSE} if otherwise
++  }
+ }
+-}
++
+ \if{html}{\out{<hr>}}
+ \if{html}{\out{<a id="method-CoordsStrider-next_element"></a>}}
+ \if{latex}{\out{\hypertarget{method-CoordsStrider-next_element}{}}}
+-\subsection{Method \code{next_element()}}{
+-Generate the next set of coordinates to yield. If there are
++\subsection{\code{CoordsStrider$next_element()}}{
++  Generate the next set of coordinates to yield. If there are
+ no more coordinates to yield, raises a \code{stopIteration} error
+-\subsection{Usage}{
+-\if{html}{\out{<div class="r">}}\preformatted{CoordsStrider$next_element()}\if{html}{\out{</div>}}
++  \subsection{Usage}{
++    \if{html}{\out{<div class="r">}}
++    \preformatted{CoordsStrider$next_element()}
++    \if{html}{\out{</div>}}
++  }
++  \subsection{Returns}{
++    An integer vector of the next set of coordinates
++  }
+ }
+ 
+-\subsection{Returns}{
+-An integer vector of the next set of coordinates
+-}
+-}
+ }
+diff --git a/apis/r/tests/testthat/helper-blockwise.R b/apis/r/tests/testthat/helper-blockwise.R
+new file mode 100644
+index 0000000000..437b38f5f5
+--- /dev/null
++++ b/apis/r/tests/testthat/helper-blockwise.R
+@@ -0,0 +1,180 @@
++#' Split a coordinate vector into consecutive blocks
++#'
++#' @param x A vector of coordinates
++#' @param size The number of coordinates per block
++#'
++#' @return A list of vectors, each up to \code{size} elements of \code{x},
++#' split in consecutive order
++#'
++chunk <- function(x, size) {
++  unname(split(x, ceiling(seq_along(x) / size)))
++}
++
++#' Create a densely-filled reference \code{SOMASparseNDArray} fixture for the
++#' coordinate-restricted blockwise tests (SOMA-990)
++#'
++#' @return A list with:
++#' \itemize{
++#'   \item \code{uri}: the URI of a 20x20 \code{SOMASparseNDArray}, densely
++#'   filled so every cell holds a unique value, so a block that lands in the
++#'   wrong place or with the wrong shape cannot pass by accident
++#'   \item \code{mat}: the dense reference matrix written to the array
++#' }
++#'
++#' @note All coordinates used with this fixture are 0-based SOMA
++#' coordinates; the one place we convert to R's 1-based indexing is inside
++#' \code{expected_block()}
++#'
++blockwise_fixture <- function() {
++  n <- 20L
++  mat <- Matrix::Matrix(matrix(seq_len(n * n), n, n), sparse = TRUE)
++  uri <- tempfile("blockwise-restricted")
++  arr <- SOMASparseNDArrayCreate(uri, arrow::int32(), shape = c(n, n))
++  arr$write(mat)
++  arr$close()
++  list(uri = uri, mat = as.matrix(mat))
++}
++
++#' Read every block from a blockwise iterator into a list
++#'
++#' @param arr An open \code{SOMASparseNDArray}
++#' @param coords Coordinates to pass to \code{arr$read()}
++#' @param axis The axis to iterate over blockwise
++#' @param size The block size
++#' @param reindex The \code{reindex_disable_on_axis} argument to
++#' \code{blockwise()}
++#' @param repr If \code{NULL}, yields Arrow tables via \code{tables()};
++#' otherwise the sparse matrix representation to yield via
++#' \code{sparse_matrix()}
++#'
++#' @return A list of blocks read from the iterator, in order
++#'
++read_blocks <- function(arr, coords, axis, size, reindex, repr = NULL) {
++  bi <- arr$read(coords)$blockwise(
++    axis = axis,
++    size = size,
++    reindex_disable_on_axis = reindex
++  )
++  it <- if (is.null(repr)) bi$tables() else bi$sparse_matrix(repr)
++  blocks <- list()
++  while (!it$read_complete()) {
++    blocks[[length(blocks) + 1L]] <- it$read_next()
++  }
++  blocks
++}
++
++#' The dense matrix a block covering \code{rows} x \code{cols} of \code{mat}
++#' should produce
++#'
++#' @param mat The dense reference matrix (see \code{blockwise_fixture()})
++#' @param rows,cols 0-based row/column coordinates covered by this block
++#' @param compact_rows,compact_cols Whether the row/column axis is
++#' re-indexed ("compacted"); a re-indexed axis has its coordinates mapped to
++#' \code{0:(n - 1)} and an extent of \code{n}, where \code{n} is the number
++#' of requested coordinates, while a non-re-indexed axis keeps its global
++#' coordinates and the full array extent. This is the rule the Python API
++#' implements
++#'
++#' @return The dense matrix expected for this block
++#'
++expected_block <- function(mat, rows, cols, compact_rows, compact_cols) {
++  n <- nrow(mat)
++  i <- if (compact_rows) seq_along(rows) - 1L else rows
++  j <- if (compact_cols) seq_along(cols) - 1L else cols
++  out <- matrix(
++    0,
++    if (compact_rows) length(rows) else n,
++    if (compact_cols) length(cols) else n
++  )
++  out[i + 1L, j + 1L] <- mat[rows + 1L, cols + 1L]
++  out
++}
++
++#' The COO triples a \code{tables()} block covering \code{rows} x
++#' \code{cols} of \code{mat} should produce
++#'
++#' @inheritParams expected_block
++#'
++#' @return A data frame of \code{soma_dim_0}, \code{soma_dim_1},
++#' \code{soma_data} triples, sorted by coordinate (see \code{as_coo()})
++#'
++expected_table <- function(mat, rows, cols, compact_rows, compact_cols) {
++  dense <- expected_block(mat, rows, cols, compact_rows, compact_cols)
++  ij <- which(dense != 0, arr.ind = TRUE)
++  as_coo(data.frame(
++    soma_dim_0 = ij[, "row"] - 1L,
++    soma_dim_1 = ij[, "col"] - 1L,
++    soma_data = dense[ij]
++  ))
++}
++
++#' Normalize an Arrow table or data frame of COO triples for comparison
++#'
++#' @param x An Arrow table or data frame with \code{soma_dim_0},
++#' \code{soma_dim_1}, and \code{soma_data} columns
++#'
++#' @return A data frame with those three columns, coerced to numeric and
++#' sorted by \code{soma_dim_0} then \code{soma_dim_1}
++#'
++as_coo <- function(x) {
++  df <- as.data.frame(x)[, c("soma_dim_0", "soma_dim_1", "soma_data")]
++  df[] <- lapply(df, as.numeric)
++  df <- df[order(df$soma_dim_0, df$soma_dim_1), ]
++  rownames(df) <- NULL
++  df
++}
++
++#' Coerce a sparse matrix block to a plain dense matrix for comparison
++#'
++#' @param mat A \code{Matrix}-derived sparse matrix
++#'
++#' @return \code{mat} as an unnamed dense \code{matrix}
++#'
++dense <- function(mat) unname(as.matrix(mat))
++
++#' Compare every block from \code{read_blocks()} against its expected value
++#'
++#' @param blocks A list of blocks, as returned by \code{read_blocks()}
++#' @param expected A list of the same length as \code{blocks}, giving the
++#' expected value of each block (see \code{expected_block()} /
++#' \code{expected_table()})
++#' @param label A label included in test failure messages to identify which
++#' scenario failed
++#'
++#' @return \code{NULL}, invisibly; called for its \code{testthat::expect_*()}
++#' side effects. Sparse matrix blocks are compared as dense matrices (see
++#' \code{dense()}), table blocks as COO triples (see \code{as_coo()})
++#'
++expect_blocks <- function(blocks, expected, label) {
++  expect_length(blocks, length(expected))
++  for (i in seq_along(blocks)) {
++    actual <- if (inherits(blocks[[i]], "Matrix")) {
++      dense(blocks[[i]])
++    } else {
++      as_coo(blocks[[i]])
++    }
++    expect_equal(
++      actual,
++      expected[[i]],
++      info = sprintf("%s, block %d", label, i)
++    )
++  }
++}
++
++#' Which axes get compacted under each \code{reindex_disable_on_axis}
++#' setting, when iterating over axis 0
++#'
++#' @format A list of scenarios, each a list with:
++#' \itemize{
++#'   \item \code{reindex}: the \code{reindex_disable_on_axis} value to pass
++#'   to \code{blockwise()}
++#'   \item \code{rows}, \code{cols}: whether the row (iterated) / column
++#'   (minor) axis is compacted under that value
++#' }
++#'
++reindex_modes <- list(
++  list(reindex = NA, rows = TRUE, cols = FALSE), # default: iterated axis only
++  list(reindex = FALSE, rows = TRUE, cols = TRUE), # all axes
++  list(reindex = TRUE, rows = FALSE, cols = FALSE), # no axes
++  list(reindex = 0L, rows = FALSE, cols = TRUE) # minor axis only
++)
+diff --git a/apis/r/tests/testthat/test-00-Blockwise.R b/apis/r/tests/testthat/test-00-Blockwise.R
+index c2f8e428de..bb0355f148 100644
+--- a/apis/r/tests/testthat/test-00-Blockwise.R
++++ b/apis/r/tests/testthat/test-00-Blockwise.R
+@@ -191,7 +191,9 @@ test_that("Blockwise iterator for sparse matrices", {
+   it <- bi$sparse_matrix()
+   at <- it$concat()
+   expect_s4_class(at, "dgTMatrix")
+-  expect_equal(dim(at), c(2638, 1838))
++  # Re-indexing is disabled on both axes, so blocks keep global coordinates
++  # and span the full array extent (for this legacy array, its domain)
++  expect_equal(dim(at), as.integer(it$array$shape()))
+ })
+ 
+ test_that("Sparse matrix blockwise iterator: re-indexed", {
+@@ -371,3 +373,149 @@ test_that("Blockwise iterate through full array", {
+   }
+   expect_true(it$read_complete())
+ })
++
++test_that("CoordsStrider length and chunking for ranges not starting at zero", {
++  strider <- CoordsStrider$new(start = 5L, end = 14L, stride = 3L)
++  expect_equal(strider$length(), 10)
++  expect_length(as.list(strider), 4L)
++  expect_equal(
++    CoordsStrider$new(start = 5L, end = 14L)$full_coords,
++    bit64::as.integer64(5:14)
++  )
++  expect_true(
++    CoordsStrider$new(start = 0L, end = 19L)$is_full_domain(20L)
++  )
++  expect_false(
++    CoordsStrider$new(start = 0L, end = 18L)$is_full_domain(20L)
++  )
++  expect_false(
++    CoordsStrider$new(bit64::as.integer64(0:19))$is_full_domain(20L)
++  )
++})
++
++test_that("Blockwise tables honor a restriction on the non-iterated axis", {
++  fx <- blockwise_fixture()
++  arr <- SOMASparseNDArrayOpen(fx$uri)
++  on.exit(arr$close(), add = TRUE, after = FALSE)
++  rows <- 5:14
++  cols <- 3:9
++  coords <- list(soma_dim_0 = rows, soma_dim_1 = cols)
++  row_chunks <- chunk(rows, 3L)
++
++  for (mode in reindex_modes) {
++    blocks <- read_blocks(arr, coords, axis = 0L, size = 3L, mode$reindex)
++    expected <- lapply(row_chunks, function(br) {
++      expected_table(fx$mat, br, cols, mode$rows, mode$cols)
++    })
++    expect_blocks(
++      blocks,
++      expected,
++      sprintf("reindex = %s", format(mode$reindex))
++    )
++  }
++})
++
++test_that("Blockwise sparse matrices honor a restriction on the non-iterated axis", {
++  fx <- blockwise_fixture()
++  arr <- SOMASparseNDArrayOpen(fx$uri)
++  on.exit(arr$close(), add = TRUE, after = FALSE)
++  rows <- 5:14
++  cols <- 3:9
++  coords <- list(soma_dim_0 = rows, soma_dim_1 = cols)
++  row_chunks <- chunk(rows, 3L)
++
++  for (mode in reindex_modes) {
++    blocks <- read_blocks(
++      arr,
++      coords,
++      axis = 0L,
++      size = 3L,
++      mode$reindex,
++      repr = "T"
++    )
++    expected <- lapply(row_chunks, function(br) {
++      expected_block(fx$mat, br, cols, mode$rows, mode$cols)
++    })
++    expect_blocks(
++      blocks,
++      expected,
++      sprintf("reindex = %s", format(mode$reindex))
++    )
++  }
++
++  # The compressed representation from the original report
++  blocks <- read_blocks(
++    arr,
++    coords,
++    axis = 0L,
++    size = 3L,
++    reindex = NA,
++    repr = "R"
++  )
++  expect_s4_class(blocks[[1L]], "dgRMatrix")
++  expected <- lapply(row_chunks, function(br) {
++    expected_block(fx$mat, br, cols, compact_rows = TRUE, compact_cols = FALSE)
++  })
++  expect_blocks(blocks, expected, "repr = R")
++
++  # Iterate over the second axis with a restriction on the first
++  col_chunks <- chunk(cols, 4L)
++  blocks <- read_blocks(
++    arr,
++    coords,
++    axis = 1L,
++    size = 4L,
++    reindex = NA,
++    repr = "T"
++  )
++  expected <- lapply(col_chunks, function(bc) {
++    expected_block(fx$mat, rows, bc, compact_rows = FALSE, compact_cols = TRUE)
++  })
++  expect_blocks(blocks, expected, "axis = 1")
++})
++
++test_that("Blockwise reads accept coords for a subset of dimensions", {
++  fx <- blockwise_fixture()
++  arr <- SOMASparseNDArrayOpen(fx$uri)
++  on.exit(arr$close(), add = TRUE, after = FALSE)
++  all_rows <- seq_len(nrow(fx$mat)) - 1L
++  all_cols <- all_rows
++
++  # Restrict only the minor axis; the iterated axis spans the full domain
++  cols <- 3:9
++  row_chunks <- chunk(all_rows, 8L)
++  blocks <- read_blocks(
++    arr,
++    list(soma_dim_1 = cols),
++    axis = 0L,
++    size = 8L,
++    reindex = NA,
++    repr = "T"
++  )
++  expected <- lapply(row_chunks, function(br) {
++    expected_block(fx$mat, br, cols, compact_rows = TRUE, compact_cols = FALSE)
++  })
++  expect_blocks(blocks, expected, "minor axis only")
++
++  # Restrict only the iterated axis
++  rows <- 5:14
++  row_chunks <- chunk(rows, 4L)
++  blocks <- read_blocks(
++    arr,
++    list(soma_dim_0 = rows),
++    axis = 0L,
++    size = 4L,
++    reindex = NA,
++    repr = "T"
++  )
++  expected <- lapply(row_chunks, function(br) {
++    expected_block(
++      fx$mat,
++      br,
++      all_cols,
++      compact_rows = TRUE,
++      compact_cols = FALSE
++    )
++  })
++  expect_blocks(blocks, expected, "major axis only")
++})

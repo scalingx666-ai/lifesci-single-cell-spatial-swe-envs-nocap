@@ -1,0 +1,1696 @@
+diff --git a/.gitignore b/.gitignore
+index 53e65d3..4611d1b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,3 +8,4 @@ resources
+ _build/
+ _build/*
+ .fleet
++.zed
+diff --git a/Cargo.toml b/Cargo.toml
+index 22cd555..28059b7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "single_rust"
+-version = "0.5.5"
++version = "0.5.6"
+ edition = "2021"
+ license-file = "LICENSE.md"
+ readme = "README.md"
+@@ -29,10 +29,10 @@ anndata-memory = { version = "1.0.6" }
+ num-traits = "0.2.19"
+ rand = "0.9.2"
+ nalgebra = { version = "0.33.2", features = ["serde-serialize", "rayon"] }
+-single_algebra = { version = "0.8.6", features = [] }
++single_algebra = { version = "0.8.7", features = [] }
+ simba = { version = "0.9.0", optional = true }
+-single-utilities = "0.8.0"
+-single-statistics = { version = "0.7.0" }
++single-utilities = "0.8.5"
++single-statistics = { version = "0.8.1" }
+ 
+ 
+ [dev-dependencies]
+diff --git a/src/memory/processing/diffexp/mod.rs b/src/memory/processing/diffexp/mod.rs
+index 8a575e9..7e351f3 100644
+--- a/src/memory/processing/diffexp/mod.rs
++++ b/src/memory/processing/diffexp/mod.rs
+@@ -1,3 +1,78 @@
++//! # Differential Expression Analysis
++//!
++//! This module provides high-performance differential expression analysis for single-cell RNA-seq data.
++//! It implements statistical tests to identify genes that are significantly differentially expressed
++//! between groups of cells, similar to scanpy's `rank_genes_groups` functionality.
++//!
++//! ## Features
++//!
++//! - **Multiple Statistical Tests**: Support for parametric (t-test variants) and non-parametric (Mann-Whitney) tests
++//! - **Parallel Processing**: Efficient parallel computation using Rust's rayon for large datasets
++//! - **Multiple Testing Correction**: Various correction methods (Bonferroni, Benjamini-Hochberg, etc.)
++//! - **Flexible Group Comparisons**: Compare specific groups vs reference groups or vs all other cells
++//! - **Effect Size Calculation**: Computation of log fold changes with customizable pseudocounts
++//!
++//! ## Statistical Methods
++//!
++//! ### Parametric Tests
++//! - **Student's t-test**: Assumes equal variances between groups
++//! - **Welch's t-test**: Does not assume equal variances (default, recommended)
++//!
++//! ### Non-parametric Tests  
++//! - **Mann-Whitney U test**: Rank-based test, no distributional assumptions
++//!
++//! ## Usage Examples
++//!
++//! ```rust,ignore
++//! use single_rust::memory::processing::diffexp::{rank_gene_groups, CorrectionMethod};
++//! use single_statistics::testing::{TestMethod, TTestType};
++//!
++//! // Basic differential expression: Compare group A vs group B
++//! rank_gene_groups(
++//!     &adata,
++//!     "cell_type",           // Column in adata.obs with group labels
++//!     Some("B"),             // Reference group
++//!     Some(&["A"]),          // Groups to test
++//!     None,                  // Use default key "rank_genes_groups"
++//!     None,                  // Use default Welch's t-test
++//!     None,                  // Return all genes
++//!     CorrectionMethod::BejaminiHochberg,
++//!     None,                  // Compute log fold changes
++//!     None,                  // Use default pseudocount
++//! )?;
++//!
++//! // Compare each group vs all other cells
++//! rank_gene_groups(
++//!     &adata,
++//!     "cell_type",
++//!     Some("rest"),          // Use all other cells as reference
++//!     None,                  // Test all groups
++//!     Some("vs_rest"),       // Custom key for results
++//!     Some(TestMethod::MannWhitney), // Use non-parametric test
++//!     Some(50),              // Return top 50 genes per group
++//!     CorrectionMethod::Bonferroni,
++//!     Some(true),
++//!     Some(0.5),             // Custom pseudocount
++//! )?;
++//! ```
++//!
++//! ## Output Format
++//!
++//! Results are stored in `adata.uns` with structured keys:
++//! - `{key}_scores`: Test statistics for each gene and group
++//! - `{key}_pvals`: Raw p-values
++//! - `{key}_pvals_adj`: Multiple testing corrected p-values  
++//! - `{key}_logfoldchanges`: Log2 fold changes
++//! - `{key}_names`: Gene names ranked by significance
++//! - `{key}_params_*`: Analysis parameters for reproducibility
++//!
++//! ## Performance Notes
++//!
++//! - Uses parallel processing with optimized chunk sizes for large datasets
++//! - Pre-computes summary statistics for t-tests to avoid redundant calculations
++//! - Optimized sparse matrix operations for memory efficiency
++//! - Results are sorted by adjusted p-values, then raw p-values for ranking
++
+ use std::cmp::Ordering;
+ use std::collections::HashMap;
+ use std::ops::Deref;
+@@ -12,7 +87,7 @@ use single_statistics::testing::correction::{
+     benjamini_hochberg_correction, benjamini_yekutieli_correction, bonferroni_correction,
+     hochberg_correction, holm_bonferroni_correction, storey_qvalues,
+ };
+-use single_statistics::testing::inference::nonparametric::mann_whitney;
++use single_statistics::testing::inference::nonparametric::mann_whitney_optimized;
+ use single_statistics::testing::inference::parametric::fast_t_test_from_sums;
+ use single_statistics::testing::inference::MatrixStatTests;
+ use single_statistics::testing::{Alternative, TTestType, TestMethod, TestResult};
+@@ -23,13 +98,38 @@ use crate::memory::utils::{create_dataframe_from_map, create_string_dataframe_fr
+ /// Chunk size for parallel processing of statistical tests
+ const PARALLEL_CHUNK_SIZE: usize = 64;
+ 
++/// Multiple testing correction methods for controlling family-wise error rate or false discovery rate.
++///
++/// When testing thousands of genes simultaneously, the probability of false positives increases
++/// dramatically. These correction methods adjust p-values to control for multiple testing.
++///
++/// ## Methods
++///
++/// - **Bonferroni**: Conservative method controlling family-wise error rate (FWER)
++/// - **BejaminiHochberg**: Controls false discovery rate (FDR), less conservative than Bonferroni
++/// - **BenjaminiYekutieli**: More conservative FDR control for dependent tests
++/// - **HolmBonferroni**: Step-down method, more powerful than Bonferroni
++/// - **Hochberg**: Step-up method, requires independence assumption
++/// - **StoreyQValue**: Estimates q-values using Storey's method
++///
++/// ## Recommendations
++///
++/// - Use **BejaminiHochberg** for most single-cell differential expression analyses
++/// - Use **Bonferroni** when very strict control of false positives is needed
++/// - Use **StoreyQValue** when you need q-value estimates rather than adjusted p-values
+ #[derive(Clone)]
+ pub enum CorrectionMethod {
++    /// Bonferroni correction: p_adj = p * n_tests
+     Bonferroni,
++    /// Benjamini-Hochberg FDR correction (recommended for most analyses)
+     BejaminiHochberg,
++    /// Benjamini-Yekutieli FDR correction for dependent tests
+     BenjaminiYekutieli,
++    /// Holm-Bonferroni step-down method
+     HolmBonferroni,
++    /// Hochberg step-up method
+     Hochberg,
++    /// Storey q-value estimation
+     StoreyQValue,
+ }
+ 
+@@ -166,11 +266,20 @@ pub fn rank_gene_groups(
+     Ok(())
+ }
+ 
++/// Container for organizing differential expression results across multiple groups.
++/// 
++/// This struct holds the complete results of differential expression analysis,
++/// with separate collections for each group tested.
+ struct DifferentialExpressionResults {
++    /// Test statistics (t-statistic, U-statistic, etc.) for each group
+     scores: HashMap<String, Vec<f64>>,
++    /// Raw p-values before multiple testing correction
+     pvals: HashMap<String, Vec<f64>>,
++    /// Adjusted p-values after multiple testing correction
+     pvals_adj: HashMap<String, Vec<f64>>,
++    /// Log2 fold changes (group_mean / reference_mean)
+     logfoldchanges: HashMap<String, Vec<f64>>,
++    /// Gene names ranked by significance for each group
+     gene_names: HashMap<String, Vec<String>>,
+ }
+ 
+@@ -241,11 +350,20 @@ where
+     })
+ }
+ 
++/// Container for differential expression results for a single group comparison.
++///
++/// Holds the complete statistical results for comparing one group against a reference,
++/// including test statistics, p-values, effect sizes, and gene rankings.
+ struct GroupTestResults {
++    /// Test statistics ranked by significance
+     scores: Vec<f64>,
++    /// Raw p-values ranked by significance  
+     pvals: Vec<f64>,
++    /// Multiple testing corrected p-values ranked by significance
+     pvals_adj: Vec<f64>,
++    /// Log2 fold changes ranked by significance
+     logfoldchanges: Vec<f64>,
++    /// Gene names ranked by significance
+     gene_names: Vec<String>,
+ }
+ 
+@@ -365,7 +483,7 @@ where
+                                 ref_values_f64.push(value);
+                             }
+ 
+-                            mann_whitney(&group_values_f64, &ref_values_f64, Alternative::TwoSided)
++                            mann_whitney_optimized(&group_values_f64, &ref_values_f64, Alternative::TwoSided)
+                         }
+                         _ => TestResult::new(0.0, 1.0),
+                     }
+@@ -443,6 +561,19 @@ where
+     })
+ }
+ 
++/// Extract unique group labels from a categorical or string column in the observation metadata.
++///
++/// This function handles different data types commonly used for group labels:
++/// - String columns
++/// - Integer columns (converted to strings)  
++/// - Categorical columns (with proper ordering preservation)
++///
++/// # Arguments
++/// * `adata` - The AnnData object
++/// * `groupby` - Column name in `adata.obs` containing group labels
++///
++/// # Returns
++/// Sorted vector of unique group names as strings
+ fn get_unique_groups(adata: &IMAnnData, groupby: &str) -> anyhow::Result<Vec<String>> {
+     let group_col = adata.obs().get_column_from_df(groupby)?;
+ 
+@@ -523,6 +654,17 @@ fn get_unique_groups(adata: &IMAnnData, groupby: &str) -> anyhow::Result<Vec<Str
+     Ok(all_groups)
+ }
+ 
++/// Filter and validate the list of groups to test from user input.
++///
++/// If specific groups are provided, validates they exist in the data.
++/// If no groups specified, returns all available groups.
++///
++/// # Arguments
++/// * `all_groups` - Complete list of groups available in the data
++/// * `groups` - Optional user-specified subset of groups to test
++///
++/// # Returns
++/// Validated vector of group names to test
+ fn filter_groups_to_test(
+     all_groups: &[String],
+     groups: Option<&[&str]>,
+@@ -549,6 +691,20 @@ fn filter_groups_to_test(
+     }
+ }
+ 
++/// Resolve the reference group specification to an actual group name or "rest" mode.
++///
++/// Handles three cases:
++/// - Specific group name: validates the group exists
++/// - "rest": use all cells not in the test group as reference
++/// - None: automatically use "rest" mode
++///
++/// # Arguments
++/// * `all_groups` - Complete list of available groups
++/// * `reference` - User-specified reference group or None
++///
++/// # Returns
++/// - `Some(group_name)` for specific reference group
++/// - `None` for "rest" mode (use all other cells)
+ fn resolve_reference_group(
+     all_groups: &[String],
+     reference: Option<&str>,
+@@ -570,6 +726,25 @@ fn resolve_reference_group(
+     }
+ }
+ 
++/// Get row indices for cells belonging to a specific group.
++///
++/// Searches through the groupby column and returns the indices of all cells
++/// that match the specified group label. Handles different column data types
++/// including strings, integers, and categorical data.
++///
++/// # Arguments
++/// * `adata` - The AnnData object
++/// * `groupby` - Column name in `adata.obs` containing group labels
++/// * `group` - Group label to search for
++///
++/// # Returns
++/// Vector of 0-based row indices for cells in the specified group
++///
++/// # Errors
++/// Returns error if:
++/// - The groupby column doesn't exist
++/// - No cells found for the specified group
++/// - Data type conversion fails
+ fn get_group_indices(adata: &IMAnnData, groupby: &str, group: &str) -> anyhow::Result<Vec<usize>> {
+     let group_col = adata.obs().get_column_from_df(groupby)?;
+ 
+@@ -642,6 +817,27 @@ fn get_group_indices(adata: &IMAnnData, groupby: &str, group: &str) -> anyhow::R
+ 
+     Ok(indices)
+ }
++
++/// Apply multiple testing correction to a vector of p-values.
++///
++/// Converts p-values to the appropriate numeric type and applies the specified
++/// correction method. All correction methods are implemented in the `single_statistics`
++/// crate with well-tested algorithms.
++///
++/// # Arguments
++/// * `p_value` - Raw p-values to correct
++/// * `method` - Multiple testing correction method to apply
++///
++/// # Returns
++/// Vector of corrected p-values in the same order as input
++///
++/// # Multiple Testing Methods
++/// - **Bonferroni**: Most conservative, controls FWER
++/// - **Benjamini-Hochberg**: Controls FDR, widely used
++/// - **Benjamini-Yekutieli**: More conservative FDR for dependent tests
++/// - **Holm-Bonferroni**: Stepwise method, less conservative than Bonferroni
++/// - **Hochberg**: Requires independence assumption
++/// - **Storey Q-value**: Provides q-value estimates
+ fn apply_correction<T>(p_value: &[T], method: CorrectionMethod) -> anyhow::Result<Vec<T>>
+ where
+     T: FloatOps,
+diff --git a/src/memory/processing/dimred/mod.rs b/src/memory/processing/dimred/mod.rs
+index 1a7f65f..8f98124 100644
+--- a/src/memory/processing/dimred/mod.rs
++++ b/src/memory/processing/dimred/mod.rs
+@@ -1,8 +1,94 @@
++//! # Dimensionality Reduction Module
++//!
++//! This module provides high-performance dimensionality reduction algorithms for single-cell RNA-seq data.
++//! Dimensionality reduction is essential for visualization, clustering, and removing noise from high-dimensional
++//! single-cell expression data.
++//!
++//!
++//! This module is actively being developed. Currently implemented:
++//! - **PCA**: Principal Component Analysis (basic implementation)
++//! - **Feature Selection**: Methods for selecting genes/features before dimensionality reduction
++//!
++//! ## Feature Selection Integration
++//!
++//! All dimensionality reduction methods support intelligent feature selection to improve
++//! performance and biological interpretability:
++//!
++//! - **Highly Variable Genes**: Use genes with high biological variability
++//! - **Full Feature Set**: Use all available genes (not recommended for large datasets)
++//! - **Random Selection**: For benchmarking and testing purposes
++//!
++//! ## Usage Philosophy
++//!
++//! This module follows single-cell analysis best practices:
++//!
++//! 1. **Feature Selection First**: Always consider which genes to include
++//! 2. **Multiple Methods**: Different algorithms reveal different aspects of data structure
++//! 3. **Parameter Tuning**: Most methods require careful parameter selection
++//! 4. **Computational Efficiency**: Optimized for large single-cell datasets
++//!
++//! ## Example Workflow (Planned)
++//!
++//! ```rust,ignore
++//! use single_rust::memory::processing::dimred::{pca, umap, FeatureSelectionMethod};
++//!
++//! // 1. Select highly variable genes for dimensionality reduction
++//! let hvg_mask = compute_highly_variable_genes(&adata, None)?;
++//! let feature_selection = FeatureSelectionMethod::HighlyVariableSelection(hvg_mask);
++//!
++//! // 2. Perform PCA for initial dimensionality reduction
++//! pca::run_pca(&adata, Some(50), Some(feature_selection.clone()), Some("X_pca"))?;
++//!
++//! // 3. Use PCA results for UMAP
++//! umap::run_umap(&adata, Some("X_pca"), Some(15), Some("X_umap"))?;
++//! ```
++//!
++//! ## Performance Considerations
++//!
++//! - **Memory Efficiency**: Supports both dense and sparse matrix operations
++//! - **Parallel Computing**: Leverages Rust's concurrency for multi-core processing
++//! - **Incremental Algorithms**: Some methods support out-of-core computation for very large datasets
++//! - **GPU Acceleration**: Planned integration with GPU compute libraries
++
+ pub mod pca;
+ 
++/// Methods for selecting features (genes) before dimensionality reduction.
++///
++/// Feature selection is crucial for dimensionality reduction in single-cell data because:
++/// - Reduces computational cost and memory usage
++/// - Removes noise from lowly expressed or invariant genes  
++/// - Focuses analysis on biologically relevant variability
++/// - Improves clustering and visualization quality
++///
++/// ## Selection Strategies
++///
++/// - **HighlyVariableSelection**: Use genes identified as highly variable (recommended)
++/// - **FullFeatures**: Use all available genes (may include noise)
++/// - **RandomSelection**: Random subset of genes (useful for benchmarking)
++///
++/// ## Usage
++///
++/// ```rust,ignore
++/// // Use highly variable genes (recommended)
++/// let hvg_mask = compute_highly_variable_genes(&adata, None)?;
++/// let feature_selection = FeatureSelectionMethod::HighlyVariableSelection(hvg_mask);
++///
++/// // Use all features (not recommended for large datasets)
++/// let feature_selection = FeatureSelectionMethod::FullFeatures;
++///
++/// // Use random subset (for testing/benchmarking)
++/// let feature_selection = FeatureSelectionMethod::RandomSelection(2000);
++/// ```
+ #[derive(Clone, Debug)]
+ pub enum FeatureSelectionMethod {
++    /// Use all available genes/features. May include noise and increase computational cost.
+     FullFeatures,
++    
++    /// Use genes marked as highly variable. Vector of booleans where true indicates
++    /// the gene should be included. Length must match the number of genes in the dataset.
+     HighlyVariableSelection(Vec<bool>),
++    
++    /// Randomly select the specified number of genes. Useful for benchmarking
++    /// and testing different feature set sizes.
+     RandomSelection(usize),
+ }
+diff --git a/src/memory/processing/dimred/pca/mod.rs b/src/memory/processing/dimred/pca/mod.rs
+index c84cad9..a583700 100644
+--- a/src/memory/processing/dimred/pca/mod.rs
++++ b/src/memory/processing/dimred/pca/mod.rs
+@@ -1,3 +1,67 @@
++//! # Principal Component Analysis (PCA) for Single-Cell Data
++//!
++//! This module provides high-performance PCA implementation optimized for single-cell RNA-seq data.
++//! PCA is a fundamental dimensionality reduction technique that identifies the directions of maximum
++//! variance in high-dimensional data.
++//!
++//! ## Overview
++//!
++//! PCA transforms the original gene expression space into a new coordinate system where:
++//! - The first principal component captures the most variance
++//! - Each subsequent component captures the most remaining variance
++//! - Components are orthogonal (uncorrelated) to each other
++//!
++//! ## Key Features
++//!
++//! - **Sparse Matrix Support**: Optimized for sparse single-cell expression matrices
++//! - **Feature Selection Integration**: Works with highly variable genes or custom gene selections
++//! - **Multiple SVD Methods**: Choice of SVD algorithms for different performance characteristics
++//! - **Memory Efficient**: Handles large datasets without excessive memory usage
++//! - **Configurable Centering**: Option to center data (recommended for most analyses)
++//!
++//! ## When to Use PCA
++//!
++//! ✅ **Good for:**
++//! - Initial exploration of dataset structure
++//! - Noise reduction before clustering
++//! - Input for other dimensionality reduction methods (t-SNE, UMAP)
++//! - Quality control and batch effect detection
++//! - Identifying major sources of variation
++//!
++//! ⚠️ **Limitations:**
++//! - Linear method - may not capture complex non-linear relationships
++//! - First components may be dominated by technical effects
++//! - Interpretation can be challenging with many genes
++//!
++//! ## Typical Workflow
++//!
++//! ```rust,ignore
++//! use single_rust::memory::processing::dimred::pca::run_pca_sparse_masked;
++//! use single_rust::memory::processing::dimred::FeatureSelectionMethod;
++//! use single_algebra::dimred::pca::SVDMethod;
++//!
++//! // 1. Select highly variable genes
++//! let hvg_mask = compute_highly_variable_genes(&adata, None)?;
++//! let feature_selection = FeatureSelectionMethod::HighlyVariableSelection(hvg_mask);
++//!
++//! // 2. Run PCA with 50 components
++//! let pca_result = run_pca_sparse_masked::<f64>(
++//!     &adata.x(),
++//!     Some(feature_selection),
++//!     Some(true),              // Center the data
++//!     Some(false),             // Verbose output
++//!     Some(50),                // Number of components
++//!     Some(1.0),               // Regularization parameter
++//!     Some(42),                // Random seed for reproducibility
++//!     Some(SVDMethod::Randomized), // Fast randomized SVD
++//! )?;
++//!
++//! // 3. Access results
++//! let embeddings = pca_result.transformed;              // Cell embeddings in PC space
++//! let variance_explained = pca_result.explained_variance_ratio;  // Variance per component
++//! let loadings = pca_result.feature_importance;         // Gene loadings/weights
++//! ```
++
+ use crate::memory::processing::dimred::FeatureSelectionMethod;
+ use crate::memory::utils::{arr1_conversion, arr2_conversion};
+ use anndata::data::DynCsrMatrix;
+@@ -12,16 +76,125 @@ use single_algebra::dimred::pca::{MaskedSparsePCABuilder, SVDMethod};
+ use single_utilities::traits::FloatOpsTS;
+ use std::ops::Deref;
+ 
++/// Results from Principal Component Analysis.
++///
++/// Contains all the essential outputs from PCA analysis including the transformed data,
++/// variance explained by each component, and feature importance scores.
++///
++/// ## Fields
++///
++/// - `transformed`: Cell embeddings in the principal component space (cells × components)
++/// - `explained_variance_ratio`: Fraction of total variance explained by each component
++/// - `cumulative_explained_variance_ratio`: Cumulative variance explained up to each component
++/// - `feature_importance`: Gene loadings/weights for each component (genes × components)
++///
++/// ## Usage
++///
++/// ```rust,ignore
++/// let pca_result = run_pca_sparse_masked(&matrix, ...)?;
++///
++/// // Get embeddings for visualization or clustering
++/// let embeddings = pca_result.transformed;
++///
++/// // Check how much variance is captured
++/// let total_variance = pca_result.cumulative_explained_variance_ratio[[49]]; // 50th component
++///
++/// // Find important genes for first component  
++/// let pc1_loadings = pca_result.feature_importance.column(0);
++/// ```
+ pub struct PCAResult<T>
+ where
+     T: FloatOpsTS,
+ {
++    /// Transformed data: cell embeddings in principal component space (n_cells × n_components)
+     pub transformed: Array2<T>,
++    /// Fraction of variance explained by each principal component
+     pub explained_variance_ratio: Array1<T>,
++    /// Cumulative fraction of variance explained up to each component
+     pub cumulative_explained_variance_ratio: Array1<T>,
++    /// Feature loadings/importance for each component (n_features × n_components)
+     pub feature_importance: Array2<T>,
+ }
+ 
++/// Perform Principal Component Analysis on sparse single-cell expression data.
++///
++/// This function provides a comprehensive PCA implementation optimized for single-cell data,
++/// with support for feature selection, sparse matrices, and various SVD algorithms.
++///
++/// ## Algorithm Details
++///
++/// The implementation uses efficient sparse matrix operations and supports multiple SVD methods:
++/// - **Randomized SVD**: Fast approximation, good for large datasets
++/// - **Full SVD**: Exact computation, slower but more accurate
++/// - **Truncated SVD**: Memory efficient for large matrices
++///
++/// ## Parameters
++///
++/// * `matrix` - The expression matrix (cells × genes) as IMArrayElement
++/// * `feature_selection_method` - Method for selecting genes (HVGs recommended)
++/// * `center` - Whether to center the data (recommended: true)
++/// * `verbose` - Enable verbose output for debugging
++/// * `n_components` - Number of principal components to compute (default: 50)
++/// * `alpha` - Regularization parameter for numerical stability (default: 1.0)
++/// * `random_seed` - Seed for reproducible results (default: 42)
++/// * `svd_method` - SVD algorithm to use (default: Randomized)
++///
++/// ## Returns
++///
++/// Returns a `PCAResult` containing:
++/// - Transformed cell embeddings
++/// - Variance explained by each component
++/// - Feature importance/loading scores
++///
++/// ## Examples
++///
++/// ### Basic Usage
++/// ```rust,ignore
++/// // Simple PCA with default parameters
++/// let result = run_pca_sparse_masked::<f64>(
++///     &adata.x(),
++///     None,                    // Use default random selection
++///     Some(true),              // Center the data
++///     None,                    // No verbose output
++///     Some(50),                // 50 components
++///     None,                    // Default alpha
++///     None,                    // Default seed
++///     None,                    // Default SVD method
++/// )?;
++/// ```
++///
++/// ### Advanced Usage with HVGs
++/// ```rust,ignore
++/// // PCA using highly variable genes
++/// let hvg_mask = compute_highly_variable_genes(&adata, None)?;
++/// let feature_selection = FeatureSelectionMethod::HighlyVariableSelection(hvg_mask);
++///
++/// let result = run_pca_sparse_masked::<f64>(
++///     &adata.x(),
++///     Some(feature_selection),
++///     Some(true),              // Center for better component interpretation
++///     Some(false),             // Quiet mode
++///     Some(30),                // Fewer components for speed
++///     Some(0.1),               // Higher regularization
++///     Some(123),               // Custom seed
++///     Some(SVDMethod::Randomized), // Fast approximation
++/// )?;
++/// ```
++///
++/// ## Performance Considerations
++///
++/// - **Feature Selection**: Using 1000-5000 highly variable genes typically optimal
++/// - **Components**: 30-50 components usually capture most biological variation
++/// - **SVD Method**: Randomized SVD recommended for >10,000 cells
++/// - **Centering**: Essential for proper component interpretation but increases memory usage
++///
++/// ## Errors
++///
++/// Returns error if:
++/// - Matrix format is not supported (only CSR matrices supported)
++/// - Data type is not F32 or F64
++/// - Feature selection mask length doesn't match number of genes
++/// - SVD computation fails (e.g., insufficient rank)
+ #[allow(clippy::too_many_arguments)]
+ pub fn run_pca_sparse_masked<T>(
+     matrix: &IMArrayElement,
+@@ -122,6 +295,36 @@ where
+     }
+ }
+ 
++/// Generate a random boolean mask for gene selection.
++///
++/// Creates a boolean vector where `num_random_selection` randomly chosen positions
++/// are set to `true`, and all others are `false`. This is used for benchmarking
++/// and testing purposes when you want to select a random subset of genes.
++///
++/// ## Parameters
++///
++/// * `n_genes` - Total number of genes in the dataset
++/// * `num_random_selection` - Number of genes to randomly select
++///
++/// ## Returns
++///
++/// Boolean vector of length `n_genes` with exactly `num_random_selection` true values
++/// at random positions.
++///
++/// ## Note
++///
++/// This function uses the default random number generator. For reproducible results,
++/// set the global random seed before calling, or consider using the `random_seed`
++/// parameter in `run_pca_sparse_masked`.
++///
++/// ## Example
++///
++/// ```rust,ignore
++/// // Select 2000 random genes from 20000 total genes
++/// let mask = generate_random_mask(20000, 2000);
++/// assert_eq!(mask.len(), 20000);
++/// assert_eq!(mask.iter().filter(|&&x| x).count(), 2000);
++/// ```
+ fn generate_random_mask(n_genes: usize, num_random_selection: usize) -> Vec<bool> {
+     let mut rng = rng();
+     let uniform = Uniform::new(0, n_genes).unwrap();
+diff --git a/src/memory/processing/hvg/mod.rs b/src/memory/processing/hvg/mod.rs
+index ec4b417..e706847 100644
+--- a/src/memory/processing/hvg/mod.rs
++++ b/src/memory/processing/hvg/mod.rs
+@@ -1,9 +1,158 @@
++//! # Highly Variable Gene Detection
++//!
++//! This module implements methods for identifying highly variable genes (HVGs) in single-cell RNA-seq data.
++//! HVGs are genes that exhibit high variability across cells beyond what would be expected from technical noise,
++//! and are crucial for downstream analysis like dimensionality reduction and clustering.
++//!
++//! ## Why Highly Variable Genes?
++//!
++//! Single-cell datasets typically contain 20,000+ genes, but most show little biological variation:
++//! - **Technical noise**: Sequencing depth, amplification bias, dropout events
++//! - **Housekeeping genes**: Consistently expressed across cell types
++//! - **Lowly expressed genes**: Dominated by technical variation
++//!
++//! By focusing on highly variable genes, we:
++//! - Reduce computational burden and noise
++//! - Highlight biologically relevant variation
++//! - Improve clustering and visualization quality
++//! - Focus on genes driving cell-to-cell differences
++//!
++//! ## Implemented Methods
++//!
++//! ### 1. Seurat Method (Default)
++//! Based on Satija lab's approach, models the mean-variance relationship using binning:
++//! - Bins genes by expression level
++//! - Calculates expected dispersion for each bin
++//! - Identifies genes with higher-than-expected dispersion
++//! - **Best for**: Most single-cell datasets, widely validated
++//!
++//! ### 2. SVR Method  
++//! Uses Support Vector Regression to model mean-variance relationship:
++//! - Fits SVR to log(mean) vs log(variance)
++//! - Identifies genes with high residuals from the trend
++//! - **Best for**: Datasets with complex mean-variance relationships
++//!
++//! ### 3. Cell Ranger Method
++//! 10x Genomics approach (not yet implemented):
++//! - Similar to Seurat but with different normalization
++//! - **Best for**: Datasets processed with Cell Ranger pipeline
++//!
++//! ## Usage Examples
++//!
++//! ```rust,ignore
++//! use single_rust::memory::processing::hvg::compute_highly_variable_genes;
++//! use single_rust::shared::processing::HVGParams;
++//!
++//! // Basic usage with defaults (Seurat method)
++//! compute_highly_variable_genes(&adata, None)?;
++//!
++//! // Custom parameters
++//! let params = HVGParams {
++//!     n_top_genes: Some(2000),     // Select top 2000 most variable genes
++//!     min_mean: 0.0125,            // Minimum mean expression
++//!     max_mean: 3.0,               // Maximum mean expression  
++//!     min_dispersion: 0.5,         // Minimum normalized dispersion
++//!     n_bins: 20,                  // Number of expression bins
++//!     flavor: FlavorType::Seurat,  // Method to use
++//! };
++//! compute_highly_variable_genes(&adata, Some(params))?;
++//!
++//! // Access results
++//! let var_df = adata.var().get_data();
++//! let hvg_mask = var_df.column("highly_variable")?.bool()?;
++//! let hvg_genes: Vec<_> = hvg_mask.into_iter()
++//!     .enumerate()
++//!     .filter_map(|(i, is_hvg)| if is_hvg.unwrap_or(false) { Some(i) } else { None })
++//!     .collect();
++//! ```
++//!
++//! ## Output Columns
++//!
++//! Results are stored in `adata.var()` with method-specific columns:
++//!
++//! ### Seurat Method
++//! - `means`: Log1p mean expression per gene
++//! - `dispersions`: Log dispersion (variance/mean)
++//! - `dispersions_norm`: Normalized dispersion scores
++//! - `highly_variable`: Boolean mask for selected genes
++//!
++//! ### SVR Method  
++//! - `means`: Mean expression per gene
++//! - `variances`: Variance per gene
++//! - `residuals`: Residuals from SVR fit
++//! - `residuals_standardized`: Standardized residuals
++//! - `mean_variance_trend`: Predicted variance from SVR
++//! - `highly_variable`: Boolean mask for selected genes
++//!
++//! ## Parameter Guidelines
++//!
++//! ### Gene Count Selection
++//! - **1000-2000 genes**: Good for initial exploration
++//! - **2000-5000 genes**: Standard for most analyses  
++//! - **5000+ genes**: May include noise, use with caution
++//!
++//! ### Expression Filters
++//! - `min_mean`: Remove lowly expressed genes (default: 0.0125)
++//! - `max_mean`: Remove highly expressed genes (default: 3.0)
++//! - Adjust based on your normalization and log-transformation
++//!
++//! ### Method Selection
++//! - **Seurat**: Robust, widely used, good default choice
++//! - **SVR**: Better for complex datasets, more computationally intensive
++//! - **Cell Ranger**: Use if data processed with 10x Cell Ranger
++
+ use crate::shared::processing::{fit_svr, standardize_log_form_vec, FlavorType, HVGParams};
+ use crate::{ComputeSum, ComputeVariance};
+ use anndata_memory::{IMAnnData, IMArrayElement};
+ use polars::prelude::Column;
+ use single_utilities::types::Direction;
+ 
++/// Compute highly variable genes using the specified method and parameters.
++///
++/// This is the main entry point for HVG detection. It analyzes the mean-variance relationship
++/// in the expression data to identify genes with biological variability above technical noise.
++///
++/// ## Algorithm Overview
++///
++/// 1. **Calculate Statistics**: Compute mean and variance for each gene
++/// 2. **Model Relationship**: Fit mean-variance relationship using chosen method
++/// 3. **Identify Outliers**: Find genes with higher variability than expected
++/// 4. **Apply Filters**: Filter by expression level and dispersion thresholds
++/// 5. **Store Results**: Add columns to `adata.var()` with results
++///
++/// ## Parameters
++///
++/// * `adata` - AnnData object containing expression data
++/// * `params` - HVG parameters (uses defaults if None)
++///
++/// ## Method Details
++///
++/// - **Seurat**: Bins genes by expression, normalizes dispersion within bins
++/// - **SVR**: Fits support vector regression to model mean-variance trend
++/// - **Cell Ranger**: (Not implemented) 10x Genomics approach
++///
++/// ## Results Storage
++///
++/// All results are stored as new columns in `adata.var()`. The exact columns
++/// depend on the method used, but all methods add a `highly_variable` boolean column.
++///
++/// ## Examples
++///
++/// ```rust,ignore
++/// // Use defaults (Seurat method, top 2000 genes)
++/// compute_highly_variable_genes(&adata, None)?;
++///
++/// // Custom SVR analysis
++/// let params = HVGParams {
++///     flavor: FlavorType::SVR,
++///     n_top_genes: Some(3000),
++///     min_mean: 0.01,
++///     max_mean: 4.0,
++///     min_dispersion: 0.3,
++///     n_bins: 25,
++/// };
++/// compute_highly_variable_genes(&adata, Some(params))?;
++/// ```
+ pub fn compute_highly_variable_genes(
+     adata: &IMAnnData,
+     params: Option<HVGParams>,
+@@ -18,6 +167,20 @@ pub fn compute_highly_variable_genes(
+     }
+ }
+ 
++/// Post-process dispersion statistics for Seurat method to handle edge cases.
++///
++/// Handles bins with single genes where standard deviation cannot be computed.
++/// Following the original Seurat implementation, single-gene bins get special treatment
++/// to ensure they can still contribute to HVG selection.
++///
++/// ## Parameters
++/// * `bin_means` - Mean dispersion values for each bin
++/// * `bin_stds` - Standard deviation of dispersions for each bin
++///
++/// ## Behavior
++/// For bins with NaN standard deviation (single gene bins):
++/// - Sets std = mean and mean = 0
++/// - This results in normalized dispersion = 1 for these genes
+ fn postprocess_seurat_dispersions(
+     bin_means: &mut [f64],
+     bin_stds: &mut [f64],
+@@ -34,6 +197,25 @@ fn postprocess_seurat_dispersions(
+     Ok(())
+ }
+ 
++/// Create equal-width bins for gene expression levels.
++///
++/// Divides the expression range into equal-width bins for the Seurat method.
++/// This allows modeling of mean-variance relationship by expression level,
++/// as highly expressed genes naturally have different variance characteristics.
++///
++/// ## Parameters
++/// * `log_means` - Log-transformed mean expression values
++/// * `n_bins` - Number of bins to create
++///
++/// ## Returns
++/// * Bin assignment for each gene (0-based indices)
++/// * Bin edge values for reference
++///
++/// ## Algorithm
++/// 1. Find min/max of valid (finite) expression values
++/// 2. Create equal-width intervals between min and max
++/// 3. Assign each gene to appropriate bin
++/// 4. Handle edge cases (NaN values, exact maximum)
+ fn equal_width_binning(log_means: &[f64], n_bins: usize) -> anyhow::Result<(Vec<usize>, Vec<f64>)> {
+     // Find min and max (excluding NaN)
+     let mut valid_means: Vec<f64> = log_means
+@@ -90,6 +272,24 @@ fn equal_width_binning(log_means: &[f64], n_bins: usize) -> anyhow::Result<(Vec<
+     Ok((bin_indices, bin_edges))
+ }
+ 
++/// Calculate mean and standard deviation of dispersions within each expression bin.
++///
++/// For the Seurat method, this establishes the expected mean-variance relationship
++/// by computing statistics within bins of similar expression levels.
++///
++/// ## Parameters
++/// * `log_dispersions` - Log-transformed dispersion values (variance/mean)
++/// * `bin_indices` - Bin assignment for each gene
++/// * `n_bins` - Total number of bins
++///
++/// ## Returns
++/// * Mean dispersion for each bin
++/// * Standard deviation of dispersion for each bin
++///
++/// ## Special Cases
++/// - Empty bins: Both mean and std set to NaN
++/// - Single-gene bins: Mean = gene value, std = NaN (handled by postprocessing)
++/// - Uses sample standard deviation (n-1 denominator)
+ fn calculate_bin_stats(
+     log_dispersions: &[f64],
+     bin_indices: &[usize],
+@@ -134,6 +334,24 @@ fn calculate_bin_stats(
+     Ok((bin_means, bin_stds))
+ }
+ 
++/// Normalize dispersions by subtracting expected values and dividing by standard deviation.
++///
++/// This creates z-scores for dispersion values, allowing identification of genes
++/// with unusually high variability relative to genes with similar expression levels.
++///
++/// ## Parameters
++/// * `log_dispersions` - Log-transformed dispersion values
++/// * `bin_indices` - Bin assignment for each gene  
++/// * `bin_means` - Expected dispersion for each bin
++/// * `bin_stds` - Standard deviation of dispersion for each bin
++///
++/// ## Returns
++/// * Normalized dispersion scores (z-scores)
++///
++/// ## Formula
++/// `normalized_dispersion = (observed_dispersion - expected_dispersion) / std_dispersion`
++///
++/// Higher values indicate genes that are more variable than expected.
+ fn normalize_dispersions(
+     log_dispersions: &[f64],
+     bin_indices: &[usize],
+@@ -163,6 +381,26 @@ fn normalize_dispersions(
+     Ok(normalized_dispersions)
+ }
+ 
++/// Select highly variable genes based on dispersion scores and expression filters.
++///
++/// Final step of HVG detection that applies thresholds to identify the most
++/// biologically relevant genes. Supports both top-N selection and threshold-based selection.
++///
++/// ## Parameters
++/// * `log_means` - Log-transformed mean expression values
++/// * `dispersion_norm` - Normalized dispersion scores
++/// * `n_top_genes` - Optional: select this many top genes by dispersion
++/// * `min_mean` - Minimum mean expression threshold
++/// * `max_mean` - Maximum mean expression threshold  
++/// * `min_dispersion` - Minimum normalized dispersion threshold
++///
++/// ## Returns
++/// * Boolean mask indicating highly variable genes
++///
++/// ## Selection Logic
++/// - If `n_top_genes` specified: Select top N genes by normalized dispersion
++/// - Otherwise: Apply all threshold filters (mean and dispersion)
++/// - Genes with NaN dispersions are handled appropriately for each mode
+ fn subset_genes(
+     log_means: &[f64], // These are already log-transformed
+     dispersion_norm: &[f64],
+@@ -227,6 +465,31 @@ fn subset_genes(
+     Ok(highly_variable)
+ }
+ 
++/// Compute highly variable genes using the Seurat method.
++///
++/// The Seurat method models the mean-variance relationship by:
++/// 1. Calculating dispersion (variance/mean) for each gene
++/// 2. Binning genes by expression level  
++/// 3. Computing expected dispersion within each bin
++/// 4. Normalizing dispersions to z-scores
++/// 5. Selecting genes with high normalized dispersion
++///
++/// ## Method Details
++/// - Uses log1p transformation of means for binning
++/// - Handles zero dispersions by setting to NaN
++/// - Applies equal-width binning strategy
++/// - Stores log-transformed values for consistency with scanpy
++///
++/// ## Parameters
++/// * `adata` - AnnData object with expression data
++/// * `x` - Expression matrix
++/// * `params` - HVG parameters including thresholds and bin count
++///
++/// ## Output Columns
++/// - `means`: Log1p mean expression
++/// - `dispersions`: Log dispersion values
++/// - `dispersions_norm`: Z-score normalized dispersions
++/// - `highly_variable`: Boolean selection mask
+ fn compute_seurat_hvg(
+     adata: &IMAnnData,
+     x: &IMArrayElement,
+@@ -308,6 +571,16 @@ fn compute_seurat_hvg(
+     adata.var().set_data(var_df)
+ }
+ 
++/// Placeholder for Cell Ranger highly variable gene detection.
++///
++/// The Cell Ranger method follows a similar approach to Seurat but with
++/// modifications specific to the 10x Genomics processing pipeline.
++/// This implementation is planned for future development.
++///
++/// ## TODO
++/// - Implement Cell Ranger-specific normalization
++/// - Add proper mean-variance modeling for 10x data
++/// - Include Cell Ranger-specific parameter handling
+ fn compute_cell_ranger_hvg(
+     _adata: &IMAnnData,
+     _x: &IMArrayElement,
+@@ -316,6 +589,37 @@ fn compute_cell_ranger_hvg(
+     todo!("Cell Ranger flavor is not implemented yet!")
+ }
+ 
++/// Compute highly variable genes using Support Vector Regression (SVR).
++///
++/// The SVR method uses machine learning to model the mean-variance relationship:
++/// 1. Computes log(mean) and log(variance) for each gene
++/// 2. Fits SVR model to predict variance from mean
++/// 3. Calculates residuals (observed - predicted variance)
++/// 4. Standardizes residuals to identify outliers
++/// 5. Selects genes with high standardized residuals
++///
++/// ## Advantages
++/// - More flexible modeling of mean-variance relationship
++/// - Can capture non-linear trends
++/// - Less sensitive to binning artifacts
++///
++/// ## Disadvantages  
++/// - More computationally intensive
++/// - Requires tuning of SVR hyperparameters
++/// - May be less stable with small datasets
++///
++/// ## Parameters
++/// * `adata` - AnnData object with expression data
++/// * `x` - Expression matrix
++/// * `params` - HVG parameters including selection criteria
++///
++/// ## Output Columns
++/// - `means`: Mean expression per gene
++/// - `variances`: Variance per gene
++/// - `residuals`: SVR residuals (observed - predicted variance)
++/// - `residuals_standardized`: Z-score standardized residuals  
++/// - `mean_variance_trend`: Predicted variance from SVR model
++/// - `highly_variable`: Boolean selection mask
+ fn compute_svr_hvg(adata: &IMAnnData, x: &IMArrayElement, params: HVGParams) -> anyhow::Result<()> {
+     let n_obs = adata.n_obs();
+     let means: Vec<f64> = x
+diff --git a/src/memory/processing/mod.rs b/src/memory/processing/mod.rs
+index 63616b8..f6286ed 100644
+--- a/src/memory/processing/mod.rs
++++ b/src/memory/processing/mod.rs
+@@ -1,3 +1,15 @@
++//! # Memory Processing Module
++//!
++//! This module provides high-performance, in-memory processing functions for single-cell RNA-seq data analysis.
++//! All functions operate on `IMAnnData` objects and their associated expression matrices.
++//!
++//! ## Modules
++//!
++//! - **`diffexp`**: Differential expression analysis with statistical tests (t-test, Mann-Whitney, Wilcoxon)
++//! - **`dimred`**: Dimensionality reduction algorithms (PCA, t-SNE, UMAP) - *In development*
++//! - **`filtering`**: Cell and gene filtering based on expression criteria
++//! - **`hvg`**: Highly variable gene detection algorithms
++//! - **`transformation`**: Expression data transformations (normalization, log1p)
+ pub mod diffexp;
+ pub mod dimred;
+ pub mod filtering;
+diff --git a/src/memory/statistics/qc.rs b/src/memory/statistics/qc.rs
+index 2b72e81..bd1cafb 100644
+--- a/src/memory/statistics/qc.rs
++++ b/src/memory/statistics/qc.rs
+@@ -1,3 +1,89 @@
++//! # Quality Control Metrics for Single-Cell Data
++//!
++//! This module provides comprehensive quality control (QC) analysis for single-cell RNA-seq datasets.
++//! QC metrics are essential for identifying low-quality cells and problematic genes that should be
++//! filtered before downstream analysis.
++//!
++//! ## Why Quality Control?
++//!
++//! Single-cell RNA-seq data contains various sources of technical variation and artifacts:
++//! - **Low-quality cells**: Dying cells, doublets, empty droplets
++//! - **Technical noise**: PCR amplification bias, sequencing depth variation
++//! - **Biological confounders**: Cell cycle, stress responses, batch effects
++//! - **Gene-specific issues**: Dropout, low detection rates
++//!
++//! ## Key QC Metrics
++//!
++//! ### Cell-level Metrics (Observations)
++//! - **Total counts**: Total UMI/read count per cell
++//! - **Number of genes**: Count of detected genes per cell
++//! - **Mitochondrial percentage**: Fraction of reads from mitochondrial genes
++//! - **Top gene percentages**: Expression concentration in highly expressed genes
++//!
++//! ### Gene-level Metrics (Variables)  
++//! - **Total counts**: Total expression across all cells
++//! - **Mean expression**: Average expression per gene
++//! - **Detection rate**: Percentage of cells expressing each gene
++//! - **Dropout percentage**: Fraction of cells with zero expression
++//!
++//! ## Usage Examples
++//!
++//! ```rust,ignore
++//! use single_rust::memory::statistics::qc::{calculate_qc_metrics, qc_metrics};
++//!
++//! // Quick QC with mitochondrial genes (recommended for most datasets)
++//! qc_metrics(&adata)?;
++//!
++//! // Custom QC analysis
++//! let (obs_qc, var_qc) = calculate_qc_metrics(
++//!     &adata,
++//!     Some("counts"),              // Expression type name
++//!     Some("genes"),               // Variable type name  
++//!     Some(vec!["mito", "ribo"]),  // QC gene sets to analyze
++//!     Some(vec![20, 50, 100]),     // Top N genes for concentration analysis
++//!     None,                        // Use main expression matrix
++//!     false,                       // Don't use raw data
++//!     true,                        // Store results in adata
++//!     true,                        // Include log1p transformations
++//! )?.unwrap();
++//! ```
++//!
++//! ## Typical QC Workflow
++//!
++//! 1. **Calculate metrics**: Run QC analysis on raw count data
++//! 2. **Visualize distributions**: Plot histograms of key metrics
++//! 3. **Set thresholds**: Determine filtering criteria based on distributions
++//! 4. **Filter data**: Remove low-quality cells and poorly detected genes
++//! 5. **Re-evaluate**: Check that filtering improved data quality
++//!
++//! ## Common QC Thresholds
++//!
++//! ### Cell Filtering (typical ranges)
++//! - **Min genes per cell**: 200-500 genes
++//! - **Max genes per cell**: 2500-5000 genes (removes doublets)
++//! - **Min UMI per cell**: 500-1000 counts
++//! - **Max mitochondrial %**: 15-25% (removes dying cells)
++//!
++//! ### Gene Filtering
++//! - **Min cells expressing**: 3-10 cells (removes rarely expressed genes)
++//! - **Min total counts**: 10-50 counts across all cells
++//!
++//! ## Output Columns
++//!
++//! ### Added to `adata.obs` (cell-level)
++//! - `n_genes_by_counts`: Number of genes with non-zero counts
++//! - `total_counts`: Total UMI/read count per cell
++//! - `pct_counts_mito`: Percentage of mitochondrial gene expression
++//! - `pct_counts_in_top_N_genes`: Expression concentration metrics
++//! - Log1p versions of count metrics (if enabled)
++//!
++//! ### Added to `adata.var` (gene-level)  
++//! - `n_cells_by_counts`: Number of cells expressing each gene
++//! - `mean_counts`: Mean expression per gene
++//! - `total_counts`: Total expression across all cells
++//! - `pct_dropout_by_counts`: Percentage of cells with zero expression
++//! - Log1p versions of count metrics (if enabled)
++
+ use anndata_memory::{IMAnnData, IMArrayElement};
+ use num_traits::Float;
+ use polars::{frame::DataFrame, prelude::Column};
+@@ -5,6 +91,29 @@ use single_utilities::types::Direction;
+ 
+ use crate::{ComputeNonZero, ComputeSum};
+ 
++/// Calculate cell-level (observation) quality control metrics.
++///
++/// Computes comprehensive QC statistics for each cell including expression totals,
++/// gene detection rates, and specialized metrics like mitochondrial gene percentages.
++///
++/// ## Parameters
++/// * `adata` - AnnData object containing the dataset
++/// * `x` - Expression matrix to analyze
++/// * `expr_type` - Label for expression type (e.g., "counts", "UMI")
++/// * `var_type` - Label for variable type (e.g., "genes", "features")
++/// * `qc_vars` - Gene sets to analyze (e.g., mitochondrial, ribosomal)
++/// * `percent_top` - Top N genes for concentration analysis
++/// * `log1p` - Whether to include log1p-transformed metrics
++///
++/// ## Returns
++/// DataFrame with cell-level QC metrics as columns
++///
++/// ## Metrics Computed
++/// - Total expression per cell
++/// - Number of detected genes per cell  
++/// - Percentage of expression from specific gene sets
++/// - Expression concentration in top N genes
++/// - Optional log1p transformations for all count metrics
+ fn describe_obs(
+     adata: &IMAnnData,
+     x: &IMArrayElement,
+@@ -102,6 +211,32 @@ fn describe_obs(
+     DataFrame::new(columns).map_err(Into::into)
+ }
+ 
++/// Calculate gene-level (variable) quality control metrics.
++///
++/// Computes QC statistics for each gene including detection rates across cells,
++/// mean expression levels, and dropout percentages.
++///
++/// ## Parameters
++/// * `adata` - AnnData object containing the dataset
++/// * `x` - Expression matrix to analyze
++/// * `expr_type` - Label for expression type (e.g., "counts", "UMI")
++/// * `_var_type` - Label for variable type (unused, kept for API consistency)
++/// * `log1p` - Whether to include log1p-transformed metrics
++///
++/// ## Returns
++/// DataFrame with gene-level QC metrics as columns
++///
++/// ## Metrics Computed
++/// - Number of cells expressing each gene
++/// - Mean expression per gene across all cells
++/// - Total expression per gene across all cells
++/// - Dropout percentage (fraction of cells with zero expression)
++/// - Optional log1p transformations for count metrics
++///
++/// ## Use Cases
++/// - Identify poorly detected genes for filtering
++/// - Assess gene expression distributions
++/// - Quality control before feature selection
+ fn describe_var(
+     adata: &IMAnnData,
+     x: &anndata_memory::IMArrayElement,
+@@ -152,6 +287,55 @@ fn describe_var(
+     DataFrame::new(columns).map_err(Into::into)
+ }
+ 
++/// Calculate comprehensive quality control metrics for single-cell data.
++///
++/// This is the main function for QC analysis, computing both cell-level and gene-level
++/// metrics that are essential for identifying low-quality data and setting filtering thresholds.
++///
++/// ## Parameters
++///
++/// * `adata` - AnnData object containing expression data
++/// * `expr_type` - Name for expression data type (default: "counts")
++/// * `var_type` - Name for variable type (default: "genes")  
++/// * `qc_vars` - Gene sets to analyze (e.g., mitochondrial genes)
++/// * `percent_top` - Top N genes for concentration analysis (default: [50,100,200,500])
++/// * `layer` - Specific layer to analyze (None = main matrix)
++/// * `use_raw` - Use raw data if available (not yet implemented)
++/// * `inplace` - Store results in adata (true) or return DataFrames (false)
++/// * `log1p` - Include log1p-transformed versions of count metrics
++///
++/// ## Returns
++///
++/// - If `inplace=true`: Results stored in `adata.obs` and `adata.var`, returns `None`
++/// - If `inplace=false`: Returns `Some((obs_metrics, var_metrics))` DataFrames
++///
++/// ## Usage Examples
++///
++/// ```rust,ignore
++/// // Store results directly in adata
++/// calculate_qc_metrics(&adata, None, None, Some(vec!["mito"]), None, None, false, true, true)?;
++///
++/// // Get results as separate DataFrames
++/// let (obs_qc, var_qc) = calculate_qc_metrics(
++///     &adata, None, None, None, None, None, false, false, true
++/// )?.unwrap();
++/// ```
++///
++/// ## Quality Control Gene Sets
++///
++/// Common gene sets for QC analysis:
++/// - **Mitochondrial**: Genes starting with "MT-" or "mt-"
++/// - **Ribosomal**: Genes starting with "RPS" or "RPL"  
++/// - **Hemoglobin**: Genes like "HBA1", "HBB" for blood contamination
++/// - **Heat shock**: Stress response genes
++///
++/// ## Typical Workflow
++///
++/// 1. Run QC analysis with mitochondrial genes
++/// 2. Plot distributions of key metrics
++/// 3. Set filtering thresholds based on data characteristics
++/// 4. Apply filters to remove low-quality cells/genes
++/// 5. Re-run QC to verify filtering effectiveness
+ #[allow(clippy::too_many_arguments)]
+ pub fn calculate_qc_metrics(
+     adata: &IMAnnData,
+@@ -208,6 +392,59 @@ pub fn calculate_qc_metrics(
+     }
+ }
+ 
++/// Convenient function to calculate standard QC metrics with mitochondrial genes.
++///
++/// This is a simplified interface for the most common QC analysis in single-cell studies.
++/// It automatically identifies mitochondrial genes and computes standard QC metrics.
++///
++/// ## What it does
++///
++/// 1. **Identifies mitochondrial genes**: Finds genes starting with "MT-" or "mt-"
++/// 2. **Adds mito annotation**: Creates boolean column in `adata.var` marking mitochondrial genes
++/// 3. **Calculates QC metrics**: Runs comprehensive QC analysis including:
++///    - Total counts and gene numbers per cell
++///    - Mitochondrial gene percentage per cell
++///    - Top gene concentration metrics (top 50, 100, 200, 500 genes)
++///    - Gene detection rates and dropout percentages
++///    - Log1p transformed versions of all count metrics
++///
++/// ## Parameters
++/// * `adata` - AnnData object to analyze
++///
++/// ## Results
++/// All results are stored directly in `adata`:
++/// - Cell-level metrics added to `adata.obs`
++/// - Gene-level metrics added to `adata.var`
++/// - Mitochondrial gene annotation in `adata.var["mito"]`
++///
++/// ## Usage
++///
++/// ```rust,ignore
++/// // Run standard QC analysis
++/// qc_metrics(&adata)?;
++///
++/// // Access results
++/// let obs_df = adata.obs().get_data();
++/// let mito_pct = obs_df.column("pct_counts_mito")?;
++/// let n_genes = obs_df.column("n_genes_by_counts")?;
++/// ```
++///
++/// ## Typical Next Steps
++///
++/// After running this function, you typically:
++/// 1. Plot distributions of `pct_counts_mito`, `n_genes_by_counts`, `total_counts`
++/// 2. Set filtering thresholds based on these distributions
++/// 3. Filter cells and genes using these thresholds
++/// 4. Proceed with normalization and downstream analysis
++///
++/// ## Mitochondrial Gene Detection
++///
++/// This function identifies mitochondrial genes using standard naming conventions:
++/// - Human: Genes starting with "MT-" (e.g., MT-CO1, MT-ND1)
++/// - Mouse: Genes starting with "mt-" (e.g., mt-Co1, mt-Nd1)
++///
++/// If your data uses different naming conventions, use `calculate_qc_metrics` directly
++/// with custom gene sets.
+ pub fn qc_metrics(adata: &IMAnnData) -> anyhow::Result<()> {
+     let var_names = adata.var_names();
+     let mito_mask: Vec<bool> = var_names
+diff --git a/src/memory/utils/mod.rs b/src/memory/utils/mod.rs
+index 45b19f2..95acf2f 100644
+--- a/src/memory/utils/mod.rs
++++ b/src/memory/utils/mod.rs
+@@ -1,3 +1,72 @@
++//! # Memory Utilities for Single-Cell Data Processing
++//!
++//! This module provides essential utility functions for handling data type conversions,
++//! matrix transformations, and data structure manipulations in single-cell analysis.
++//! These utilities are crucial for ensuring compatibility between different numeric types
++//! and data formats used throughout the SingleRust ecosystem.
++//!
++//! ## Key Functionality
++//!
++//! ### Type Conversions
++//! - **Float conversions**: Convert integer/other numeric types to f32/f64 for analysis
++//! - **Precision control**: Handle single vs double precision requirements
++//! - **Matrix format preservation**: Maintain sparse matrix structure during conversion
++//!
++//! ### Data Structure Utilities
++//! - **DataFrame creation**: Convert analysis results to Polars DataFrames
++//! - **Array conversions**: Transform between different ndarray types
++//! - **Result formatting**: Prepare data for storage in AnnData objects
++//!
++//! ## Why Type Conversion Matters
++//!
++//! Single-cell data often comes in various numeric formats:
++//! - **Raw counts**: Usually integers (u32, i32)
++//! - **Normalized data**: Requires floating point (f32, f64)
++//! - **Statistical results**: Often need double precision (f64)
++//! - **Memory efficiency**: Sometimes f32 is preferred for large datasets
++//!
++//! This module handles these conversions safely and efficiently while preserving
++//! data structure characteristics like sparsity.
++//!
++//! ## Usage Patterns
++//!
++//! ```rust,ignore
++//! use single_rust::memory::utils::{
++//!     convert_to_float_if_non_float_type, 
++//!     create_dataframe_from_map,
++//!     arr1_conversion
++//! };
++//! use single_rust::shared::Precision;
++//!
++//! // Convert matrix to double precision for analysis
++//! convert_to_float_if_non_float_type(&adata.x(), Some(Precision::Double))?;
++//!
++//! // Create DataFrame from analysis results
++//! let mut results = HashMap::new();
++//! results.insert("group_A".to_string(), vec![1.0, 2.0, 3.0]);
++//! results.insert("group_B".to_string(), vec![4.0, 5.0, 6.0]);
++//! let df = create_dataframe_from_map(&results)?;
++//! ```
++//!
++//! ## Supported Conversions
++//!
++//! ### Matrix Types
++//! - **Dense arrays**: ndarray Array types
++//! - **CSR sparse matrices**: Compressed Sparse Row format
++//! - **CSC sparse matrices**: Compressed Sparse Column format
++//!
++//! ### Numeric Types
++//! - **Integers**: i8, i16, i32, i64, u8, u16, u32, u64
++//! - **Floats**: f32, f64
++//! - **Target precision**: Single (f32) or Double (f64)
++//!
++//! ## Performance Considerations
++//!
++//! - **In-place conversion**: Minimizes memory usage by modifying existing data
++//! - **Sparse preservation**: Maintains sparsity structure during conversion
++//! - **Batch operations**: Efficient vectorized conversions
++//! - **Zero-copy when possible**: Avoids unnecessary data copying
++
+ use polars::prelude::{IntoColumn, NamedFrom, NamedFromOwned};
+ use polars::series::Series;
+ use std::collections::HashMap;
+@@ -13,6 +82,30 @@ use num_traits::{Float, Num, NumCast};
+ use polars::prelude::DataFrame;
+ use single_utilities::traits::NumericOps;
+ 
++/// Check if a matrix data type requires conversion to float for processing.
++///
++/// Determines whether the given matrix data type needs to be converted to a floating-point
++/// type for mathematical operations. Most single-cell analysis requires floating-point
++/// arithmetic for normalization, statistical tests, and dimensionality reduction.
++///
++/// ## Parameters
++/// * `matrix_datatype` - The AnnData backend data type to check
++///
++/// ## Returns
++/// * `Ok(true)` - Conversion to float is needed
++/// * `Ok(false)` - Data is already in appropriate float format
++/// * `Err` - Unsupported data type for conversion
++///
++/// ## Supported Types
++/// - Array types (dense matrices)
++/// - CSR/CSC sparse matrices  
++/// - Scalar values
++///
++/// ## Unsupported Types
++/// - DataFrames (use specialized handling)
++/// - Mappings (not suitable for numeric operations)
++/// - Categorical data (convert manually first)
++/// - NullableArrays (handle nulls before conversion)
+ pub fn _target_type_float_need_conversion_in_memory(
+     matrix_datatype: &DataType,
+ ) -> anyhow::Result<bool> {
+@@ -36,6 +129,50 @@ pub fn _target_type_float_need_conversion_in_memory(
+     }
+ }
+ 
++/// Convert matrix data to floating-point format if needed for analysis.
++///
++/// This is the main conversion function that handles in-place transformation of matrix data
++/// from integer or other numeric types to floating-point types (f32 or f64). Essential for
++/// most single-cell analysis operations that require floating-point arithmetic.
++///
++/// ## Key Features
++/// - **In-place conversion**: Modifies existing data to minimize memory usage
++/// - **Precision control**: Choose between single (f32) or double (f64) precision
++/// - **Sparse preservation**: Maintains sparse matrix structure during conversion
++/// - **Type safety**: Comprehensive error handling for unsupported conversions
++///
++/// ## Parameters
++/// * `matrix` - The matrix element to convert (modified in-place)
++/// * `precision` - Target precision (Single=f32, Double=f64, None=Double)
++///
++/// ## Supported Source Types
++/// - **Integers**: i8, i16, i32, i64, u8, u16, u32, u64
++/// - **Floats**: f32 ↔ f64 conversion
++/// - **Matrix formats**: Dense arrays, CSR matrices, CSC matrices
++///
++/// ## When to Use
++/// - Before normalization operations
++/// - Prior to statistical analysis
++/// - When switching between f32/f64 for memory vs precision trade-offs
++/// - Before applying mathematical transformations
++///
++/// ## Examples
++/// ```rust,ignore
++/// // Convert to double precision for high-accuracy analysis
++/// convert_to_float_if_non_float_type(&adata.x(), Some(Precision::Double))?;
++///
++/// // Convert to single precision to save memory
++/// convert_to_float_if_non_float_type(&adata.x(), Some(Precision::Single))?;
++///
++/// // Use default (double precision)
++/// convert_to_float_if_non_float_type(&adata.x(), None)?;
++/// ```
++///
++/// ## Performance Notes
++/// - In-place operation minimizes memory overhead
++/// - Vectorized conversions for efficiency
++/// - Preserves sparse matrix structure (no densification)
++/// - Zero-copy when source and target types match
+ pub fn convert_to_float_if_non_float_type(
+     matrix: &IMArrayElement,
+     precision: Option<Precision>,
+@@ -308,6 +445,26 @@ pub fn convert_to_float_if_non_float_type(
+     Ok(())
+ }
+ 
++/// Convert CSR sparse matrix between numeric types.
++///
++/// Transforms a Compressed Sparse Row matrix from one numeric type to another while
++/// preserving the sparse structure. Particularly useful for converting integer count
++/// data to floating-point for analysis.
++///
++/// ## Parameters
++/// * `matrix` - Source CSR matrix to convert
++///
++/// ## Type Parameters
++/// * `T` - Source numeric type (e.g., i32, u32)
++/// * `U` - Target floating-point type (f32 or f64)
++///
++/// ## Returns
++/// New CSR matrix with converted values in target type
++///
++/// ## Preservation
++/// - **Sparsity pattern**: Row offsets and column indices unchanged
++/// - **Matrix dimensions**: Rows and columns preserved
++/// - **Memory efficiency**: No unnecessary densification
+ fn convert_csr_sparse_matrix<T, U>(matrix: CsrMatrix<T>) -> anyhow::Result<CsrMatrix<U>>
+ where
+     T: NumericOps + NumCast + Copy, // Base numeric traits for source
+@@ -326,6 +483,20 @@ where
+         .map_err(|e| anyhow::anyhow!("Failed to create CSR matrix: {}", e))
+ }
+ 
++/// Convert CSC sparse matrix between numeric types.
++///
++/// Transforms a Compressed Sparse Column matrix from one numeric type to another while
++/// preserving the sparse structure. Similar to CSR conversion but for column-major format.
++///
++/// ## Parameters
++/// * `matrix` - Source CSC matrix to convert
++///
++/// ## Type Parameters  
++/// * `T` - Source numeric type (e.g., i32, u32)
++/// * `U` - Target floating-point type (f32 or f64)
++///
++/// ## Returns
++/// New CSC matrix with converted values in target type
+ fn convert_csc_sparse_matrix<T, U>(matrix: CscMatrix<T>) -> anyhow::Result<CscMatrix<U>>
+ where
+     T: NumericOps + NumCast + Copy, // Base numeric traits for source
+@@ -344,6 +515,20 @@ where
+         .map_err(|e| anyhow::anyhow!("Failed to create CSC matrix: {}", e))
+ }
+ 
++/// Convert dense ndarray between numeric types.
++///
++/// Transforms a dense array from one numeric type to another, preserving the
++/// multidimensional structure. Handles dynamic dimensionality efficiently.
++///
++/// ## Parameters
++/// * `array` - Source array with dynamic dimensions
++///
++/// ## Type Parameters
++/// * `T` - Source numeric type
++/// * `U` - Target floating-point type
++///
++/// ## Returns
++/// New array with same shape but converted element type
+ fn convert_array<T, U>(
+     array: ArrayBase<OwnedRepr<T>, Dim<IxDynImpl>>,
+ ) -> anyhow::Result<ArrayBase<OwnedRepr<U>, Dim<IxDynImpl>>>
+@@ -360,6 +545,37 @@ where
+     Ok(ArrayBase::from_shape_vec(shape, new_values)?)
+ }
+ 
++/// Create a Polars DataFrame from a HashMap of numeric vectors.
++///
++/// Converts analysis results stored as HashMap<String, Vec<T>> into a structured
++/// DataFrame format suitable for storage in AnnData objects or further analysis.
++/// Commonly used for differential expression results, QC metrics, and other
++/// group-wise analysis outputs.
++///
++/// ## Parameters
++/// * `map` - HashMap where keys are column names and values are data vectors
++///
++/// ## Type Parameters
++/// * `T` - Numeric type that can be stored in Polars Series
++///
++/// ## Returns
++/// Polars DataFrame with columns corresponding to HashMap keys
++///
++/// ## Usage Examples
++/// ```rust,ignore
++/// let mut results = HashMap::new();
++/// results.insert("group_A_scores".to_string(), vec![1.5, 2.3, 0.8]);
++/// results.insert("group_B_scores".to_string(), vec![0.2, 1.9, 2.1]);
++/// 
++/// let df = create_dataframe_from_map(&results)?;
++/// // Results in DataFrame with columns "group_A_scores" and "group_B_scores"
++/// ```
++///
++/// ## Common Use Cases
++/// - Storing differential expression results by group
++/// - Organizing QC metrics by sample/condition
++/// - Converting analysis outputs for AnnData storage
++/// - Preparing data for visualization or export
+ pub fn create_dataframe_from_map<T>(map: &HashMap<String, Vec<T>>) -> anyhow::Result<DataFrame>
+ where
+     T: Clone,
+@@ -374,6 +590,33 @@ where
+     Ok(df)
+ }
+ 
++/// Create a Polars DataFrame from a HashMap of String vectors.
++///
++/// Specialized version of DataFrame creation for string data, commonly used for
++/// gene names, cell identifiers, and categorical analysis results.
++///
++/// ## Parameters
++/// * `map` - HashMap where keys are column names and values are String vectors
++///
++/// ## Returns
++/// Polars DataFrame with string columns
++///
++/// ## Usage Examples
++/// ```rust,ignore
++/// let mut gene_results = HashMap::new();
++/// gene_results.insert("group_A_genes".to_string(), 
++///                    vec!["ACTB".to_string(), "GAPDH".to_string()]);
++/// gene_results.insert("group_B_genes".to_string(), 
++///                    vec!["TP53".to_string(), "MYC".to_string()]);
++/// 
++/// let df = create_string_dataframe_from_map(&gene_results)?;
++/// ```
++///
++/// ## Common Use Cases
++/// - Storing gene names from differential expression analysis
++/// - Organizing cell type annotations by group
++/// - Creating lookup tables for identifiers
++/// - Preparing categorical results for storage
+ pub fn create_string_dataframe_from_map(
+     map: &HashMap<String, Vec<String>>,
+ ) -> anyhow::Result<DataFrame> {
+@@ -388,6 +631,31 @@ pub fn create_string_dataframe_from_map(
+     Ok(df)
+ }
+ 
++/// Convert a 2D array between numeric types.
++///
++/// Type-safe conversion between different numeric types for 2D arrays, commonly
++/// used when interfacing between different libraries or precision requirements.
++///
++/// ## Parameters
++/// * `array2` - Source 2D array to convert
++///
++/// ## Type Parameters
++/// * `M` - Source numeric type
++/// * `T` - Target numeric type
++///
++/// ## Returns
++/// New 2D array with same dimensions but converted element type
++///
++/// ## Usage
++/// ```rust,ignore
++/// let f32_array: Array2<f32> = Array2::zeros((10, 5));
++/// let f64_array: Array2<f64> = arr2_conversion(f32_array)?;
++/// ```
++///
++/// ## Common Scenarios
++/// - Converting PCA results between precision levels
++/// - Interfacing with external libraries requiring specific types
++/// - Preparing data for storage or analysis pipelines
+ pub fn arr2_conversion<M, T>(array2: Array2<M>) -> anyhow::Result<Array2<T>>
+ where
+     M: Num + Copy + num_traits::ToPrimitive,
+@@ -402,6 +670,32 @@ where
+     Ok(result)
+ }
+ 
++/// Convert a 1D array between numeric types.
++///
++/// Type-safe conversion for 1D arrays, useful for converting vectors of statistics,
++/// scores, or other single-dimensional data between numeric types.
++///
++/// ## Parameters
++/// * `array1` - Source 1D array to convert
++///
++/// ## Type Parameters
++/// * `M` - Source numeric type
++/// * `T` - Target numeric type
++///
++/// ## Returns
++/// New 1D array with same length but converted element type
++///
++/// ## Usage
++/// ```rust,ignore
++/// let scores_f32: Array1<f32> = Array1::from_vec(vec![1.0, 2.0, 3.0]);
++/// let scores_f64: Array1<f64> = arr1_conversion(scores_f32)?;
++/// ```
++///
++/// ## Common Use Cases
++/// - Converting statistical test results between precision levels
++/// - Preparing vectors for different analysis functions
++/// - Type compatibility between library interfaces
++/// - Converting scores or weights for storage
+ pub fn arr1_conversion<M, T>(array1: Array1<M>) -> anyhow::Result<Array1<T>>
+ where
+     M: Num + Copy + num_traits::ToPrimitive,

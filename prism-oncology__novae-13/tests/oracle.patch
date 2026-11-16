@@ -1,0 +1,418 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 947d2a99..b1f7b10f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,7 +1,8 @@
+ ## [0.2.3] - xxxx-xx-xx
+ 
+ ### Fixed
+-- Fix `model.plot_prototype_covariance`
++- Fix `model.plot_prototype_covariance` and `model.plot_prototype_weights`
++- Edge case: ensure that even negative max-weights are above the prototype threshold
+ 
+ ## [0.2.2] - 2024-12-17
+ 
+diff --git a/novae/_constants.py b/novae/_constants.py
+index b7d74f31..f93b2c00 100644
+--- a/novae/_constants.py
++++ b/novae/_constants.py
+@@ -51,8 +51,8 @@ class Nums:
+     # swav head constants
+     SWAV_EPSILON: float = 0.05
+     SINKHORN_ITERATIONS: int = 3
+-    QUEUE_SIZE: int = 3
+-    QUEUE_WEIGHT_THRESHOLD_RATIO: float = 0.9
++    QUEUE_SIZE: int = 2
++    QUEUE_WEIGHT_THRESHOLD_RATIO: float = 0.99
+ 
+     # misc nums
+     MEAN_NGH_TH_WARNING: float = 3.5
+diff --git a/novae/model.py b/novae/model.py
+index 1a3f659d..843cc59b 100644
+--- a/novae/model.py
++++ b/novae/model.py
+@@ -1,4 +1,5 @@
+ import logging
++from typing import Literal
+ 
+ import lightning as L
+ import numpy as np
+@@ -292,7 +293,7 @@ def _load_wandb_artifact(cls, model_name: str, map_location: str = "cpu", **kwar
+ 
+         try:
+             model = cls.load_from_checkpoint(artifact_path, map_location=map_location, strict=False, **kwargs)
+-        except:
++        except TypeError:
+             ckpt_version = torch.load(artifact_path, map_location=map_location).get(Keys.NOVAE_VERSION, "unknown")
+             raise ValueError(f"The model was trained with `novae=={ckpt_version}`, but your version is {__version__}")
+ 
+@@ -306,6 +307,7 @@ def compute_representations(
+         adata: AnnData | list[AnnData] | None = None,
+         *,
+         zero_shot: bool = False,
++        reference: str | int | Literal["all", "largest"] = "largest",
+         accelerator: str = "cpu",
+         num_workers: int | None = None,
+     ) -> None:
+@@ -316,6 +318,8 @@ def compute_representations(
+ 
+         Args:
+             adata: An `AnnData` object, or a list of `AnnData` objects. Optional if the model was initialized with `adata`.
++            zero_shot: If `True`, the model will be used in zero-shot mode, i.e. without training. In this case, the model will assign each cell to a leaf based on the latent representations.
++            reference: Use only if `zero_shot=True`. Reference slide to use for the new prototypes. Can be the AnnData index, a unique slide id, or one of `["all", "largest"]`.
+             accelerator: Accelerator to use. For instance, `'cuda'`, `'cpu'`, or `'auto'`. See Pytorch Lightning for more details.
+             num_workers: Number of workers for the dataloader.
+         """
+@@ -335,12 +339,21 @@ def compute_representations(
+                 self._compute_representations_datamodule(adata, datamodule)
+ 
+         if self.mode.zero_shot:
+-            latent = np.concatenate([adata.obsm[Keys.REPR][utils.valid_indices(adata)] for adata in adatas])
+-            self.swav_head.set_kmeans_prototypes(latent)
+-            self.swav_head.reset_clustering(only_zero_shot=True)
++            self.assign_to_kmeans_prototypes(adatas, reference)
+ 
+-            for adata in adatas:
+-                self._compute_leaves(adata, None, None)
++    def assign_to_kmeans_prototypes(
++        self, adatas: AnnData | list[AnnData], reference: str | int | Literal["all", "largest"]
++    ):
++        """Compute prototypes based on the latent representations, and assign each cell to a leaf."""
++        adatas = [adatas] if isinstance(adatas, AnnData) else adatas
++        adatas_reference = _get_reference(adatas, reference)
++
++        latent = np.concatenate([adata.obsm[Keys.REPR][utils.valid_indices(adata)] for adata in adatas_reference])
++        self.swav_head.set_kmeans_prototypes(latent)
++        self.swav_head.reset_clustering(only_zero_shot=True)
++
++        for adata in adatas:
++            self._compute_leaves(adata, None, None)
+ 
+     @torch.no_grad()
+     def _compute_representations_datamodule(
+@@ -414,12 +427,14 @@ def plot_prototype_weights(self, **kwargs: int):
+         weights, thresholds = self.swav_head.queue_weights()
+         weights, thresholds = weights.numpy(force=True), thresholds.numpy(force=True)
+ 
+-        where_enough_prototypes = (weights >= thresholds).sum(1) >= self.swav_head.min_prototypes
+-        for i in np.where(where_enough_prototypes)[0]:
+-            weights[i, weights[i] < thresholds] = 0
+-        for i in np.where(~where_enough_prototypes)[0]:
+-            indices_0 = np.argsort(weights[i])[: -self.swav_head.min_prototypes]
+-            weights[i, indices_0] = 0
++        for i in range(len(weights)):
++            below_threshold_ilocs = np.where(weights[i] < thresholds)[0]
++            if len(thresholds) - len(below_threshold_ilocs) >= self.swav_head.min_prototypes:
++                weights[i, below_threshold_ilocs] = 0
++            else:
++                n_missing = len(thresholds) - self.swav_head.min_prototypes
++                ilocs = below_threshold_ilocs[np.argpartition(weights[i, below_threshold_ilocs], n_missing)[:n_missing]]
++                weights[i, ilocs] = 0
+ 
+         plot._weights_clustermap(weights, self.adatas, list(self.swav_head.slide_label_encoder.keys()), **kwargs)
+ 
+@@ -493,6 +508,7 @@ def fine_tune(
+         self,
+         adata: AnnData | list[AnnData],
+         *,
++        reference: str | int | Literal["all", "largest"] = "largest",
+         accelerator: str = "cpu",
+         num_workers: int | None = None,
+         min_prototypes_ratio: float = 0.6,
+@@ -504,6 +520,7 @@ def fine_tune(
+ 
+         Args:
+             adata: An `AnnData` object, or a list of `AnnData` objects. Optional if the model was initialized with `adata`.
++            reference: Reference slide to use for the new prototypes. Can be the AnnData index, a unique slide id, or one of `["all", "largest"]`.
+             accelerator: Accelerator to use. For instance, `'cuda'`, `'cpu'`, or `'auto'`. See Pytorch Lightning for more details.
+             num_workers: Number of workers for the dataloader.
+             min_prototypes_ratio: Minimum ratio of prototypes to be used for each slide. Use a low value to get highly slide-specific or condition-specific prototypes.
+@@ -516,15 +533,17 @@ def fine_tune(
+ 
+         assert adata is not None, "Please provide an AnnData object to fine-tune the model."
+ 
+-        datamodule = self._init_datamodule(self._prepare_adatas(adata), sample_cells=Nums.DEFAULT_SAMPLE_CELLS)
+-        self.init_slide_queue(adata, min_prototypes_ratio)
+-
++        datamodule = self._init_datamodule(
++            self._prepare_adatas(_get_reference(adata, reference)), sample_cells=Nums.DEFAULT_SAMPLE_CELLS
++        )
+         latent = self._compute_representations_datamodule(None, datamodule, return_representations=True)
+         self.swav_head.set_kmeans_prototypes(latent.numpy(force=True))
+ 
+         self.swav_head._prototypes = self.swav_head._kmeans_prototypes
+         del self.swav_head._kmeans_prototypes
+ 
++        self.init_slide_queue(adata, min_prototypes_ratio)
++
+         self.fit(
+             adata=adata,
+             max_epochs=max_epochs,
+@@ -621,3 +640,34 @@ def _train(
+         **trainer_kwargs,
+     )
+     trainer.fit(model, datamodule=datamodule)
++
++
++def _get_reference(
++    adata: AnnData | list[AnnData], reference: str | int | Literal["all", "largest"]
++) -> AnnData | list[AnnData]:
++    if reference == "all":
++        return adata
++
++    if isinstance(reference, int):
++        assert isinstance(adata, list), "When providing an index, you must provide a list of AnnData objects."
++        return adata[reference]
++
++    if reference == "largest":
++
++        def _select_largest_slide(adata: AnnData):
++            counts = adata.obs[Keys.SLIDE_ID].value_counts()
++            return counts.max(), adata[adata.obs[Keys.SLIDE_ID] == counts.idxmax()]
++
++        if isinstance(adata, AnnData):
++            return _select_largest_slide(adata)[1]
++        else:
++            return max([_select_largest_slide(_adata) for _adata in adata])[1]
++
++    assert isinstance(reference, str), f"Invalid type for `reference`: {type(reference)}"
++
++    adatas = [adata] if isinstance(adata, AnnData) else adata
++    for adata in adatas:
++        if reference in adata.obs[Keys.SLIDE_ID].cat.categories:
++            return adata[adata.obs[Keys.SLIDE_ID] == reference]
++
++    raise ValueError(f"Did not found slide id `{reference}` in the provided AnnData object(s).")
+diff --git a/novae/module/swav.py b/novae/module/swav.py
+index cbc0f964..3e301097 100644
+--- a/novae/module/swav.py
++++ b/novae/module/swav.py
+@@ -16,7 +16,7 @@
+ 
+ 
+ class SwavHead(L.LightningModule):
+-    queue: None | Tensor  # (n_slides, num_prototypes)
++    queue: None | Tensor  # (n_slides, QUEUE_SIZE, num_prototypes)
+ 
+     def __init__(
+         self,
+@@ -131,17 +131,25 @@ def prototype_ilocs(self, projections: Tensor, slide_id: str | None = None) -> T
+         slide_weights = weights[slide_index]
+ 
+         ilocs = torch.where(slide_weights >= thresholds)[0]
+-        return ilocs if len(ilocs) >= self.min_prototypes else torch.topk(slide_weights, self.min_prototypes).indices
++
++        if len(ilocs) >= self.min_prototypes:
++            return ilocs
++
++        other_locs = torch.where(slide_weights < thresholds)[0]
++        other_locs = other_locs[torch.topk(slide_weights[other_locs], self.min_prototypes - len(ilocs)).indices]
++
++        return torch.cat([ilocs, other_locs])
+ 
+     def queue_weights(self) -> tuple[Tensor, Tensor]:
+         """Convert the queue to a matrix of prototype weight per slide.
+ 
+         Returns:
+-            A tensor of shape `(n_slides, K)`.
++            A tensor of shape `(n_slides, K)`, and a tensor of shape (K,).
+         """
+         max_projections = self.queue.max(dim=1).values
+ 
+         thresholds = max_projections.max(0).values * Nums.QUEUE_WEIGHT_THRESHOLD_RATIO
++        thresholds -= 1 - Nums.QUEUE_WEIGHT_THRESHOLD_RATIO  # ensure that for max-weights < 0 are above the threshold
+ 
+         return max_projections, thresholds
+ 
+diff --git a/scripts/revision/cpu.sh b/scripts/revision/cpu.sh
+index ff6680d0..7f1b9c9e 100644
+--- a/scripts/revision/cpu.sh
++++ b/scripts/revision/cpu.sh
+@@ -11,4 +11,4 @@ module load anaconda3/2022.10/gcc-11.2.0 && source activate novae
+ cd /gpfs/workdir/blampeyq/novae/scripts/revision
+ 
+ # Execute training
+-python -u $1.py
++python -u $1
+diff --git a/scripts/revision/heterogeneous.py b/scripts/revision/heterogeneous.py
+index d63f24d2..ac165ce5 100644
+--- a/scripts/revision/heterogeneous.py
++++ b/scripts/revision/heterogeneous.py
+@@ -2,32 +2,55 @@
+ import scanpy as sc
+ 
+ import novae
++from novae._constants import Nums
++
++Nums.QUEUE_WEIGHT_THRESHOLD_RATIO = 0.9999999
++Nums.WARMUP_EPOCHS = 4
++
++suffix = "_constants_fit_all8"
++
++dir_name = "/gpfs/workdir/blampeyq/novae/data/_heterogeneous"
+ 
+ adatas = [
+-    sc.read_h5ad(
+-        "/gpfs/workdir/blampeyq/novae/data/_heterogeneous/Xenium_V1_Human_Colon_Cancer_P2_CRC_Add_on_FFPE_outs.h5ad"
+-    ),
+-    sc.read_h5ad("/gpfs/workdir/blampeyq/novae/data/_heterogeneous/Xenium_V1_Human_Brain_GBM_FFPE_outs.h5ad"),
++    sc.read_h5ad(f"{dir_name}/Xenium_V1_Human_Colon_Cancer_P2_CRC_Add_on_FFPE_outs.h5ad"),
++    # sc.read_h5ad(f"{dir_name}/Xenium_V1_Human_Brain_GBM_FFPE_outs.h5ad"),
++    sc.read_h5ad(f"{dir_name}/Xenium_V1_hLymphNode_nondiseased_section_outs.h5ad"),
+ ]
+ 
+ adatas[0].uns["novae_tissue"] = "colon"
+-adatas[1].uns["novae_tissue"] = "brain"
++# adatas[1].uns["novae_tissue"] = "brain"
++adatas[1].uns["novae_tissue"] = "lymph_node"
+ 
+ novae.utils.spatial_neighbors(adatas, radius=80)
+ 
+-model = novae.Novae(adatas, min_prototypes_ratio=0.25)
+-
++model = novae.Novae(
++    adatas,
++    scgpt_model_dir="/gpfs/workdir/blampeyq/checkpoints/scgpt/scGPT_human",
++    min_prototypes_ratio=0.3,
++    heads=16,
++    hidden_size=128,
++    temperature=0.1,
++    num_prototypes=1048,
++    background_noise_lambda=5,
++    panel_subset_size=0.8,
++    # num_prototypes=512,
++    # temperature=0.5,
++)
+ model.fit(max_epochs=10)
+ model.compute_representations()
+ 
++# model = novae.Novae.from_pretrained("MICS-Lab/novae-human-0")
++# model.fine_tune(adatas, min_prototypes_ratio=0.25, reference="all")
++# model.compute_representations(adatas)
++
+ for level in range(7, 15):
+     model.assign_domains(level=level)
+ 
+ model.plot_prototype_weights()
+-plt.savefig("/gpfs/workdir/blampeyq/novae/data/_heterogeneous/prototype_weights.pdf", bbox_inches="tight")
++plt.savefig(f"{dir_name}/prototype_weights{suffix}.pdf", bbox_inches="tight")
+ 
+ for i, adata in enumerate(adatas):
+     del adata.X
+     for key in list(adata.layers.keys()):
+         del adata.layers[key]
+-    adata.write_h5ad(f"/gpfs/workdir/blampeyq/novae/data/_heterogeneous/{i}_res.h5ad")
++    adata.write_h5ad(f"{dir_name}/{i}_res{suffix}.h5ad")
+diff --git a/scripts/revision/heterogeneous_start.py b/scripts/revision/heterogeneous_start.py
+new file mode 100644
+index 00000000..9f74a84e
+--- /dev/null
++++ b/scripts/revision/heterogeneous_start.py
+@@ -0,0 +1,53 @@
++import matplotlib.pyplot as plt
++import scanpy as sc
++
++import novae
++from novae._constants import Nums
++
++Nums.QUEUE_WEIGHT_THRESHOLD_RATIO = 0.99
++
++suffix = ""
++
++dir_name = "/gpfs/workdir/blampeyq/novae/data/_heterogeneous"
++
++adatas = [
++    sc.read_h5ad(f"{dir_name}/Xenium_V1_Human_Colon_Cancer_P2_CRC_Add_on_FFPE_outs.h5ad"),
++    # sc.read_h5ad(f"{dir_name}/Xenium_V1_Human_Brain_GBM_FFPE_outs.h5ad"),
++    sc.read_h5ad(f"{dir_name}/Xenium_V1_hLymphNode_nondiseased_section_outs.h5ad"),
++]
++
++adatas[0].uns["novae_tissue"] = "colon"
++# adatas[1].uns["novae_tissue"] = "brain"
++adatas[1].uns["novae_tissue"] = "lymph_node"
++
++for adata in adatas:
++    adata.obs["novae_tissue"] = adata.uns["novae_tissue"]
++
++novae.utils.spatial_neighbors(adatas, radius=80)
++
++# model = novae.Novae(adatas)
++# model.mode.trained = True
++# model.compute_representations(adatas)
++# model.assign_domains(adatas)
++
++# adata = sc.concat(adatas, join="inner")
++# adata = sc.pp.subsample(adata, n_obs=100_000, copy=True)
++# sc.pp.neighbors(adata, use_rep="novae_latent")
++# sc.tl.umap(adata)
++# sc.pl.umap(adata, color=["novae_domains_7", "novae_tissue"])
++# plt.savefig(f"{dir_name}/umap_start{suffix}.png", bbox_inches="tight")
++
++model = novae.Novae(
++    adatas,
++    scgpt_model_dir="/gpfs/workdir/blampeyq/checkpoints/scgpt/scGPT_human",
++)
++model.mode.trained = True
++model.compute_representations(adatas)
++model.assign_domains(adatas)
++
++adata = sc.concat(adatas, join="inner")
++adata = sc.pp.subsample(adata, n_obs=100_000, copy=True)
++sc.pp.neighbors(adata, use_rep="novae_latent")
++sc.tl.umap(adata)
++sc.pl.umap(adata, color=["novae_domains_7", "novae_tissue"])
++plt.savefig(f"{dir_name}/umap_start_scgpt{suffix}.png", bbox_inches="tight")
+diff --git a/scripts/revision/missing_domains.py b/scripts/revision/missing_domains.py
+index bb20a354..465cd7d6 100644
+--- a/scripts/revision/missing_domains.py
++++ b/scripts/revision/missing_domains.py
+@@ -4,6 +4,8 @@
+ 
+ import novae
+ 
++suffix = "_one_latent99"
++
+ path = Path("/gpfs/workdir/blampeyq/novae/data/_lung_robustness")
+ 
+ adata1_full = sc.read_h5ad(path / "v1_full.h5ad")
+@@ -13,33 +15,9 @@
+ 
+ model = novae.Novae.from_pretrained("MICS-Lab/novae-human-0")
+ 
+-### Full
+-
+-# adatas = [adata1_full, adata2_full]
+-
+-# model.compute_representations(adatas, zero_shot=True)
+-# obs_key = model.assign_domains(adatas, level=7)
+-
+-# for adata in adatas:
+-#     adata.obs[f"{obs_key}_full"] = adata.obs[obs_key]
+-
+-### Split zero-shot
+-
+ adatas = [adata1_split, adata2_full]
+ 
+-model.compute_representations(adatas, zero_shot=True)
+-obs_key = model.assign_domains(adatas, level=7)
+-
+-for adata in adatas:
+-    adata.obs[f"{obs_key}_split_zs"] = adata.obs[obs_key]
+-
+-### Split fine tune
+-
+-model = novae.Novae.from_pretrained("MICS-Lab/novae-human-0")
+-
+-model.init_slide_queue(adatas, min_prototypes_ratio=0.5)
+-
+-model.fine_tune(adatas)
++model.fine_tune(adatas, min_prototypes_ratio=0.5)
+ model.compute_representations(adatas)
+ 
+ obs_key = model.assign_domains(adatas, level=7)
+@@ -53,4 +31,4 @@
+     del adata.X
+     for key in list(adata.layers.keys()):
+         del adata.layers[key]
+-    adata.write_h5ad(path / f"{name}_res2.h5ad")
++    adata.write_h5ad(path / f"{name}_res2{suffix}.h5ad")

@@ -1,0 +1,719 @@
+diff --git a/pantheon/agent.py b/pantheon/agent.py
+index 505ea4dd4..92d267b90 100644
+--- a/pantheon/agent.py
++++ b/pantheon/agent.py
+@@ -1932,6 +1932,7 @@ async def _ttft_probe(chunk, _orig=enhanced_process_chunk):  # type: ignore[misc
+             message=message,
+             messages=messages,
+             model=model,
++            tools=tools,
+         )
+         
+         # ✅ Simplified logging using only required metadata fields
+diff --git a/pantheon/internal/compression/compressor.py b/pantheon/internal/compression/compressor.py
+index deabaaf9d..496235b24 100644
+--- a/pantheon/internal/compression/compressor.py
++++ b/pantheon/internal/compression/compressor.py
+@@ -63,7 +63,13 @@ def __init__(self, config: CompressionConfig, model: str):
+         self._failed_attempt_count = 0
+         self._messages_since_last_compression = 0
+ 
+-    def should_compress(self, messages: list[dict], model: str | None = None) -> bool:
++    def should_compress(
++        self,
++        messages: list[dict],
++        model: str | None = None,
++        pending_messages: list[dict] | None = None,
++        tools: list[dict] | None = None,
++    ) -> bool:
+         """Check if compression is needed based on token usage.
+ 
+         Reads token counts from last assistant message's _metadata
+@@ -112,9 +118,49 @@ def should_compress(self, messages: list[dict], model: str | None = None) -> boo
+ 
+         metadata = last_assistant.get("_metadata", {})
+ 
+-        # Read raw token counts (populated by count_tokens_in_messages)
++        # Read raw token counts (populated by count_tokens_in_messages).
++        # ``pending_messages`` represents the user turn that has not yet been
++        # appended to memory by PantheonTeam.run. The previous assistant usage
++        # already includes the prompt and completion from the previous turn,
++        # but its tool schema may differ from the active agent's schema.
+         total_tokens = metadata.get("total_tokens", 0)
+         max_tokens = metadata.get("max_tokens", 0)
++        active_model = model or self.model
++        pending_tokens = 0
++        output_reserve = 0
++        current_tools_tokens = 0
++        previous_tools_tokens = metadata.get("tools_definition_tokens")
++        current_context_tokens = None
++        try:
++            from pantheon.utils.llm import _safe_token_counter
++            from pantheon.utils.provider_registry import get_model_info
++
++            if previous_tools_tokens is None:
++                current_messages = list(messages)
++                if pending_messages:
++                    current_messages.extend(pending_messages)
++                # Older metadata has no prior tool count. Estimate the whole
++                # next request instead of blindly adding the current schema,
++                # which could already be included in the stored usage.
++                current_context_tokens = _safe_token_counter(
++                    active_model,
++                    messages=current_messages,
++                    tools=tools,
++                )
++            else:
++                if pending_messages:
++                    pending_tokens = _safe_token_counter(
++                        active_model, messages=pending_messages
++                    )
++                if tools:
++                    current_tools_tokens = _safe_token_counter(
++                        active_model, tools=tools
++                    )
++            info = get_model_info(active_model)
++            max_tokens = info.get("max_input_tokens") or max_tokens
++            output_reserve = info.get("max_output_tokens") or 0
++        except Exception:
++            pass
+ 
+         if max_tokens == 0:
+             # Fallback: try to fetch from model info if available
+@@ -132,8 +178,25 @@ def should_compress(self, messages: list[dict], model: str | None = None) -> boo
+             if max_tokens == 0:
+                 return False
+ 
+-        # Calculate usage ratio dynamically (adapts to model changes)
+-        usage_ratio = total_tokens / max_tokens
++        # The previous provider usage already includes the previous tool
++        # schema. Add only the increase for the active schema; this handles an
++        # agent/toolset switch without double-counting an unchanged schema.
++        if previous_tools_tokens is None:
++            tool_delta = 0
++        else:
++            tool_delta = max(0, current_tools_tokens - previous_tools_tokens)
++
++        # Calculate usage ratio dynamically (adapts to model changes), while
++        # reserving the next response budget.
++        estimated_next_tokens = (
++            total_tokens + pending_tokens + tool_delta + output_reserve
++        )
++        if current_context_tokens is not None:
++            estimated_next_tokens = max(
++                estimated_next_tokens,
++                current_context_tokens + output_reserve,
++            )
++        usage_ratio = estimated_next_tokens / max_tokens
+ 
+         return usage_ratio >= self.config.threshold
+ 
+diff --git a/pantheon/internal/compression/plugin.py b/pantheon/internal/compression/plugin.py
+index 8e9bbea1c..ba9218cf7 100644
+--- a/pantheon/internal/compression/plugin.py
++++ b/pantheon/internal/compression/plugin.py
+@@ -133,9 +133,38 @@ async def on_run_start(self, team: "PantheonTeam", user_input: str, context: dic
+         # Get active agent's model
+         active_agent = team.get_active_agent(memory)
+         model = active_agent.models[0] if active_agent and getattr(active_agent, "models", None) else self.model
+-        
++
++        pending_messages = None
++        if active_agent and hasattr(active_agent, "_input_to_openai_messages"):
++            try:
++                pending_messages = await active_agent._input_to_openai_messages(user_input)
++            except Exception as e:
++                logger.debug(f"Failed to normalize pending input for compression preflight: {e}")
++        if pending_messages is None:
++            if isinstance(user_input, list):
++                pending_messages = [
++                    item if isinstance(item, dict) else {"role": "user", "content": str(item)}
++                    for item in user_input
++                ]
++            elif isinstance(user_input, dict):
++                pending_messages = [user_input]
++            elif user_input:
++                pending_messages = [{"role": "user", "content": str(user_input)}]
++
++        tools = None
++        if active_agent and hasattr(active_agent, "get_tools_for_llm"):
++            try:
++                tools = await active_agent.get_tools_for_llm()
++            except Exception as e:
++                logger.debug(f"Failed to collect tools for compression preflight: {e}")
++
+         # Check if compression is needed
+-        if self.compressor.should_compress(memory._messages, model):
++        if self.compressor.should_compress(
++            memory._messages,
++            model,
++            pending_messages=pending_messages,
++            tools=tools,
++        ):
+             await self._perform_compression(team, memory)
+     
+     async def _perform_compression(self, team: "PantheonTeam", memory: "Memory", force: bool = False) -> dict:
+diff --git a/pantheon/utils/llm.py b/pantheon/utils/llm.py
+index 60c123e2f..d91a0ef7e 100644
+--- a/pantheon/utils/llm.py
++++ b/pantheon/utils/llm.py
+@@ -8,6 +8,13 @@
+ from .log import logger
+ from .misc import run_func
+ 
++CONTEXT_TOKEN_SAFETY_MARGIN = 1024
++
++
++class ContextWindowExceededError(ValueError):
++    """Raised before a provider call when no output token can fit."""
++
++
+ _PATTERN_BASE64_DATA_URI = re.compile(
+     r"data:image/([a-zA-Z0-9+-]+);base64,([A-Za-z0-9+/=]+)"
+ )
+@@ -336,6 +343,8 @@ def _normalize_output_token_param(
+     *,
+     api_mode: str = "chat",
+     force_param: str | None = None,
++    messages: list[dict] | None = None,
++    tools: list[dict] | None = None,
+ ) -> dict:
+     """Normalize output-token parameter names for the target model/API.
+ 
+@@ -357,6 +366,11 @@ def _normalize_output_token_param(
+             source_param = key
+             break
+ 
++    try:
++        model_info = get_model_info(model)
++    except Exception:
++        model_info = {}
++
+     target_param = force_param
+     if target_param is None:
+         try:
+@@ -365,12 +379,30 @@ def _normalize_output_token_param(
+             target_param = None
+ 
+     if token_value is None:
+-        try:
+-            max_out = get_model_info(model).get("max_output_tokens")
+-            if max_out and max_out > 0:
+-                token_value = max_out
+-        except Exception:
+-            token_value = None
++        max_out = model_info.get("max_output_tokens")
++        if max_out and max_out > 0:
++            token_value = max_out
++
++    # A model's advertised output limit is not automatically safe for the
++    # current prompt.  Include message + tool-definition tokens and clamp the
++    # response budget for every candidate in a fallback chain.  Passing
++    # messages/tools as None preserves the old metadata-only behavior for
++    # callers that do not have the request payload available.
++    if token_value is not None and (messages is not None or tools is not None):
++        max_input = model_info.get("max_input_tokens") or 0
++        if max_input > 0:
++            input_tokens = _safe_token_counter(
++                model,
++                messages=messages or [],
++                tools=tools,
++            )
++            remaining = max_input - input_tokens - CONTEXT_TOKEN_SAFETY_MARGIN
++            if remaining <= 0:
++                raise ContextWindowExceededError(
++                    f"{model} context exhausted: input={input_tokens}, "
++                    f"context={max_input}, safety_margin={CONTEXT_TOKEN_SAFETY_MARGIN}"
++                )
++            token_value = min(token_value, remaining)
+ 
+     if token_value is not None:
+         normalized[target_param or source_param or "max_tokens"] = token_value
+@@ -414,6 +446,8 @@ async def acompletion_responses(
+         model,
+         model_params,
+         api_mode="responses",
++        messages=messages,
++        tools=tools,
+     )
+     extra_params = _convert_model_params_for_responses(response_model_params)
+ 
+@@ -753,6 +787,8 @@ async def acompletion(
+         model,
+         model_params,
+         api_mode="chat",
++        messages=messages,
++        tools=tools,
+     )
+ 
+     # ========== Mode Detection & Configuration ==========
+@@ -778,6 +814,8 @@ async def acompletion(
+             model_params,
+             api_mode="chat",
+             force_param="max_tokens",
++            messages=messages,
++            tools=tools,
+         )
+     elif provider_key == "openai":
+         effective_base_url = openai_specific_base or openai_effective_base or provider_config.get("base_url")
+@@ -1529,11 +1567,15 @@ def _safe_token_counter(
+                 for part in content:
+                     if isinstance(part, dict) and "text" in part:
+                         total += _fallback_token_count(part["text"])
++            for field in ("tool_calls", "function_call"):
++                payload = msg.get(field)
++                if payload:
++                    total += _fallback_token_count(
++                        json.dumps(payload, sort_keys=True, default=str)
++                    )
+         # Estimate tools tokens
+         if tools:
+-            import json
+-
+-            total += _fallback_token_count(json.dumps(tools))
++            total += _fallback_token_count(json.dumps(tools, default=str))
+         return total
+ 
+ 
+@@ -1567,6 +1609,7 @@ def collect_message_stats_lightweight(
+     message: dict,
+     messages: list[dict],
+     model: str,
++    tools: list[dict] | None = None,
+ ) -> None:
+     """Lightweight statistics collection - read usage from _debug fields
+     
+@@ -1641,6 +1684,13 @@ def collect_message_stats_lightweight(
+     except Exception:
+         meta["max_tokens"] = 200000
+ 
++    # Keep the tool-definition estimate alongside provider usage so the next
++    # compression preflight can add only a changed schema's token delta.
++    try:
++        meta["tools_definition_tokens"] = _safe_token_counter(model, tools=tools)
++    except Exception:
++        pass
++
+ 
+ def count_tokens_in_messages(
+     messages: list[dict],
+diff --git a/pantheon/utils/provider_registry.py b/pantheon/utils/provider_registry.py
+index 2d41f919b..6509cca5b 100644
+--- a/pantheon/utils/provider_registry.py
++++ b/pantheon/utils/provider_registry.py
+@@ -281,6 +281,10 @@ def token_counter(
+                         # Image tokens: rough estimate
+                         if part.get("type") == "image_url":
+                             total += 765  # ~average image token cost
++            for field in ("tool_calls", "function_call"):
++                payload = msg.get(field)
++                if payload:
++                    total += len(encoding.encode(json.dumps(payload, sort_keys=True)))
+ 
+         if tools:
+             total += len(encoding.encode(json.dumps(tools)))
+@@ -300,6 +304,10 @@ def token_counter(
+             for part in content:
+                 if isinstance(part, dict) and "text" in part:
+                     total += _heuristic_token_count(part["text"])
++        for field in ("tool_calls", "function_call"):
++            payload = msg.get(field)
++            if payload:
++                total += _heuristic_token_count(json.dumps(payload, sort_keys=True))
+ 
+     if tools:
+         total += _heuristic_token_count(json.dumps(tools))
+diff --git a/tests/test_context_budget.py b/tests/test_context_budget.py
+new file mode 100644
+index 000000000..7ddf6dbbc
+--- /dev/null
++++ b/tests/test_context_budget.py
+@@ -0,0 +1,388 @@
++"""Regression tests for model context/output budgeting."""
++
++import pytest
++
++from pantheon.internal.compression import CompressionConfig, ContextCompressor
++from pantheon.utils import llm
++from pantheon.utils.provider_registry import token_counter
++
++
++def test_output_budget_is_clamped_to_remaining_context(monkeypatch):
++    """A large input plus tools must leave room for the model response."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {
++            "max_input_tokens": 204800,
++            "max_output_tokens": 128000,
++        },
++    )
++    monkeypatch.setattr(llm, "_safe_token_counter", lambda *_args, **_kwargs: 172000)
++
++    params = llm._normalize_output_token_param(
++        "openrouter/z-ai/glm-5",
++        None,
++        api_mode="chat",
++        force_param="max_tokens",
++        messages=[{"role": "user", "content": "large"}],
++        tools=[{"type": "function", "function": {"name": "tool"}}],
++    )
++
++    assert params["max_tokens"] == 204800 - 172000 - llm.CONTEXT_TOKEN_SAFETY_MARGIN
++
++
++def test_context_budget_raises_when_no_output_can_fit(monkeypatch):
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {"max_input_tokens": 1000, "max_output_tokens": 128},
++    )
++    monkeypatch.setattr(llm, "_safe_token_counter", lambda *_args, **_kwargs: 1000)
++
++    with pytest.raises(llm.ContextWindowExceededError, match="context exhausted"):
++        llm._normalize_output_token_param(
++            "openrouter/test/model",
++            None,
++            force_param="max_tokens",
++            messages=[{"role": "user", "content": "too large"}],
++        )
++
++
++@pytest.mark.asyncio
++async def test_responses_api_sends_clamped_output_budget(monkeypatch):
++    """The Responses adapter receives the same guarded budget as chat calls."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {
++            "max_input_tokens": 204800,
++            "max_output_tokens": 128000,
++        },
++    )
++    monkeypatch.setattr(llm, "_safe_token_counter", lambda *_args, **_kwargs: 172000)
++
++    captured = {}
++
++    class EmptyStream:
++        async def __aiter__(self):
++            if False:
++                yield None
++
++    class FakeResponses:
++        async def create(self, **kwargs):
++            captured.update(kwargs)
++            return EmptyStream()
++
++    class FakeClient:
++        def __init__(self, **_kwargs):
++            self.responses = FakeResponses()
++
++    import openai
++
++    monkeypatch.setattr(openai, "AsyncOpenAI", FakeClient)
++
++    await llm.acompletion_responses(
++        messages=[{"role": "user", "content": "large"}],
++        model="openai/gpt-5.4",
++        model_params={"max_output_tokens": 128000},
++    )
++
++    output_keys = [
++        key for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")
++        if key in captured
++    ]
++    assert len(output_keys) == 1
++    assert captured[output_keys[0]] == 204800 - 172000 - llm.CONTEXT_TOKEN_SAFETY_MARGIN
++
++
++@pytest.mark.asyncio
++async def test_openai_compatible_fallback_sends_clamped_max_tokens(monkeypatch):
++    """The legacy OpenAI-compatible fallback cannot bypass the context guard."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {
++            "max_input_tokens": 204800,
++            "max_output_tokens": 128000,
++        },
++    )
++    monkeypatch.setattr(llm, "_safe_token_counter", lambda *_args, **_kwargs: 172000)
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.find_provider_for_model",
++        lambda _model: ("openai", "gpt-5.4", {"sdk": "openai"}),
++    )
++
++    captured = {}
++
++    class FakeAdapter:
++        async def acompletion(self, **kwargs):
++            captured.update(kwargs)
++            return []
++
++    monkeypatch.setattr(
++        "pantheon.utils.adapters.get_adapter",
++        lambda _sdk: FakeAdapter(),
++    )
++    monkeypatch.setenv("LLM_API_BASE", "https://mock.invalid/v1")
++    monkeypatch.setenv("LLM_API_KEY", "test-key")
++    monkeypatch.delenv("OPENAI_API_BASE", raising=False)
++    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
++
++    await llm.acompletion(
++        messages=[{"role": "user", "content": "large"}],
++        model="openai/gpt-5.4",
++        model_params={"max_output_tokens": 128000},
++    )
++
++    assert captured["max_tokens"] == 204800 - 172000 - llm.CONTEXT_TOKEN_SAFETY_MARGIN
++    assert "max_output_tokens" not in captured
++
++
++@pytest.mark.asyncio
++async def test_context_exhaustion_moves_to_next_model_candidate(monkeypatch):
++    """A context-only failure skips the exhausted primary without an API call."""
++    from pantheon.agent import Agent
++
++    agent = Agent(
++        name="budget-test",
++        instructions="Be concise.",
++        model=["primary/model", "fallback/model"],
++    )
++    calls = []
++
++    async def fake_acompletion(_history, *, model, **_kwargs):
++        calls.append(model)
++        if model == "primary/model":
++            raise llm.ContextWindowExceededError("primary context exhausted")
++        return {"role": "assistant", "content": "fallback response"}
++
++    monkeypatch.setattr(agent, "_acompletion", fake_acompletion)
++
++    result = await agent._acompletion_with_models(
++        history=[],
++        tool_use=False,
++        response_format=None,
++        process_chunk=None,
++        allow_transfer=True,
++    )
++
++    assert result["content"] == "fallback response"
++    assert calls == ["primary/model", "fallback/model"]
++
++
++def test_compression_considers_pending_input_and_output_reserve(monkeypatch):
++    """Compression must trigger before a smaller fallback model overflows."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {
++            "max_input_tokens": 204800,
++            "max_output_tokens": 128000,
++        },
++    )
++    monkeypatch.setattr(llm, "_safe_token_counter", lambda *_args, **_kwargs: 10000)
++
++    compressor = ContextCompressor(CompressionConfig(enable=True, threshold=0.8), "normal")
++    messages = [{"role": "assistant", "content": "history", "_metadata": {
++        "total_tokens": 120000,
++        "max_tokens": 204800,
++    }}]
++
++    assert compressor.should_compress(
++        messages,
++        model="openrouter/z-ai/glm-5",
++        pending_messages=[{"role": "user", "content": "new request"}],
++        tools=[{"type": "function", "function": {"name": "tool"}}],
++    ) is True
++
++
++def test_compression_does_not_double_count_tool_schema(monkeypatch):
++    """Previous assistant usage already includes the stable tool definition."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {"max_input_tokens": 204800, "max_output_tokens": 32000},
++    )
++    monkeypatch.setattr(llm, "_safe_token_counter", lambda *_args, **kwargs: 100000 if kwargs.get("tools") else 1000)
++
++    compressor = ContextCompressor(CompressionConfig(enable=True, threshold=0.8), "normal")
++    messages = [{"role": "assistant", "content": "history", "_metadata": {
++        "total_tokens": 100000,
++        "max_tokens": 204800,
++        "tools_definition_tokens": 100000,
++    }}]
++
++    assert compressor.should_compress(
++        messages,
++        model="openrouter/z-ai/glm-5",
++        pending_messages=[{"role": "user", "content": "new request"}],
++        tools=[{"type": "function", "function": {"name": "large_tool_schema"}}],
++    ) is False
++
++
++def test_legacy_compression_metadata_does_not_double_count_tools(monkeypatch):
++    """Pre-upgrade metadata must not assume current tools are new tokens."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {"max_input_tokens": 204800, "max_output_tokens": 32000},
++    )
++    monkeypatch.setattr(
++        llm,
++        "_safe_token_counter",
++        lambda *_args, **kwargs: 100000 if kwargs.get("tools") else 1000,
++    )
++
++    compressor = ContextCompressor(CompressionConfig(enable=True, threshold=0.8), "normal")
++    messages = [{"role": "assistant", "content": "history", "_metadata": {
++        "total_tokens": 100000,
++        "max_tokens": 204800,
++    }}]
++
++    assert compressor.should_compress(
++        messages,
++        model="openrouter/z-ai/glm-5",
++        pending_messages=[{"role": "user", "content": "new request"}],
++        tools=[{"type": "function", "function": {"name": "large_tool_schema"}}],
++    ) is False
++
++
++def test_compression_accounts_for_changed_tool_schema(monkeypatch):
++    """A newly active tool schema must count even when prior usage had no tools."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {"max_input_tokens": 204800, "max_output_tokens": 32000},
++    )
++
++    def count_tokens(_model, messages=None, tools=None):
++        message_tokens = 1_000 if messages else 0
++        tool_tokens = 70_000 if tools else 0
++        return message_tokens + tool_tokens
++
++    monkeypatch.setattr(llm, "_safe_token_counter", count_tokens)
++
++    compressor = ContextCompressor(CompressionConfig(enable=True, threshold=0.8), "normal")
++    messages = [{"role": "assistant", "content": "history", "_metadata": {
++        "total_tokens": 110_000,
++        "max_tokens": 204800,
++        "tools_definition_tokens": 0,
++    }}]
++    tools = [{"type": "function", "function": {"name": "new_tool"}}]
++
++    assert compressor.should_compress(
++        messages,
++        model="openrouter/z-ai/glm-5",
++        pending_messages=[{"role": "user", "content": "new request"}],
++        tools=tools,
++    ) is True
++
++    assert compressor.should_compress(
++        messages,
++        model="openrouter/z-ai/glm-5",
++        pending_messages=[{"role": "user", "content": "new request"}],
++        tools=None,
++    ) is False
++
++
++def test_token_counter_includes_tool_call_arguments():
++    plain = token_counter(
++        "openrouter/z-ai/glm-5",
++        messages=[{"role": "assistant", "content": "ok"}],
++    )
++    with_call = token_counter(
++        "openrouter/z-ai/glm-5",
++        messages=[
++            {
++                "role": "assistant",
++                "content": "ok",
++                "tool_calls": [
++                    {
++                        "id": "call_1",
++                        "type": "function",
++                        "function": {
++                            "name": "write_file",
++                            "arguments": '{"content":"' + ("x" * 4000) + '"}',
++                        },
++                    }
++                ],
++            }
++        ],
++    )
++
++    assert with_call > plain
++
++
++def test_safe_token_counter_fallback_includes_tool_call_arguments(monkeypatch):
++    """Fallback estimation must protect context budgets when tiktoken fails."""
++    def unavailable(*_args, **_kwargs):
++        raise RuntimeError("counter unavailable")
++
++    monkeypatch.setattr("pantheon.utils.provider_registry.token_counter", unavailable)
++
++    tokens = llm._safe_token_counter(
++        "unsupported/model",
++        messages=[{
++            "role": "assistant",
++            "tool_calls": [{
++                "id": "call_1",
++                "function": {
++                    "name": "write_file",
++                    "arguments": '{"content":"' + ("x" * 4000) + '"}',
++                },
++            }],
++        }],
++    )
++
++    assert tokens > 0
++
++
++def test_message_stats_records_tool_definition_tokens(monkeypatch):
++    """Subsequent compression checks can compare the active tool schema delta."""
++    monkeypatch.setattr(
++        "pantheon.utils.provider_registry.get_model_info",
++        lambda _model: {"max_input_tokens": 204800, "max_output_tokens": 32000},
++    )
++    monkeypatch.setattr(
++        llm,
++        "_safe_token_counter",
++        lambda *_args, **kwargs: 700 if kwargs.get("tools") else 100,
++    )
++
++    message = {"_metadata": {"_debug_usage": {"total_tokens": 500}}}
++    llm.collect_message_stats_lightweight(
++        message=message,
++        messages=[],
++        model="openrouter/z-ai/glm-5",
++        tools=[{"type": "function", "function": {"name": "tool"}}],
++    )
++
++    assert message["_metadata"]["tools_definition_tokens"] == 700
++
++
++def test_compression_plugin_normalizes_structured_pending_input():
++    """List/BaseModel AgentInput values must reach the preflight as messages."""
++    import asyncio
++    from pantheon.internal.compression.plugin import CompressionPlugin
++
++    captured = {}
++
++    class Compressor:
++        def should_compress(self, messages, model, **kwargs):
++            captured.update(kwargs)
++            return False
++
++    class Agent:
++        models = ["openrouter/z-ai/glm-5"]
++
++        async def _input_to_openai_messages(self, _value):
++            return [{"role": "user", "content": "normalized"}]
++
++        async def get_tools_for_llm(self):
++            return [{"type": "function", "function": {"name": "tool"}}]
++
++    class Team:
++        def get_active_agent(self, _memory):
++            return Agent()
++
++    class Memory:
++        _messages = [{"role": "assistant", "_metadata": {"total_tokens": 1, "max_tokens": 204800}}]
++
++    plugin = CompressionPlugin({"enable": True})
++    plugin.compressor = Compressor()
++    asyncio.run(plugin.on_run_start(Team(), ["structured"], {"memory": Memory()}))
++
++    assert captured["pending_messages"] == [{"role": "user", "content": "normalized"}]
++    assert captured["tools"] == [{"type": "function", "function": {"name": "tool"}}]

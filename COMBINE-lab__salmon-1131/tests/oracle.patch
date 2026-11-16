@@ -1,0 +1,1112 @@
+diff --git a/crates/salmon-align/Cargo.toml b/crates/salmon-align/Cargo.toml
+index bbd46d82b..b3ba3923d 100644
+--- a/crates/salmon-align/Cargo.toml
++++ b/crates/salmon-align/Cargo.toml
+@@ -35,6 +35,7 @@ tracing = { workspace = true }
+ 
+ [dev-dependencies]
+ tempfile = { workspace = true }
++serde_json = { workspace = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index 941b1a539..8daaf8e28 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -296,6 +296,15 @@ pub struct AlignQuantResult {
+     /// RAD too, independently of whether the file carries salmon's provenance.
+     /// `None` for a BAM input, which this path does not tally.
+     pub num_orphan: Option<u64>,
++    /// fragments judged against a known expected library format that had at
++    /// least one strand-compatible placement / had none (#1130). An unstranded
++    /// format is judged like any other and simply finds every fragment
++    /// compatible. Both zero only when no placement was ever compared to an
++    /// expected format, where the writer falls back to the historical
++    /// `num_mapped` / ratio-1.0 form. Feed `lib_format_counts.json`, mirroring
++    /// the reads-mode fields in `salmon-quant`'s `QuantResult`.
++    pub num_compatible_fragments: u64,
++    pub num_incompatible_fragments: u64,
+     /// what the RAD says about the mapping pass that produced it; empty for a
+     /// BAM input, which has no RAD provenance to read
+     pub provenance: crate::rad::RadProvenance,
+@@ -882,6 +891,10 @@ struct PassAccum {
+     num_mapped: u64,
+     /// mapped fragments where every surviving placement placed only one mate
+     num_orphan: u64,
++    /// fragments judged against a known expected format with ≥1 strand-compatible
++    /// placement / with none (#1130); see [`AlignQuantResult`]'s fields
++    num_frags_compat: u64,
++    num_frags_incompat: u64,
+ }
+ 
+ /// The online pass over an alignment record stream, structured as a persistent
+@@ -974,7 +987,7 @@ where
+         let mut workers = Vec::with_capacity(cfg.nthreads);
+         for _ in 0..cfg.nthreads {
+             let rx = rx.clone();
+-            workers.push(scope.spawn(move || -> (Local, u64, u64, u64) {
++            workers.push(scope.spawn(move || -> (Local, u64, u64, u64, u64, u64) {
+                 let mut local = Local::new(
+                     cfg.use_error_model,
+                     cfg.error_bins,
+@@ -987,6 +1000,8 @@ where
+                 let mut count = 0u64;
+                 let mut mapped = 0u64;
+                 let mut orphan = 0u64;
++                let mut compat = 0u64;
++                let mut incompat = 0u64;
+                 let mut frags: Vec<FragRecord> = Vec::new();
+                 while let Ok((log_fm, raw_batch)) = rx.recv() {
+                     let ctx = FragCtx {
+@@ -1012,6 +1027,8 @@ where
+                     // Plain locals, summed once per worker at the end: the
+                     // per-fragment cost is an increment, with no atomic traffic.
+                     let mut batch_orphan = 0u64;
++                    let mut batch_compat = 0u64;
++                    let mut batch_incompat = 0u64;
+                     for raw_group in &raw_batch {
+                         frags.clear();
+                         for r in raw_group {
+@@ -1019,7 +1036,13 @@ where
+                                 frags.push(f);
+                             }
+                         }
+-                        match process_fragment(&frags, &ctx, &mut local) {
++                        let (outcome, strand_judged) = process_fragment(&frags, &ctx, &mut local);
++                        match strand_judged {
++                            Some(true) => batch_compat += 1,
++                            Some(false) => batch_incompat += 1,
++                            None => {}
++                        }
++                        match outcome {
+                             FragmentOutcome::Unmapped => {}
+                             FragmentOutcome::Mapped => batch_mapped += 1,
+                             FragmentOutcome::MappedOrphan => {
+@@ -1051,6 +1074,8 @@ where
+                     count += raw_batch.len() as u64;
+                     mapped += batch_mapped;
+                     orphan += batch_orphan;
++                    compat += batch_compat;
++                    incompat += batch_incompat;
+                     // Live progress: every fragment in the BAM is "processed";
+                     // only fragments with a surviving strand-compatible placement
+                     // are "mapped" (so percent_mapped is correct on stranded data).
+@@ -1063,7 +1088,7 @@ where
+                             .fetch_add(batch_mapped, std::sync::atomic::Ordering::Relaxed);
+                     }
+                 }
+-                (local, count, mapped, orphan)
++                (local, count, mapped, orphan, compat, incompat)
+             }));
+         }
+         drop(rx); // workers hold their own clones; lets the queue disconnect
+@@ -1085,14 +1110,18 @@ where
+         let mut total = 0u64;
+         let mut total_mapped = 0u64;
+         let mut total_orphan = 0u64;
++        let mut total_compat = 0u64;
++        let mut total_incompat = 0u64;
+         for w in workers {
+-            let (local, count, mapped, orphan) = w
++            let (local, count, mapped, orphan, compat, incompat) = w
+                 .join()
+                 .map_err(|_| anyhow::anyhow!("alignment worker thread panicked"))?;
+             merged = merged.merge(local);
+             total += count;
+             total_mapped += mapped;
+             total_orphan += orphan;
++            total_compat += compat;
++            total_incompat += incompat;
+         }
+         acc.seq_obs = merged.seq_obs;
+         acc.gc_obs = merged.gc_obs;
+@@ -1103,6 +1132,8 @@ where
+         acc.num_processed = total;
+         acc.num_mapped = total_mapped;
+         acc.num_orphan = total_orphan;
++        acc.num_frags_compat = total_compat;
++        acc.num_frags_incompat = total_incompat;
+         Ok(())
+     })
+ }
+@@ -1249,7 +1280,11 @@ enum FragmentOutcome {
+     MappedOrphan,
+ }
+ 
+-fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) -> FragmentOutcome {
++fn process_fragment(
++    recs: &[FragRecord],
++    ctx: &FragCtx,
++    local: &mut Local,
++) -> (FragmentOutcome, Option<bool>) {
+     use salmon_model::seqbias::{CONTEXT_LEFT, CONTEXT_LENGTH, CONTEXT_RIGHT};
+     // salmon's LOG_EPSILON = log(0.375e-10): the orphan / implausible-length penalty.
+     const LOG_EPSILON: f64 = -23.998_158_637_57;
+@@ -1282,6 +1317,13 @@ fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) -> Fr
+     // — the same signal #1057 turned on.
+     let mut any_both_mates = false;
+     let mut any_orphan = false;
++    // Strand judgment for `lib_format_counts.json` (#1130): `None` until a
++    // placement is actually compared against an expected format (a
++    // `--discardOrphans`-dropped placement never is), then whether any placement
++    // was compatible. Judged over all compared placements — including ones
++    // `ignore_incompat` then drops — because a fragment whose every reported
++    // alignment is wrong-strand is exactly what the count exists to report.
++    let mut strand_judged: Option<bool> = None;
+     for (pi, pl) in placements.iter().enumerate() {
+         let tid = pl.tid;
+         let idxs = &pl.idxs;
+@@ -1332,7 +1374,9 @@ fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) -> Fr
+         let mut aux = basis + log_frag_prob;
+         if let Some(exp) = ctx.expected_format {
+             let (obs, is_fw, status) = frag_format(recs, idxs);
+-            if !is_compatible(exp, obs, is_fw, status) {
++            let compat = is_compatible(exp, obs, is_fw, status);
++            strand_judged = Some(strand_judged.unwrap_or(false) || compat);
++            if !compat {
+                 if ctx.ignore_incompat {
+                     continue; // this placement contributes nothing
+                 }
+@@ -1353,9 +1397,11 @@ fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) -> Fr
+         sp_pl.push(pi);
+     }
+     // a fragment whose every reported alignment was incompatible is a
+-    // zero-probability fragment: it is not assigned and joins no eq-class.
++    // zero-probability fragment: it is not assigned and joins no eq-class —
++    // but the strand judgment stands, and is the very thing
++    // `num_incompatible_fragments` exists to count.
+     if sp_tid.is_empty() {
+-        return FragmentOutcome::Unmapped;
++        return (FragmentOutcome::Unmapped, strand_judged);
+     }
+     // The fragment counts as an orphan only when nothing paired both mates, so a
+     // fragment that is a proper pair on one transcript and an orphan on another
+@@ -1503,7 +1549,7 @@ fn process_fragment(recs: &[FragRecord], ctx: &FragCtx, local: &mut Local) -> Fr
+         TranscriptGroup::from_sorted(tids)
+     };
+     ctx.eq_builder.add_group(group, weights, 1);
+-    outcome
++    (outcome, strand_judged)
+ }
+ 
+ /// Is the input coordinate-sorted and *not* grouped by read name?
+@@ -1981,7 +2027,7 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+     // is trained there too but not needed afterward. Scope `cfg`/`acc` so their
+     // borrows (fld, eq_builder, online, ...) are released before the post-pass
+     // effective-length / EM work below.
+-    let (seq_obs, gc_obs, pos_obs, num_processed, num_mapped, num_orphan) = {
++    let (seq_obs, gc_obs, pos_obs, num_processed, num_mapped, num_orphan, num_compat, num_incompat) = {
+         let cfg = PassCfg {
+             online: online.as_ref(),
+             fld: &fld,
+@@ -2016,6 +2062,8 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+             num_processed: 0,
+             num_mapped: 0,
+             num_orphan: 0,
++            num_frags_compat: 0,
++            num_frags_incompat: 0,
+         };
+         stream_online_pass(&opts.bam, &cfg, &mut acc)?;
+         (
+@@ -2025,6 +2073,8 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+             acc.num_processed,
+             acc.num_mapped,
+             acc.num_orphan,
++            acc.num_frags_compat,
++            acc.num_frags_incompat,
+         )
+     };
+ 
+@@ -2220,6 +2270,8 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+         // Tallied while streaming the BAM, so `-a` reports the same
+         // concordant/orphan split the reads path does.
+         num_orphan: Some(num_orphan),
++        num_compatible_fragments: num_compat,
++        num_incompatible_fragments: num_incompat,
+         provenance: crate::rad::RadProvenance::default(),
+         // Straight from the BAM being quantified, no RAD in between.
+         source_programs: source_program_lines(&header),
+@@ -2491,11 +2543,24 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+             expected_format: String,
+             compatible_fragment_ratio: f64,
+             num_compatible_fragments: u64,
++            num_incompatible_fragments: u64,
+             num_assigned_fragments: u64,
+             num_frags_with_concordant_consistent_mappings: u64,
+             num_frags_with_inconsistent_or_orphan_mappings: u64,
+             strand_mapping_bias: f64,
+         }
++        // Same semantics as reads mode's `write_lib_counts` (#1130): the ratio is
++        // over the fragments the strand filter actually judged, with the
++        // historical `num_mapped` / 1.0 fallback when nothing ever was. For
++        // phase 2 of `--deterministic` this rewrite is what puts *measured*
++        // values in the final output directory — the mapping pass's file is
++        // overwritten here, so these fields must be real, not placeholders.
++        let judged = res.num_compatible_fragments + res.num_incompatible_fragments;
++        let ratio = if judged > 0 {
++            res.num_compatible_fragments as f64 / judged as f64
++        } else {
++            1.0
++        };
+         let counts = LibCounts {
+             // The RAD is the input; the reads that produced it are not known here.
+             read_files: vec![],
+@@ -2503,8 +2568,13 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+                 .detected_library_type
+                 .clone()
+                 .unwrap_or_else(|| opts.lib_type.clone()),
+-            compatible_fragment_ratio: 1.0,
+-            num_compatible_fragments: res.num_mapped,
++            compatible_fragment_ratio: ratio,
++            num_compatible_fragments: if judged > 0 {
++                res.num_compatible_fragments
++            } else {
++                res.num_mapped
++            },
++            num_incompatible_fragments: res.num_incompatible_fragments,
+             num_assigned_fragments: res.num_mapped,
+             num_frags_with_concordant_consistent_mappings: res.num_mapped - num_orphan,
+             num_frags_with_inconsistent_or_orphan_mappings: num_orphan,
+diff --git a/crates/salmon-align/src/rad.rs b/crates/salmon-align/src/rad.rs
+index 1beb949ca..0dee4b642 100644
+--- a/crates/salmon-align/src/rad.rs
++++ b/crates/salmon-align/src/rad.rs
+@@ -484,15 +484,21 @@ fn process_rad_fragment(
+     order: PlacementOrder,
+     cfg: &FragCfg,
+     scratch: &mut RadScratch,
+-) -> FragmentOutcome {
++) -> (FragmentOutcome, Option<bool>) {
+     if placements.is_empty() {
+-        return FragmentOutcome::Unmapped;
++        return (FragmentOutcome::Unmapped, None);
+     }
+     // Orphan bookkeeping, folded into the loop below so the tally does not have
+     // to walk these placements a second time. Counted over the *surviving* set,
+     // which is what "assigned" means and what the alignment path counts.
+     let mut any_pair = false;
+     let mut any_orphan = false;
++    // Strand judgment for `lib_format_counts.json` (#1130): `None` until a
++    // placement is actually compared against an expected format, then whether
++    // any placement was compatible. Judged over *all* placements — including
++    // ones `ignore_incompat` then drops — because a fragment whose every
++    // placement is wrong-strand is exactly what the count exists to report.
++    let mut strand_judged: Option<bool> = None;
+     let best = placements.iter().map(|p| p.score).max().unwrap_or(0);
+     let at = |snap: &[f64], i: usize| -> f64 {
+         if snap.is_empty() {
+@@ -539,7 +545,9 @@ fn process_rad_fragment(
+         let mut aux = basis + log_frag_prob;
+         if let Some(exp) = cfg.expected_format {
+             let (obs, is_fw, status) = rad_frag_format(p);
+-            if !is_compatible(exp, obs, is_fw, status) {
++            let compat = is_compatible(exp, obs, is_fw, status);
++            strand_judged = Some(strand_judged.unwrap_or(false) || compat);
++            if !compat {
+                 if cfg.ignore_incompat {
+                     continue;
+                 }
+@@ -560,7 +568,10 @@ fn process_rad_fragment(
+         );
+     }
+     if scratch.core.is_empty() {
+-        return FragmentOutcome::Unmapped;
++        // Every placement was dropped by the strand filter: unmapped for
++        // assignment, but the judgment still stands — this is the wrong-strand
++        // fragment the tally exists to count.
++        return (FragmentOutcome::Unmapped, strand_judged);
+     }
+ 
+     // Aggregate by distinct transcript id (ascending), softmax over the
+@@ -593,11 +604,12 @@ fn process_rad_fragment(
+     cfg.eq_builder.add_group(group, weights, 1);
+     // Orphan only when nothing paired both mates: the most complete status
+     // across a fragment's hits wins, as in the RAD fragment-level type.
+-    if any_orphan && !any_pair {
++    let outcome = if any_orphan && !any_pair {
+         FragmentOutcome::MappedOrphan
+     } else {
+         FragmentOutcome::Mapped
+-    }
++    };
++    (outcome, strand_judged)
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -772,6 +784,13 @@ struct RadTallies {
+     mapped: AtomicU64,
+     /// mapped records placed as orphans (only one mate mapped)
+     orphans: AtomicU64,
++    /// records judged against a known expected format with at least one
++    /// strand-compatible placement / with none (#1130). Feed
++    /// `lib_format_counts.json`, so a requant — including phase 2 of
++    /// `--deterministic`, which rewrites that file into the final output
++    /// directory — reports measured values rather than a hardcoded 1.0.
++    frags_compat: AtomicU64,
++    frags_incompat: AtomicU64,
+ }
+ 
+ /// One worker's private copy of [`RadTallies`], merged into the shared atomics
+@@ -793,6 +812,8 @@ struct LocalTallies {
+     records: u64,
+     mapped: u64,
+     orphans: u64,
++    frags_compat: u64,
++    frags_incompat: u64,
+ }
+ 
+ impl LocalTallies {
+@@ -801,9 +822,19 @@ impl LocalTallies {
+     /// again here would be a second pass — and reading it off `placements[0]`
+     /// only worked while the placements happened to arrive in a particular
+     /// order, which the fused pass no longer guarantees.
++    ///
++    /// `strand_judged` is tallied before the `Unmapped` early-return: a fragment
++    /// whose every placement the strand filter dropped is `Unmapped` *and*
++    /// incompatible, and the second fact is the one `num_incompatible_fragments`
++    /// exists to record (#1130).
+     #[inline]
+-    fn tally(&mut self, outcome: FragmentOutcome) {
++    fn tally(&mut self, outcome: FragmentOutcome, strand_judged: Option<bool>) {
+         self.records += 1;
++        match strand_judged {
++            Some(true) => self.frags_compat += 1,
++            Some(false) => self.frags_incompat += 1,
++            None => {}
++        }
+         if outcome == FragmentOutcome::Unmapped {
+             return;
+         }
+@@ -824,6 +855,8 @@ impl LocalTallies {
+         add(&shared.records, self.records);
+         add(&shared.mapped, self.mapped);
+         add(&shared.orphans, self.orphans);
++        add(&shared.frags_compat, self.frags_compat);
++        add(&shared.frags_incompat, self.frags_incompat);
+     }
+ }
+ 
+@@ -1025,13 +1058,13 @@ where
+                         for rec in &chunk.reads {
+                             pls.clear();
+                             rec.placements_into(&mut pls);
+-                            let outcome = process_rad_fragment(
++                            let (outcome, strand_judged) = process_rad_fragment(
+                                 &pls,
+                                 PlacementOrder::Arrival,
+                                 cfg,
+                                 &mut scratch,
+                             );
+-                            local.tally(outcome);
++                            local.tally(outcome, strand_judged);
+                         }
+                     }
+                 }
+@@ -1524,13 +1557,13 @@ where
+                             // once here and tell both. Neither then re-derives
+                             // what this sort already established.
+                             sort_placements_by_tid(&mut pls);
+-                            let outcome = process_rad_fragment(
++                            let (outcome, strand_judged) = process_rad_fragment(
+                                 &pls,
+                                 PlacementOrder::ByTid,
+                                 cfg,
+                                 &mut scratch,
+                             );
+-                            local_tallies.tally(outcome);
++                            local_tallies.tally(outcome, strand_judged);
+                             collect_bias_fragment(
+                                 &pls,
+                                 PlacementOrder::ByTid,
+@@ -1892,6 +1925,8 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+     let num_records = tallies.records.into_inner();
+     let num_mapped = tallies.mapped.into_inner();
+     let num_orphan = tallies.orphans.into_inner();
++    let num_frags_compat = tallies.frags_compat.into_inner();
++    let num_frags_incompat = tallies.frags_incompat.into_inner();
+     // How many fragments the *mapper* saw, which only the header can say; falling
+     // back to the record count is what yields a 100% rate, so it is reported as
+     // such (see `warn_incomplete_provenance`).
+@@ -2138,6 +2173,8 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+         num_processed,
+         num_mapped,
+         num_orphan: Some(num_orphan),
++        num_compatible_fragments: num_frags_compat,
++        num_incompatible_fragments: num_frags_incompat,
+         source_programs: provenance.source_programs.clone(),
+         source: crate::FragmentSource::Rad,
+         provenance,
+diff --git a/crates/salmon-align/tests/rad_lib_format_counts.rs b/crates/salmon-align/tests/rad_lib_format_counts.rs
+new file mode 100644
+index 000000000..b68956cae
+--- /dev/null
++++ b/crates/salmon-align/tests/rad_lib_format_counts.rs
+@@ -0,0 +1,110 @@
++//! RAD-input quantification must report measured strand-compatibility counts in
++//! `lib_format_counts.json` (#1130), not the historical hardcoded `1.0`.
++//!
++//! This is what makes the full `--deterministic` flow correct: its phase 2 is a
++//! RAD requant into the final output directory, whose `write_outputs` rewrites
++//! the mapping pass's `lib_format_counts.json`. If the requant did not measure,
++//! every deterministic run would end with placeholder values no matter what the
++//! mapping pass tallied — which is exactly the bug this test would catch.
++
++use std::path::Path;
++
++use salmon_align::{quantify_rad, AlignQuantOptions};
++use salmon_rad::{frag_map_type, FragmentChunkBuf, RadHit, RadOutputWriter, RadProfile};
++
++/// Write a salmon RAD of uniquely-mapped proper pairs on one transcript:
++/// `n_isf` fragments observed inward-FR (read1 forward — `ISF`-compatible) and
++/// `n_isr` observed inward-RF (read1 reverse — `ISR`-compatible).
++fn write_mixed_orientation_rad(path: &Path, n_isf: usize, n_isr: usize) {
++    let prov = salmon_rad::WriterProvenance {
++        mapping_type: salmon_rad::MappingType::Mapping,
++        index: None,
++        source_programs: vec![],
++    };
++    let w = RadOutputWriter::create(
++        path,
++        &["t0"],
++        &[4000u32],
++        true,
++        RadProfile::Sketch,
++        1024,
++        salmon_rad::ChunkCodec::None,
++        &prov,
++    )
++    .unwrap();
++    let ctx: salmon_rad::SalmonBulkContext = *w.context();
++    let mut cb = FragmentChunkBuf::with_capacity_codec(4096, salmon_rad::ChunkCodec::None);
++    let mut emit = |is_fw: bool, n: usize| {
++        for _ in 0..n {
++            let hit = RadHit {
++                tid: 0,
++                is_fw,
++                mate_fw: !is_fw,
++                pos: 0,
++                frag_len: 200,
++                score: 0,
++            };
++            let rec = salmon_rad::SalmonBulkRecord::new(frag_map_type::MAPPED_PAIR, vec![hit]);
++            cb.write(&rec, &ctx).unwrap();
++        }
++    };
++    emit(true, n_isf);
++    emit(false, n_isr);
++    w.append_chunk_bytes(&cb.take_bytes().unwrap()).unwrap();
++    w.finalize().unwrap();
++}
++
++fn lib_counts(dir: &Path) -> serde_json::Value {
++    let s = std::fs::read_to_string(dir.join("lib_format_counts.json")).unwrap();
++    serde_json::from_str(&s).unwrap()
++}
++
++fn u64_field(v: &serde_json::Value, k: &str) -> u64 {
++    v[k].as_u64().unwrap()
++}
++
++#[test]
++fn rad_requant_lib_format_counts_report_incompatible_fragments() {
++    let tmp = tempfile::tempdir().unwrap();
++    let rad = tmp.path().join("mixed.rad");
++    let (n_isf, n_isr) = (30usize, 20usize);
++    let total = (n_isf + n_isr) as u64;
++    write_mixed_orientation_rad(&rad, n_isf, n_isr);
++
++    let run = |lib_type: &str, out: &Path| -> salmon_align::AlignQuantResult {
++        let mut o = AlignQuantOptions::new(rad.clone(), out.to_path_buf());
++        o.lib_type = lib_type.to_string();
++        o.fld_mean = 200.0;
++        o.fld_sd = 20.0;
++        quantify_rad(&o, &rad).expect("quantify_rad")
++    };
++
++    // Stranded ISF: the ISR-observed fragments are judged and found wrong-strand;
++    // with the default `--incompatPrior 0` they are dropped, so they are counted
++    // incompatible yet excluded from the assigned total.
++    let out_isf = tmp.path().join("isf");
++    let res = run("ISF", &out_isf);
++    let v = lib_counts(&out_isf);
++    assert_eq!(u64_field(&v, "num_compatible_fragments"), n_isf as u64);
++    assert_eq!(u64_field(&v, "num_incompatible_fragments"), n_isr as u64);
++    let ratio = v["compatible_fragment_ratio"].as_f64().unwrap();
++    let expect = n_isf as f64 / total as f64;
++    assert!((ratio - expect).abs() < 1e-12, "ratio {ratio} != {expect}");
++    assert_eq!(u64_field(&v, "num_assigned_fragments"), res.num_mapped);
++    assert_eq!(res.num_mapped, n_isf as u64);
++
++    // The opposite stranded type flips the split exactly.
++    let out_isr = tmp.path().join("isr");
++    run("ISR", &out_isr);
++    let v = lib_counts(&out_isr);
++    assert_eq!(u64_field(&v, "num_compatible_fragments"), n_isr as u64);
++    assert_eq!(u64_field(&v, "num_incompatible_fragments"), n_isf as u64);
++
++    // Unstranded: judged like any other type, and everything passes.
++    let out_iu = tmp.path().join("iu");
++    run("IU", &out_iu);
++    let v = lib_counts(&out_iu);
++    assert_eq!(u64_field(&v, "num_compatible_fragments"), total);
++    assert_eq!(u64_field(&v, "num_incompatible_fragments"), 0);
++    assert_eq!(v["compatible_fragment_ratio"].as_f64().unwrap(), 1.0);
++}
+diff --git a/crates/salmon-align/tests/stranded_num_mapped.rs b/crates/salmon-align/tests/stranded_num_mapped.rs
+index 8d92cf66c..9cde6bdf5 100644
+--- a/crates/salmon-align/tests/stranded_num_mapped.rs
++++ b/crates/salmon-align/tests/stranded_num_mapped.rs
+@@ -167,3 +167,48 @@ fn single_end_strand_filters_respect_alignment_orientation() {
+     );
+     mass_conserved(&sr, "SR");
+ }
++
++/// `lib_format_counts.json` must report measured strand-compatibility counts in
++/// alignment mode too, not the historical hardcoded `1.0` (#1130). The BAM
++/// streaming pass judges every reported alignment against the expected format
++/// already; this pins that the judgment reaches the output file: exact
++/// `num_compatible_fragments` / `num_incompatible_fragments`, the ratio over
++/// judged fragments, and `num_assigned_fragments` still excluding the dropped
++/// wrong-strand fragments (default `--incompatPrior 0`).
++#[test]
++fn stranded_align_lib_format_counts_report_incompatible_fragments() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (n_fwd, n_rev) = (12usize, 7usize);
++    let sam = write_sam(tmp.path(), n_fwd, n_rev);
++    let total = (n_fwd + n_rev) as u64;
++
++    let lib_counts = |dir: &Path| -> serde_json::Value {
++        let s = std::fs::read_to_string(dir.join("lib_format_counts.json")).unwrap();
++        serde_json::from_str(&s).unwrap()
++    };
++    let u64_field = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap();
++
++    // Stranded ISF: the reverse fragments aligned but only on the wrong strand.
++    let out_isf = tmp.path().join("isf_counts");
++    let isf_res = run(&sam, &out_isf, "ISF");
++    let isf = lib_counts(&out_isf);
++    assert_eq!(u64_field(&isf, "num_compatible_fragments"), n_fwd as u64);
++    assert_eq!(u64_field(&isf, "num_incompatible_fragments"), n_rev as u64);
++    let ratio = isf["compatible_fragment_ratio"].as_f64().unwrap();
++    let expect = n_fwd as f64 / total as f64;
++    assert!((ratio - expect).abs() < 1e-12, "ratio {ratio} != {expect}");
++    // Dropped, so not assigned: the two counts answer different questions.
++    assert_eq!(
++        u64_field(&isf, "num_assigned_fragments"),
++        isf_res.num_mapped
++    );
++    assert_eq!(isf_res.num_mapped, n_fwd as u64);
++
++    // Unstranded: judged like any other type, and everything passes.
++    let out_iu = tmp.path().join("iu_counts");
++    run(&sam, &out_iu, "IU");
++    let iu = lib_counts(&out_iu);
++    assert_eq!(u64_field(&iu, "num_compatible_fragments"), total);
++    assert_eq!(u64_field(&iu, "num_incompatible_fragments"), 0);
++    assert_eq!(iu["compatible_fragment_ratio"].as_f64().unwrap(), 1.0);
++}
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index c1dfeb91b..22cdf1625 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -288,6 +288,23 @@ pub struct QuantResult {
+     pub num_mapped: u64,
+     /// mapped fragments placed as orphans (only one mate of a pair mapped)
+     pub num_orphan: u64,
++    /// fragments with at least one mapping strand-compatible with the expected
++    /// library format (`lib_format_counts.json`'s `num_compatible_fragments`)
++    pub num_compatible_fragments: u64,
++    /// fragments that mapped but had *no* strand-compatible mapping
++    /// (`lib_format_counts.json`'s `num_incompatible_fragments`). On a stranded
++    /// library this is the wrong-strand fraction, the cheapest available signal
++    /// of double-stranded (genomic DNA) carry-over; see #1130.
++    ///
++    /// Counted whatever `--incompatPrior` is: under the default 0 these
++    /// fragments are dropped and excluded from `num_mapped`, above 0 they are
++    /// down-weighted and *included* in it.
++    ///
++    /// Both tallies cover only fragments filtered against a known expected
++    /// format, so under `-l A` fragments consumed before the detector locks in
++    /// are in neither, and `num_compatible_fragments + num_incompatible_fragments`
++    /// can fall short of the mapped total.
++    pub num_incompatible_fragments: u64,
+     /// fragment mass (sum of equivalence-class counts) that could not be assigned
+     /// to any transcript in the final min-alpha redistribution because every
+     /// member of the class was truncated; reported, not rescaled. Normally 0.
+@@ -404,6 +421,8 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let num_processed = &progress.processed;
+     let num_mapped = &progress.mapped;
+     let num_orphan = AtomicU64::new(0);
++    let num_frags_compat = AtomicU64::new(0);
++    let num_frags_incompat = AtomicU64::new(0);
+     let num_decoy = AtomicU64::new(0);
+     let num_dovetail = AtomicU64::new(0);
+     let num_frags_filtered_vm = AtomicU64::new(0);
+@@ -671,6 +690,8 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+             num_processed,
+             num_mapped,
+             num_orphan: &num_orphan,
++            num_frags_compat: &num_frags_compat,
++            num_frags_incompat: &num_frags_incompat,
+             num_decoy: &num_decoy,
+             num_dovetail: &num_dovetail,
+             num_frags_filtered_vm: &num_frags_filtered_vm,
+@@ -1292,6 +1313,8 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         num_processed: num_processed.load(Ordering::Relaxed),
+         num_mapped: num_mapped.load(Ordering::Relaxed),
+         num_orphan: num_orphan.load(Ordering::Relaxed),
++        num_compatible_fragments: num_frags_compat.load(Ordering::Relaxed),
++        num_incompatible_fragments: num_frags_incompat.load(Ordering::Relaxed),
+         inference_truncated_mass,
+         num_eq_classes,
+         first_decoy_index: salmon.info().first_decoy_index,
+diff --git a/crates/salmon-quant/src/output.rs b/crates/salmon-quant/src/output.rs
+index 9a92ffdb1..4046ae779 100644
+--- a/crates/salmon-quant/src/output.rs
++++ b/crates/salmon-quant/src/output.rs
+@@ -279,12 +279,18 @@ fn write_cmd_info(path: &Path, opts: &QuantOptions) -> Result<()> {
+ /// `lib_format_counts.json`: how many fragments were compatible with the
+ /// declared library type, which is the first thing to check when a mapping rate
+ /// looks wrong.
++///
++/// `num_incompatible_fragments` extends salmon's C++ field set (#1130): it is the
++/// count of fragments that mapped but had no placement on the strand the declared
++/// library type expects. Everything else keeps its C++ name and meaning, so the
++/// file stays a drop-in for existing readers.
+ #[derive(Serialize)]
+ struct LibCounts {
+     read_files: Vec<String>,
+     expected_format: String,
+     compatible_fragment_ratio: f64,
+     num_compatible_fragments: u64,
++    num_incompatible_fragments: u64,
+     num_assigned_fragments: u64,
+     num_frags_with_concordant_consistent_mappings: u64,
+     num_frags_with_inconsistent_or_orphan_mappings: u64,
+@@ -292,16 +298,31 @@ struct LibCounts {
+ }
+ 
+ fn write_lib_counts(path: &Path, opts: &QuantOptions, res: &QuantResult) -> Result<()> {
+-    // No strand-compatibility filtering yet: every mapped fragment is treated
+-    // as compatible with the declared library type.
+     let mut read_files = paths_to_strings(&opts.mates1);
+     read_files.extend(paths_to_strings(&opts.mates2));
+     read_files.extend(paths_to_strings(&opts.unmated));
++    // Ratio over the fragments the strand filter actually judged, not over
++    // everything that mapped: under `-l A` the fragments consumed before the
++    // detector locks in were never compared to an expected format. An unstranded
++    // type is judged like any other and simply finds every fragment compatible.
++    let judged = res.num_compatible_fragments + res.num_incompatible_fragments;
++    let ratio = if judged > 0 {
++        res.num_compatible_fragments as f64 / judged as f64
++    } else {
++        1.0
++    };
+     let counts = LibCounts {
+         read_files,
+         expected_format: res.library_type.clone(),
+-        compatible_fragment_ratio: 1.0,
+-        num_compatible_fragments: res.num_mapped,
++        compatible_fragment_ratio: ratio,
++        // Falls back to the mapped total for the unstranded / unjudged case,
++        // where every mapped fragment is compatible by definition.
++        num_compatible_fragments: if judged > 0 {
++            res.num_compatible_fragments
++        } else {
++            res.num_mapped
++        },
++        num_incompatible_fragments: res.num_incompatible_fragments,
+         num_assigned_fragments: res.num_mapped,
+         num_frags_with_concordant_consistent_mappings: res.num_mapped - res.num_orphan,
+         num_frags_with_inconsistent_or_orphan_mappings: res.num_orphan,
+diff --git a/crates/salmon-quant/src/processor.rs b/crates/salmon-quant/src/processor.rs
+index aa5bb84cd..e3442fc37 100644
+--- a/crates/salmon-quant/src/processor.rs
++++ b/crates/salmon-quant/src/processor.rs
+@@ -150,6 +150,20 @@ pub(crate) struct Shared<'a> {
+     /// of a paired-end fragment mapped); feeds `lib_format_counts.json`'s
+     /// `num_frags_with_inconsistent_or_orphan_mappings`.
+     pub num_orphan: &'a AtomicU64,
++    /// fragments with at least one mapping that is strand-compatible with the
++    /// expected library format, and fragments with mappings of which *none* is.
++    /// The second is the direct, free measure of how much of the library sits on
++    /// the wrong strand. On a stranded protocol the leading cause is
++    /// double-stranded (genomic DNA) input, half of which lands on the expected
++    /// strand by chance and cannot be told apart from RNA (#1130). Both feed
++    /// `lib_format_counts.json` (`num_compatible_fragments`,
++    /// `num_incompatible_fragments`, `compatible_fragment_ratio`).
++    ///
++    /// Only fragments filtered against a *known* expected format are counted, so
++    /// under `-l A` the fragments consumed before the detector locks in are in
++    /// neither tally.
++    pub num_frags_compat: &'a AtomicU64,
++    pub num_frags_incompat: &'a AtomicU64,
+     /// selective-alignment meta counters (salmon's `aux_info/meta_info.json`):
+     /// decoy-dominated fragments, dovetail fragments, fragments that had
+     /// candidates but no surviving mapping, and (for mapped fragments) candidate
+@@ -207,6 +221,9 @@ pub(crate) struct Shared<'a> {
+ #[derive(Default)]
+ pub(crate) struct Counters {
+     pub orphan: u64,
++    /// see [`Shared::num_frags_compat`]
++    pub frags_compat: u64,
++    pub frags_incompat: u64,
+     pub decoy: u64,
+     pub dovetail: u64,
+     pub frags_filtered_vm: u64,
+@@ -223,6 +240,8 @@ impl Counters {
+             }
+         };
+         add(sh.num_orphan, self.orphan);
++        add(sh.num_frags_compat, self.frags_compat);
++        add(sh.num_frags_incompat, self.frags_incompat);
+         add(sh.num_decoy, self.decoy);
+         add(sh.num_dovetail, self.dovetail);
+         add(sh.num_frags_filtered_vm, self.frags_filtered_vm);
+@@ -646,6 +665,21 @@ fn record_discrete(
+     ) {
+         counters.orphan += 1;
+     }
++    // Library-format accounting (see `record`). The deterministic pass does no
++    // strand filtering (incompatible placements are dropped later, when the RAD
++    // is quantified), but with an explicit `-l` the expected format is already
++    // known here, so the same wrong-strand tally is free. Under `-l A` the format
++    // is only resolved at end of pass, so nothing is counted.
++    if let Some(exp) = sh.expected_format {
++        if placements
++            .iter()
++            .any(|m| is_compatible(exp, m.format, m.is_fw, m.status))
++        {
++            counters.frags_compat += 1;
++        } else {
++            counters.frags_incompat += 1;
++        }
++    }
+     // A uniquely-mapped proper pair unambiguously implies its fragment length and
+     // orientation; its observed format also feeds order-independent `-l A`
+     // detection. Uses the raw mapping (like the RAD records written this pass, and
+@@ -766,6 +800,10 @@ fn record(
+     // Indices into `placements` rather than references, so the buffer can outlive the
+     // call and be reused by the next fragment.
+     compat.clear();
++    // Tallied here rather than derived from `compat.len()` afterwards, because
++    // with `--incompatPrior > 0` an incompatible mapping is kept (down-weighted)
++    // and is indistinguishable from a compatible one once it is in the buffer.
++    let mut num_compat_placements = 0usize;
+     compat.extend(
+         placements
+             .iter()
+@@ -773,6 +811,7 @@ fn record(
+             .filter_map(|(i, m)| match expected {
+                 Some(exp) => {
+                     if is_compatible(exp, m.format, m.is_fw, m.status) {
++                        num_compat_placements += 1;
+                         Some((MapIdx(i), m.weight))
+                     } else if sh.ignore_incompat {
+                         None
+@@ -783,6 +822,18 @@ fn record(
+                 None => Some((MapIdx(i), m.weight)),
+             }),
+     );
++    // Library-format accounting, independent of what is quantified below: a
++    // fragment that mapped somewhere but nowhere on the expected strand is the
++    // wrong-strand evidence `lib_format_counts.json` reports. It is counted under
++    // every `--incompatPrior`, including the default 0 where the fragment is then
++    // dropped, and only when there is an expected format to compare against.
++    if expected.is_some() {
++        if num_compat_placements > 0 {
++            counters.frags_compat += 1;
++        } else {
++            counters.frags_incompat += 1;
++        }
++    }
+     if compat.is_empty() {
+         return; // no compatible mapping -> fragment is unassigned (not mapped)
+     }
+diff --git a/crates/salmon-quant/tests/quant_end_to_end.rs b/crates/salmon-quant/tests/quant_end_to_end.rs
+index d60d7d8ea..f660e552b 100644
+--- a/crates/salmon-quant/tests/quant_end_to_end.rs
++++ b/crates/salmon-quant/tests/quant_end_to_end.rs
+@@ -266,6 +266,230 @@ fn stranded_num_mapped_matches_quantified_mass() {
+     mass_conserved(&res_isr);
+ }
+ 
++/// `lib_format_counts.json` must report the wrong-strand fragment count.
++///
++/// On a stranded protocol, fragments that map but land on the strand the library
++/// type does not expect are the direct signal of double-stranded input (genomic
++/// DNA carry-over), because half of such a fragment population lands on the
++/// expected strand by chance and is then indistinguishable from RNA. Salmon
++/// already discards the wrong-strand half, but used to report
++/// `compatible_fragment_ratio: 1.0` / `num_compatible_fragments == num_mapped`
++/// unconditionally, so the evidence never reached the user (#1130).
++///
++/// The simulated reads are inward FR (observed `ISF`): under `ISF` every fragment
++/// is compatible, under the opposite `ISR` every fragment is incompatible. The
++/// two runs therefore pin both ends of the new field.
++#[test]
++fn stranded_lib_format_counts_report_incompatible_fragments() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (fasta, r1, r2, truth) = simulate(tmp.path());
++    let total_truth: u64 = truth.values().sum();
++
++    let idx_dir = tmp.path().join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    let lib_counts = |dir: &Path| -> serde_json::Value {
++        let s = std::fs::read_to_string(dir.join("lib_format_counts.json")).unwrap();
++        serde_json::from_str(&s).unwrap()
++    };
++    let u64_field = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap();
++
++    let quant = |lib_type: &str, out: PathBuf| {
++        let mut opts = QuantOptions::new(idx_dir.clone(), out);
++        opts.mates1 = vec![r1.clone()];
++        opts.mates2 = vec![r2.clone()];
++        opts.lib_type = lib_type.to_string();
++        opts.num_threads = 1;
++        quantify(&opts).unwrap_or_else(|e| panic!("quantify {lib_type}: {e}"))
++    };
++
++    // Matching stranded type: essentially every mapped fragment is compatible.
++    let out_isf = tmp.path().join("quant_isf");
++    let res_isf = quant("ISF", out_isf.clone());
++    let isf = lib_counts(&out_isf);
++    assert_eq!(
++        u64_field(&isf, "num_compatible_fragments"),
++        res_isf.num_mapped,
++        "ISF: {isf}"
++    );
++    assert_eq!(
++        u64_field(&isf, "num_incompatible_fragments"),
++        0,
++        "ISF: {isf}"
++    );
++    assert_eq!(isf["compatible_fragment_ratio"].as_f64().unwrap(), 1.0);
++
++    // Opposite stranded type: every fragment that mapped is on the wrong strand,
++    // so the count that used to be invisible now equals (near enough) the whole
++    // library, and the ratio collapses to ~0.
++    let out_isr = tmp.path().join("quant_isr");
++    let res_isr = quant("ISR", out_isr.clone());
++    let isr = lib_counts(&out_isr);
++    let incompat = u64_field(&isr, "num_incompatible_fragments");
++    assert!(
++        incompat as f64 >= 0.9 * total_truth as f64,
++        "ISR: only {incompat} of {total_truth} fragments reported incompatible: {isr}"
++    );
++    assert!(
++        u64_field(&isr, "num_compatible_fragments") as f64 <= 0.1 * total_truth as f64,
++        "ISR: {isr}"
++    );
++    assert!(
++        isr["compatible_fragment_ratio"].as_f64().unwrap() <= 0.1,
++        "ISR: {isr}"
++    );
++    // The incompatible fragments were dropped (default `--incompatPrior` 0), so
++    // they are not in the assigned total: the two counts answer different
++    // questions and must not be conflated.
++    assert_eq!(
++        u64_field(&isr, "num_assigned_fragments"),
++        res_isr.num_mapped,
++        "ISR: {isr}"
++    );
++}
++
++/// Sketch mode must report the wrong-strand tally in `lib_format_counts.json`,
++/// consistent with the strand filter it now applies (#1136).
++///
++/// Since the #1136 fix, a sketch proper pair carries its observed
++/// `LibraryFormat`, so `is_compatible` judges it exactly as in selective
++/// alignment: the tally counts every mapped fragment before the filter drops
++/// the incompatible ones. A wrong `-l` therefore shows a low
++/// `compatible_fragment_ratio` *and* a collapsed mapping rate, and the JSON is
++/// what says why. `pseudoalignment_strand_filter_respects_library_type` pins
++/// the mapping side; this test pins the reported counts against it.
++#[test]
++fn sketch_lib_format_counts_report_dropped_wrong_strand_fragments() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (fasta, r1, r2, truth) = simulate(tmp.path());
++    let total_truth: u64 = truth.values().sum();
++
++    let idx_dir = tmp.path().join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    let quant = |lib_type: &str, out: PathBuf| {
++        let mut opts = QuantOptions::new(idx_dir.clone(), out);
++        opts.mates1 = vec![r1.clone()];
++        opts.mates2 = vec![r2.clone()];
++        opts.lib_type = lib_type.to_string();
++        opts.sketch = true;
++        opts.num_threads = 1;
++        quantify(&opts).unwrap_or_else(|e| panic!("sketch quantify {lib_type}: {e}"))
++    };
++    let lib_counts = |dir: &Path| -> serde_json::Value {
++        let s = std::fs::read_to_string(dir.join("lib_format_counts.json")).unwrap();
++        serde_json::from_str(&s).unwrap()
++    };
++
++    // The reads are inward FR, i.e. observed `ISF`: everything is compatible.
++    let out_isf = tmp.path().join("sketch_isf");
++    let res_isf = quant("ISF", out_isf.clone());
++    let isf = lib_counts(&out_isf);
++    assert_eq!(
++        isf["num_incompatible_fragments"].as_u64().unwrap(),
++        0,
++        "sketch ISF: {isf}"
++    );
++    assert!(
++        isf["compatible_fragment_ratio"].as_f64().unwrap() >= 0.999,
++        "sketch ISF: {isf}"
++    );
++    assert_eq!(
++        isf["num_assigned_fragments"].as_u64().unwrap(),
++        res_isf.num_mapped,
++        "sketch ISF: {isf}"
++    );
++
++    // Opposite strandedness: every pair is wrong-strand. The tally judges the
++    // fragment before the filter drops it, so the count is measured even though
++    // (under the default `--incompatPrior 0`) almost nothing survives to be
++    // assigned.
++    let out_isr = tmp.path().join("sketch_isr");
++    let res_isr = quant("ISR", out_isr.clone());
++    let isr = lib_counts(&out_isr);
++    let incompat = isr["num_incompatible_fragments"].as_u64().unwrap();
++    assert!(
++        incompat as f64 >= 0.9 * total_truth as f64,
++        "sketch ISR: only {incompat} of {total_truth} counted as wrong-strand: {isr}"
++    );
++    assert!(
++        isr["compatible_fragment_ratio"].as_f64().unwrap() <= 0.1,
++        "sketch ISR: {isr}"
++    );
++    // The dropped fragments are excluded from assignment, not silently kept:
++    // the wrong-strand run maps a small fraction of what the matching run does,
++    // and the JSON's assigned count agrees with the quantifier's.
++    assert!(
++        (res_isr.num_mapped as f64) <= 0.05 * (res_isf.num_mapped as f64),
++        "sketch ISR kept {} of {} fragments a strand filter should drop",
++        res_isr.num_mapped,
++        res_isf.num_mapped
++    );
++    assert_eq!(
++        isr["num_assigned_fragments"].as_u64().unwrap(),
++        res_isr.num_mapped,
++        "sketch ISR: {isr}"
++    );
++    let mass: f64 = res_isr.counts.iter().sum();
++    assert!(
++        (mass - res_isr.num_mapped as f64).abs() < 1.0,
++        "sketch ISR mass {mass} vs num_mapped {}",
++        res_isr.num_mapped
++    );
++}
++
++/// The `--deterministic` mapping pass must report the same wrong-strand count.
++///
++/// In the full `--deterministic` flow this file is later *rewritten* by the
++/// phase-2 RAD requant, which measures the same tallies from the RAD's stored
++/// orientations (covered by `salmon-align`'s `rad_lib_format_counts` test) —
++/// so end to end the counts survive. This test pins the mapping pass's own
++/// file, which is what a standalone `--writeRad --skipQuant` run ships. The
++/// pass does no strand filtering of its own (incompatible placements are
++/// dropped later, in the requant), but with an explicit `-l` it can still
++/// count them.
++#[test]
++fn deterministic_mapping_pass_reports_incompatible_fragments() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (fasta, r1, r2, truth) = simulate(tmp.path());
++    let total_truth: u64 = truth.values().sum();
++
++    let idx_dir = tmp.path().join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    // Phase 1 of `--deterministic`, as the CLI configures it: map, write the RAD,
++    // skip quantification. Reads are inward FR, so `ISR` is the wrong strand.
++    let out = tmp.path().join("quant_det");
++    let mut opts = QuantOptions::new(idx_dir, out.clone());
++    opts.mates1 = vec![r1];
++    opts.mates2 = vec![r2];
++    opts.lib_type = "ISR".to_string();
++    opts.num_threads = 1;
++    opts.write_rad = Some(out.join("intermediate_mappings.rad"));
++    opts.skip_quant = true;
++    opts.deterministic_fld = true;
++    std::fs::create_dir_all(&out).unwrap();
++    quantify(&opts).expect("deterministic mapping pass");
++
++    let s = std::fs::read_to_string(out.join("lib_format_counts.json")).unwrap();
++    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
++    let incompat = v["num_incompatible_fragments"].as_u64().unwrap();
++    assert!(
++        incompat as f64 >= 0.9 * total_truth as f64,
++        "deterministic pass: only {incompat} of {total_truth} reported incompatible: {v}"
++    );
++    assert!(
++        v["compatible_fragment_ratio"].as_f64().unwrap() <= 0.1,
++        "deterministic pass: {v}"
++    );
++}
++
+ /// Read back a salmon RAD file: detected profile, ref names, and all records.
+ fn read_rad(
+     path: &Path,
+diff --git a/website/src/content/docs/reference/output-formats.md b/website/src/content/docs/reference/output-formats.md
+index a596b8dfc..f472e03b9 100644
+--- a/website/src/content/docs/reference/output-formats.md
++++ b/website/src/content/docs/reference/output-formats.md
+@@ -198,9 +198,45 @@ salmon's `GZipWriter::writeBootstrap<double>`.
+ 
+ `lib_format_counts.json` records library-format detection: `read_files`,
+ `expected_format`, `compatible_fragment_ratio`, `num_compatible_fragments`,
+-`num_assigned_fragments`, `num_frags_with_concordant_consistent_mappings`,
++`num_incompatible_fragments`, `num_assigned_fragments`,
++`num_frags_with_concordant_consistent_mappings`,
+ `num_frags_with_inconsistent_or_orphan_mappings`, `strand_mapping_bias`.
+ 
++`num_incompatible_fragments` is an addition to the C++ field set (every other
++field keeps its C++ name and meaning). It counts fragments that mapped but had
++**no** placement on the strand the declared library type expects:
++
++- `num_compatible_fragments`: fragments with at least one strand-compatible
++  mapping.
++- `num_incompatible_fragments`: fragments that mapped only on the wrong strand.
++  With the default `--incompatPrior 0` these are discarded, so they are **not**
++  included in `num_assigned_fragments`; with `--incompatPrior > 0` they are kept
++  at reduced weight and are included.
++- `compatible_fragment_ratio`: `num_compatible_fragments` over the sum of the
++  two, i.e. over the fragments the strand filter actually judged.
++
++On a stranded protocol the wrong-strand fraction is the cheapest available
++measure of double-stranded input (genomic DNA carry-over from incomplete DNase
++digestion): such fragments map to either strand with equal probability, so an
++excess of incompatible fragments implies a comparable amount of contamination
++sitting *on* the expected strand, where nothing can distinguish it from RNA.
++Comparing the ratio across samples of one cohort flags the affected libraries
++without a separate strandedness pass over an alignment.
++
++Both counts cover only fragments compared against a known expected format. Under
++`-l A` the fragments consumed before the library type is inferred are in neither
++tally, so their sum can be lower than the mapped total; under an unstranded type
++every fragment is compatible and the ratio is 1.
++
++The fields are measured in every mode that writes this file: read-based
++quantification (selective alignment and `--sketch`, which applies the same
++strand filter), alignment-based quantification (`-a`), RAD-input
++quantification, and `--deterministic` (whose phase-2 requant rewrites the file
++with tallies measured from the RAD's stored orientations). In every mode the
++fragment is judged before the filter acts on it, so on a stranded `-l` a
++wrong-strand library shows both signals at once: a low
++`compatible_fragment_ratio` explaining a collapsed mapping rate.
++
+ ## Documented Rust-format files (diagnostic)
+ 
+ These are bias-model and FLD diagnostic dumps, not read by standard downstream

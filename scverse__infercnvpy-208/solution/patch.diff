@@ -1,0 +1,1366 @@
+diff --git a/docs/large_data.md b/docs/large_data.md
+index 3bd9573..76cf321 100644
+--- a/docs/large_data.md
++++ b/docs/large_data.md
+@@ -81,3 +81,12 @@ cnv.tl.infercnv(genes, reference_key="cell_type", reference_cat=["Fibroblast", "
+ Genes on chromosomes without a position (and on `chrX` and `chrY` by default) are skipped, and a chromosome with
+ fewer genes than `window_size` becomes a single window. Targeted panels with few genes per chromosome carry much less
+ CNV signal than whole-transcriptome data, so consider a smaller `window_size`.
++
++## Plotting
++
++{func}`infercnvpy.pl.chromosome_heatmap` draws one row per pixel of the figure, whatever the number of cells: the
++cell in the middle of the cells that fall into that row (as the full plot looks when downscaled), or with
++`aggregate="mean"` their mean. It reads the CNV matrix once, block by block if `adata.obsm["X_cnv"]` is a dask array
++(the lazy result of `infercnv`) or a backed matrix, and keeps only the drawn rows in memory.
++{func}`~infercnvpy.pl.chromosome_heatmap_summary` computes the group means in the same way. `mode="legacy"` draws
++every cell with {func}`scanpy.pl.heatmap`, which needs the whole matrix in memory as a dense table.
+diff --git a/pyproject.toml b/pyproject.toml
+index 13f09db..0e062e9 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -167,6 +167,7 @@ overrides = [
+     "gtfparse.*",
+     "h5py.*",
+     "leidenalg.*",
++    "mpl_toolkits.*",
+     "numba.*",
+     "pooch.*",
+     "rpy2.*",
+diff --git a/src/infercnvpy/pl/_chromosome_heatmap.py b/src/infercnvpy/pl/_chromosome_heatmap.py
+index 39fcddb..2792e4e 100644
+--- a/src/infercnvpy/pl/_chromosome_heatmap.py
++++ b/src/infercnvpy/pl/_chromosome_heatmap.py
+@@ -1,18 +1,45 @@
+-import matplotlib.axes
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from typing import TYPE_CHECKING, Any, Literal
++
+ import numpy as np
+ import pandas as pd
+ import scanpy as sc
+ from anndata import AnnData
+-from matplotlib.colors import Colormap, TwoSlopeNorm
++from matplotlib import patches
++from matplotlib import pyplot as plt
++from matplotlib.colors import BoundaryNorm, Colormap, ListedColormap, Normalize, TwoSlopeNorm
++from matplotlib.path import Path as MplPath
++from mpl_toolkits.axes_grid1 import make_axes_locatable
++from mpl_toolkits.axes_grid1.axes_size import Fixed
+ 
++from infercnvpy._logging import log
++from infercnvpy._numba import n_kernel_chunks, numba_threads
+ from infercnvpy._util import _as_df, _as_matrix
++from infercnvpy.pl._heatmap_kernels import binned_sums, pixel_rows, sampled_rows
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
++
++    from matplotlib.axes import Axes
++    from matplotlib.figure import Figure
++
++# Sizes in inches, as `scanpy.pl.heatmap` lays them out at figsize=(16, 10).
++_GROUP_W = 0.155  # colour blocks of the groups
++_CBAR_W = 0.155
++_DENDRO_W = 0.775
++_CHR_H = 0.115  # chromosome brackets
++_PAD_W = 0.03
++_PAD_H = 0.05
++_CBAR_MAX_H = 4.0
+ 
+-# TODO should not use private scanpy functions
+-try:
+-    from scanpy.plotting._utils import savefig_or_show
+-except ImportError:
+-    # scanpy >= 1.13
+-    from scanpy.plotting.legacy._utils import savefig_or_show
++#: :func:`scanpy.pl.heatmap` arguments that `mode="fast"` implements; any other one switches to `mode="legacy"`.
++FAST_KWARGS = frozenset(
++    {"swap_axes", "standard_scale", "var_group_rotation", "dendrogram", "vmin", "vmax", "vcenter", "norm"}
++    | {"show_gene_labels", "log"}
++)
+ 
+ 
+ def chromosome_heatmap(
+@@ -21,14 +48,25 @@ def chromosome_heatmap(
+     groupby: str = "cnv_leiden",
+     use_rep: str = "cnv",
+     cmap: str | Colormap = "bwr",
+-    figsize: tuple[int, int] = (16, 10),
++    figsize: tuple[float, float] = (16, 10),
++    mode: Literal["fast", "legacy"] = "fast",
++    aggregate: Literal["sample", "mean"] = "sample",
++    ax: Axes | None = None,
++    n_jobs: int | None = None,
+     show: bool | None = None,
+     save: str | bool | None = None,
++    return_fig: bool | None = None,
+     **kwargs,
+-) -> dict[str, matplotlib.axes.Axes] | None:
++) -> Figure | dict[str, Axes] | None:
+     """Plot a heatmap of smoothed gene expression by chromosome.
+ 
+-    Wrapper around :func:`scanpy.pl.heatmap`.
++    Cells are sorted by `groupby` and each group gets a share of the heatmap's height proportional to its size.
++
++    .. versionchanged:: 0.7.0
++       Rendered by infercnvpy instead of :func:`scanpy.pl.heatmap` (`mode="fast"`): each pixel row of the figure
++       shows one cell of the cells that fall into it, or their mean, so large data plots in seconds. The previous
++       implementation is available as `mode="legacy"`. Both modes keep the original order of the cells within a
++       group; before, scanpy's unstable sort made that order depend on the platform.
+ 
+     Parameters
+     ----------
+@@ -39,66 +77,79 @@ def chromosome_heatmap(
+         sense to either group by unsupervised clustering obtained from
+         :func:`infercnvpy.tl.leiden` (the default) or a cell-type label.
+     use_rep
+-        Key under which the result from :func:`infercnvpy.tl.infercnv` are stored.
++        Key under which the result from :func:`infercnvpy.tl.infercnv` are stored. With `mode="fast"`,
++        `adata.obsm[f"X_{use_rep}"]` can also be a dask array or a backed matrix, which is read block by block.
+     cmap
+         colormap to use
+     figsize
+-        (width, height) tuple in inches
++        (width, height) tuple in inches. Ignored if `ax` is given.
++    mode
++        `"fast"` draws the heatmap with infercnvpy at the resolution of the figure. `"legacy"` draws every cell
++        with :func:`scanpy.pl.heatmap`, which needs the CNV matrix as a dense table and several times its memory.
++        `mode="fast"` implements the :func:`scanpy.pl.heatmap` arguments `swap_axes`, `standard_scale`,
++        `var_group_rotation`, `dendrogram`, `vmin`, `vmax`, `vcenter`, `norm`, `show_gene_labels` (ignored) and
++        `log`; with any other argument (or a numeric, not categorical, `groupby` column), it logs an info message
++        and uses `mode="legacy"`.
++    aggregate
++        What a pixel row shows when there are more cells than pixel rows (`mode="fast"` only). `"sample"` shows the
++        cell in the middle of the cells that fall into the row, as the full-resolution plot downscaled with
++        nearest-neighbour interpolation, with the colour scale from the values of all cells. `"mean"` shows their
++        mean, with the colour scale from the range of the drawn (averaged) values unless `vmin` and `vmax` are
++        given.
++    ax
++        Draw the heatmap into this axes (`mode="fast"` only). The group colours, chromosome labels, dendrogram and
++        colour bar go into axes split off from it.
++    n_jobs
++        Number of threads for reading the CNV matrix (`mode="fast"`). `None` uses all cores.
+     show
+-        Whether to show the figure or to return the axes objects.
++        Whether to show the figure. Defaults to :attr:`scanpy.settings.autoshow`.
+     save
+-        If `True` or a `str`, save the figure. A string is appended to the default filename.
+-        Infer the filetype if ending on `{'.pdf', '.png', '.svg'}`.
++        If `True` or a `str`, save the figure to :attr:`scanpy.settings.figdir`. A string is appended to the default
++        filename `heatmap`; it sets the file type if it ends in `.pdf`, `.png` or `.svg`, otherwise
++        :attr:`scanpy.settings.file_format_figs` does.
++    return_fig
++        Return the :class:`~matplotlib.figure.Figure`.
+     **kwargs
+-        Arguments passed on to :func:`scanpy.pl.heatmap`.
++        Arguments of :func:`scanpy.pl.heatmap`, see `mode`. By default, the colour scale is a
++        :class:`~matplotlib.colors.TwoSlopeNorm` centred at `vcenter=0`. `dendrogram=True` orders the groups by
++        hierarchical clustering of their mean CNV profiles (Pearson correlation, complete linkage, as
++        :func:`scanpy.tl.dendrogram`) and draws the dendrogram next to the heatmap.
+ 
+     Returns
+     -------
+-    If `show` is False, a dictionary of axes.
+-
++    The figure if `return_fig` is true. Otherwise, if `show` is false, a dictionary of axes with the keys
++    `heatmap_ax`, `groupby_ax` (group colours), `gene_groups_ax` (chromosome labels), `colorbar_ax` (not with
++    `mode="legacy"`) and, with `dendrogram`, `dendrogram_ax`.
+     """
+-    if groupby == "cnv_leiden" and "cnv_leiden" not in adata.obs.columns:
+-        raise ValueError("'cnv_leiden' is not in `adata.obs`. Did you run `tl.leiden()`?")
+-    tmp_adata = AnnData(X=_as_matrix(adata.obsm[f"X_{use_rep}"]), obs=_as_df(adata.obs), uns=adata.uns)
+-
+-    # re-sort, as saving & loading anndata destroys the order
+-    chr_pos_dict = dict(sorted(adata.uns[use_rep]["chr_pos"].items(), key=lambda x: x[1]))
+-    chr_pos = list(chr_pos_dict.values())
+-
+-    # center color map at 0
+-    X = _as_matrix(tmp_adata.X)
+-    tmp_data = X if isinstance(X, np.ndarray) else X.data
+-    vmin = kwargs.pop("vmin", None)
+-    vmax = kwargs.pop("vmax", None)
+-    if vmin is None:
+-        vmin = np.nanmin(tmp_data)
+-    if vmax is None:
+-        vmax = np.nanmax(tmp_data)
+-    kwargs["norm"] = TwoSlopeNorm(0, vmin=vmin, vmax=vmax)
+-
+-    # add chromosome annotations
+-    var_group_positions = list(zip(chr_pos, chr_pos[1:] + [tmp_adata.shape[1]], strict=False))
+-
+-    return_ax_dic = sc.pl.heatmap(
+-        tmp_adata,
+-        var_names=tmp_adata.var.index.values,
+-        groupby=groupby,
+-        figsize=figsize,
+-        cmap=cmap,
+-        show_gene_labels=False,
+-        var_group_positions=var_group_positions,
+-        var_group_labels=list(chr_pos_dict.keys()),
+-        show=False,
+-        **kwargs,
+-    )
+-
+-    return_ax_dic["heatmap_ax"].vlines(chr_pos[1:], lw=0.6, ymin=0, ymax=tmp_adata.shape[0])
+-
+-    savefig_or_show("heatmap", show=show, save=save)
+-    show = sc.settings.autoshow if show is None else show
+-    if not show:
+-        return return_ax_dic
+-    return None
++    if aggregate not in ("sample", "mean"):
++        raise ValueError(f"`aggregate` must be 'sample' or 'mean', got {aggregate!r}.")
++    if _use_legacy("chromosome_heatmap", adata, groupby, mode, kwargs):
++        return _legacy(_legacy_heatmap, adata, groupby, use_rep, cmap, figsize, ax, show, save, return_fig, kwargs)
++    opts = _Options.pop(kwargs)
++    fig, ax = _figure(ax, figsize)
++    cat = _categories(adata, groupby)
++    palette = _group_colors(adata, groupby, len(cat.categories))
++    X = _as_matrix(adata.obsm[f"X_{use_rep}"], f"`adata.obsm['X_{use_rep}']`", lazy=True)
++    dendro = None
++    with numba_threads(n_jobs):
++        if opts.dendrogram:
++            cat, palette, dendro = _order_by_dendrogram(
++                adata, groupby, cat, palette, lambda: _group_means(X, cat.codes.astype(np.int64), len(cat.categories))
++            )
++        codes = cat.codes.astype(np.int64)
++        order, bounds, rows = pixel_rows(codes, len(cat.categories), _n_pixel_rows(fig, ax, swap=opts.swap_axes))
++        if aggregate == "sample":
++            values, lo, hi = sampled_rows(X, order[(bounds[:-1] + bounds[1:]) // 2])
++        else:
++            values = binned_sums(X, order, bounds) / np.diff(bounds)[:, None]
++    values = opts.transform(values)
++    if aggregate == "mean":
++        lo, hi = np.nanmin(values), np.nanmax(values)
++        center = 0 if opts.vcenter is None else opts.vcenter
++        lo, hi = min(lo, center - 1e-9), max(hi, center + 1e-9)  # TwoSlopeNorm needs vmin < vcenter < vmax
++    norm = opts.color_norm(lo, hi)
++    axes = _draw(fig, ax, adata, groupby, cat, palette, values, rows, dendro, use_rep, norm, cmap, opts)
++    return _finish(fig, axes, show=show, save=save, return_fig=return_fig)
+ 
+ 
+ def chromosome_heatmap_summary(
+@@ -107,14 +158,22 @@ def chromosome_heatmap_summary(
+     groupby: str = "cnv_leiden",
+     use_rep: str = "cnv",
+     cmap: str | Colormap = "bwr",
+-    figsize: tuple[int, int] = (16, 10),
++    figsize: tuple[float, float] = (16, 10),
++    mode: Literal["fast", "legacy"] = "fast",
++    ax: Axes | None = None,
++    n_jobs: int | None = None,
+     show: bool | None = None,
+     save: str | bool | None = None,
++    return_fig: bool | None = None,
+     **kwargs,
+-) -> dict[str, matplotlib.axes.Axes] | None:
++) -> Figure | dict[str, Axes] | None:
+     """Plot a heatmap of average of the smoothed gene expression by chromosome per category in groupby.
+ 
+-    Wrapper around :func:`scanpy.pl.heatmap`.
++    Each group is one row of equal height.
++
++    .. versionchanged:: 0.7.0
++       Rendered by infercnvpy instead of :func:`scanpy.pl.heatmap` (`mode="fast"`). The previous implementation is
++       available as `mode="legacy"`.
+ 
+     Parameters
+     ----------
+@@ -125,79 +184,399 @@ def chromosome_heatmap_summary(
+         sense to either group by unsupervised clustering obtained from
+         :func:`infercnvpy.tl.leiden` (the default) or a cell-type label.
+     use_rep
+-        Key under which the result from :func:`infercnvpy.tl.infercnv` are stored.
++        Key under which the result from :func:`infercnvpy.tl.infercnv` are stored. With `mode="fast"`,
++        `adata.obsm[f"X_{use_rep}"]` can also be a dask array or a backed matrix, which is read block by block.
+     cmap
+         colormap to use
+     figsize
+-        (width, height) tuple in inches
++        (width, height) tuple in inches. Ignored if `ax` is given.
++    mode
++        `"fast"` computes the group means in one pass over the CNV matrix and draws them with infercnvpy.
++        `"legacy"` uses :func:`scanpy.pl.heatmap`. `mode="fast"` implements the :func:`scanpy.pl.heatmap` arguments
++        `swap_axes`, `standard_scale`, `var_group_rotation`, `dendrogram`, `vmin`, `vmax`, `vcenter`, `norm`,
++        `show_gene_labels` (ignored) and `log`; with any other argument (or a numeric, not categorical, `groupby`
++        column), it logs an info message and uses `mode="legacy"`.
++    ax
++        Draw the heatmap into this axes (`mode="fast"` only). The group colours, chromosome labels, dendrogram and
++        colour bar go into axes split off from it.
++    n_jobs
++        Number of threads for reading the CNV matrix (`mode="fast"`). `None` uses all cores.
+     show
+-        Whether to show the figure or to return the axes objects.
++        Whether to show the figure. Defaults to :attr:`scanpy.settings.autoshow`.
+     save
+-        If `True` or a `str`, save the figure. A string is appended to the default filename.
+-        Infer the filetype if ending on `{'.pdf', '.png', '.svg'}`.
++        If `True` or a `str`, save the figure to :attr:`scanpy.settings.figdir`. A string is appended to the default
++        filename `heatmap`; it sets the file type if it ends in `.pdf`, `.png` or `.svg`, otherwise
++        :attr:`scanpy.settings.file_format_figs` does.
++    return_fig
++        Return the :class:`~matplotlib.figure.Figure`.
+     **kwargs
+-        Arguments passed on to :func:`scanpy.pl.heatmap`.
++        Arguments of :func:`scanpy.pl.heatmap`, see `mode`. By default, the colour scale is a
++        :class:`~matplotlib.colors.TwoSlopeNorm` centred at `vcenter=0` from the smallest to the largest group mean.
+ 
+     Returns
+     -------
+-    If `show` is False, a dictionary of axes.
++    The figure if `return_fig` is true. Otherwise, if `show` is false, a dictionary of axes with the keys
++    `heatmap_ax`, `groupby_ax` (group colours), `gene_groups_ax` (chromosome labels), `colorbar_ax` (not with
++    `mode="legacy"`) and, with `dendrogram`, `dendrogram_ax`.
++    """
++    if _use_legacy("chromosome_heatmap_summary", adata, groupby, mode, kwargs):
++        return _legacy(_legacy_summary, adata, groupby, use_rep, cmap, figsize, ax, show, save, return_fig, kwargs)
++    opts = _Options.pop(kwargs)
++    fig, ax = _figure(ax, figsize)
++    cat = _categories(adata, groupby)
++    palette = _group_colors(adata, groupby, len(cat.categories))
++    X = _as_matrix(adata.obsm[f"X_{use_rep}"], f"`adata.obsm['X_{use_rep}']`", lazy=True)
++    with numba_threads(n_jobs):
++        means = _group_means(X, cat.codes.astype(np.int64), len(cat.categories))
++    dendro = None
++    if opts.dendrogram:
++        present = np.flatnonzero(np.bincount(cat.codes[cat.codes >= 0], minlength=len(cat.categories)))
++        before = list(cat.categories[present])
++        cat, palette, dendro = _order_by_dendrogram(adata, groupby, cat, palette, lambda: means)
++        means = means[[before.index(c) for c in cat.categories if c in before]]
++    rows = (np.bincount(cat.codes[cat.codes >= 0], minlength=len(cat.categories)) > 0).astype(np.int64)
++    norm = opts.color_norm(float(np.min(means)), float(np.max(means)))
++    axes = _draw(fig, ax, adata, groupby, cat, palette, opts.transform(means), rows, dendro, use_rep, norm, cmap, opts)
++    return _finish(fig, axes, show=show, save=save, return_fig=return_fig)
++
++
++# --- options of mode="fast" -------------------------------------------------------------------------------------------
++
++
++@dataclass
++class _Options:
++    """The :func:`scanpy.pl.heatmap` arguments that `mode="fast"` implements."""
++
++    swap_axes: bool = False
++    standard_scale: Literal["var", "obs"] | None = None
++    var_group_rotation: float | None = None
++    dendrogram: bool = False
++    vmin: float | None = None
++    vmax: float | None = None
++    vcenter: float | None = None
++    norm: Normalize | None = None
++    log: bool = False
++
++    @classmethod
++    def pop(cls, kwargs: dict[str, Any]) -> _Options:
++        kwargs.pop("show_gene_labels", None)  # there are too many windows to label
++        opts = cls(**kwargs)
++        kwargs.clear()
++        return opts
++
++    def transform(self, values: np.ndarray) -> np.ndarray:
++        """`log` and `standard_scale` of the drawn rows, as :func:`scanpy.pl.heatmap` does for all cells."""
++        if self.log:
++            values = np.log1p(values)
++        if self.standard_scale is not None:
++            axis = 0 if self.standard_scale == "var" else 1
++            values = values - np.nanmin(values, axis=axis, keepdims=True)
++            with np.errstate(invalid="ignore", divide="ignore"):
++                values = np.nan_to_num(values / np.nanmax(values, axis=axis, keepdims=True), nan=0)
++        return values
++
++    def color_norm(self, lo: float, hi: float) -> Normalize:
++        """The user's `norm`, or a `TwoSlopeNorm` at `vcenter` (0) from `vmin` to `vmax` (default `lo` and `hi`)."""
++        if self.norm is not None:
++            return self.norm
++        return TwoSlopeNorm(
++            0 if self.vcenter is None else self.vcenter,
++            vmin=lo if self.vmin is None else self.vmin,
++            vmax=hi if self.vmax is None else self.vmax,
++        )
++
++
++# --- mode selection -------------------------------------------------------------------------------------------------
++
++
++def _use_legacy(func: str, adata: AnnData, groupby: str, mode: str, kwargs: dict[str, Any]) -> bool:
++    """Whether to draw with `mode="legacy"`: asked for, or needed for an argument `mode="fast"` does not implement."""
++    if mode not in ("fast", "legacy"):
++        raise ValueError(f"`mode` must be 'fast' or 'legacy', got {mode!r}.")
++    if groupby not in adata.obs.columns:
++        if groupby == "cnv_leiden":
++            raise ValueError("'cnv_leiden' is not in `adata.obs`. Did you run `tl.leiden()`?")
++        raise ValueError(f"{groupby!r} is not in `adata.obs`.")
++    if mode == "legacy":
++        return True
++    reasons = sorted(set(kwargs) - FAST_KWARGS)
++    if not isinstance(kwargs.get("dendrogram", False), bool | np.bool_):
++        reasons.append("dendrogram=<key>")
++    if kwargs.get("standard_scale") not in (None, "var", "obs"):
++        reasons.append(f"standard_scale={kwargs['standard_scale']!r}")
++    col = _as_df(adata.obs)[groupby]
++    if pd.api.types.is_numeric_dtype(col) and not isinstance(col.dtype, pd.CategoricalDtype):
++        reasons.append("a numeric `groupby` column")
++    if reasons:
++        log.info("%s: mode='fast' does not support %s, using mode='legacy'", func, ", ".join(reasons))
++        return True
++    return False
++
++
++def _legacy(
++    fn: Callable[..., dict[str, Axes] | None],
++    adata: AnnData,
++    groupby: str,
++    use_rep: str,
++    cmap: str | Colormap,
++    figsize: tuple[float, float],
++    ax: Axes | None,
++    show: bool | None,
++    save: str | bool | None,
++    return_fig: bool | None,
++    kwargs: dict[str, Any],
++) -> Figure | dict[str, Axes] | None:
++    if ax is not None:
++        raise ValueError("`ax` needs mode='fast' (and only arguments that it supports, see `mode`).")
++    common = {"groupby": groupby, "use_rep": use_rep, "cmap": cmap, "figsize": figsize, "save": save}
++    if not return_fig:
++        return fn(adata, show=show, **common, **kwargs)
++    axes = fn(adata, show=False, **common, **kwargs)
++    assert axes is not None
++    fig = axes["heatmap_ax"].get_figure(root=True)
++    assert fig is not None
++    return fig
++
++
++def _legacy_heatmap(adata: AnnData, **kwargs) -> dict[str, Axes] | None:
++    from infercnvpy.pl._chromosome_heatmap_legacy import legacy_heatmap
++
++    return legacy_heatmap(adata, **kwargs)
++
++
++def _legacy_summary(adata: AnnData, **kwargs) -> dict[str, Axes] | None:
++    from infercnvpy.pl._chromosome_heatmap_legacy import legacy_summary
++
++    return legacy_summary(adata, **kwargs)
++
+ 
++# --- data -----------------------------------------------------------------------------------------------------------
++
++
++def _figure(ax: Axes | None, figsize: tuple[float, float]) -> tuple[Figure, Axes]:
++    if ax is None:
++        ax = plt.figure(figsize=figsize).add_subplot()
++    fig = ax.get_figure(root=True)
++    assert fig is not None
++    return fig, ax
++
++
++def _n_pixel_rows(fig: Figure, ax: Axes, *, swap: bool) -> int:
++    """Extent of `ax` along the cells, in pixels at the larger of the figure and savefig resolution."""
++    dpi = fig.dpi
++    if not isinstance(save_dpi := plt.rcParams["savefig.dpi"], str):
++        dpi = max(dpi, save_dpi)
++    pos, (width, height) = ax.get_position(), fig.get_size_inches()
++    return max(1, int(np.ceil((pos.width * width if swap else pos.height * height) * dpi)))
++
++
++def _categories(adata: AnnData, groupby: str) -> pd.Categorical:
++    col = _as_df(adata.obs)[groupby].astype("category")  # keeps the order of categories that are already categorical
++    return pd.Categorical(col, categories=col.cat.categories)
++
++
++def _group_colors(adata: AnnData, groupby: str, n: int) -> list:
++    """The colours scanpy stores for `groupby`, or the default palette scanpy would pick."""
++    colors = adata.uns.get(f"{groupby}_colors")
++    if colors is not None and len(colors) >= n:
++        return list(colors[:n])
++    if n <= len(cycle := plt.rcParams["axes.prop_cycle"].by_key()["color"]):
++        return cycle[:n]
++    for palette in (sc.pl.palettes.default_20, sc.pl.palettes.default_28, sc.pl.palettes.default_102):
++        if n <= len(palette):
++            return list(palette[:n])
++    return ["grey"] * n
++
++
++def _reduce_groups(sums: np.ndarray, counts: np.ndarray, rows: np.ndarray) -> np.ndarray:
++    """Means of the non-empty groups from the sums and cell counts of their `rows` runs of cells."""
++    starts = np.concatenate([[0], np.cumsum(rows[rows > 0])[:-1]])
++    return np.add.reduceat(sums, starts, axis=0) / np.add.reduceat(counts, starts)[:, None]
++
++
++def _group_means(X: Any, codes: np.ndarray, n_groups: int) -> np.ndarray:
++    """Means of the non-empty groups in one pass, with several runs per group so that all threads take part."""
++    order, bounds, rows = pixel_rows(codes, n_groups, max(n_groups, n_kernel_chunks(len(codes))))
++    return _reduce_groups(binned_sums(X, order, bounds), np.diff(bounds), rows)
++
++
++def _order_by_dendrogram(
++    adata: AnnData, groupby: str, cat: pd.Categorical, palette: list, means: Callable[[], np.ndarray]
++) -> tuple[pd.Categorical, list, dict[str, Any] | None]:
++    """Reorder the categories (and their colours) as the leaves of the dendrogram of the non-empty groups.
++
++    The dendrogram is `adata.uns[f"dendrogram_{groupby}"]` from :func:`scanpy.tl.dendrogram` if that has exactly
++    these groups, as for `mode="legacy"`, otherwise it is computed from the groups' mean CNV profiles (`means()`).
++    Unused categories go last. With fewer than two groups, there is no dendrogram.
+     """
+-    if groupby == "cnv_leiden" and "cnv_leiden" not in adata.obs.columns:
+-        raise ValueError("'cnv_leiden' is not in `adata.obs`. Did you run `tl.leiden()`?")
+-
+-    # TODO this dirty hack repeats each row 10 times, since scanpy
+-    # heatmap cannot really handle it if there's just one observation
+-    # per row. Scanpy matrixplot is not an option, since it plots each
+-    # gene individually.
+-    groups = adata.obs[groupby].unique()
+-    tmp_obs = pd.DataFrame()
+-    tmp_obs[groupby] = np.hstack([np.repeat(x, 10) for x in groups])
+-    tmp_obs.index = tmp_obs.index.astype(str)
+-
+-    def _get_group_mean(group):
+-        group_mean = np.mean(adata.obsm[f"X_{use_rep}"][adata.obs[groupby].values == group, :], axis=0)
+-        if len(group_mean.shape) == 1:
+-            # derived from an array instead of sparse matrix -> 1 dim instead of 2
+-            group_mean = group_mean[np.newaxis, :]
+-        return group_mean
+-
+-    tmp_adata = sc.AnnData(
+-        X=np.vstack([np.repeat(_get_group_mean(group), 10, axis=0) for group in groups]), obs=tmp_obs, uns=adata.uns
+-    )
++    present = np.flatnonzero(np.bincount(cat.codes[cat.codes >= 0], minlength=len(cat.categories)))
++    if len(present) < 2:
++        return cat, palette, None
++    labels = [str(c) for c in cat.categories[present]]
++    stored = adata.uns.get(f"dendrogram_{groupby}", {}).get("dendrogram_info")
++    if stored is not None and sorted(map(str, stored["ivl"])) == sorted(labels):
++        dendro = {**stored, "leaves": [labels.index(str(c)) for c in stored["ivl"]]}
++    else:
++        dendro = _dendrogram(means(), labels)
++    new = [*present[dendro["leaves"]], *np.setdiff1d(np.arange(len(cat.categories)), present)]
++    return cat.reorder_categories(cat.categories[new]), [palette[i] for i in new], dendro
++
++
++def _dendrogram(means: np.ndarray, labels: list[str]) -> dict[str, Any]:
++    """`scipy.cluster.hierarchy.dendrogram` of the groups, computed like :func:`scanpy.tl.dendrogram`."""
++    import scipy.cluster.hierarchy as sch
++    from scipy.spatial import distance
++
++    corr = np.clip(pd.DataFrame(means.T).corr().to_numpy(), -1, 1)
++    z = sch.linkage(distance.squareform(1 - corr, checks=False), method="complete")
++    return sch.dendrogram(z, labels=labels, no_plot=True)
++
++
++# --- drawing --------------------------------------------------------------------------------------------------------
++
++
++def _draw(
++    fig: Figure,
++    ax: Axes,
++    adata: AnnData,
++    groupby: str,
++    cat: pd.Categorical,
++    palette: list,
++    values: np.ndarray,
++    rows: np.ndarray,
++    dendro: dict[str, Any] | None,
++    use_rep: str,
++    norm: Normalize,
++    cmap: str | Colormap,
++    opts: _Options,
++) -> dict[str, Axes]:
++    """Draw `values` (pixel rows x windows, `rows` rows per category of `cat`) with its annotations.
++
++    Cells run down the heatmap, or along it with `swap_axes`. `palette` has a colour per category, `dendro` the
++    dendrogram of the non-empty groups in their order.
++    """
++    keep = np.flatnonzero(rows)
++    labels = [str(c) for c in cat.categories[keep]]
++    colors = [palette[g] for g in keep]
++    rows = rows[keep]
++    n_rows, n_cols = values.shape
++    ends = np.cumsum(rows)
++    centers = ends - rows / 2 - 0.5
++    swap = opts.swap_axes
+ 
+     chr_pos_dict = dict(sorted(adata.uns[use_rep]["chr_pos"].items(), key=lambda x: x[1]))
+     chr_pos = list(chr_pos_dict.values())
+ 
+-    # center color map at 0
+-    vmin = kwargs.pop("vmin", None)
+-    vmax = kwargs.pop("vmax", None)
+-    if vmin is None:
+-        vmin = np.min(tmp_adata.X)
+-    if vmax is None:
+-        vmax = np.max(tmp_adata.X)
+-    kwargs["norm"] = TwoSlopeNorm(0, vmin=vmin, vmax=vmax)
+-
+-    # add chromosome annotations
+-    var_group_positions = list(zip(chr_pos, chr_pos[1:] + [tmp_adata.shape[1]], strict=False))
+-
+-    return_ax_dic = sc.pl.heatmap(
+-        tmp_adata,
+-        var_names=tmp_adata.var.index.values,
+-        groupby=groupby,
+-        figsize=figsize,
+-        cmap=cmap,
+-        show_gene_labels=False,
+-        var_group_positions=var_group_positions,
+-        var_group_labels=list(chr_pos_dict.keys()),
+-        show=False,
+-        **kwargs,
++    im = ax.imshow(values.T if swap else values, aspect="auto", interpolation="nearest", norm=norm, cmap=cmap)
++    ax.tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
++    ax.grid(visible=False)
++    line: dict[str, Any] = {"lw": 1, "color": "black", "zorder": 10, "clip_on": False}
++    if swap:
++        ax.set_xlim(-0.5, n_rows - 0.5)
++        ax.set_ylim(n_cols - 0.5, -0.5)
++        ax.vlines(ends[:-1] - 0.5, -0.5, n_cols - 0.5, **line)
++        ax.hlines(chr_pos[1:], lw=0.6, xmin=-0.5, xmax=n_rows - 0.5)
++    else:
++        ax.set_ylim(n_rows - 0.5, -0.5)
++        ax.set_xlim(-0.5, n_cols - 0.5)
++        ax.hlines(ends[:-1] - 0.5, -0.5, n_cols - 0.5, **line)
++        ax.vlines(chr_pos[1:], lw=0.6, ymin=-0.5, ymax=n_rows - 0.5)
++
++    divider = make_axes_locatable(ax)
++    axes = {"heatmap_ax": ax}
++    along_cells = {"sharex": ax} if swap else {"sharey": ax}
++    along_windows = {"sharey": ax} if swap else {"sharex": ax}
++
++    chr_ax = axes["gene_groups_ax"] = divider.append_axes(
++        "right" if swap else "top", size=Fixed(_CHR_H), pad=Fixed(_PAD_W if swap else _PAD_H), **along_windows
+     )
++    _chromosome_brackets(chr_ax, list(chr_pos_dict), chr_pos, n_cols, rotation=opts.var_group_rotation, right=swap)
++
++    group_ax = axes["groupby_ax"] = divider.append_axes(
++        "bottom" if swap else "left", size=Fixed(_GROUP_W), pad=Fixed(_PAD_H if swap else _PAD_W), **along_cells
++    )
++    blocks = np.repeat(np.arange(len(rows)), rows)[:, None]
++    group_ax.imshow(
++        blocks.T if swap else blocks,
++        aspect="auto",
++        interpolation="nearest",
++        cmap=ListedColormap(colors),
++        norm=BoundaryNorm(np.arange(len(rows) + 1) - 0.5, len(rows)),
++    )
++    group_ax.tick_params(left=False, bottom=False, labelleft=not swap, labelbottom=swap, labelsize="small")
++    if swap:
++        group_ax.set_xticks(centers, labels, rotation=0 if max(len(x) for x in labels) < 3 else 90)
++        group_ax.set_xlabel(groupby)
++    else:
++        group_ax.set_yticks(centers, labels)
++        group_ax.set_ylabel(groupby)
++    group_ax.set_frame_on(False)
++    group_ax.grid(visible=False)
++
++    if dendro is not None:
++        dendro_ax = axes["dendrogram_ax"] = divider.append_axes(
++            "top" if swap else "right", size=Fixed(_DENDRO_W), pad=Fixed(_PAD_H if swap else _PAD_W), **along_cells
++        )
++        leaf_pos = np.arange(5, 10 * len(rows), 10, dtype=float)  # where scipy puts the leaves
++        for xs, ys in zip(dendro["icoord"], dendro["dcoord"], strict=True):
++            pos = np.interp(xs, leaf_pos, centers)
++            dendro_ax.plot(*((pos, ys) if swap else (ys, pos)), color="#555555")
++        dendro_ax.tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
++        dendro_ax.set_frame_on(False)
++        dendro_ax.grid(visible=False)
++
++    cbar_holder = divider.append_axes("right", size=Fixed(_CBAR_W), pad=Fixed(_PAD_W))
++    cbar_holder.axis("off")
++    cbar_ax = axes["colorbar_ax"] = cbar_holder.inset_axes((0, 0, 1, min(1, _CBAR_MAX_H / fig.get_size_inches()[1])))
++    fig.colorbar(im, cax=cbar_ax)
++    return axes
++
++
++def _chromosome_brackets(
++    ax: Axes, labels: list[str], starts: list[int], n_cols: int, *, rotation: float | None, right: bool
++) -> None:
++    """Brackets over (or, with `right`, next to) the windows of each chromosome with its label, as scanpy draws."""
++    verts, codes = [], []
++    if rotation is None:
++        rotation = 90 if max(len(x) for x in labels) > 4 else 0
++    for label, start, end in zip(labels, starts, [*starts[1:], n_cols], strict=True):
++        lo, hi = start - 0.3, end + 0.3
++        if right:
++            verts += [(0, lo), (0.15, lo), (0.15, hi), (0, hi)]
++            text = label if (hi - lo) * 2 >= len(label) else f"{label[: int((hi - lo) * 2)]}."
++            ax.text(0.6, (lo + hi) / 2, text, ha="right", va="center", rotation=270, fontsize="small")
++        else:
++            verts += [(lo, 0), (lo, 0.6), (hi, 0.6), (hi, 0)]
++            ax.text((lo + hi) / 2, 1.1, label, ha="center", va="bottom", rotation=rotation)
++        codes += [MplPath.MOVETO, MplPath.LINETO, MplPath.LINETO, MplPath.LINETO]
++    ax.add_patch(patches.PathPatch(MplPath(verts, codes), facecolor="none", lw=1.5))
++    if right:
++        ax.set_xlim(0, 1)
++    else:
++        ax.set_ylim(0, 1)
++    ax.axis("off")
++
++
++def _finish(
++    fig: Figure, axes: dict[str, Axes], *, show: bool | None, save: str | bool | None, return_fig: bool | None
++) -> Figure | dict[str, Axes] | None:
++    if sc.settings.autosave if save is None else save:
++        _save(fig, save)
++    if return_fig:
++        return fig
++    if sc.settings.autoshow if show is None else show:
++        plt.show()
++        return None
++    return axes
+ 
+-    return_ax_dic["heatmap_ax"].vlines(chr_pos[1:], lw=0.6, ymin=-1, ymax=tmp_adata.shape[0])
+ 
+-    savefig_or_show("heatmap", show=show, save=save)
+-    show = sc.settings.autoshow if show is None else show
+-    if not show:
+-        return return_ax_dic
+-    return None
++def _save(fig: Figure, save: str | bool | None) -> None:
++    """Save as `<figdir>/heatmap<save><plot_suffix>.<ext>`, the file name `scanpy.pl.heatmap` used."""
++    name, ext = "heatmap", sc.settings.file_format_figs
++    if isinstance(save, str):
++        if (suffix := Path(save).suffix) in {".svg", ".pdf", ".png"}:
++            save, ext = save.removesuffix(suffix), suffix[1:]
++        name += save
++    figdir = Path(sc.settings.figdir)
++    figdir.mkdir(parents=True, exist_ok=True)
++    fig.savefig(figdir / f"{name}{sc.settings.plot_suffix}.{ext}", bbox_inches="tight")
+diff --git a/src/infercnvpy/pl/_chromosome_heatmap_legacy.py b/src/infercnvpy/pl/_chromosome_heatmap_legacy.py
+new file mode 100644
+index 0000000..7473921
+--- /dev/null
++++ b/src/infercnvpy/pl/_chromosome_heatmap_legacy.py
+@@ -0,0 +1,165 @@
++"""`mode="legacy"` of the chromosome heatmaps: the implementation before 0.7.0, through :func:`scanpy.pl.heatmap`."""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import numpy as np
++import pandas as pd
++import scanpy as sc
++from anndata import AnnData
++from matplotlib.colors import TwoSlopeNorm
++
++from infercnvpy._util import _as_df, _as_matrix
++
++try:
++    from scanpy.plotting._utils import savefig_or_show
++except ImportError:  # scanpy >= 1.13
++    from scanpy.plotting.legacy._utils import savefig_or_show
++
++if TYPE_CHECKING:
++    from matplotlib.axes import Axes
++    from matplotlib.colors import Colormap
++
++
++def legacy_heatmap(
++    adata: AnnData,
++    *,
++    groupby: str,
++    use_rep: str,
++    cmap: str | Colormap,
++    figsize: tuple[float, float],
++    show: bool | None,
++    save: str | bool | None,
++    **kwargs,
++) -> dict[str, Axes] | None:
++    """Every cell as a row of :func:`scanpy.pl.heatmap`, in the original order within each group."""
++    tmp_adata = AnnData(X=_as_matrix(adata.obsm[f"X_{use_rep}"]), obs=_as_df(adata.obs), uns=adata.uns)
++    tmp_adata = tmp_adata[_stable_group_order(tmp_adata, groupby, kwargs.get("dendrogram", False))]
++
++    # re-sort, as saving & loading anndata destroys the order
++    chr_pos_dict = dict(sorted(adata.uns[use_rep]["chr_pos"].items(), key=lambda x: x[1]))
++    chr_pos = list(chr_pos_dict.values())
++
++    # center color map at 0
++    X = _as_matrix(tmp_adata.X)
++    tmp_data = X if isinstance(X, np.ndarray) else X.data
++    vmin = kwargs.pop("vmin", None)
++    vmax = kwargs.pop("vmax", None)
++    if vmin is None:
++        vmin = np.nanmin(tmp_data)
++    if vmax is None:
++        vmax = np.nanmax(tmp_data)
++    kwargs["norm"] = TwoSlopeNorm(0, vmin=vmin, vmax=vmax)
++
++    # add chromosome annotations
++    var_group_positions = list(zip(chr_pos, chr_pos[1:] + [tmp_adata.shape[1]], strict=False))
++
++    return_ax_dic = sc.pl.heatmap(
++        tmp_adata,
++        var_names=tmp_adata.var.index.values,
++        groupby=groupby,
++        figsize=figsize,
++        cmap=cmap,
++        show_gene_labels=False,
++        var_group_positions=var_group_positions,
++        var_group_labels=list(chr_pos_dict.keys()),
++        show=False,
++        **kwargs,
++    )
++
++    return_ax_dic["heatmap_ax"].vlines(chr_pos[1:], lw=0.6, ymin=0, ymax=tmp_adata.shape[0])
++
++    savefig_or_show("heatmap", show=show, save=save)
++    show = sc.settings.autoshow if show is None else show
++    if not show:
++        return return_ax_dic
++    return None
++
++
++def _stable_group_order(adata: AnnData, groupby: str, dendrogram: bool | str) -> np.ndarray:
++    """The cells sorted by group with a stable sort, in the group order `scanpy.pl.heatmap` will use.
++
++    `scanpy.pl.heatmap` sorts the cells with pandas' default (unstable) sort, so the order of the cells within a
++    group depends on the platform. pandas does not reorder an index that is already sorted, so cells passed in this
++    order keep their original order within each group. With a dendrogram, the groups are in its order; it is
++    computed here, as `scanpy.pl.heatmap` would, if `adata.uns` does not have it yet.
++    """
++    categories = _as_df(adata.obs)[groupby].astype("category").cat.categories
++    if dendrogram:
++        key = dendrogram if isinstance(dendrogram, str) else f"dendrogram_{groupby}"
++        if key not in adata.uns:
++            sc.tl.dendrogram(adata, groupby, key_added=key)
++        categories = pd.Index(adata.uns[key]["categories_ordered"])
++    rank = pd.Categorical(_as_df(adata.obs)[groupby], categories=categories).codes.astype(np.int64)
++    rank[rank < 0] = len(categories)  # cells without a group last, as pandas sorts NaN
++    return np.argsort(rank, kind="stable")
++
++
++def legacy_summary(
++    adata: AnnData,
++    *,
++    groupby: str,
++    use_rep: str,
++    cmap: str | Colormap,
++    figsize: tuple[float, float],
++    show: bool | None,
++    save: str | bool | None,
++    **kwargs,
++) -> dict[str, Axes] | None:
++    """Every group mean as 10 rows of :func:`scanpy.pl.heatmap`."""
++    # this dirty hack repeats each row 10 times, since scanpy
++    # heatmap cannot really handle it if there's just one observation
++    # per row. Scanpy matrixplot is not an option, since it plots each
++    # gene individually.
++    groups = adata.obs[groupby].unique()
++    tmp_obs = pd.DataFrame()
++    tmp_obs[groupby] = np.hstack([np.repeat(x, 10) for x in groups])
++    tmp_obs.index = tmp_obs.index.astype(str)
++
++    def _get_group_mean(group):
++        group_mean = np.mean(adata.obsm[f"X_{use_rep}"][adata.obs[groupby].values == group, :], axis=0)
++        if len(group_mean.shape) == 1:
++            # derived from an array instead of sparse matrix -> 1 dim instead of 2
++            group_mean = group_mean[np.newaxis, :]
++        return group_mean
++
++    tmp_adata = sc.AnnData(
++        X=np.vstack([np.repeat(_get_group_mean(group), 10, axis=0) for group in groups]), obs=tmp_obs, uns=adata.uns
++    )
++
++    chr_pos_dict = dict(sorted(adata.uns[use_rep]["chr_pos"].items(), key=lambda x: x[1]))
++    chr_pos = list(chr_pos_dict.values())
++
++    # center color map at 0
++    vmin = kwargs.pop("vmin", None)
++    vmax = kwargs.pop("vmax", None)
++    if vmin is None:
++        vmin = np.min(tmp_adata.X)
++    if vmax is None:
++        vmax = np.max(tmp_adata.X)
++    kwargs["norm"] = TwoSlopeNorm(0, vmin=vmin, vmax=vmax)
++
++    # add chromosome annotations
++    var_group_positions = list(zip(chr_pos, chr_pos[1:] + [tmp_adata.shape[1]], strict=False))
++
++    return_ax_dic = sc.pl.heatmap(
++        tmp_adata,
++        var_names=tmp_adata.var.index.values,
++        groupby=groupby,
++        figsize=figsize,
++        cmap=cmap,
++        show_gene_labels=False,
++        var_group_positions=var_group_positions,
++        var_group_labels=list(chr_pos_dict.keys()),
++        show=False,
++        **kwargs,
++    )
++
++    return_ax_dic["heatmap_ax"].vlines(chr_pos[1:], lw=0.6, ymin=-1, ymax=tmp_adata.shape[0])
++
++    savefig_or_show("heatmap", show=show, save=save)
++    show = sc.settings.autoshow if show is None else show
++    if not show:
++        return return_ax_dic
++    return None
+diff --git a/src/infercnvpy/pl/_heatmap_kernels.py b/src/infercnvpy/pl/_heatmap_kernels.py
+new file mode 100644
+index 0000000..a04d904
+--- /dev/null
++++ b/src/infercnvpy/pl/_heatmap_kernels.py
+@@ -0,0 +1,133 @@
++"""Reading the CNV matrix for :func:`infercnvpy.pl.chromosome_heatmap`, one pixel row per run of cells.
++
++The cells are sorted by group and every group is split into contiguous runs of cells, one per pixel row
++(`pixel_rows`). A pixel row then shows either one cell of its run (`sampled_rows`: the cell in the middle, which is
++what matplotlib's nearest-neighbour downscaling shows when every cell is drawn) or the mean of the run (`binned_sums`:
++`_bin_sums_csr` / `_bin_sums_dense` add up the rows of each run straight from the matrix, CSR without densifying).
++A figure is ~1000 pixels tall, so the result is a small dense matrix whatever the number of cells.
++
++The matrix is read in row blocks (`infercnvpy.tl._infercnv._Rows`): an in-memory matrix as one block with the parallel
++kernel, a dask array block by block and a backed matrix `CHUNKSIZE` rows at a time, with the serial kernel.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import numpy as np
++import scipy.sparse as sp
++
++from infercnvpy._numba import njit_parallel, prange
++from infercnvpy.tl._infercnv import _Rows
++
++CHUNKSIZE = 10_000  # rows per block of a backed matrix
++
++
++@njit_parallel
++def _bin_sums_csr(indptr, indices, data, order, bounds, bins, sums):  # pragma: no cover
++    """Add rows `order[bounds[j]:bounds[j + 1]]` to `sums[bins[j]]`."""
++    for j in prange(len(bounds) - 1):
++        row = sums[bins[j]]
++        for k in range(bounds[j], bounds[j + 1]):
++            i = order[k]
++            for p in range(indptr[i], indptr[i + 1]):
++                row[indices[p]] += data[p]
++
++
++@njit_parallel
++def _bin_sums_dense(X, order, bounds, bins, sums):  # pragma: no cover
++    """Like `_bin_sums_csr` for a dense matrix."""
++    n_cols = X.shape[1]
++    for j in prange(len(bounds) - 1):
++        row = sums[bins[j]]
++        for k in range(bounds[j], bounds[j + 1]):
++            x = X[order[k]]
++            for c in range(n_cols):
++                row[c] += x[c]
++
++
++def _rows_per_group(counts: np.ndarray, n_rows: int) -> np.ndarray:
++    """Split `n_rows` pixel rows over groups in proportion to `counts` (largest remainder).
++
++    A non-empty group gets at least one row, and no group more rows than cells.
++    """
++    exact = counts * (n_rows / counts.sum())
++    rows = np.floor(exact).astype(np.int64)
++    rest = n_rows - rows.sum()
++    rows[np.argsort(rows - exact, kind="stable")[:rest]] += 1
++    return np.clip(rows, counts > 0, counts)
++
++
++def pixel_rows(codes: np.ndarray, n_groups: int, n_rows: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """Order the cells by group (`codes`, -1 is left out) and cut each group into runs of cells, one per pixel row.
++
++    Within a group, the cells keep their order in `codes`. (:func:`scanpy.pl.heatmap` sorts with pandas' unstable
++    default sort, so its order within a group is arbitrary.) Returns the cell order, the start of each run in that order (plus the end), and the
++    number of rows per group.
++    """
++    keep = np.flatnonzero(codes >= 0)
++    order = keep[codes[keep].argsort(kind="stable")]
++    counts = np.bincount(codes[order], minlength=n_groups)
++    rows = _rows_per_group(counts, min(n_rows, len(order)))
++    starts = np.concatenate([[0], np.cumsum(counts)])
++    bounds = [starts[g] + np.arange(rows[g]) * counts[g] // rows[g] for g in range(n_groups) if rows[g]]
++    return order, np.concatenate([*bounds, [len(order)]]).astype(np.int64), rows
++
++
++def _blocks(X: Any) -> _Rows:
++    return _Rows(X, max(X.shape[0], 1) if isinstance(X, np.ndarray) or sp.issparse(X) else CHUNKSIZE)
++
++
++def binned_sums(X: Any, order: np.ndarray, bounds: np.ndarray) -> np.ndarray:
++    """Sum of the rows of `X` in each run `order[bounds[b]:bounds[b + 1]]` (float64, runs x columns).
++
++    `X` is a numpy array, scipy sparse matrix, dask array or backed matrix.
++    """
++    n_bins = len(bounds) - 1
++    sums = np.zeros((n_bins, X.shape[1]), dtype=np.float64)
++    row_bin = np.full(X.shape[0], -1, dtype=np.int64)
++    row_bin[order] = np.repeat(np.arange(n_bins), np.diff(bounds))
++    source = _blocks(X)
++    serial = source.kind != "in memory"
++
++    def add(Xb, row0, n, start):
++        local = np.flatnonzero(row_bin[start : start + n] >= 0)
++        b = row_bin[start + local]
++        by_bin = np.argsort(b, kind="stable")
++        bins, first = np.unique(b[by_bin], return_index=True)
++        o = (row0 + local[by_bin]).astype(np.int64)
++        bnd = np.append(first, len(o)).astype(np.int64)
++        if sp.issparse(Xb):
++            _bin_sums_csr(Xb.indptr, Xb.indices, Xb.data, o, bnd, bins, sums, serial=serial)
++        else:
++            _bin_sums_dense(Xb, o, bnd, bins, sums, serial=serial)
++
++    for _ in source.map(add):
++        pass
++    return sums
++
++
++def sampled_rows(X: Any, picks: np.ndarray) -> tuple[np.ndarray, float, float]:
++    """Rows `picks` of `X` as a dense float64 array, and the min and max of all values of `X`.
++
++    For sparse input, the min and max are those of the stored values (as before 0.7.0). NaNs are ignored.
++    """
++    out = np.empty((len(picks), X.shape[1]), dtype=np.float64)
++    sorted_picks = np.argsort(picks, kind="stable")
++    ranges = []
++
++    def take(Xb, row0, n, start):
++        values = Xb.data if sp.issparse(Xb) else Xb[row0 : row0 + n]
++        if values.size:
++            ranges.append((np.nanmin(values), np.nanmax(values)))
++        lo, hi = np.searchsorted(picks[sorted_picks], [start, start + n])
++        dest = sorted_picks[lo:hi]
++        rows = Xb[row0 + picks[dest] - start]
++        out[dest] = rows.toarray() if sp.issparse(rows) else rows
++
++    source = _blocks(X)
++    for _ in source.map(take):
++        pass
++    if not ranges:
++        return out, np.nan, np.nan
++    return out, float(min(r[0] for r in ranges)), float(max(r[1] for r in ranges))
+diff --git a/tests/_images/chromosome_heatmap.png b/tests/_images/chromosome_heatmap.png
+index 9a6ba79..d7f79a0 100644
+Binary files a/tests/_images/chromosome_heatmap.png and b/tests/_images/chromosome_heatmap.png differ
+diff --git a/tests/_images/chromosome_heatmap_summary.png b/tests/_images/chromosome_heatmap_summary.png
+index 8eabd5a..d474050 100644
+Binary files a/tests/_images/chromosome_heatmap_summary.png and b/tests/_images/chromosome_heatmap_summary.png differ
+diff --git a/tests/test_plotting.py b/tests/test_plotting.py
+index f27e019..8380a09 100644
+--- a/tests/test_plotting.py
++++ b/tests/test_plotting.py
+@@ -1,6 +1,306 @@
++import logging
++
++import dask
++import dask.array as da
++import numpy as np
++import pandas as pd
+ import pytest
++import scanpy as sc
++import scipy.sparse as sp
++from anndata import AnnData
++from matplotlib import pyplot as plt
++from matplotlib.colors import Normalize
++from matplotlib.figure import Figure
+ 
+ import infercnvpy as cnv
++from infercnvpy.pl._chromosome_heatmap import _group_means
++from infercnvpy.pl._heatmap_kernels import _rows_per_group, binned_sums, pixel_rows, sampled_rows
++
++AX_KEYS = {"heatmap_ax", "groupby_ax", "gene_groups_ax", "colorbar_ax"}
++LOGGER = "scverse.infercnvpy"
++both_plots = pytest.mark.parametrize("plot", [cnv.pl.chromosome_heatmap, cnv.pl.chromosome_heatmap_summary])
++
++
++@pytest.fixture(autouse=True)
++def _close_figures():
++    yield
++    plt.close("all")
++
++
++@pytest.fixture
++def adata_small() -> AnnData:
++    """60 cells in uneven groups (one category unused, one cell without a group) x 12 windows on 3 chromosomes."""
++    rng = np.random.default_rng(0)
++    X = rng.normal(size=(60, 12)).astype(np.float32)
++    X[np.abs(X) < 0.8] = 0
++    groups = rng.choice(["b", "a", "c"], size=60, p=[0.6, 0.3, 0.1]).astype(object)
++    groups[7] = None
++    obs = pd.DataFrame({"group": pd.Categorical(groups, categories=["c", "b", "unused", "a"])})
++    obs.index = obs.index.astype(str)
++    return AnnData(
++        obs=obs,
++        obsm={"X_cnv": sp.csr_matrix(X)},
++        uns={"cnv": {"chr_pos": {"chr2": 5, "chr1": 0, "chr3": 9}}, "group_colors": ["red", "green", "blue", "black"]},
++    )
++
++
++def _image(axes) -> np.ndarray:
++    return np.asarray(axes["heatmap_ax"].images[0].get_array())
++
++
++def _dask(X, block_rows=7):
++    """A dask array with row blocks of `block_rows` (CSR blocks for sparse `X`)."""
++    if not sp.issparse(X):
++        return da.from_array(X, chunks=(block_rows, -1))
++    X = sp.csr_matrix(X)
++    meta = sp.csr_matrix((0, X.shape[1]), dtype=X.dtype)
++    blocks = [
++        da.from_delayed(
++            dask.delayed(X[s : s + block_rows]), shape=X[s : s + block_rows].shape, dtype=X.dtype, meta=meta
++        )
++        for s in range(0, X.shape[0], block_rows)
++    ]
++    return da.concatenate(blocks, axis=0)
++
++
++# --- data ---------------------------------------------------------------------------------------------------------
++
++
++def test_rows_per_group():
++    counts = np.array([500, 3, 0, 97, 1])
++    np.testing.assert_array_equal(_rows_per_group(counts, 100), [83, 1, 0, 16, 1])  # proportional, >= 1 if not empty
++    np.testing.assert_array_equal(_rows_per_group(counts, counts.sum()), counts)  # one row per cell
++
++
++@pytest.mark.parametrize("fmt", [np.asarray, sp.csr_matrix, sp.csc_matrix, _dask, lambda X: _dask(sp.csr_matrix(X))])
++@pytest.mark.parametrize("n_rows", [7, 20, 1000])
++def test_pixel_rows_match_numpy(fmt, n_rows):
++    rng = np.random.default_rng(1)
++    X = rng.normal(size=(120, 9))
++    X[np.abs(X) < 1] = 0
++    codes = rng.choice([0, 1, 3, -1], size=120, p=[0.7, 0.2, 0.05, 0.05])  # group 2 empty, -1 no group
++    order, bounds, rows = pixel_rows(codes, 4, n_rows)
++
++    np.testing.assert_array_equal(np.sort(order), np.flatnonzero(codes >= 0))
++    assert np.all(np.diff(codes[order]) >= 0)  # sorted by group
++    assert np.all(np.diff(bounds) > 0)  # no empty pixel row
++    assert rows[2] == 0
++    assert np.all(rows[[0, 1, 3]] >= 1)
++    assert rows.sum() == len(bounds) - 1
++    starts = np.concatenate([[0], np.cumsum(np.bincount(codes[order], minlength=4))])
++    assert set(bounds[:-1]) >= set(starts[:-1][rows > 0])  # each pixel row holds cells of one group
++
++    runs = list(zip(bounds[:-1], bounds[1:], strict=True))
++    sums = binned_sums(fmt(X), order, bounds)
++    np.testing.assert_allclose(sums, np.stack([X[order[a:b]].sum(axis=0) for a, b in runs]))
++
++    picks = order[(bounds[:-1] + bounds[1:]) // 2]
++    picked, lo, hi = sampled_rows(fmt(X), picks)
++    np.testing.assert_array_equal(picked, X[picks])
++    stored = X if fmt is np.asarray or fmt is _dask else X[X != 0]  # sparse: stored values only, as before 0.7.0
++    assert (lo, hi) == (stored.min(), stored.max())
++
++    expected = pd.DataFrame(X[codes >= 0]).groupby(codes[codes >= 0]).mean().to_numpy()
++    np.testing.assert_allclose(_group_means(fmt(X), codes, 4), expected)
++
++
++# --- fast vs legacy -----------------------------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("fmt", [np.asarray, sp.csr_matrix])
++@pytest.mark.parametrize("kwargs", [{}, {"standard_scale": "var"}, {"standard_scale": "obs", "log": True}])
++@both_plots
++def test_fast_draws_what_legacy_draws(adata_small, fmt, kwargs, plot):
++    """With a row per cell, `mode="fast"` draws the cells of `mode="legacy"` in the same order and colours."""
++    adata_small = adata_small[adata_small.obs["group"].notna()].copy()  # legacy cannot draw cells without group
++    adata_small.obsm["X_cnv"] = fmt(adata_small.obsm["X_cnv"].toarray())
++    legacy = plot(adata_small, groupby="group", show=False, mode="legacy", **kwargs)
++    fast = plot(adata_small, groupby="group", show=False, **kwargs)
++    assert set(fast) == AX_KEYS
++    legacy_values = _image(legacy)
++    if plot is cnv.pl.chromosome_heatmap_summary:
++        # legacy repeats each group 10 times, and sorts the groups by name instead of the order of the categories
++        legacy_labels = [t.get_text() for t in legacy["groupby_ax"].get_yticklabels()]
++        legacy_values = legacy_values[::10][[legacy_labels.index(c) for c in ["c", "b", "a"]]]
++    np.testing.assert_allclose(_image(fast), legacy_values, rtol=1e-6, atol=1e-6)
++    for key in ("vmin", "vcenter", "vmax"):
++        assert getattr(fast["heatmap_ax"].images[0].norm, key) == pytest.approx(
++            getattr(legacy["heatmap_ax"].images[0].norm, key)
++        )
++    assert [t.get_text() for t in fast["groupby_ax"].get_yticklabels()] == ["c", "b", "a"]
++
++
++@pytest.mark.parametrize("dendrogram", [False, True])
++def test_legacy_keeps_cell_order_within_groups(adata_small, dendrogram):
++    """scanpy sorts with pandas' unstable default sort; legacy passes the cells already sorted, so it keeps them."""
++    adata_small = adata_small[adata_small.obs["group"].notna()].copy()
++    adata_small.obsm["X_cnv"] = adata_small.obsm["X_cnv"].toarray()  # scanpy's dendrogram needs dense data here
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", show=False, mode="legacy", dendrogram=dendrogram)
++    order = [t.get_text() for t in axes["groupby_ax"].get_yticklabels()]
++    rank = pd.Categorical(adata_small.obs["group"], categories=order).codes
++    np.testing.assert_array_equal(_image(axes), adata_small.obsm["X_cnv"][np.argsort(rank, kind="stable")])
++
++
++def test_dendrogram_reuses_stored_one(adata_small):
++    adata_small = adata_small[adata_small.obs["group"].notna()].copy()
++    adata_small.obsm["X_cnv"] = adata_small.obsm["X_cnv"].toarray()  # scanpy's dendrogram needs dense data here
++    legacy = cnv.pl.chromosome_heatmap(adata_small, groupby="group", show=False, mode="legacy", dendrogram=True)
++    assert "dendrogram_group" in adata_small.uns  # scanpy stores it
++    fast = cnv.pl.chromosome_heatmap(adata_small, groupby="group", show=False, dendrogram=True)
++    assert set(fast) == AX_KEYS | {"dendrogram_ax"}
++    np.testing.assert_allclose(_image(fast), _image(legacy), rtol=1e-6)
++
++
++def test_dendrogram_from_mean_profiles(adata_small):
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", dendrogram=True, show=False)
++    tmp = AnnData(adata_small.obsm["X_cnv"].toarray(), obs=adata_small.obs)
++    tmp = tmp[tmp.obs["group"].notna()].copy()
++    tmp.obs["group"] = tmp.obs["group"].cat.remove_unused_categories()
++    expected = sc.tl.dendrogram(tmp, "group", var_names=tmp.var_names, inplace=False)["categories_ordered"]
++    assert [t.get_text() for t in axes["groupby_ax"].get_yticklabels()] == expected
++    summary = cnv.pl.chromosome_heatmap_summary(adata_small, groupby="group", dendrogram=True, show=False)
++    assert [t.get_text() for t in summary["groupby_ax"].get_yticklabels()] == expected
++    X, g = adata_small.obsm["X_cnv"].toarray(), adata_small.obs["group"]
++    np.testing.assert_allclose(_image(summary), [X[(g == c).to_numpy()].mean(axis=0) for c in expected], rtol=1e-6)
++
++
++@both_plots
++def test_unsupported_argument_falls_back_to_legacy(adata_small, caplog, plot):
++    adata_small = adata_small[adata_small.obs["group"].notna()].copy()
++    with caplog.at_level(logging.INFO, logger=LOGGER):
++        axes = plot(adata_small, groupby="group", show=False, interpolation="none")
++    assert "colorbar_ax" not in axes  # drawn by scanpy
++    [msg] = [r.getMessage() for r in caplog.records if r.name == LOGGER]
++    assert msg.endswith("mode='fast' does not support interpolation, using mode='legacy'")
++
++
++def test_legacy_rejects_ax(adata_small):
++    _, ax = plt.subplots()
++    with pytest.raises(ValueError, match="`ax` needs mode='fast'"):
++        cnv.pl.chromosome_heatmap(adata_small, groupby="group", ax=ax, mode="legacy")
++
++
++def test_legacy_return_fig(adata_small):
++    adata_small = adata_small[adata_small.obs["group"].notna()].copy()
++    assert isinstance(cnv.pl.chromosome_heatmap(adata_small, groupby="group", mode="legacy", return_fig=True), Figure)
++
++
++# --- fast mode ----------------------------------------------------------------------------------------------------
++
++
++def test_sample_picks_middle_cell(adata_small):
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", figsize=(4, 0.2), show=False)
++    values = _image(axes)
++    assert 3 <= len(values) < 59
++    X = adata_small.obsm["X_cnv"].toarray()
++    assert all(any(np.array_equal(row, cell) for cell in X) for row in values)  # whole cells, not means
++    norm = axes["heatmap_ax"].images[0].norm
++    assert (norm.vmin, norm.vmax) == (X[X != 0].min(), X[X != 0].max())  # colour scale of all cells
++
++
++def test_mean(adata_small):
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", figsize=(4, 0.2), aggregate="mean", show=False)
++    values = _image(axes)
++    codes = adata_small.obs["group"].cat.codes.to_numpy().astype(np.int64)
++    order, bounds, _ = pixel_rows(codes, 4, len(values))
++    X = adata_small.obsm["X_cnv"].toarray()
++    expected = [X[order[a:b]].mean(axis=0) for a, b in zip(bounds[:-1], bounds[1:], strict=True)]
++    np.testing.assert_allclose(values, expected, rtol=1e-6)
++    norm = axes["heatmap_ax"].images[0].norm
++    assert (norm.vmin, norm.vmax) == pytest.approx((np.min(expected), np.max(expected)))
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", aggregate="mean", vmin=-3, vmax=3, show=False)
++    assert (axes["heatmap_ax"].images[0].norm.vmin, axes["heatmap_ax"].images[0].norm.vmax) == (-3, 3)
++
++
++@pytest.mark.parametrize("aggregate", ["sample", "mean"])
++@pytest.mark.parametrize("sparse", [False, True])
++def test_dask_matches_in_memory(adata_small, aggregate, sparse):
++    X = adata_small.obsm["X_cnv"]
++    expected = _image(
++        cnv.pl.chromosome_heatmap(adata_small, groupby="group", figsize=(4, 0.2), aggregate=aggregate, show=False)
++    )
++    adata_small.obsm["X_cnv"] = _dask(X if sparse else X.toarray())
++    actual = _image(
++        cnv.pl.chromosome_heatmap(adata_small, groupby="group", figsize=(4, 0.2), aggregate=aggregate, show=False)
++    )
++    np.testing.assert_allclose(actual, expected, rtol=1e-6)
++    summary = _image(cnv.pl.chromosome_heatmap_summary(adata_small, groupby="group", show=False))
++    adata_small.obsm["X_cnv"] = X
++    np.testing.assert_allclose(
++        summary, _image(cnv.pl.chromosome_heatmap_summary(adata_small, groupby="group", show=False))
++    )
++
++
++def test_swap_axes(adata_small):
++    plain = cnv.pl.chromosome_heatmap(adata_small, groupby="group", show=False)
++    swapped = cnv.pl.chromosome_heatmap(adata_small, groupby="group", figsize=(16, 10), swap_axes=True, show=False)
++    assert set(swapped) == AX_KEYS
++    np.testing.assert_array_equal(_image(swapped), _image(plain).T)  # 59 cells fit both ways
++    assert [t.get_text() for t in swapped["groupby_ax"].get_xticklabels()] == ["c", "b", "a"]
++
++
++def test_norm_options(adata_small):
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", vmin=-5, vmax=2, vcenter=0.5, show=False)
++    norm = axes["heatmap_ax"].images[0].norm
++    assert (norm.vmin, norm.vcenter, norm.vmax) == (-5, 0.5, 2)
++    custom = Normalize(-1, 1)
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", norm=custom, show_gene_labels=True, show=False)
++    assert axes["heatmap_ax"].images[0].norm is custom
++
++
++def test_var_group_rotation(adata_small):
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", var_group_rotation=45, show=False)
++    assert [t.get_rotation() for t in axes["gene_groups_ax"].texts] == [45] * 3
++    assert [t.get_text() for t in axes["gene_groups_ax"].texts] == ["chr1", "chr2", "chr3"]
++
++
++def test_group_colors(adata_small):
++    axes = cnv.pl.chromosome_heatmap(adata_small, groupby="group", show=False)
++    blocks = axes["groupby_ax"].images[0]
++    assert [tuple(blocks.cmap(i)) for i in range(3)] == [
++        (1.0, 0.0, 0.0, 1.0),
++        (0.0, 0.5019607843137255, 0.0, 1.0),
++        (0.0, 0.0, 0.0, 1.0),
++    ]
++
++
++@both_plots
++def test_ax_and_return_fig(adata_small, plot):
++    fig, (ax, other) = plt.subplots(1, 2)
++    assert plot(adata_small, groupby="group", ax=ax, return_fig=True) is fig
++    axes = plot(adata_small, groupby="group", ax=other, show=False)
++    assert axes["heatmap_ax"] is other
++    assert all(a.get_figure(root=True) is fig for a in axes.values())
++
++
++def test_return_fig_without_ax(adata_small):
++    fig = cnv.pl.chromosome_heatmap(adata_small, groupby="group", figsize=(5, 3), return_fig=True)
++    assert isinstance(fig, Figure)
++    assert tuple(fig.get_size_inches()) == (5, 3)
++
++
++def test_save(adata_small, tmp_path):
++    figdir = sc.settings.figdir
++    sc.settings.figdir = tmp_path  # a property without deleter, so no monkeypatch
++    try:
++        cnv.pl.chromosome_heatmap(adata_small, groupby="group", show=False, save=True)
++        cnv.pl.chromosome_heatmap_summary(adata_small, groupby="group", show=False, save="_summary.png")
++    finally:
++        sc.settings.figdir = figdir
++    ext = sc.settings.file_format_figs
++    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([f"heatmap.{ext}", "heatmap_summary.png"])
++
++
++def test_bad_arguments(adata_small):
++    with pytest.raises(ValueError, match="tl.leiden"):
++        cnv.pl.chromosome_heatmap(adata_small)
++    with pytest.raises(ValueError, match="`mode`"):
++        cnv.pl.chromosome_heatmap(adata_small, groupby="group", mode="slow")  # type: ignore[arg-type]
++    with pytest.raises(ValueError, match="`aggregate`"):
++        cnv.pl.chromosome_heatmap(adata_small, groupby="group", aggregate="max")  # type: ignore[arg-type]
++
++
++# --- on infercnv results ------------------------------------------------------------------------------------------
+ 
+ 
+ def test_plot_chromosome_heatmap(adata_infercnv):
+@@ -12,7 +312,7 @@ def test_plot_chromosome_heatmap_summary(adata_infercnv):
+ 
+ 
+ # Grouped by the annotated cell types, not leiden clusters, so the baseline does not depend on the igraph version.
+-@pytest.mark.parametrize("plot", [cnv.pl.chromosome_heatmap, cnv.pl.chromosome_heatmap_summary])
++@both_plots
+ def test_chromosome_heatmap_image(_adata_infercnv, image_comparer, plot):
+     plot(_adata_infercnv.copy(), groupby="cell_type", figsize=(8, 5), show=False)
+     image_comparer(plot.__name__)

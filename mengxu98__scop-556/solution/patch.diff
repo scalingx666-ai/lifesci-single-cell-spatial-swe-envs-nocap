@@ -1,0 +1,474 @@
+diff --git a/NAMESPACE b/NAMESPACE
+index 104b20c59..60172b8ee 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -90,6 +90,8 @@ export(ATACDepthCorPlot)
+ export(ATACFootprintPlot)
+ export(ATACFragmentPlot)
+ export(ATACMotifPlot)
++export(ATACRegionHeatmap)
++export(ATACRegionPlot)
+ export(ATACTSSPlot)
+ export(AddATACMotifs)
+ export(AddFeaturesData)
+@@ -245,6 +247,7 @@ export(RenameClusters)
+ export(RenameFeatures)
+ export(RunATACFootprint)
+ export(RunATACQC)
++export(RunATACRegionMatrix)
+ export(RunAugur)
+ export(RunBANKSY)
+ export(RunBayesSpace)
+diff --git a/NEWS.md b/NEWS.md
+index 36845da4b..c347c05cc 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -6,6 +6,7 @@
+ 
+ # scop (development version)
+ 
++* Add grouped ATAC region endpoint matrices, heatmaps and aggregate profiles with explicit strand, coordinate and normalization semantics.
+ * Add `ATACDepthCorPlot()` for depth/component correlations using fresh count-layer totals by default.
+ * Add `ATACTSSPlot()` for precomputed positional TSS enrichment profiles with assay-cell alignment.
+ * Add `ATACFragmentPlot()` for regional fragment-length diagnostics with explicit barcode mappings.
+diff --git a/R/ATACRegions.R b/R/ATACRegions.R
+new file mode 100644
+index 000000000..e7a81bfcd
+--- /dev/null
++++ b/R/ATACRegions.R
+@@ -0,0 +1,267 @@
++#' Count strand-oriented insertion endpoints around ATAC regions
++#'
++#' @md
++#' @description Build group-specific region-by-position matrices from local
++#' indexed fragments, without subsampling cells or regions. Repeated endpoints
++#' are counted with their multiplicity. This is an explicit SCOP endpoint
++#' counter, not a call to Signac's RegionMatrix.
++#' @param object A Seurat object containing a validated ChromatinAssay with
++#'   local indexed fragments and explicit cell-to-barcode mappings.
++#' @param regions Non-empty GRanges in 1-based closed coordinates. Each region
++#'   is centered at start + floor((width - 1)/2). Minus-strand regions are
++#'   reversed; unstranded regions use genomic orientation. Duplicate genomic
++#'   intervals are rejected even when their names differ. Unique names are
++#'   used as row IDs when provided, otherwise genomic coordinate IDs are used.
++#' @param assay Chromatin assay; defaults to the active assay.
++#' @param group.by Metadata column for grouping. NULL uses active identities.
++#' @param cells Unique source-assay cells; NULL includes all assay cells.
++#' @param upstream,downstream Non-negative integer distances from the center.
++#'   Windows must fit entirely within known chromosome boundaries; no trimming
++#'   or reference/chromosome conversion is performed.
++#' @param bin.size Positive integer width of positional bins. The last bin may
++#'   be shorter; actual widths and centers are returned.
++#' @param max.entries Maximum number of dense output entries across all groups.
++#'   Exceeding this explicit memory guard errors rather than sampling. This
++#'   guards output size, not transient memory for a single dense fragment query.
++#' @param verbose Whether to print progress messages.
++#' @details A BED fragment [start,end) contributes two endpoints, start + 1
++#'   and end, in 1-based coordinates. Only endpoints inside each region window
++#'   are counted. Read-support column 5 is not a weight. There is no extra Tn5
++#'   shift, bias correction, fragment-length weighting or depth normalization.
++#'   Overlapping windows can count the same endpoint. Grouping is descriptive,
++#'   not a replicate-level statistical test; library-size and cell-composition
++#'   confounding remain. Declared reference contigs absent from a file produce
++#'   zero counts for that file, not evidence of biological inaccessibility.
++#'   The caller's object is not modified.
++#' @return A scop_atac_regions list with matrices (one raw count matrix per
++#'   group), regions, bin positions/widths, cells.per.group, and a receipt.
++#' @seealso [ATACRegionHeatmap()], [ATACRegionPlot()]
++#' @export
++RunATACRegionMatrix <- function(
++  object, regions, assay = NULL, group.by = NULL, cells = NULL,
++  upstream = 3000L, downstream = 3000L, bin.size = 50L,
++  max.entries = 5e7, verbose = TRUE
++) {
++  report <- CheckATACData(object, assay = assay)
++  if (!report$valid) stop(paste(report$errors, collapse = " "), call. = FALSE)
++  assay <- report$assay
++  chromatin <- object[[assay]]
++  if (length(report$genome) != 1L) stop("Region counting requires one verified assay genome label.", call. = FALSE)
++  problems <- atac_ranges_problems(regions)
++  if (length(problems)) stop(paste(problems, collapse = " "), call. = FALSE)
++  if (!length(regions)) stop("regions must not be empty.", call. = FALSE)
++  atac_qc_ranges(regions, chromatin, "Regions")
++  for (x in list(upstream, downstream)) atac_region_integer(x, "upstream/downstream", 0)
++  atac_region_integer(bin.size, "bin.size", 1)
++  if (!is.numeric(max.entries) || length(max.entries) != 1L ||
++      !is.finite(max.entries) || max.entries < 1) stop("max.entries must be positive.", call. = FALSE)
++  if (as.double(upstream) + downstream + 1 > .Machine$integer.max) stop("Region window is too wide.", call. = FALSE)
++  ids <- names(regions)
++  if (is.null(ids)) ids <- atac_range_ids(regions)
++  if (!atac_unique_ids(ids)) stop("Regions require unique non-empty IDs or coordinates.", call. = FALSE)
++  if (is.null(cells)) cells <- colnames(chromatin)
++  if (!atac_unique_ids(cells) || !all(cells %in% colnames(chromatin))) {
++    stop("cells must be unique non-empty source-assay cell IDs.", call. = FALSE)
++  }
++  if (is.null(group.by)) {
++    groups <- as.character(SeuratObject::Idents(object)[cells])
++  } else {
++    if (!is.character(group.by) || length(group.by) != 1L || is.na(group.by) ||
++        !group.by %in% colnames(object[[]])) stop("group.by must identify one metadata column.", call. = FALSE)
++    groups <- as.character(object[[]][cells, group.by])
++  }
++  if (anyNA(groups) || any(!nzchar(groups))) stop("Selected cells must have non-missing, non-empty groups.", call. = FALSE)
++  names(groups) <- cells
++  levels <- unique(groups)
++  window.width <- as.double(upstream) + downstream + 1
++  nbins <- ceiling(window.width / bin.size)
++  if (length(regions) * nbins * length(levels) > max.entries) {
++    stop("Output exceeds max.entries; use wider bins, explicit fewer regions, or raise the guard knowingly.", call. = FALSE)
++  }
++  first <- seq.int(0, window.width - 1, by = bin.size)
++  widths <- pmin(bin.size, window.width - first)
++  positions <- -upstream + first + (widths - 1) / 2
++  centers <- GenomicRanges::start(regions) + floor((GenomicRanges::width(regions) - 1) / 2)
++  minus <- as.character(GenomicRanges::strand(regions)) == "-"
++  window.start <- centers - ifelse(minus, downstream, upstream)
++  window.end <- centers + ifelse(minus, upstream, downstream)
++  chromosomes <- as.character(GenomicRanges::seqnames(regions))
++  source.lengths <- atac_backend_fun("GenomeInfoDb", "seqlengths")(chromatin)
++  supplied.lengths <- atac_backend_fun("GenomeInfoDb", "seqlengths")(regions)
++  shared <- source.lengths[names(supplied.lengths)]
++  if (any(shared != supplied.lengths, na.rm = TRUE)) stop("Region and assay chromosome lengths conflict.", call. = FALSE)
++  limits <- source.lengths[chromosomes]
++  missing <- is.na(limits)
++  limits[missing] <- supplied.lengths[chromosomes[missing]]
++  if (any(window.start < 1) || any(window.end > limits, na.rm = TRUE)) {
++    stop("Extended region windows cross chromosome boundaries; reduce the flanks or explicitly select valid regions.", call. = FALSE)
++  }
++  windows <- GenomicRanges::GRanges(chromosomes, IRanges::IRanges(window.start, window.end))
++  fragments <- atac_region_fragments(chromatin, cells, verbose)
++  known <- union(names(source.lengths), unlist(lapply(fragments, `[[`, "contigs"), use.names = FALSE))
++  if (length(setdiff(chromosomes, known))) stop("Regions contain unknown reference contigs.", call. = FALSE)
++  matrices <- lapply(levels, function(x) matrix(0, nrow = length(regions), ncol = nbins,
++    dimnames = list(ids, as.character(positions))))
++  names(matrices) <- levels
++  for (file in fragments) {
++    connection <- Rsamtools::TabixFile(file$path, index = file$index)
++    open(connection)
++    # Each connection is closed even when parsing or counting fails.
++    matrices <- tryCatch({
++      for (i in which(chromosomes %in% file$contigs)) {
++        records <- Rsamtools::scanTabix(connection, param = windows[i])[[1L]]
++        if (!length(records)) next
++        parts <- strsplit(records, "\t", fixed = TRUE)
++        if (any(lengths(parts) < 4L)) stop("Malformed fragment record: at least four fields required.", call. = FALSE)
++        barcodes <- vapply(parts, `[[`, character(1), 4L)
++        selected <- match(barcodes, unname(file$map))
++        keep <- !is.na(selected)
++        if (!any(keep)) next
++        parts <- parts[keep]
++        mapped.groups <- groups[names(file$map)[selected[keep]]]
++        starts <- suppressWarnings(as.numeric(vapply(parts, `[[`, character(1), 2L)))
++        ends <- suppressWarnings(as.numeric(vapply(parts, `[[`, character(1), 3L)))
++        if (any(!is.finite(starts) | !is.finite(ends) | starts < 0 | ends <= starts |
++                starts %% 1 != 0 | ends %% 1 != 0 | ends > .Machine$integer.max)) stop("Invalid BED fragment coordinates.", call. = FALSE)
++        for (group in unique(mapped.groups)) {
++          index <- mapped.groups == group
++          endpoints <- c(starts[index] + 1, ends[index])
++          offsets <- if (minus[i]) centers[i] - endpoints else endpoints - centers[i]
++          offsets <- offsets[offsets >= -upstream & offsets <= downstream]
++          bins <- floor((offsets + upstream) / bin.size) + 1L
++          matrices[[group]][i, ] <- matrices[[group]][i, ] + tabulate(bins, nbins = nbins)
++        }
++      }
++      matrices
++    }, finally = close(connection))
++  }
++  names(regions) <- ids
++  result <- list(matrices = matrices, regions = regions, positions = positions,
++    bin.widths = widths, cells.per.group = table(factor(groups, levels = levels)),
++    receipt = list(source_assay = assay, cells = cells, groups = groups,
++      upstream = upstream, downstream = downstream, bin.size = bin.size,
++      genome = report$genome, coordinate_system = "1-based closed endpoints: BED start+1 and end",
++      endpoint_shift = 0L, column5_weighted = FALSE, bias_corrected = FALSE,
++      fragments = lapply(fragments, function(x) x[c("path", "index", "hash")]),
++      backend = "SCOP indexed endpoint tabulation", signac_version = as.character(utils::packageVersion("Signac"))))
++  class(result) <- c("scop_atac_regions", "list")
++  result
++}
++
++atac_region_integer <- function(x, label, minimum = 0) {
++  if (!is.numeric(x) || length(x) != 1L || !is.finite(x) || x < minimum ||
++      x %% 1 != 0 || x > .Machine$integer.max) stop(paste(label, "must be an integer >=", minimum), call. = FALSE)
++  invisible(x)
++}
++
++atac_region_fragments <- function(chromatin, cells, verbose) {
++  atac_backend_fun("Rsamtools", "TabixFile")
++  fragments <- Signac::Fragments(chromatin)
++  maps <- lapply(fragments, Signac::GetFragmentData, slot = "cells")
++  maps <- lapply(maps, function(x) x[names(x) %in% cells])
++  active <- lengths(maps) > 0L
++  maps <- maps[active]
++  fragments <- fragments[active]
++  if (!length(fragments)) stop("Region counting requires attached local indexed fragments.", call. = FALSE)
++  if (!all(vapply(maps, function(x) atac_unique_ids(x) && atac_unique_ids(names(x)), logical(1))) ||
++      anyDuplicated(unlist(lapply(maps, names))) || !setequal(unlist(lapply(maps, names)), cells)) {
++    stop("Fragment maps must cover each selected cell exactly once with unique barcodes.", call. = FALSE)
++  }
++  paths <- vapply(fragments, Signac::GetFragmentData, character(1), slot = "path")
++  if (!all(file.exists(paths))) stop("Fragment files must exist locally.", call. = FALSE)
++  paths <- normalizePath(paths, mustWork = TRUE)
++  if (anyDuplicated(paths)) stop("Fragment paths must be distinct.", call. = FALSE)
++  lapply(seq_along(fragments), function(i) {
++    index <- paste0(paths[i], c(".tbi", ".csi"))
++    index <- index[file.exists(index)][1L]
++    if (is.na(index)) stop("Fragment index is missing.", call. = FALSE)
++    if (!Signac::ValidateHash(fragments[[i]], verbose = verbose)) stop("Fragment hash changed.", call. = FALSE)
++    if (!Signac::ValidateCells(fragments[[i]], cells = unname(maps[[i]]),
++      tolerance = 0, max.lines = NULL, verbose = verbose)) stop("Requested barcodes are absent from fragment file.", call. = FALSE)
++    list(path = paths[i], index = index, map = maps[[i]],
++      contigs = Rsamtools::seqnamesTabix(Rsamtools::TabixFile(paths[i], index = index)),
++      hash = Signac::GetFragmentData(fragments[[i]], slot = "hash"))
++  })
++}
++
++#' Plot positional ATAC region signal
++#'
++#' @md
++#' @param x Output of [RunATACRegionMatrix()].
++#' @param normalize Divide counts by the number of selected cells in each group.
++#' @param per.base Divide counts by actual bin widths (including a shorter last
++#'   bin). TRUE makes differently sized bins comparable.
++#' @param groups Optional unique group names to plot, in display order.
++#' @param log1p Apply log1p to displayed heatmap values only.
++#' @param order.rows Order heatmap rows by their total displayed signal across
++#'   all selected groups; the same order is used in every panel.
++#' @param low,high Heatmap color endpoints.
++#' @return A ggplot with its summarized plotting data. The line plot shows the
++#'   mean across supplied regions, not a confidence interval or enrichment test.
++#' @seealso [RunATACRegionMatrix()]
++#' @export
++ATACRegionHeatmap <- function(x, normalize = TRUE, per.base = TRUE,
++  groups = NULL, log1p = FALSE, order.rows = FALSE, low = "white", high = "#2166AC"
++) {
++  data <- atac_region_plot_data(x, normalize, per.base, groups)
++  for (value in list(log1p, order.rows)) if (!is.logical(value) || length(value) != 1L || is.na(value)) stop("Plot flags must be TRUE or FALSE.", call. = FALSE)
++  ids <- rownames(x$matrices[[1L]])
++  if (order.rows) {
++    totals <- tapply(data$value, data$region, sum)
++    ids <- ids[order(totals[ids])]
++  }
++  data$region <- factor(data$region, levels = ids)
++  if (log1p) data$value <- base::log1p(data$value)
++  ggplot2::ggplot(data, ggplot2::aes(x = .data$position, y = .data$region, fill = .data$value)) +
++    ggplot2::geom_tile(ggplot2::aes(width = .data$bin.width), height = 1) +
++    ggplot2::facet_wrap(~group) + ggplot2::scale_fill_gradient(low = low, high = high) +
++    ggplot2::labs(x = "Distance from region center (bp)", y = "Region",
++      fill = paste0(if (log1p) "log1p " else "", atac_region_units(normalize, per.base))) +
++    ggplot2::theme_classic()
++}
++
++#' @rdname ATACRegionHeatmap
++#' @export
++ATACRegionPlot <- function(x, normalize = TRUE, per.base = TRUE, groups = NULL) {
++  data <- atac_region_plot_data(x, normalize, per.base, groups)
++  data <- stats::aggregate(value ~ position + group, data = data, FUN = mean)
++  ggplot2::ggplot(data, ggplot2::aes(x = .data$position, y = .data$value, color = .data$group, group = .data$group)) +
++    ggplot2::geom_line() + ggplot2::labs(x = "Distance from region center (bp)",
++      y = paste("Mean across regions:", atac_region_units(normalize, per.base)), color = "Group") +
++    ggplot2::theme_classic()
++}
++
++atac_region_units <- function(normalize, per.base) {
++  paste0("Endpoints", if (normalize) "/cell" else "", if (per.base) "/bp" else "/bin")
++}
++
++atac_region_plot_data <- function(x, normalize, per.base, groups) {
++  if (!inherits(x, "scop_atac_regions") || !is.list(x$matrices) || !length(x$matrices)) stop("x must be a RunATACRegionMatrix result.", call. = FALSE)
++  for (flag in list(normalize, per.base)) if (!is.logical(flag) || length(flag) != 1L || is.na(flag)) stop("normalize and per.base must be TRUE or FALSE.", call. = FALSE)
++  if (!is.numeric(x$positions) || !length(x$positions) || any(!is.finite(x$positions)) ||
++      any(diff(x$positions) <= 0) || !is.numeric(x$bin.widths)) {
++    stop("Malformed region positions or bin widths.", call. = FALSE)
++  }
++  reference.ids <- rownames(x$matrices[[1L]])
++  if (is.null(groups)) groups <- names(x$matrices)
++  if (!atac_unique_ids(groups) || !all(groups %in% names(x$matrices))) stop("groups must be unique existing group names.", call. = FALSE)
++  result <- lapply(groups, function(group) {
++    m <- x$matrices[[group]]
++    if (!is.matrix(m) || !is.numeric(m) || any(!is.finite(m)) || any(m < 0) ||
++        ncol(m) != length(x$positions) || ncol(m) != length(x$bin.widths) ||
++        !atac_unique_ids(rownames(m)) || !identical(rownames(m), reference.ids) || any(!is.finite(x$bin.widths) | x$bin.widths <= 0)) stop("Malformed region matrix or bin metadata.", call. = FALSE)
++    if (normalize) {
++      n <- x$cells.per.group[[group]]
++      if (length(n) != 1L || !is.finite(n) || n <= 0) stop("Invalid group cell denominator.", call. = FALSE)
++      m <- m / n
++    }
++    if (per.base) m <- sweep(m, 2L, x$bin.widths, "/")
++    data.frame(region = rep(rownames(m), times = ncol(m)),
++      position = rep(x$positions, each = nrow(m)),
++      bin.width = rep(x$bin.widths, each = nrow(m)), value = as.vector(m),
++      group = group, stringsAsFactors = FALSE)
++  })
++  result <- do.call(rbind, result)
++  result$group <- factor(result$group, levels = groups)
++  result
++}
+diff --git a/_pkgdown.yml b/_pkgdown.yml
+index 99f82948c..17f870c13 100644
+--- a/_pkgdown.yml
++++ b/_pkgdown.yml
+@@ -440,6 +440,9 @@ reference:
+   - ATACTSSPlot
+   - ATACFragmentPlot
+   - CoverageTrackPlot
++  - RunATACRegionMatrix
++  - ATACRegionHeatmap
++  - ATACRegionPlot
+ 
+ - subtitle: "Peak Definition and Annotation"
+   contents:
+diff --git a/man/ATACRegionHeatmap.Rd b/man/ATACRegionHeatmap.Rd
+new file mode 100644
+index 000000000..716eba58e
+--- /dev/null
++++ b/man/ATACRegionHeatmap.Rd
+@@ -0,0 +1,21 @@
++\name{ATACRegionHeatmap}
++\alias{ATACRegionHeatmap}
++\alias{ATACRegionPlot}
++\title{Plot positional ATAC region signal}
++\usage{
++ATACRegionHeatmap(x, normalize = TRUE, per.base = TRUE, groups = NULL,
++  log1p = FALSE, order.rows = FALSE, low = "white", high = "#2166AC")
++ATACRegionPlot(x, normalize = TRUE, per.base = TRUE, groups = NULL)
++}
++\arguments{
++\item{x}{Output of RunATACRegionMatrix.}
++\item{normalize}{Divide by selected cells per group.}
++\item{per.base}{Divide by actual bin widths, including the shorter last bin.}
++\item{groups}{Unique group names in display order; NULL includes all.}
++\item{log1p}{Apply log1p to displayed heatmap values.}
++\item{order.rows}{Order all panels by total signal across selected groups.}
++\item{low,high}{Heatmap color endpoints.}
++}
++\description{Display raw or explicitly normalized endpoint signal from ATAC regions.}
++\value{A ggplot with summarized plotting data. The line plot averages across regions, not across independent biological replicates; it is not a confidence interval or enrichment test.}
++\seealso{\code{\link{RunATACRegionMatrix}}}
+diff --git a/man/RunATACRegionMatrix.Rd b/man/RunATACRegionMatrix.Rd
+new file mode 100644
+index 000000000..3d980f142
+--- /dev/null
++++ b/man/RunATACRegionMatrix.Rd
+@@ -0,0 +1,23 @@
++\name{RunATACRegionMatrix}
++\alias{RunATACRegionMatrix}
++\title{Count strand-oriented insertion endpoints around ATAC regions}
++\usage{
++RunATACRegionMatrix(object, regions, assay = NULL, group.by = NULL,
++  cells = NULL, upstream = 3000L, downstream = 3000L, bin.size = 50L,
++  max.entries = 5e7, verbose = TRUE)
++}
++\arguments{
++\item{object}{Seurat object with a validated ChromatinAssay, local indexed fragments and explicit cell-to-barcode mappings.}
++\item{regions}{Non-empty GRanges in 1-based closed coordinates. The center is start + floor((width - 1)/2). Minus-strand regions are reversed. Genomic intervals and names, if supplied, must be unique.}
++\item{assay}{Chromatin assay; NULL selects the active assay.}
++\item{group.by}{Metadata grouping column; NULL uses active identities.}
++\item{cells}{Unique source-assay cells; NULL includes all.}
++\item{upstream,downstream}{Non-negative integer flank widths. Windows must fit inside known chromosome boundaries.}
++\item{bin.size}{Positive integer positional bin width. A shorter last bin is retained.}
++\item{max.entries}{Dense-output entry guard across all groups. Errors rather than sampling when exceeded; transient single-query memory is not capped.}
++\item{verbose}{Whether to print progress messages.}
++}
++\description{Build group-specific region-by-position matrices from indexed fragments without subsampling. This explicit SCOP counter is not Signac RegionMatrix. Repeated endpoints are counted with multiplicity.}
++\details{A BED fragment [start,end) contributes endpoints start + 1 and end. Only endpoints inside each window count. Column 5 is not a weight; no extra Tn5 shift, bias correction or depth normalization is applied. Overlapping windows can count the same endpoint. The source object is unchanged. Group signal is descriptive, not a replicate-level statistical test or evidence of binding.}
++\value{A scop_atac_regions list with raw matrices, regions, bin positions and widths, selected group cell counts and a receipt.}
++\seealso{\code{\link{ATACRegionHeatmap}}, \code{\link{ATACRegionPlot}}}
+diff --git a/tests/testthat/test-atac-regions.R b/tests/testthat/test-atac-regions.R
+new file mode 100644
+index 000000000..5d52f314a
+--- /dev/null
++++ b/tests/testthat/test-atac-regions.R
+@@ -0,0 +1,92 @@
++make_atac_regions_fixture <- function(directory) {
++  ranges <- GenomicRanges::GRanges(c("chr1:80-120", "chr1:140-180"))
++  GenomeInfoDb::seqlengths(ranges) <- c(chr1 = 250)
++  counts <- Matrix::Matrix(matrix(c(2, 1, 3, 1, 1, 2), nrow = 2,
++    dimnames = list(c("p1", "p2"), c("S1_A", "S1_B", "S2_A"))), sparse = TRUE)
++  paths <- file.path(directory, c("one.tsv.gz", "two.tsv.gz"))
++  lines <- list(c("chr1\t90\t100\tA\t7", "chr1\t90\t100\tB\t2",
++    "chr1\t95\t105\tB\t1", "chr1\t100\t110\tA\t1"),
++    c("chr1\t90\t100\tA\t3", "chr1\t150\t160\tA\t1"))
++  for (i in seq_along(paths)) {
++    path <- sub(".gz$", "", paths[i])
++    writeLines(lines[[i]], path)
++    Rsamtools::bgzip(path, dest = paths[i], overwrite = TRUE)
++    Rsamtools::indexTabix(paths[i], format = "bed")
++  }
++  object <- ReadATACData(counts, ranges = ranges, fragments = paths,
++    fragment.cells = list(c(S1_A = "A", S1_B = "B"), c(S2_A = "A")),
++    genome = "toy", verbose = FALSE)
++  object$sample <- c("first", "first", "second")
++  object
++}
++
++atac_regions_test_centers <- function() {
++  ranges <- GenomicRanges::GRanges(c("chr1:100-100", "chr1:99-101"), strand = c("+", "-"))
++  names(ranges) <- c("forward", "reverse")
++  ranges
++}
++
++test_that("region endpoint counting preserves duplicates, strand and barcode mapping", {
++  skip_if_not_installed("Rsamtools")
++  directory <- tempfile("regions_"); dir.create(directory)
++  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
++  object <- make_atac_regions_fixture(directory)
++  original <- serialize(object, NULL)
++  result <- RunATACRegionMatrix(object, atac_regions_test_centers(), group.by = "sample",
++    upstream = 10, downstream = 10, bin.size = 1, verbose = FALSE)
++  expect_s3_class(result, "scop_atac_regions")
++  expect_identical(names(result$matrices), c("first", "second"))
++  plus <- numeric(21)
++  plus[c(2, 7, 11, 12, 16, 21)] <- c(2, 1, 2, 1, 1, 1)
++  expect_equal(unname(result$matrices$first["forward", ]), plus)
++  expect_equal(unname(result$matrices$first["reverse", ]), rev(plus))
++  expect_equal(sum(result$matrices$second["forward", ]), 2)
++  expect_equal(as.numeric(result$cells.per.group), c(2, 1))
++  expect_equal(result$positions, -10:10)
++  expect_false(result$receipt$column5_weighted)
++  expect_identical(result$receipt$endpoint_shift, 0L)
++  expect_identical(serialize(object, NULL), original)
++})
++
++test_that("region bins include boundaries and partial last bins without sampling", {
++  skip_if_not_installed("Rsamtools")
++  directory <- tempfile("regions_"); dir.create(directory)
++  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
++  object <- make_atac_regions_fixture(directory)
++  result <- RunATACRegionMatrix(object, atac_regions_test_centers(), group.by = "sample",
++    cells = c("S1_B", "S1_A"), upstream = 10, downstream = 10,
++    bin.size = 10, verbose = FALSE)
++  expect_equal(result$bin.widths, c(10, 10, 1))
++  expect_equal(result$positions, c(-5.5, 4.5, 10))
++  expect_equal(unname(result$matrices$first[1, ]), c(3, 4, 1))
++  center <- RunATACRegionMatrix(object, atac_regions_test_centers()[1], group.by = "sample",
++    upstream = 0, downstream = 0, bin.size = 1, verbose = FALSE)
++  expect_equal(unname(center$matrices$first[1, 1]), 2)
++  expect_error(RunATACRegionMatrix(object, atac_regions_test_centers(), max.entries = 1), "max.entries")
++  expect_error(RunATACRegionMatrix(object, GenomicRanges::GRanges("chr1:1-1")), "boundaries")
++  expect_error(RunATACRegionMatrix(object, atac_regions_test_centers(), cells = "unknown"), "source-assay")
++  object$sample[1] <- NA
++  expect_error(RunATACRegionMatrix(object, atac_regions_test_centers(), group.by = "sample"), "non-missing")
++})
++
++test_that("region plots expose raw and normalized values and actual bin widths", {
++  x <- list(matrices = list(a = matrix(c(2, 4, 6, 8), 2,
++    dimnames = list(c("r1", "r2"), c("0", "1")))), positions = c(0, 1),
++    bin.widths = c(2, 1), cells.per.group = c(a = 2))
++  class(x) <- c("scop_atac_regions", "list")
++  heat <- ATACRegionHeatmap(x)
++  expect_s3_class(heat, "ggplot")
++  expect_equal(heat$data$value, c(0.5, 1, 3, 4))
++  expect_equal(heat$data$bin.width, c(2, 2, 1, 1))
++  curve <- ATACRegionPlot(x)
++  expect_equal(curve$data$value, c(0.75, 3.5))
++  raw <- ATACRegionHeatmap(x, normalize = FALSE, per.base = FALSE, log1p = TRUE)
++  expect_equal(raw$data$value, log1p(c(2, 4, 6, 8)))
++  expect_error(ATACRegionPlot(x, groups = "missing"), "groups")
++  expect_error(ATACRegionPlot(x, normalize = NA), "TRUE or FALSE")
++  bad <- x; bad$positions[1] <- NA_real_
++  expect_error(ATACRegionPlot(bad), "positions")
++  bad <- x; bad$matrices$b <- x$matrices$a[2:1, , drop = FALSE]
++  bad$cells.per.group <- c(a = 2, b = 2)
++  expect_error(ATACRegionHeatmap(bad), "Malformed")
++})

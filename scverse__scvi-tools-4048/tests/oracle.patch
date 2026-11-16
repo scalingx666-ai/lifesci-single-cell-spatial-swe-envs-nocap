@@ -1,0 +1,282 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ed6849c4c2..b62bd755e3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -38,6 +38,25 @@ to [Semantic Versioning]. The full commit history is available in the [commit lo
+     instead of collecting every parameter's device on each call, and
+     `scrna_raw_counts_properties` takes column means on CSR instead of COO, {pr}`4049`.
+ 
++#### Fixed
++
++- Fix {class}`scvi.external.CYTOVI`'s `get_aggregated_posterior` passing the latent posterior
++    variance instead of the standard deviation as the scale of its Normal/Student-t components.
++    This changes the results of `get_aggregated_posterior`, `get_sample_logprobs` and
++    `differential_abundance` compared with earlier versions, {pr}`4048`.
++- Fix {class}`scvi.external.CYTOVI`'s `differential_expression` ignoring `test_mode` when
++    `lfc_clipping=False`, {pr}`4048`.
++- Fix numerical underflow/overflow in {class}`scvi.external.CYTOVI`'s differential-abundance
++    aggregation by computing the log-median of probabilities in log space, {pr}`4048`.
++- Fix {class}`scvi.external.CYTOVI`'s `get_aggregated_posterior` and `get_sample_logprobs`
++    using the training AnnData instead of the supplied `adata` for default indices and query
++    latent representations, {pr}`4048`.
++- Fix {class}`scvi.external.CYTOVI`'s `differential_abundance` dropping cell names from the
++    result index and matching conditions to sample columns by position instead of by sample
++    identifier. `groupby` may now equal the sample key, and invalid designs (missing labels,
++    a sample with multiple conditions, or fewer than two conditions) raise a `ValueError`,
++    {pr}`4048`.
++
+ ### 1.5.1 (2026-09-10)
+ 
+ #### Added
+diff --git a/src/scvi/external/cytovi/_model.py b/src/scvi/external/cytovi/_model.py
+index 82c1968a16..4e044a777b 100644
+--- a/src/scvi/external/cytovi/_model.py
++++ b/src/scvi/external/cytovi/_model.py
+@@ -811,13 +811,9 @@ def differential_expression(
+                 warnings.warn(msg, UserWarning, stacklevel=settings.warnings_stacklevel)
+             change_fn_clp = clip_lfc_factory(clip_min, clip_max)
+ 
+-            if kwargs is None:
+-                kwargs = {}
+-                kwargs["change_fn"] = change_fn_clp
+-                kwargs["test_mode"] = test_mode
+-            else:
+-                kwargs["change_fn"] = change_fn_clp
+-                kwargs["test_mode"] = test_mode
++            kwargs["change_fn"] = change_fn_clp
++
++        kwargs["test_mode"] = test_mode
+ 
+         if self.registry_["setup_args"]["sample_key"] and balance_samples is not False:
+             subset_idx = get_balanced_sample_indices(adata, self.sample_key)
+@@ -879,19 +875,20 @@ def get_aggregated_posterior(
+         adata = self._validate_anndata(adata)
+ 
+         if indices is None:
+-            indices = np.arange(self.adata.n_obs)
++            indices = np.arange(adata.n_obs)
+         if sample is not None:
+             indices = np.intersect1d(
+                 np.array(indices), np.where(adata.obs[self.sample_key] == sample)[0]
+             )
+ 
+         dataloader = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+-        qu_loc, qu_scale = self.get_latent_representation(
++        qu_loc, qu_var = self.get_latent_representation(
+             batch_size=batch_size, return_dist=True, dataloader=dataloader, give_mean=True
+         )
+ 
+         qu_loc = torch.tensor(qu_loc, device=self.device).T
+-        qu_scale = torch.tensor(qu_scale, device=self.device).T
++        # The latent representation returns variance; distributions require standard deviation.
++        qu_scale = torch.tensor(qu_var, device=self.device).T.sqrt()
+ 
+         if dof is None:
+             components = dist.Normal(qu_loc, qu_scale)
+@@ -934,7 +931,7 @@ def get_sample_logprobs(
+         adata = self._validate_anndata(adata)
+ 
+         zs = self.get_latent_representation(
+-            batch_size=batch_size, return_dist=False, give_mean=True
++            adata=adata, batch_size=batch_size, return_dist=False, give_mean=True
+         )
+ 
+         unique_samples = adata.obs[self.sample_key].unique()
+@@ -981,7 +978,9 @@ def differential_abundance(
+         adata
+             AnnData object to use. If `None`, defaults to the model's internal AnnData.
+         groupby
+-            Key in `adata.obs` that contains condition or group labels.
++            Key in `adata.obs` that contains condition or group labels. Each sample
++            must have exactly one non-missing condition, and at least two conditions
++            must be present.
+             If not provided, returns log-probabilities per sample without aggregation.
+         batch_size
+             Mini-batch size for computing log-probabilities. Default: 128.
+@@ -1015,6 +1014,22 @@ def differential_abundance(
+         """
+         adata = self._validate_anndata(adata)
+ 
++        if groupby is not None and not return_log_probs:
++            validate_obs_keys(adata, groupby)
++            # Use distinct column names so grouping by the sample key also works.
++            md = adata.obs[list(dict.fromkeys([self.sample_key, groupby]))].drop_duplicates()
++            if md.isna().any().any():
++                raise ValueError(
++                    "Differential abundance requires sample and condition labels without missing values."
++                )
++            if md[self.sample_key].duplicated().any():
++                raise ValueError(
++                    "Differential abundance requires exactly one condition per sample."
++                )
++            conditions = pd.Series(md[groupby].to_numpy(), index=md[self.sample_key])
++            if conditions.nunique() < 2:
++                raise ValueError("Differential abundance requires at least two conditions.")
++
+         log_probs = self.get_sample_logprobs(
+             adata, batch_size=batch_size, downsample_cells=downsample_cells, dof=dof
+         )
+@@ -1030,20 +1045,18 @@ def differential_abundance(
+                 stacklevel=settings.warnings_stacklevel,
+             )
+             return log_probs
+-        else:
+-            validate_obs_keys(adata, groupby)
+ 
+-        md = adata.obs[[self.sample_key, groupby]].drop_duplicates()
++        conditions = conditions.reindex(log_probs.columns)
+ 
+         da_dict = {}
+-        for cond in set(md[groupby].values):
+-            is_case = (md[groupby] == cond).values
++        for cond in conditions.unique():
++            is_case = (conditions == cond).to_numpy()
+             log_probs_cond = aggregation_fn(log_probs.loc[:, is_case], 1)
+             log_prop_controls = aggregation_fn(log_probs.loc[:, ~is_case], 1)
+             log_ratios = log_probs_cond - log_prop_controls
+             da_dict[f"DA_{cond}"] = log_ratios
+ 
+-        da_df = pd.DataFrame(da_dict)
++        da_df = pd.DataFrame(da_dict, index=log_probs.index)
+ 
+         return da_df
+ 
+diff --git a/src/scvi/external/cytovi/_utils.py b/src/scvi/external/cytovi/_utils.py
+index 8e6a74fdea..8449901057 100644
+--- a/src/scvi/external/cytovi/_utils.py
++++ b/src/scvi/external/cytovi/_utils.py
+@@ -158,7 +158,32 @@ def impute_expr_with_neighbors(
+ 
+ 
+ def log_median(x, axis=1):
+-    return np.log(np.median(np.exp(x), axis=axis))
++    """Compute ``log(median(exp(x)))`` without exponentiating the input.
++
++    Parameters
++    ----------
++    x
++        Array-like log probabilities.
++    axis
++        Axis or tuple of axes to aggregate. If ``None``, aggregate all values.
++
++    Returns
++    -------
++    scalar or numpy.ndarray
++        Logarithm of the probability-space median. For even sample counts,
++        average the two central probabilities, rather than their logarithms.
++    """
++    values = np.asarray(x)
++    if values.size == 0:
++        # Preserve NumPy's empty-reduction shape, NaNs, and warnings.
++        return np.median(values, axis=axis)
++
++    # A monotone transform preserves order, so select central values in log space.
++    lower = np.quantile(values, 0.5, axis=axis, method="lower")
++    upper = np.quantile(values, 0.5, axis=axis, method="higher")
++    # Propagate input NaNs without adding an invalid-operation warning.
++    with np.errstate(invalid="ignore"):
++        return np.logaddexp(lower, upper) - np.log(2.0)
+ 
+ 
+ def get_balanced_sample_indices(
+diff --git a/tests/external/cytovi/test_cytovi.py b/tests/external/cytovi/test_cytovi.py
+index 1b7d58dc03..7543776184 100644
+--- a/tests/external/cytovi/test_cytovi.py
++++ b/tests/external/cytovi/test_cytovi.py
+@@ -2,12 +2,15 @@
+ 
+ import anndata as ad
+ import numpy as np
++import pandas as pd
+ import pytest
+ 
+ from scvi.criticism import PosteriorPredictiveCheck
+ from scvi.criticism._constants import METRIC_CV_GENE
+ from scvi.data import synthetic_iid
+ from scvi.external import cytovi
++from scvi.external.cytovi import _model as cytovi_model
++from scvi.external.cytovi._utils import log_median
+ 
+ RAW_LAYER_KEY = "raw"
+ SCALED_LAYER_KEY = "scaled"
+@@ -299,3 +302,80 @@ def test_cytovi_write_read_fcs(adata, save_path):
+     adata_read = cytovi.read_fcs(save_path + "test_cytovi.fcs")
+     assert adata_read.shape == adata.shape
+     assert np.allclose(adata_read.X, adata.layers[SCALED_LAYER_KEY])
++
++
++@pytest.fixture
++def small_model():
++    # untrained model on a tiny AnnData, for unit tests that only exercise plumbing
++    adata = ad.AnnData(np.random.default_rng(0).uniform(0.1, 0.9, (12, 4)).astype(np.float32))
++    adata.obs["sample"] = ["a"] * 6 + ["b"] * 6
++    cytovi.CYTOVI.setup_anndata(adata, sample_key="sample")
++    model = cytovi.CYTOVI(adata, n_latent=2)
++    model.is_trained_ = True
++    return model
++
++
++@pytest.mark.parametrize("lfc_clipping", [False, True])
++def test_cytovi_de_forwards_test_mode(small_model, monkeypatch, lfc_clipping):
++    # https://github.com/scverse/scvi-tools/pull/4037
++    received = {}
++    monkeypatch.setattr(cytovi_model, "_de_core", lambda *args, **kwargs: received.update(kwargs))
++    small_model.differential_expression(
++        groupby="sample", test_mode="three", lfc_clipping=lfc_clipping, balance_samples=False
++    )
++    assert received["test_mode"] == "three"
++
++
++def test_cytovi_log_median():
++    # https://github.com/scverse/scvi-tools/pull/4040
++    # even counts average the central values in probability space: log((1 + 9) / 2)
++    np.testing.assert_allclose(log_median(np.log([[1.0, 9.0]])), np.log([5.0]))
++    # extreme log probabilities would under/overflow if exponentiated
++    np.testing.assert_allclose(log_median([[-900.0, -900.0], [880.0, 880.0]]), [-900.0, 880.0])
++
++
++def test_cytovi_aggregated_posterior_scale_is_std(small_model, monkeypatch):
++    # https://github.com/scverse/scvi-tools/pull/4034
++    means = np.zeros((3, 2), dtype=np.float32)
++    variances = np.array([[0.25, 4.0], [9.0, 16.0], [1.0, 0.0625]], dtype=np.float32)
++    # get_latent_representation(return_dist=True) returns means and variances
++    monkeypatch.setattr(
++        small_model, "get_latent_representation", lambda **kwargs: (means, variances)
++    )
++    posterior = small_model.get_aggregated_posterior(indices=np.arange(3))
++    np.testing.assert_allclose(
++        posterior.component_distribution.scale.cpu().numpy(), np.sqrt(variances).T
++    )
++
++
++def test_cytovi_uses_supplied_adata(small_model):
++    # https://github.com/scverse/scvi-tools/pull/4035
++    adata = small_model.adata[[9, 1, 7, 3]].copy()
++    posterior = small_model.get_aggregated_posterior(adata)
++    assert posterior.component_distribution.loc.shape == (2, adata.n_obs)
++    log_probs = small_model.get_sample_logprobs(adata)
++    assert log_probs.shape == (adata.n_obs, 2)
++
++
++def test_cytovi_da_alignment(small_model, monkeypatch):
++    # https://github.com/scverse/scvi-tools/pull/4036
++    adata = small_model.adata
++    adata.obs["condition"] = adata.obs["sample"].map({"a": "case", "b": "control"}).astype(str)
++
++    da = small_model.differential_abundance(groupby="condition")
++    assert da.index.tolist() == adata.obs_names.tolist()
++    assert set(da.columns) == {"DA_case", "DA_control"}
++
++    # grouping by the sample key itself
++    da = small_model.differential_abundance(groupby="sample")
++    assert set(da.columns) == {"DA_a", "DA_b"}
++
++    # conditions are matched to score columns by sample name, not by position
++    scores = pd.DataFrame({"b": -3.0, "a": -1.0}, index=adata.obs_names)
++    monkeypatch.setattr(small_model, "get_sample_logprobs", lambda *args, **kwargs: scores)
++    da = small_model.differential_abundance(groupby="condition")
++    np.testing.assert_allclose(da["DA_case"], 2.0)
++
++    adata.obs["condition"] = ["x", "y"] * 6
++    with pytest.raises(ValueError, match="exactly one condition per sample"):
++        small_model.differential_abundance(groupby="condition")

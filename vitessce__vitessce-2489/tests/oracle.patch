@@ -1,0 +1,367 @@
+diff --git a/.changeset/blue-eels-switch.md b/.changeset/blue-eels-switch.md
+new file mode 100644
+index 0000000000..bcc921de6d
+--- /dev/null
++++ b/.changeset/blue-eels-switch.md
+@@ -0,0 +1,5 @@
++---
++"@vitessce/spatial-zarr": patch
++---
++
++Updated tiled points loading implementation to rely on the first 2-4 rows of the points dataframe to compute the bounding box, rather than relying on non-standard metadata (as the new approach only requires sorting).
+diff --git a/examples/configs/src/view-configs/spatial-beta/spatialdata-xenium_rep1_io.js b/examples/configs/src/view-configs/spatial-beta/spatialdata-xenium_rep1_io.js
+index 7e390b9d8c..d9c6430192 100644
+--- a/examples/configs/src/view-configs/spatial-beta/spatialdata-xenium_rep1_io.js
++++ b/examples/configs/src/view-configs/spatial-beta/spatialdata-xenium_rep1_io.js
+@@ -4,7 +4,7 @@ import {
+   getInitialCoordinationScopePrefix,
+ } from '@vitessce/config';
+ 
+-const sdataUrl = 'https://data-2.vitessce.io/sdata-xenium/xenium_rep1_io.spatialdata.zarr';
++const sdataUrl = 'https://data-2.vitessce.io/sdata-xenium/xenium_rep1_io_v2.spatialdata.zarr';
+ 
+ function generateXeniumConfig() {
+   const vc = new VitessceConfig({
+@@ -73,7 +73,7 @@ function generateXeniumConfig() {
+       options: {
+         obsPoints: {
+           path: 'points/transcripts_with_morton_codes',
+-          featureIndexColumn: 'feature_index',
++          featureIndexColumn: 'feature_name_codes',
+           mortonCodeColumn: 'morton_code_2d',
+         },
+         coordinateSystem: 'global',
+diff --git a/packages/file-types/spatial-zarr/src/SpatialDataPointsSource.js b/packages/file-types/spatial-zarr/src/SpatialDataPointsSource.js
+index bad294df9c..24a6271f75 100644
+--- a/packages/file-types/spatial-zarr/src/SpatialDataPointsSource.js
++++ b/packages/file-types/spatial-zarr/src/SpatialDataPointsSource.js
+@@ -215,11 +215,6 @@ export default class SpatialDataPointsSource extends SpatialDataTableSource {
+     const {
+       // axes,
+       spatialdata_attrs: spatialDataAttrs,
+-      // The bounding box (extent) of all points.
+-      // Required for un-normalization from uints back to floats.
+-      // TODO: decide whether these will be stored here or somewhere else.
+-      // Reference: https://github.com/vitessce/vitessce-python/pull/476#issuecomment-3362656956
+-      bounding_box: allPointsBbox,
+     } = zattrs;
+     // const normAxes = normalizeAxes(axes);
+     // const axisNames = normAxes.map((/** @type {{ name: string }} */ axis) => axis.name);
+@@ -235,7 +230,7 @@ export default class SpatialDataPointsSource extends SpatialDataTableSource {
+     );
+ 
+     return this.loadParquetTableInRect(
+-      parquetPath, tileBbox, allPointsBbox, signal,
++      parquetPath, tileBbox, signal,
+       featureIndexColumnName, mortonCodeColumn,
+     );
+   }
+diff --git a/packages/file-types/spatial-zarr/src/SpatialDataTableSource.js b/packages/file-types/spatial-zarr/src/SpatialDataTableSource.js
+index f99fa01805..462b773215 100644
+--- a/packages/file-types/spatial-zarr/src/SpatialDataTableSource.js
++++ b/packages/file-types/spatial-zarr/src/SpatialDataTableSource.js
+@@ -6,11 +6,13 @@ import { tableFromIPC } from 'apache-arrow';
+ import { AnnDataSource } from '@vitessce/zarr';
+ import { log } from '@vitessce/globals';
+ import { createGetRange } from '@vitessce/zarr-utils';
++import { range } from 'lodash-es';
+ import {
+   getParquetModule,
+   _loadParquetMetadataByPart,
+   _loadParquetRowGroupByGroupIndex,
+   _rectToRowGroupIndices,
++  MORTON_CODE_EXTREME_VALUE_INDICATOR,
+ } from './parquet-query-utils.js';
+ 
+ /** @import { DataSourceParams } from '@vitessce/types' */
+@@ -492,13 +494,14 @@ export default class SpatialDataTableSource extends AnnDataSource {
+ 
+     // Now we can load the row groups and concatenate them into typed arrays.
+     // We already know the size of the final arrays based on the number of rows in each row group.
+-    const { numRowsPerGroup } = allMetadata;
+-    const numRowsTotal = allMetadata.numRows;
+-    if (numRowsPerGroup >= 100_000) {
++    const { numRowsPerGroupByPart } = allMetadata;
++    const numRowsTotal = allMetadata.totalNumRows;
++    const maxNumRowsPerGroup = Math.max(...numRowsPerGroupByPart);
++    if (maxNumRowsPerGroup >= 100_000) {
+       // Heuristic: if there are more than 100,000 rows per row group,
+       // then tiled loading is probably difficult.
+       if (numRowsTotal > 5_000_000) {
+-        throw new Error(`The Parquet table at ${parquetPath} has ${numRowsTotal} total rows, which necessitates tiled loading, but it was not possible because the row group size is too large (${numRowsPerGroup}). See the Vitessce documentation at Data Troubleshooting -> Points for more details.`);
++        throw new Error(`The Parquet table at ${parquetPath} has ${numRowsTotal} total rows, which necessitates tiled loading, but it was not possible because the row group size is too large (${maxNumRowsPerGroup}). See the Vitessce documentation at Data Troubleshooting -> Points for more details.`);
+       }
+       return false;
+     }
+@@ -530,7 +533,6 @@ export default class SpatialDataTableSource extends AnnDataSource {
+   async loadParquetTableInRect(
+     parquetPath,
+     tileBbox,
+-    allPointsBbox,
+     // eslint-disable-next-line no-unused-vars
+     signal,
+     featureIndexColumnName,
+@@ -573,6 +575,39 @@ export default class SpatialDataTableSource extends AnnDataSource {
+ 
+     // TODO: pass signal to react-query functions to allow aborting requests.
+ 
++    // Load the first four rows to determine the full data extent/bounding box.
++    // To do so, we can load the first row group,
++    // which should be small if the parquet file is properly tiled,
++    // and will be cached for subsequent requests if this row group is needed again.
++    const firstRowGroupTable = await _loadParquetRowGroupByGroupIndex(
++      { queryClient, store },
++      parquetPath,
++      0,
++    );
++    const xColumnForBoundingBox = firstRowGroupTable.getChild('x');
++    const yColumnForBoundingBox = firstRowGroupTable.getChild('y');
++    const mortonCodeColumnForBoundingBox = firstRowGroupTable.getChild(mortonCodeColumnName);
++    const boundingBoxMaxNumRows = Math.min(4, firstRowGroupTable.numRows);
++    const firstMortonCodes = range(boundingBoxMaxNumRows)
++      .map(i => mortonCodeColumnForBoundingBox.get(i));
++    const boundingBoxNumRows = firstMortonCodes
++      .filter(code => code === MORTON_CODE_EXTREME_VALUE_INDICATOR)
++      .length;
++
++    const boundingBoxXValues = range(boundingBoxNumRows).map(i => xColumnForBoundingBox.get(i));
++    const boundingBoxYValues = range(boundingBoxNumRows).map(i => yColumnForBoundingBox.get(i));
++    const xMin = Math.min(...boundingBoxXValues);
++    const xMax = Math.max(...boundingBoxXValues);
++    const yMin = Math.min(...boundingBoxYValues);
++    const yMax = Math.max(...boundingBoxYValues);
++
++    const allPointsBbox = {
++      x_min: xMin,
++      x_max: xMax,
++      y_min: yMin,
++      y_max: yMax,
++    };
++
+     const rowGroupIndicesPerTile = await Promise.all(
+       tileBboxes
+         .map(async subTileBbox => _rectToRowGroupIndices(
+@@ -594,13 +629,34 @@ export default class SpatialDataTableSource extends AnnDataSource {
+ 
+     // Now we can load the row groups and concatenate them into typed arrays.
+     // We already know the size of the final arrays based on the number of rows in each row group.
+-    const { numRowsPerGroup } = allMetadata;
+-    const numRowGroups = uniqueCoveredRowGroupIndices.length;
+-    const totalNumRows = numRowsPerGroup * numRowGroups;
++    const { numRowsPerGroupByPart, numRowGroupsByPart } = allMetadata;
++
++    // Given a row group index, determine how many rows are in that row group by
++    // first determining which part it belongs to,
++    // and then looking up the number of rows per group for that part.
++    const rowGroupIToNumRows = (rowGroupI) => {
++      let currPartIndex = 0;
++      let prevTotalRowGroupCount = 0;
++      for (let partIndex = 0; partIndex < numRowGroupsByPart.length; partIndex++) {
++        const numRowGroupsInPart = numRowGroupsByPart[partIndex];
++        if (
++          prevTotalRowGroupCount <= rowGroupI
++          && rowGroupI < prevTotalRowGroupCount + numRowGroupsInPart
++        ) {
++          currPartIndex = partIndex;
++          break;
++        }
++        prevTotalRowGroupCount += numRowGroupsInPart;
++      }
++      return numRowsPerGroupByPart[currPartIndex];
++    };
++
++    const totalNumRowsToLoad = uniqueCoveredRowGroupIndices
++      .reduce((acc, rowGroupI) => acc + rowGroupIToNumRows(rowGroupI), 0);
+ 
+-    const xArr = new Float32Array(totalNumRows);
+-    const yArr = new Float32Array(totalNumRows);
+-    const featureIndexArr = new Uint32Array(totalNumRows);
++    const xArr = new Float32Array(totalNumRowsToLoad);
++    const yArr = new Float32Array(totalNumRowsToLoad);
++    const featureIndexArr = new Uint32Array(totalNumRowsToLoad);
+ 
+     const rowGroupTables = await Promise.all(
+       uniqueCoveredRowGroupIndices
+@@ -624,7 +680,7 @@ export default class SpatialDataTableSource extends AnnDataSource {
+       xArr.set(xColumn.toArray(), rowOffset);
+       yArr.set(yColumn.toArray(), rowOffset);
+       featureIndexArr.set(featureIndexColumn.toArray(), rowOffset);
+-      rowOffset += numRowsPerGroup;
++      rowOffset += table.numRows;
+     });
+ 
+     return {
+@@ -633,7 +689,7 @@ export default class SpatialDataTableSource extends AnnDataSource {
+         y: yArr,
+         featureIndices: featureIndexArr,
+       },
+-      shape: [3, totalNumRows],
++      shape: [3, totalNumRowsToLoad],
+     };
+   }
+ }
+diff --git a/packages/file-types/spatial-zarr/src/parquet-query-utils.js b/packages/file-types/spatial-zarr/src/parquet-query-utils.js
+index 3041d71501..f467a06b43 100644
+--- a/packages/file-types/spatial-zarr/src/parquet-query-utils.js
++++ b/packages/file-types/spatial-zarr/src/parquet-query-utils.js
+@@ -8,10 +8,14 @@
+ import { tableFromIPC } from 'apache-arrow';
+ import { range } from 'lodash-es';
+ import { createGetRange } from '@vitessce/zarr-utils';
++import { log } from '@vitessce/globals';
+ import { sdataMortonQueryRectAux } from './spatialdata-points-zorder.js';
+ 
+ /** @import { QueryClient } from '@tanstack/react-query' */
+ 
++// Corresponds to value in vitessce-python.
++export const MORTON_CODE_EXTREME_VALUE_INDICATOR = 0;
++
+ 
+ export async function getParquetModule() {
+   // Reference: https://observablehq.com/@kylebarron/geoparquet-on-the-web
+@@ -184,24 +188,30 @@ export async function _loadParquetMetadataByPart({ queryClient, store }, parquet
+           if (error.message.includes('Failed to load parquet footerLength')) {
+             // No more parts found.
+             numParts = partIndex;
++            log.info(`Found ${numParts} parts for parquet path ${parquetPath}; An above "Failed to load parquet footerLength" error is expected for the subsequent part.`);
+           }
+         }
+       } while (numParts === undefined);
+ 
+       // Accumulate metadata across all parts.
++      // Note: It is possible for each part to have a different number of row groups
++      // and rows per row group.
++      // Namely, the first part is likely to contain only the first 0-4 "sentinel" rows
++      // for computing the bounding box in a single 4-element row group,
++      // while the subsequent parts will contain more row groups of size ~25_000.
++      const numRows = allMetadata.map(part => part.metadata.fileMetadata().numRows());
++      const numRowGroups = allMetadata.map(part => part.metadata.numRowGroups());
++      const numRowsPerGroup = allMetadata.map(part => part.metadata.rowGroup(0).numRows());
++
+       const metadata = {
+-        numRows: 0,
+-        numRowGroups: 0,
+-        numRowsPerGroup: 0,
+-        schema: null,
++        totalNumRows: numRows.reduce((a, b) => a + b, 0),
++        totalNumRowGroups: numRowGroups.reduce((a, b) => a + b, 0),
++        // Array of count per part (length equal to numParts).
++        numRowsByPart: numRows,
++        numRowGroupsByPart: numRowGroups,
++        numRowsPerGroupByPart: numRowsPerGroup,
++        schema: allMetadata?.[0]?.schema?.schema,
+       };
+-      if (allMetadata.length > 0) {
+-        const firstPart = allMetadata[0];
+-        metadata.numRows = allMetadata.reduce((sum, part) => sum + part.metadata.fileMetadata().numRows(), 0);
+-        metadata.numRowGroups = allMetadata.reduce((sum, part) => sum + part.metadata.numRowGroups(), 0);
+-        metadata.numRowsPerGroup = firstPart.metadata.rowGroup(0).numRows(); // TODO: try/catch in case no row groups?
+-        metadata.schema = firstPart.schema.schema;
+-      }
+ 
+       const result = {
+         ...metadata,
+@@ -226,8 +236,8 @@ export async function _loadParquetRowGroupByGroupIndex({ queryClient, store }, p
+       const { readParquetRowGroup } = await _getParquetModule({ queryClient });
+ 
+       const allMetadata = await _loadParquetMetadataByPart({ queryClient, store }, parquetPath);
+-      if (rowGroupIndex < 0 || rowGroupIndex >= allMetadata.numRowGroups) {
+-        throw new Error(`Row group index ${rowGroupIndex} is out of bounds for parquet table with ${allMetadata.numRowGroups} row groups.`);
++      if (rowGroupIndex < 0 || rowGroupIndex >= allMetadata.totalNumRowGroups) {
++        throw new Error(`Row group index ${rowGroupIndex} is out of bounds for parquet table with ${allMetadata.totalNumRowGroups} row groups.`);
+       }
+ 
+       // Find the part index that contains this row group.
+@@ -384,10 +394,10 @@ async function _bisectRowGroupsRight({ queryClient, store }, parquetPath, column
+       const queryClient = /** @type {QueryClient} */ (ctx.meta?.queryClient);
+       const store = ctx.meta?.store;
+       const allMetadata = await _loadParquetMetadataByPart({ queryClient, store }, parquetPath);
+-      const { numRowGroups } = allMetadata;
++      const { totalNumRowGroups } = allMetadata;
+ 
+       let lo = 0;
+-      let hi = numRowGroups;
++      let hi = totalNumRowGroups;
+       while (lo < hi) {
+         // The optimization: Can we do better than lo and hi?
+         // Check cachedRowGroupInfo to determine whether a closer row group is already contained in the queryClient cache.
+diff --git a/packages/file-types/spatial-zarr/src/spatialdata-loaders/SpatialDataObsPointsLoader.js b/packages/file-types/spatial-zarr/src/spatialdata-loaders/SpatialDataObsPointsLoader.js
+index 74bd74c20f..4468e4539b 100644
+--- a/packages/file-types/spatial-zarr/src/spatialdata-loaders/SpatialDataObsPointsLoader.js
++++ b/packages/file-types/spatial-zarr/src/spatialdata-loaders/SpatialDataObsPointsLoader.js
+@@ -138,7 +138,6 @@ export default class SpatialDataObsPointsLoader extends AbstractTwoStepLoader {
+       mortonCodeColumn,
+     } = this.options;
+ 
+-    // Check for the presence of bounding_box metadata.
+     const zattrs = await this.dataSource.loadSpatialDataElementAttrs(path);
+     const { spatialdata_attrs: spatialDataAttrs } = zattrs;
+     const { feature_key: featureKey } = spatialDataAttrs;
+@@ -161,17 +160,9 @@ export default class SpatialDataObsPointsLoader extends AbstractTwoStepLoader {
+     ]);
+ 
+     const isSupportedVersion = formatVersion === '0.1' || formatVersion === '0.2';
+-    const boundingBox = zattrs?.bounding_box;
+-    const hasBoundingBox2D = (
+-      typeof boundingBox?.x_max === 'number'
+-      && typeof boundingBox?.x_min === 'number'
+-      && typeof boundingBox?.y_max === 'number'
+-      && typeof boundingBox?.y_min === 'number'
+-    );
+ 
+     return (
+       isSupportedVersion
+-      && hasBoundingBox2D
+       && hasRequiredColumnsAndRowGroupSize
+     );
+   }
+@@ -221,7 +212,7 @@ export default class SpatialDataObsPointsLoader extends AbstractTwoStepLoader {
+         obsPointsModelMatrix: modelMatrix,
+ 
+         // Return 'tiled' if the morton_code_2d column
+-        // and bounding_box metadata are present,
++        // is present,
+         // and the row group size is small enough.
+         // Otherwise, return 'full'.
+         obsPointsTilingType: (supportsTiling ? 'tiled' : 'full'),
+diff --git a/sites/docs/docs/data-troubleshooting.md b/sites/docs/docs/data-troubleshooting.md
+index 5551b469d1..80d270f250 100644
+--- a/sites/docs/docs/data-troubleshooting.md
++++ b/sites/docs/docs/data-troubleshooting.md
+@@ -419,23 +419,24 @@ Here, we associate the sorted Dask dataframe with a new Points element called `t
+ Then, we save this new element to disk using [write_element](https://spatialdata.scverse.org/en/stable/api/SpatialData.html#spatialdata.SpatialData.write_element).
+ 
+ ```py
+-sdata["transcripts_with_morton_codes"] = ddf
++from spatialdata.models import PointsModel
++
++# Optionally, if your original points dataset defines a `transform` attribute:
++transformations = sdata['transcripts'].attrs['transform']
++del ddf.attrs['transform']
++# End optional lines.
++
++sdata["transcripts_with_morton_codes"] = PointsModel.parse(
++    ddf,
++    feature_key="feature_name",
++    instance_key="cell_id",
++    transformations=transformations
++)
+ sdata.write_element("transcripts_with_morton_codes")
+ ```
+ 
+ For more information about writing and overwriting Spatial Elements, see this [spatialdata discussion](https://github.com/scverse/spatialdata/discussions/520).
+ 
+-#### Saving bounding box to Point element metadata (Zarr attrs)
+-
+-Running `sdata_morton_sort_points` will save the bounding box of the points to the `bounding_box` attribute of the Points element.
+-However, this attribute will not be written to disk, as only [recognized attributes are preserved](https://github.com/scverse/spatialdata/blob/aeef0cc3ebd7c10a7ed17b84415213bb259a5f4b/src/spatialdata/_io/format.py#L116) during writing.
+-
+-
+-```py
+-from vitessce.data_utils import sdata_points_write_bounding_box_attrs
+-
+-sdata_points_write_bounding_box_attrs(sdata, "transcripts_with_morton_codes")
+-```
+ 
+ #### Row group size
+ 

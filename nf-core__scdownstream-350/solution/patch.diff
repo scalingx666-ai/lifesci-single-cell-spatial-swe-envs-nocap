@@ -1,0 +1,519 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2e288743..d6a4a577 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -70,6 +70,7 @@ Initial release of nf-core/scdownstream, created with the [nf-core](https://nf-c
+ - Preserve counts during log1p normalisation and populate query expression layers before extension merges, with nf-test coverage for expression layers and scVI training, by @nictru and GPT-6.1 Sol [[#337](https://github.com/nf-core/scdownstream/pull/337)].
+ - Pin `pandas` and `anndata` in `SCANPY_RANKGENESGROUPS`, `CYTETYPE`, and `ADATA_EXTEND` to avoid nullable-string H5AD writes; remove `allow_write_nullable_strings` opt-ins and cast remaining `StringDtype` columns to plain `object` at write boundaries by @nictru [[#310](https://github.com/nf-core/scdownstream/pull/310)].
+ - Pass gene symbols into edgePython DE so volcano labels use gene names instead of row indices by @nictru.
++- Merge compatible annotation fragments by index, reject conflicting fragment values and distinguish subset-specific aggregated annotations, by @nictru, Claude Sonnet 4.5 and GPT-6.1 Sol.
+ - Deduplicate by-sample LIANA obs column selection so `context_key=condition` does not build a 2D frame and crash pandas by @nictru [[#310](https://github.com/nf-core/scdownstream/pull/310)].
+ - Sort doublet prediction columns before writing to `obs` so nf-test snapshots are order-stable across parallel methods by @nictru [[#310](https://github.com/nf-core/scdownstream/pull/310)].
+ - Make by-sample LIANA subsampling context/donor-aware and drop contexts with too few cells per group before calling LIANA by @nictru.
+diff --git a/modules/local/adata/extend/templates/extend.py b/modules/local/adata/extend/templates/extend.py
+index 8c0b5715..d091cb51 100644
+--- a/modules/local/adata/extend/templates/extend.py
++++ b/modules/local/adata/extend/templates/extend.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python3
+ 
++import csv
+ import importlib.metadata
+ import pickle
+ import platform
+@@ -26,6 +27,10 @@ def load_pickle_or_csv(path):
+     if path.suffix == ".pkl":
+         return pd.read_pickle(path)
+     elif path.suffix == ".csv":
++        with path.open(newline="") as handle:
++            columns = next(csv.reader(handle))[1:]
++        if len(columns) != len(set(columns)):
++            raise ValueError(f"Fragment '{path.name}' contains duplicate column names")
+         return pd.read_csv(path, index_col=0)
+     else:
+         raise ValueError(f"Unsupported file extension: {path}")
+@@ -41,13 +46,58 @@ def load_layer(path):
+     raise ValueError(f"Unsupported layer file extension: {path}")
+ 
+ 
+-for path in obs_paths:
+-    df = load_pickle_or_csv(path).reindex(adata.obs_names)
+-    adata.obs = pd.concat([adata.obs, df], axis=1)
+-
+-for path in var_paths:
+-    df = load_pickle_or_csv(path).reindex(adata.var_names)
+-    adata.var = pd.concat([adata.var, df], axis=1)
++def restore_dtype(values, dtypes):
++    categoricals = [dtype for dtype in dtypes if isinstance(dtype, pd.CategoricalDtype)]
++    if categoricals:
++        categories = categoricals[0].categories
++        for dtype in categoricals[1:]:
++            categories = categories.union(dtype.categories, sort=False)
++        categories = categories.union(pd.Index(values.dropna().unique().tolist()), sort=False)
++        return pd.Categorical(values, categories=categories, ordered=categoricals[0].ordered)
++
++    values = values.infer_objects(copy=False)
++    # AnnData cannot serialise object arrays containing booleans and missing values.
++    if values.dtype == object and all(isinstance(value, (bool, np.bool_)) for value in values.dropna()):
++        return pd.Categorical(values, categories=pd.Index([False, True], dtype=bool))
++    return values
++
++
++def merge_dataframe(base, paths):
++    """Apply indexed updates while checking agreement between fragment sources."""
++    fragments = []
++    for path in paths:
++        fragment = load_pickle_or_csv(path)
++        if not fragment.index.is_unique:
++            raise ValueError(f"Fragment '{path.name}' contains duplicate indices")
++        if not fragment.columns.is_unique:
++            raise ValueError(f"Fragment '{path.name}' contains duplicate column names")
++        fragments.append((path, fragment.loc[fragment.index.isin(base.index)]))
++
++    result = base.copy()
++    columns = dict.fromkeys(column for _, fragment in fragments for column in fragment.columns)
++    for column in columns:
++        parts = {path.name: fragment[column] for path, fragment in fragments if column in fragment}
++        incoming = pd.concat({name: values.dropna().astype(object) for name, values in parts.items()})
++        grouped = incoming.groupby(level=1, sort=False, observed=True)
++        conflicts = grouped.nunique().gt(1)
++        if conflicts.any():
++            rows = incoming.index.get_level_values(1).isin(conflicts.index[conflicts])
++            sources = sorted(incoming.index.get_level_values(0)[rows].unique())
++            raise ValueError(f"Conflicting non-null values in column {column!r} between fragments {sources}")
++
++        values = (
++            base[column].astype(object).copy() if column in base else pd.Series(np.nan, index=base.index, dtype=object)
++        )
++        updates = grouped.first()
++        values.loc[updates.index] = updates
++        values = values.where(values.notna(), np.nan)
++        dtypes = ([base[column].dtype] if column in base else []) + [part.dtype for part in parts.values()]
++        result[column] = restore_dtype(values, dtypes)
++    return result
++
++
++adata.obs = merge_dataframe(adata.obs, obs_paths)
++adata.var = merge_dataframe(adata.var, var_paths)
+ 
+ for path in obsm_paths:
+     df = pd.read_pickle(path).reindex(adata.obs_names)
+diff --git a/modules/local/adata/extend/tests/main.nf.test b/modules/local/adata/extend/tests/main.nf.test
+index 2739c92e..bda914d9 100644
+--- a/modules/local/adata/extend/tests/main.nf.test
++++ b/modules/local/adata/extend/tests/main.nf.test
+@@ -7,6 +7,155 @@ nextflow_process {
+     tag "modules"
+     tag "modules_local"
+ 
++    test("Should merge compatible obs and var updates without losing base rows") {
++
++        when {
++            params {
++                outdir = "$outputDir"
++            }
++            process {
++                """
++                obs_a = channel.of('cell,label,n_counts,score,flag,version.1\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell,100,1.0,True,first\\nSRR28679756_AAACCTGAGATGCCTT,,,2.0,,\\nnot_a_cell,ignored,999,9,True,ignored\\n')
++                    .collectFile(name: 'a_obs.csv')
++                obs_b = channel.of('cell,label,n_counts,score,flag,version.1\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell,100.0,1,True,first\\nSRR28679756_AAACCTGAGATGCCTT,B_cell,,2,False,second\\n')
++                    .collectFile(name: 'b_obs.csv')
++                var_a = channel.of('gene,selected,score\\nA1BG,True,1.0\\n')
++                    .collectFile(name: 'a_var.csv')
++                var_b = channel.of('gene,selected,score\\nA1BG,True,1\\nA2M,False,2.5\\n')
++                    .collectFile(name: 'b_var.csv')
++                input[0] = obs_a.combine(obs_b).combine(var_a).combine(var_b)
++                    .map { a, b, c, d -> [
++                        [id: 'compatible'],
++                        file(params.pipelines_testdata_base_path + '/intermediates/fragments/merged_outer.h5ad', checkIfExists: true),
++                        [a, b], [c, d], [], [], [], []
++                    ] }
++                """
++            }
++        }
++
++        then {
++            assert process.success
++            def adata = anndata(process.out.h5ad[0][1])
++            assert adata.n_obs == 23373
++            assert adata.n_vars == 9887
++            assert adata.obs.colnames.toList().unique().size() == adata.obs.colnames.size()
++            assert adata.var.colnames.toList().unique().size() == adata.var.colnames.size()
++            assert adata.obs.index.values.take(3) == ['SRR28679756_AAACCTGAGAGCTGGT', 'SRR28679756_AAACCTGAGATGCCTT', 'SRR28679756_AAACCTGAGCTGTTCA']
++            assert adata.var.index.values.take(3) == ['A1BG', 'A2M', 'A2ML1']
++            assert adata.obs.get('label').data.take(3) == ['T_cell', 'B_cell', 'Unknown']
++            assert adata.obs.get('n_counts').data.take(3) == [100.0, 43.0, 36.0]
++            assert adata.obs.get('score').data.take(2) == [1.0, 2.0]
++            assert adata.obs.get('flag').data.take(2).collect { it.toString().toLowerCase() } == ['true', 'false']
++            assert adata.obs.get('version.1').data.take(2) == ['first', 'second']
++            assert adata.var.get('selected').data.take(2).collect { it.toString().toLowerCase() } == ['true', 'false']
++            assert adata.var.get('score').data.take(2) == [1.0, 2.5]
++            assert adata.obs.get('score').data[0] instanceof Number
++            assert adata.var.get('score').data[0] instanceof Number
++            assert snapshot(path(process.out.versions[0]).yaml, adata.yaml).match()
++        }
++
++    }
++
++    test("Should reject conflicting obs fragments and identify both sources") {
++
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                a = channel.of('cell,label\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell\\n').collectFile(name: 'a_conflict.csv')
++                b = channel.of('cell,label\\nSRR28679756_AAACCTGAGAGCTGGT,B_cell\\n').collectFile(name: 'b_conflict.csv')
++                input[0] = a.combine(b).map { first, second -> [
++                    [id: 'conflict'],
++                    file(params.pipelines_testdata_base_path + '/intermediates/fragments/merged_outer.h5ad', checkIfExists: true),
++                    [first, second], [], [], [], [], []
++                ] }
++                """
++            }
++        }
++
++        then {
++            assert process.failed
++            assert process.errorReport.contains("ValueError: Conflicting non-null values in column 'label'")
++            assert process.errorReport.contains('a_conflict.csv')
++            assert process.errorReport.contains('b_conflict.csv')
++        }
++
++    }
++
++    test("Should reject conflicting var fragments") {
++
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                a = channel.of('gene,score\\nA1BG,1\\n').collectFile(name: 'a_score.csv')
++                b = channel.of('gene,score\\nA1BG,2\\n').collectFile(name: 'b_score.csv')
++                input[0] = a.combine(b).map { first, second -> [
++                    [id: 'conflict'],
++                    file(params.pipelines_testdata_base_path + '/intermediates/fragments/merged_outer.h5ad', checkIfExists: true),
++                    [], [first, second], [], [], [], []
++                ] }
++                """
++            }
++        }
++
++        then {
++            assert process.failed
++            assert process.errorReport.contains("ValueError: Conflicting non-null values in column 'score'")
++            assert process.errorReport.contains('a_score.csv')
++            assert process.errorReport.contains('b_score.csv')
++        }
++
++    }
++
++    test("Should reject duplicate fragment indices") {
++
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                input[0] = channel.of('cell,label\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell\\n')
++                    .collectFile(name: 'duplicate_index.csv')
++                    .map { obs -> [
++                        [id: 'duplicate'],
++                        file(params.pipelines_testdata_base_path + '/intermediates/fragments/merged_outer.h5ad', checkIfExists: true),
++                        [obs], [], [], [], [], []
++                    ] }
++                """
++            }
++        }
++
++        then {
++            assert process.failed
++            assert process.errorReport.contains("ValueError: Fragment 'duplicate_index.csv' contains duplicate indices")
++        }
++
++    }
++
++    test("Should reject duplicate CSV headers before pandas renames them") {
++
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                input[0] = channel.of('cell,label,label\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell,B_cell\\n')
++                    .collectFile(name: 'duplicate_columns.csv')
++                    .map { obs -> [
++                        [id: 'duplicate'],
++                        file(params.pipelines_testdata_base_path + '/intermediates/fragments/merged_outer.h5ad', checkIfExists: true),
++                        [obs], [], [], [], [], []
++                    ] }
++                """
++            }
++        }
++
++        then {
++            assert process.failed
++            assert process.errorReport.contains("ValueError: Fragment 'duplicate_columns.csv' contains duplicate column names")
++        }
++
++    }
++
+     test("Should extend with obs data") {
+ 
+         when {
+diff --git a/modules/local/adata/extend/tests/main.nf.test.snap b/modules/local/adata/extend/tests/main.nf.test.snap
+index cc78c5b2..45416b7d 100644
+--- a/modules/local/adata/extend/tests/main.nf.test.snap
++++ b/modules/local/adata/extend/tests/main.nf.test.snap
+@@ -104,6 +104,72 @@
+             "nextflow": "26.04.6"
+         }
+     },
++    "Should merge compatible obs and var updates without losing base rows": {
++        "content": [
++            {
++                "ADATA_EXTEND": {
++                    "anndata": "0.13.2",
++                    "numpy": "2.5.3",
++                    "pandas": "3.0.5",
++                    "python": "3.13.12"
++                }
++            },
++            {
++                "n_obs": 23373,
++                "n_vars": 9887,
++                "obs": {
++                    "index": "_index",
++                    "columns": [
++                        "batch",
++                        "celltypist:Adult_Human_Skin",
++                        "celltypist:Adult_Human_Skin:conf",
++                        "label",
++                        "n_counts",
++                        "n_genes",
++                        "n_genes_by_counts",
++                        "pct_counts_mt",
++                        "sample",
++                        "sample_original",
++                        "total_counts",
++                        "total_counts_mt",
++                        "score",
++                        "flag",
++                        "version.1"
++                    ]
++                },
++                "var": {
++                    "index": "_index",
++                    "columns": [
++                        "selected",
++                        "score"
++                    ]
++                },
++                "layers": [
++                    
++                ],
++                "obsm": [
++                    
++                ],
++                "varm": [
++                    
++                ],
++                "obsp": [
++                    
++                ],
++                "varp": [
++                    
++                ],
++                "uns": [
++                    
++                ]
++            }
++        ],
++        "timestamp": "2026-10-21T15:20:59.621676754",
++        "meta": {
++            "nf-test": "0.9.4",
++            "nextflow": "26.04.6"
++        }
++    },
+     "Should extend with obsm data": {
+         "content": [
+             {
+diff --git a/modules/local/custom/aggregate_per_cell_annotations/templates/aggregate_per_cell_annotations.py b/modules/local/custom/aggregate_per_cell_annotations/templates/aggregate_per_cell_annotations.py
+index 3eb58fa1..7a7629c4 100644
+--- a/modules/local/custom/aggregate_per_cell_annotations/templates/aggregate_per_cell_annotations.py
++++ b/modules/local/custom/aggregate_per_cell_annotations/templates/aggregate_per_cell_annotations.py
+@@ -14,11 +14,14 @@
+ annotation_col = "${annotation_col}"
+ integration = "${integration}"
+ resolution = "${resolution}"
++subset = "${meta.subset ?: ''}"
+ 
+ if ":per_cell" not in annotation_col:
+     raise ValueError(f"Unexpected per-cell annotation column: {annotation_col!r}")
+ 
+ output_col = annotation_col.replace(":per_cell", f":aggregated:{integration}:{resolution}")
++if subset and subset != "global":
++    output_col += f":subset:{subset}"
+ 
+ if annotation_col not in adata.obs.columns:
+     raise ValueError(f"Annotation column {annotation_col!r} not found in adata.obs")
+diff --git a/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test b/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test
+index 8b3f1c66..743fbf5f 100644
+--- a/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test
++++ b/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test
+@@ -7,7 +7,60 @@ nextflow_process {
+     tag "modules"
+     tag "modules_local"
+ 
+-    test("Should run without failures") {
++    test("Should distinguish named subsets and preserve global annotation names") {
++
++        setup {
++            run("ADATA_EXTEND") {
++                script "../../../adata/extend/main.nf"
++                process {
++                    """
++                    input[0] = channel.of('cell,annotation:test:per_cell\\nSRR28679756_AAACCTGAGAGCTGGT,T_cell\\nSRR28679756_AAACCTGAGATGCCTT,T_cell\\n')
++                        .collectFile(name: 'annotations.csv')
++                        .map { obs -> [
++                            [id: 'annotations'],
++                            file(params.pipelines_testdata_base_path + '/intermediates/fragments/merged_outer.h5ad', checkIfExists: true),
++                            [obs], [], [], [], [], []
++                        ] }
++                    """
++                }
++            }
++        }
++
++        when {
++            params { outdir = "$outputDir" }
++            process {
++                """
++                input[0] = ADATA_EXTEND.out.h5ad.flatMap { meta, h5ad -> [
++                    [[id: 'global', subset: 'global'], h5ad],
++                    [[id: 'named', subset: 'T_cells'], h5ad],
++                    [[id: 'unsplit'], h5ad]
++                ] }
++                input[1] = 'annotation:test:per_cell'
++                input[2] = 'annotation:test:per_cell'
++                input[3] = 'scvi'
++                input[4] = '0.5'
++                """
++            }
++        }
++
++        then {
++            assert process.success
++            assert process.out.obs.size() == 3
++            def names = [:]
++            process.out.aggregate_per_cell_annotations.each { summary ->
++                def file = path(summary)
++                def context = file.fileName.toString().split('_aggregate')[0]
++                names[context] = file.text.readLines().drop(1).collect { it.split(',')[2] }.toSet().toList().sort()
++            }
++            assert names.global == ['annotation:test:aggregated:scvi:0.5']
++            assert names.unsplit == names.global
++            assert names.named == ['annotation:test:aggregated:scvi:0.5:subset:T_cells']
++            assert snapshot(names).match()
++        }
++
++    }
++
++    test("Should reject annotation columns without a per-cell suffix") {
+ 
+         when {
+             params {
+@@ -30,6 +83,7 @@ nextflow_process {
+ 
+         then {
+             assert process.failed
++            assert process.errorReport.contains("ValueError: Unexpected per-cell annotation column: 'sample'")
+         }
+ 
+     }
+diff --git a/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test.snap b/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test.snap
+index 8d4f636f..883b449a 100644
+--- a/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test.snap
++++ b/modules/local/custom/aggregate_per_cell_annotations/tests/main.nf.test.snap
+@@ -1,4 +1,24 @@
+ {
++    "Should distinguish named subsets and preserve global annotation names": {
++        "content": [
++            {
++                "global": [
++                    "annotation:test:aggregated:scvi:0.5"
++                ],
++                "named": [
++                    "annotation:test:aggregated:scvi:0.5:subset:T_cells"
++                ],
++                "unsplit": [
++                    "annotation:test:aggregated:scvi:0.5"
++                ]
++            }
++        ],
++        "timestamp": "2026-10-21T15:24:17.870509136",
++        "meta": {
++            "nf-test": "0.9.4",
++            "nextflow": "26.04.6"
++        }
++    },
+     "Should run without failures - stub": {
+         "content": [
+             {
+@@ -53,58 +73,5 @@
+             "nf-test": "0.9.5",
+             "nextflow": "26.04.4"
+         }
+-    },
+-    "Should run without failures": {
+-        "content": [
+-            {
+-                "CUSTOM_AGGREGATE_PER_CELL_ANNOTATIONS": {
+-                    "python": "3.13.12",
+-                    "scanpy": "1.12"
+-                }
+-            },
+-            {
+-                "n_obs": 7373,
+-                "n_vars": 9887,
+-                "obs": {
+-                    "index": "_index",
+-                    "columns": [
+-                        "leiden",
+-                        "sample"
+-                    ]
+-                },
+-                "var": {
+-                    "index": "_index",
+-                    "columns": [
+-                        
+-                    ]
+-                },
+-                "layers": [
+-                    
+-                ],
+-                "obsm": [
+-                    "X_pca"
+-                ],
+-                "varm": [
+-                    "X_pca"
+-                ],
+-                "obsp": [
+-                    "connectivities",
+-                    "distances"
+-                ],
+-                "varp": [
+-                    
+-                ],
+-                "uns": [
+-                    "X_pca",
+-                    "leiden",
+-                    "neighbors"
+-                ]
+-            }
+-        ],
+-        "timestamp": "2026-07-10T08:05:29.728576",
+-        "meta": {
+-            "nf-test": "0.9.5",
+-            "nextflow": "26.04.4"
+-        }
+     }
+ }
+\ No newline at end of file

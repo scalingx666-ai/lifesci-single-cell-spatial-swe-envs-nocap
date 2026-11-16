@@ -1,0 +1,248 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c224809..c7a01be 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,10 @@
+ 
+ #### Changes
+ 
++- **`--clumpify` peak memory drops 13–17% and its banner figures are now labelled MiB**
++  ([#439](https://github.com/FelixKrueger/TrimGalore/issues/439)) — the budget is not yet a
++  guaranteed bound at large `--memory` values.
++
+ - **An output file is now published only if every byte it owes was written, including the
+   gzip trailer** ([#434](https://github.com/FelixKrueger/TrimGalore/issues/434)). #428 made the
+   final name appear only after the writer was closed; it did not make "closed" mean
+diff --git a/src/clump.rs b/src/clump.rs
+index 9796267..273a22d 100644
+--- a/src/clump.rs
++++ b/src/clump.rs
+@@ -137,16 +137,27 @@ pub fn bin_for(key: MinimizerKey, n_bins: usize) -> usize {
+ pub struct ClumpLayout {
+     pub n_bins: usize,
+     pub bin_byte_budget: usize,
++    /// Worker count this layout was sized for; the prediction is only valid for
++    /// that count.
++    cores: usize,
+ }
+ 
+ impl ClumpLayout {
+-    /// Predicted peak RSS in bytes for a run with this layout and `cores`
+-    /// workers. Inverse of the formula in `resolve_layout`; calling this from
+-    /// `main.rs` keeps the startup banner honest with what the layout was sized
+-    /// against.
+-    pub fn predicted_peak_bytes(&self, cores: usize) -> u64 {
++    /// Layout with an explicit core count, for callers that bypass
++    /// `resolve_layout`.
++    pub fn new(n_bins: usize, bin_byte_budget: usize, cores: usize) -> Self {
++        Self {
++            n_bins,
++            bin_byte_budget,
++            cores,
++        }
++    }
++
++    /// Predicted peak RSS in bytes. Inverse of the formula in `resolve_layout`,
++    /// so the startup banner cannot disagree with the sizing.
++    pub fn predicted_peak_bytes(&self) -> u64 {
+         let dyn_bytes =
+-            self.bin_byte_budget as u64 * (5 * self.n_bins as u64 + 7 * cores as u64) / 4;
++            self.bin_byte_budget as u64 * (5 * self.n_bins as u64 + 7 * self.cores as u64) / 4;
+         STATIC_OVERHEAD_BYTES + dyn_bytes
+     }
+ }
+@@ -175,14 +186,18 @@ const STATIC_OVERHEAD_BYTES: u64 = 512 * 1024 * 1024;
+ /// 1. Reader's resident bins: `n_bins × bin_byte_budget` of FASTQ text +
+ ///    `Vec<FastqRecord>` spine entries (72 bytes per record on top of ~350 byte
+ ///    text records ≈ 25% extra).
+-/// 2. Worker input batches in flight: up to `cores × bin_byte_budget` of text
+-///    + matching spine.
++/// 2. Worker input batches in flight: up to `2 × cores × bin_byte_budget` of
++///    text + matching spine — the clumpy work channel has depth 1, so a worker
++///    holds one queued batch and one in hand.
+ /// 3. Worker output Vecs growing during gzip-encode: roughly `0.5 ×` input
+ ///    size at L1 (smaller at higher gzip levels, but use L1 as the upper bound).
+ ///
+ /// Combine: peak ≈ STATIC + B × [(n_bins + cores) × 1.25 + cores × 0.5]
+ ///                = STATIC + B × (5 × n_bins + 7 × cores) / 4
+ ///
++/// The in-flight term charges one batch per worker where two can be resident,
++/// so this prediction is a known under-estimate — see issue #439.
++///
+ /// Solving for B given the user's budget gives the formula below. The 1.25 ×
+ /// spine factor is the doubling-free post-pre-size value; the 0.5 × output
+ /// factor is the L1 worst case.
+@@ -216,6 +231,7 @@ pub fn resolve_layout(memory_budget_bytes: u64, cores: usize) -> Result<ClumpLay
+     Ok(ClumpLayout {
+         n_bins,
+         bin_byte_budget: bin_byte_budget as usize,
++        cores,
+     })
+ }
+ 
+@@ -461,13 +477,22 @@ mod tests {
+         assert!(layout.bin_byte_budget < 70 * 1024 * 1024);
+     }
+ 
++    #[test]
++    fn resolve_layout_pins_the_default_cell() {
++        // 1 GiB + 4 cores is the cell #439 is about, so the sizing arithmetic may
++        // not move it silently: 4 × 512 MiB / 108.
++        let layout = resolve_layout(1024 * 1024 * 1024, 4).unwrap();
++        assert_eq!(layout.n_bins, 16);
++        assert_eq!(layout.bin_byte_budget, 19_884_107);
++    }
++
+     #[test]
+     fn resolve_layout_predicted_peak_fits_budget() {
+         // The whole point of the formula: predicted peak ≤ user-supplied --memory.
+         for (mem_gib, cores) in [(2u64, 4), (4, 8), (8, 8), (16, 16)] {
+             let budget = mem_gib * 1024 * 1024 * 1024;
+             let layout = resolve_layout(budget, cores).unwrap();
+-            let predicted_peak = layout.predicted_peak_bytes(cores);
++            let predicted_peak = layout.predicted_peak_bytes();
+             assert!(
+                 predicted_peak <= budget,
+                 "predicted peak {} > budget {} for {} GiB / {} cores",
+diff --git a/src/clump_only.rs b/src/clump_only.rs
+index 2046456..a60c4bc 100644
+--- a/src/clump_only.rs
++++ b/src/clump_only.rs
+@@ -278,7 +278,7 @@ pub fn clump_only_single(
+     let output_path = naming::clumped_output_name(input, output_dir, basename, gzip_output);
+ 
+     eprintln!(
+-        "clump-only: reordering '{}' -> '{}' ({} bins × {} MB budget, gzip level {}{})",
++        "clump-only: reordering '{}' -> '{}' ({} bins × {} MiB budget, gzip level {}{})",
+         input.display(),
+         output_path.display(),
+         layout.n_bins,
+@@ -417,7 +417,7 @@ pub fn clump_only_paired(
+         naming::clumped_paired_output_names(input_r1, input_r2, output_dir, basename, gzip_output);
+ 
+     eprintln!(
+-        "clump-only (paired): '{}' + '{}' -> '{}' + '{}' ({} bins × {} MB, gzip level {}{})",
++        "clump-only (paired): '{}' + '{}' -> '{}' + '{}' ({} bins × {} MiB, gzip level {}{})",
+         input_r1.display(),
+         input_r2.display(),
+         out_r1_path.display(),
+@@ -757,7 +757,7 @@ pub fn clump_only_single_to_bam(
+     let output_path = naming::clumped_bam_output_name(input, output_dir, basename);
+ 
+     eprintln!(
+-        "clump-only (uBAM out): reordering '{}' -> '{}' ({} bins × {} MB budget, BGZF)",
++        "clump-only (uBAM out): reordering '{}' -> '{}' ({} bins × {} MiB budget, BGZF)",
+         input.display(),
+         output_path.display(),
+         layout.n_bins,
+@@ -996,7 +996,7 @@ pub fn clump_only_paired_to_bam_one_pair(
+         format!("{} + {}", inputs[0].display(), inputs[1].display())
+     };
+     eprintln!(
+-        "clump-only (uBAM out, paired): '{}' -> '{}' ({} bins × {} MB budget, BGZF)",
++        "clump-only (uBAM out, paired): '{}' -> '{}' ({} bins × {} MiB budget, BGZF)",
+         input_display,
+         output_path.display(),
+         layout.n_bins,
+diff --git a/src/main.rs b/src/main.rs
+index 158c057..958b972 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -200,10 +200,10 @@ fn resolve_clump_layout(cli: &Cli) -> Result<Option<clump::ClumpLayout>> {
+     }
+     let layout = clump::resolve_layout(memory_bytes, cli.cores)?;
+     eprintln!(
+-        "clumpify: {} bins × {} MB; predicted peak ≈ {} MB (gzip level {})",
++        "clumpify: {} bins × {} MiB; predicted peak ≈ {} MiB (gzip level {})",
+         layout.n_bins,
+         layout.bin_byte_budget / (1024 * 1024),
+-        layout.predicted_peak_bytes(cli.cores) / (1024 * 1024),
++        layout.predicted_peak_bytes() / (1024 * 1024),
+         cli.compression,
+     );
+     Ok(Some(layout))
+diff --git a/src/parallel.rs b/src/parallel.rs
+index 9672431..816273a 100644
+--- a/src/parallel.rs
++++ b/src/parallel.rs
+@@ -113,10 +113,12 @@ pub fn run_paired_end_parallel(
+     );
+ 
+     // Per-worker channels (round-robin distribution — no MPMC dependency needed)
++    // A clumpy batch is a whole bin, so a shallower queue caps resident bins.
++    let queue_depth = if clump_layout.is_some() { 1 } else { 2 };
+     let mut work_txs: Vec<mpsc::SyncSender<PairedWork>> = Vec::with_capacity(cores);
+     let mut work_rxs: Vec<mpsc::Receiver<PairedWork>> = Vec::with_capacity(cores);
+     for _ in 0..cores {
+-        let (tx, rx) = mpsc::sync_channel::<PairedWork>(2);
++        let (tx, rx) = mpsc::sync_channel::<PairedWork>(queue_depth);
+         work_txs.push(tx);
+         work_rxs.push(rx);
+     }
+@@ -346,9 +348,9 @@ fn process_paired_batch(
+     let mut stats_r2 = TrimStats::with_adapter_count(config.r2_adapter_count());
+     let mut pair_stats = PairValidationStats::default();
+ 
+-    let cap = reads_r1.len() * 300;
+-    let mut buf_r1 = Vec::with_capacity(cap);
+-    let mut buf_r2 = Vec::with_capacity(cap);
++    // Each buffer holds one mate of this batch, so reserve that mate's own bytes.
++    let mut buf_r1 = Vec::with_capacity(reads_r1.iter().map(estimated_record_bytes).sum::<usize>());
++    let mut buf_r2 = Vec::with_capacity(reads_r2.iter().map(estimated_record_bytes).sum::<usize>());
+     let mut buf_up_r1 = Vec::new();
+     let mut buf_up_r2 = Vec::new();
+     // Passthrough buffer + sink. `passthrough_active` decides whether the
+@@ -937,10 +939,12 @@ pub fn run_single_end_parallel(
+     gzip: bool,
+     clump_layout: Option<ClumpLayout>,
+ ) -> Result<TrimStats> {
++    // A clumpy batch is a whole bin, so a shallower queue caps resident bins.
++    let queue_depth = if clump_layout.is_some() { 1 } else { 2 };
+     let mut work_txs: Vec<mpsc::SyncSender<SingleWork>> = Vec::with_capacity(cores);
+     let mut work_rxs: Vec<mpsc::Receiver<SingleWork>> = Vec::with_capacity(cores);
+     for _ in 0..cores {
+-        let (tx, rx) = mpsc::sync_channel::<SingleWork>(2);
++        let (tx, rx) = mpsc::sync_channel::<SingleWork>(queue_depth);
+         work_txs.push(tx);
+         work_rxs.push(rx);
+     }
+@@ -1066,8 +1070,7 @@ fn process_single_batch(
+     gzip: bool,
+ ) -> Result<SingleBatchResult> {
+     let mut stats = TrimStats::with_adapter_count(config.adapters.len());
+-    let cap = reads.len() * 300;
+-    let mut buf = Vec::with_capacity(cap);
++    let mut buf = Vec::with_capacity(reads.iter().map(estimated_record_bytes).sum::<usize>());
+ 
+     if gzip {
+         {
+@@ -1609,10 +1612,7 @@ mod tests {
+     /// the sorted runs (which is the point of clumpy). 1 MiB per bin
+     /// matches the production minimum floor in `clump::MIN_BIN_BYTES`.
+     fn small_clump_layout() -> ClumpLayout {
+-        ClumpLayout {
+-            n_bins: 16,
+-            bin_byte_budget: 1024 * 1024,
+-        }
++        ClumpLayout::new(16, 1024 * 1024, 2)
+     }
+ 
+     fn read_all_records(path: &std::path::Path) -> Result<Vec<(String, String, String)>> {
+diff --git a/tests/integration_preflight_tripwire.rs b/tests/integration_preflight_tripwire.rs
+index 3214384..20f2225 100644
+--- a/tests/integration_preflight_tripwire.rs
++++ b/tests/integration_preflight_tripwire.rs
+@@ -593,6 +593,13 @@ fn se_trim_clumpify() {
+         "clumpify did not engage, so this case proves nothing about its writers:\n{}",
+         out.stderr
+     );
++
++    // Both banner figures are MiB: bins before the semicolon, peak before "(gzip".
++    assert!(
++        out.stderr.contains("MiB; predicted peak ≈") && out.stderr.contains("MiB (gzip level"),
++        "clumpify banner must label both figures MiB:\n{}",
++        out.stderr
++    );
+ }
+ 
+ #[test]

@@ -1,0 +1,2131 @@
+diff --git a/crates/salmon-align/src/bam_rad.rs b/crates/salmon-align/src/bam_rad.rs
+index 9256263bb..4b0663155 100644
+--- a/crates/salmon-align/src/bam_rad.rs
++++ b/crates/salmon-align/src/bam_rad.rs
+@@ -51,8 +51,7 @@ use salmon_core::{LibraryFormat, MateStatus};
+ use salmon_eqclass::{NaiveEqBuilder, NaivePlacement, NAIVE_NO_FMT};
+ use salmon_model::{smoothed_effective_length, DiscreteFld, PairObs};
+ use salmon_rad::{
+-    frag_map_type, ChunkCodec, FragmentChunkBuf, RadHit, RadOutputWriter, RadProfile,
+-    SalmonBulkRecord,
++    ChunkCodec, FragmentChunkBuf, RadHit, RadOutputWriter, RadProfile, SalmonBulkRecord,
+ };
+ 
+ use crate::error_model::{AlignmentModel, CountingAlignmentModel};
+@@ -114,9 +113,8 @@ pub fn write_alignment_rad(
+     // ever consume (#1140).
+     let bias_on =
+         (opts.seq_bias || opts.gc_bias || opts.pos_bias) && opts.length_correction().is_effective();
+-    // Paired unless the library type is explicitly single-end (matches the
+-    // alignment-mode `paired_lib` derivation in `quantify_alignments`).
+-    let is_paired = !matches!(opts.lib_type.as_str(), "U" | "SF" | "SR" | "S");
++    // Matches the alignment-mode `paired_lib` derivation in `quantify_alignments`.
++    let is_paired = crate::rad_library_is_paired(&opts.bam, &opts.lib_type)?;
+     // Only meaningful for a paired library: with single-end reads every
+     // placement is an "orphan" and the flag would discard the entire run. Same
+     // guard the online path applies (`discard_orphans && paired_lib`).
+@@ -189,7 +187,7 @@ pub fn write_alignment_rad(
+         // Pass A — train the counting error model + FLD + naive-eq (records not
+         // written yet; scores aren't final). Per-worker counting models are
+         // merged by integer add, so the total is partition-independent.
+-        let models = stream_grouped(&opts.bam, nthreads, || {
++        let (models, _) = stream_grouped(&opts.bam, nthreads, || {
+             TrainWorker::new(error_bins, &fld, naive.as_ref(), ref_bytes, discard_orphans)
+         })?;
+         let mut counting = CountingAlignmentModel::new(error_bins);
+@@ -198,14 +196,14 @@ pub fn write_alignment_rad(
+         }
+         let fixed = counting.finalize(ERROR_MODEL_ALPHA);
+         // Pass B — score each placement against the fixed model and write records.
+-        let sums = stream_grouped(&opts.bam, nthreads, || {
++        let (sums, unmapped_reads) = stream_grouped(&opts.bam, nthreads, || {
+             ScoreWriteWorker::new(&writer, ref_bytes, &fixed, discard_orphans)
+         })?;
+         writer.set_score_kind(salmon_rad::SCORE_KIND_LOGWEIGHT);
+-        reduce_summary(sums)
++        reduce_summary(sums, unmapped_reads)
+     } else {
+         // One pass — write records carrying the BAM `AS` score + FLD + naive-eq.
+-        let sums = stream_grouped(&opts.bam, nthreads, || {
++        let (sums, unmapped_reads) = stream_grouped(&opts.bam, nthreads, || {
+             WriteWorker::new(&writer, &fld, naive.as_ref(), discard_orphans)
+         })?;
+         // The scores these records carry are only as good as the tags they came
+@@ -221,7 +219,7 @@ pub fn write_alignment_rad(
+         if let Some(text) = &complaint {
+             tracing::warn!("{text}");
+         }
+-        let mut summary = reduce_summary(plain);
++        let mut summary = reduce_summary(plain, unmapped_reads);
+         summary.score_tag_warning = complaint;
+         summary
+     };
+@@ -361,8 +359,10 @@ impl ScoreTagTally {
+     }
+ }
+ 
+-fn reduce_summary(parts: Vec<(u64, u64)>) -> AlignRadSummary {
+-    let (mut num_processed, mut num_mapped) = (0u64, 0u64);
++/// Sum the workers' (processed, mapped) counts, plus the reads the reader saw
++/// with no mapped record.
++fn reduce_summary(parts: Vec<(u64, u64)>, unmapped_reads: u64) -> AlignRadSummary {
++    let (mut num_processed, mut num_mapped) = (unmapped_reads, 0u64);
+     for (p, m) in parts {
+         num_processed += p;
+         num_mapped += m;
+@@ -472,11 +472,21 @@ fn analyze_group<R: sam::alignment::Record>(
+             fmt_id: fmt.map(|f| f.format_id()).unwrap_or(NAIVE_NO_FMT),
+         });
+     }
++    // A proper pair discards the fragment's orphans, as in the mapper: a record
++    // has one type, so an orphan beside a pair would be read back as a pair.
++    if infos.iter().any(|i| i.paired) {
++        infos.retain(|i| i.paired);
++    }
+     Some(GroupData { frags, infos })
+ }
+ 
+ /// Feed a group's placements to the shared FLD + naive-eq accumulators.
+ fn tally_fld_naive(data: &GroupData, fld: &DiscreteFld, naive: Option<&NaiveEqBuilder>) {
++    if let [only] = data.infos.as_slice() {
++        if only.status == MateStatus::SingleEnd {
++            fld.add_single_end(only.is_fw);
++        }
++    }
+     fld.add_fragment(
+         data.infos.len() == 1,
+         data.infos
+@@ -522,8 +532,7 @@ fn write_record(
+             )
+         })
+         .collect();
+-    let frag_type = frag_map_type::fragment_level(data.infos.iter().map(|i| i.status));
+-    let rec = SalmonBulkRecord::new(frag_type, hits);
++    let rec = SalmonBulkRecord::from_placements(data.infos.iter().map(|i| i.status), hits);
+     buf.write(&rec, writer.context())?;
+     if buf.byte_len() >= CHUNK_FLUSH_BYTES {
+         let bytes = buf.take_bytes()?;
+@@ -780,12 +789,12 @@ impl GroupWorker for ScoreWriteWorker<'_> {
+ 
+ /// Dispatch the grouped pass over SAM or BAM (chosen by extension), mirroring
+ /// [`crate::stream_online_pass`]'s decoder setup, driving one `make_worker()`
+-/// per thread.
++/// per thread. See [`run_grouped`] for what it returns.
+ fn stream_grouped<MK, W>(
+     bam_path: &Path,
+     nthreads: usize,
+     make_worker: MK,
+-) -> Result<Vec<W::Output>>
++) -> Result<(Vec<W::Output>, u64)>
+ where
+     MK: Fn() -> W + Sync + Send,
+     W: GroupWorker,
+@@ -813,13 +822,14 @@ where
+ }
+ 
+ /// One reader thread groups consecutive same-canonical-name records into
+-/// minibatches; a worker pool consumes them. Returns each worker's `finish()`.
++/// minibatches; a worker pool consumes them. Returns each worker's `finish()`,
++/// and the number of reads with no mapped record, which no worker sees.
+ fn run_grouped<R, I, MK, W>(
+     records: I,
+     header: &Header,
+     nthreads: usize,
+     make_worker: MK,
+-) -> Result<Vec<W::Output>>
++) -> Result<(Vec<W::Output>, u64)>
+ where
+     R: sam::alignment::Record + Send + Sync,
+     I: Iterator<Item = std::io::Result<R>> + Send,
+@@ -828,42 +838,30 @@ where
+ {
+     let (tx, rx) = bounded::<Vec<Vec<R>>>(2 * nthreads + 1);
+ 
+-    std::thread::scope(|scope| -> Result<Vec<W::Output>> {
++    std::thread::scope(|scope| -> Result<(Vec<W::Output>, u64)> {
+         // Reader/parser thread: group consecutive same-canonical-name records.
+-        let reader = scope.spawn(move || -> Result<()> {
+-            let mut cur_name: Vec<u8> = Vec::new();
+-            let mut have = false;
+-            let mut group: Vec<R> = Vec::new();
++        let reader = scope.spawn(move || -> Result<u64> {
++            let mut reads = crate::ReadGrouper::new();
+             let mut batch: Vec<Vec<R>> = Vec::with_capacity(MINIBATCH);
+             for result in records {
+                 let rec = result.context("reading alignment record")?;
+-                if rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++                let Some(group) = reads.push(rec) else {
+                     continue;
+-                }
+-                let Some(name) = rec.name() else { continue };
+-                let cname = crate::canonical_name(name.as_ref()).to_vec();
+-                if !have {
+-                    cur_name = cname;
+-                    have = true;
+-                } else if cname != cur_name {
+-                    batch.push(std::mem::take(&mut group));
+-                    cur_name = cname;
+-                    if batch.len() >= MINIBATCH {
+-                        if tx.send(std::mem::take(&mut batch)).is_err() {
+-                            return Ok(()); // all workers gone
+-                        }
+-                        batch = Vec::with_capacity(MINIBATCH);
++                };
++                batch.push(group);
++                if batch.len() >= MINIBATCH {
++                    if tx.send(std::mem::take(&mut batch)).is_err() {
++                        return Ok(reads.unmapped_reads); // all workers gone
+                     }
++                    batch = Vec::with_capacity(MINIBATCH);
+                 }
+-                group.push(rec);
+-            }
+-            if have && !group.is_empty() {
+-                batch.push(group);
+             }
++            batch.extend(reads.finish());
+             if !batch.is_empty() {
+                 let _ = tx.send(batch);
+             }
+-            Ok(())
++            reads.grouping.finish()?;
++            Ok(reads.unmapped_reads)
+         });
+ 
+         // Worker pool.
+@@ -883,7 +881,7 @@ where
+         }
+         drop(rx);
+ 
+-        reader
++        let unmapped_reads = reader
+             .join()
+             .map_err(|_| anyhow::anyhow!("alignment reader thread panicked"))??;
+ 
+@@ -894,6 +892,6 @@ where
+                     .map_err(|_| anyhow::anyhow!("alignment worker thread panicked"))??,
+             );
+         }
+-        Ok(outs)
++        Ok((outs, unmapped_reads))
+     })
+ }
+diff --git a/crates/salmon-align/src/genome_project.rs b/crates/salmon-align/src/genome_project.rs
+index eb48a416f..1dac02698 100644
+--- a/crates/salmon-align/src/genome_project.rs
++++ b/crates/salmon-align/src/genome_project.rs
+@@ -54,8 +54,7 @@ use salmon_core::{observed_paired_format, LibraryFormat, MateStatus};
+ use salmon_eqclass::{NaiveEqBuilder, NaivePlacement, NAIVE_NO_FMT};
+ use salmon_model::{smoothed_effective_length, DiscreteFld, PairObs};
+ use salmon_rad::{
+-    frag_map_type, ChunkCodec, FragmentChunkBuf, RadHit, RadOutputWriter, RadProfile,
+-    SalmonBulkRecord,
++    ChunkCodec, FragmentChunkBuf, RadHit, RadOutputWriter, RadProfile, SalmonBulkRecord,
+ };
+ 
+ use crate::{coordinate_sorted_unusable, is_sam_path, open_sam_reader, read_alignment_header};
+@@ -145,7 +144,7 @@ pub fn project_genome_bam_to_rad(
+         None
+     };
+ 
+-    let is_paired = !matches!(opts.lib_type.as_str(), "U" | "SF" | "SR" | "S");
++    let is_paired = crate::rad_library_is_paired(&opts.bam, &opts.lib_type)?;
+     let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+     let mut writer = RadOutputWriter::create(
+         rad_path,
+@@ -418,7 +417,11 @@ fn build_projected_record(
+     proj: &[ProjectedAlignment],
+     tx_is_minus: &[bool],
+     is_short: bool,
+-) -> Option<(SalmonBulkRecord, (bool, Vec<PairObs>), Vec<NaivePlacement>)> {
++) -> Option<(
++    SalmonBulkRecord,
++    (bool, Vec<PairObs>, Option<bool>),
++    Vec<NaivePlacement>,
++)> {
+     if proj.is_empty() {
+         return None;
+     }
+@@ -426,11 +429,26 @@ fn build_projected_record(
+     for p in proj {
+         by_tid.entry(p.transcript_id).or_default().push(p);
+     }
+-    let single_tid = by_tid.len() == 1;
++    let is_proper = |entries: &[&ProjectedAlignment]| {
++        entries.len() >= 2
++            && entries
++                .iter()
++                .any(|e| e.same_transcript_as_mate && e.insert_size != 0)
++    };
++    // A proper pair discards the fragment's orphans, as in the mapper: a record
++    // has one type, so an orphan beside a pair would be read back as a pair.
++    let n_proper = by_tid.values().filter(|e| is_proper(e)).count();
++    let single_tid = if n_proper > 0 {
++        n_proper == 1
++    } else {
++        by_tid.len() == 1
++    };
+     let mut hits = Vec::with_capacity(by_tid.len());
+     let mut statuses = Vec::with_capacity(by_tid.len());
+     let mut naive_sig = Vec::with_capacity(by_tid.len());
+     let mut fld_pairs = Vec::new();
++    // Strand of a read that is single-end and maps to one place, for `-l A`.
++    let mut single_end_fw = None;
+ 
+     let is_read1 =
+         |e: &ProjectedAlignment| gas.get(e.input_index).is_none_or(|g| g.is_first_in_pair);
+@@ -471,11 +489,7 @@ fn build_projected_record(
+     };
+ 
+     for (&tid, entries) in &by_tid {
+-        let proper = entries.len() >= 2
+-            && entries
+-                .iter()
+-                .any(|e| e.same_transcript_as_mate && e.insert_size != 0);
+-        if proper {
++        if is_proper(entries) {
+             let r1 = entries
+                 .iter()
+                 .copied()
+@@ -517,6 +531,9 @@ fn build_projected_record(
+                 });
+             }
+         } else {
++            if n_proper > 0 {
++                continue;
++            }
+             // Orphan(s) / single-end on this transcript: one hit per projected
+             // alignment, with the read length in the frag_len slot.
+             for e in entries {
+@@ -529,6 +546,9 @@ fn build_projected_record(
+                     MateStatus::PairedEndRight
+                 };
+                 let is_fw = genomic_fw(e);
++                if single_tid && entries.len() == 1 && status == MateStatus::SingleEnd {
++                    single_end_fw = Some(is_fw);
++                }
+                 let pos = e.transcript_start.saturating_sub(1) as i32;
+                 let read_len = e.query_aligned_len as i32;
+                 let score = placement_score(e);
+@@ -545,10 +565,9 @@ fn build_projected_record(
+             }
+         }
+     }
+-    let frag_type = frag_map_type::fragment_level(statuses.iter().copied());
+     Some((
+-        SalmonBulkRecord::new(frag_type, hits),
+-        (single_tid, fld_pairs),
++        SalmonBulkRecord::from_placements(statuses.iter().copied(), hits),
++        (single_tid, fld_pairs, single_end_fw),
+         naive_sig,
+     ))
+ }
+@@ -633,40 +652,28 @@ where
+     let codec = writer.codec();
+ 
+     std::thread::scope(|scope| -> Result<(u64, u64)> {
+-        let reader = scope.spawn(move || -> Result<()> {
+-            let mut cur_name: Vec<u8> = Vec::new();
+-            let mut have = false;
+-            let mut group: Vec<R> = Vec::new();
++        let reader = scope.spawn(move || -> Result<u64> {
++            let mut reads = crate::ReadGrouper::new();
+             let mut batch: Vec<Vec<R>> = Vec::with_capacity(MINIBATCH);
+             for result in records {
+                 let rec = result.context("reading alignment record")?;
+-                if rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++                let Some(group) = reads.push(rec) else {
+                     continue;
+-                }
+-                let Some(name) = rec.name() else { continue };
+-                let cname = crate::canonical_name(name.as_ref()).to_vec();
+-                if !have {
+-                    cur_name = cname;
+-                    have = true;
+-                } else if cname != cur_name {
+-                    batch.push(std::mem::take(&mut group));
+-                    cur_name = cname;
+-                    if batch.len() >= MINIBATCH {
+-                        if tx.send(std::mem::take(&mut batch)).is_err() {
+-                            return Ok(());
+-                        }
+-                        batch = Vec::with_capacity(MINIBATCH);
++                };
++                batch.push(group);
++                if batch.len() >= MINIBATCH {
++                    if tx.send(std::mem::take(&mut batch)).is_err() {
++                        return Ok(reads.unmapped_reads);
+                     }
++                    batch = Vec::with_capacity(MINIBATCH);
+                 }
+-                group.push(rec);
+-            }
+-            if have && !group.is_empty() {
+-                batch.push(group);
+             }
++            batch.extend(reads.finish());
+             if !batch.is_empty() {
+                 let _ = tx.send(batch);
+             }
+-            Ok(())
++            reads.grouping.finish()?;
++            Ok(reads.unmapped_reads)
+         });
+ 
+         let mut workers = Vec::with_capacity(nthreads);
+@@ -716,8 +723,11 @@ where
+                             let bytes = buf.take_bytes()?;
+                             writer.append_chunk_bytes(&bytes)?;
+                         }
+-                        let (unique, pairs) = fld_sample;
++                        let (unique, pairs, single_end_fw) = fld_sample;
+                         fld.add_fragment(unique, pairs);
++                        if let Some(is_fw) = single_end_fw {
++                            fld.add_single_end(is_fw);
++                        }
+                         if let Some(nb) = naive {
+                             nb.add(naive_sig);
+                         }
+@@ -733,11 +743,11 @@ where
+         }
+         drop(rx);
+ 
+-        reader
++        let unmapped_reads = reader
+             .join()
+             .map_err(|_| anyhow::anyhow!("genome-BAM reader thread panicked"))??;
+ 
+-        let mut num_processed = 0u64;
++        let mut num_processed = unmapped_reads;
+         let mut num_mapped = 0u64;
+         for w in workers {
+             let (p, m) = w
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index f4a06f9b0..1baab158e 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -839,6 +839,76 @@ fn canonical_name(name: &[u8]) -> &[u8] {
+     }
+ }
+ 
++/// Groups an alignment stream's consecutive records by read, for the reader
++/// threads. Only mapped records are kept: a read with none is counted here and
++/// never reaches the workers, so it costs no more than its decode, and the
++/// minibatches hold the same reads they would without it.
++pub(crate) struct ReadGrouper<R> {
++    name: Vec<u8>,
++    group: Vec<R>,
++    started: bool,
++    /// Reads seen with no mapped record: processed, never mapped.
++    pub(crate) unmapped_reads: u64,
++    /// Whether the mates of each read are next to each other.
++    pub(crate) grouping: GroupingCheck,
++}
++
++impl<R: sam::alignment::Record> ReadGrouper<R> {
++    pub(crate) fn new() -> Self {
++        Self {
++            name: Vec::new(),
++            group: Vec::new(),
++            started: false,
++            unmapped_reads: 0,
++            grouping: GroupingCheck::default(),
++        }
++    }
++
++    /// Add the next record. Returns the previous read's mapped records when this
++    /// record starts a new read.
++    pub(crate) fn push(&mut self, rec: R) -> Option<Vec<R>> {
++        let name = rec.name()?;
++        let name = canonical_name(name.as_ref());
++        let mut done = None;
++        if !self.started || name != self.name.as_slice() {
++            if self.started {
++                done = self.close();
++            }
++            self.name.clear();
++            self.name.extend_from_slice(name);
++            self.started = true;
++        }
++        match rec.flags() {
++            Ok(flags) if !flags.is_unmapped() => {
++                self.grouping.record(flags);
++                self.group.push(rec);
++            }
++            _ => {}
++        }
++        done
++    }
++
++    /// The last read's mapped records, at the end of the stream.
++    pub(crate) fn finish(&mut self) -> Option<Vec<R>> {
++        if self.started {
++            self.started = false;
++            self.close()
++        } else {
++            None
++        }
++    }
++
++    fn close(&mut self) -> Option<Vec<R>> {
++        if self.group.is_empty() {
++            self.unmapped_reads += 1;
++            None
++        } else {
++            self.grouping.end_read();
++            Some(std::mem::take(&mut self.group))
++        }
++    }
++}
++
+ /// Map a noodles CIGAR op kind to our `AlnOp`.
+ fn kind_to_op(k: Kind) -> AlnOp {
+     match k {
+@@ -1100,42 +1170,30 @@ where
+ 
+     std::thread::scope(|scope| -> Result<()> {
+         // Reader/parser thread.
+-        let reader = scope.spawn(move || -> Result<()> {
+-            let mut cur_name: Vec<u8> = Vec::new();
+-            let mut have = false;
+-            let mut group: Vec<R> = Vec::new();
++        let reader = scope.spawn(move || -> Result<u64> {
++            let mut reads = ReadGrouper::new();
+             let mut batch: Vec<Vec<R>> = Vec::with_capacity(minibatch);
+             for result in records {
+                 let rec = result.context("reading alignment record")?;
+-                if rec.flags().map(|f| f.is_unmapped()).unwrap_or(true) {
++                let Some(group) = reads.push(rec) else {
+                     continue;
+-                }
+-                let Some(name) = rec.name() else { continue };
+-                let cname = canonical_name(name.as_ref()).to_vec();
+-                if !have {
+-                    cur_name = cname;
+-                    have = true;
+-                } else if cname != cur_name {
+-                    batch.push(std::mem::take(&mut group));
+-                    cur_name = cname;
+-                    if batch.len() >= minibatch {
+-                        let fm = online_reader.map(|o| o.next_log_fm()).unwrap_or(0.0);
+-                        if tx.send((fm, std::mem::take(&mut batch))).is_err() {
+-                            return Ok(()); // all workers gone
+-                        }
+-                        batch = Vec::with_capacity(minibatch);
++                };
++                batch.push(group);
++                if batch.len() >= minibatch {
++                    let fm = online_reader.map(|o| o.next_log_fm()).unwrap_or(0.0);
++                    if tx.send((fm, std::mem::take(&mut batch))).is_err() {
++                        return Ok(reads.unmapped_reads); // all workers gone
+                     }
++                    batch = Vec::with_capacity(minibatch);
+                 }
+-                group.push(rec);
+-            }
+-            if have && !group.is_empty() {
+-                batch.push(group);
+             }
++            batch.extend(reads.finish());
+             if !batch.is_empty() {
+                 let fm = online_reader.map(|o| o.next_log_fm()).unwrap_or(0.0);
+                 let _ = tx.send((fm, batch));
+             }
+-            Ok(())
++            reads.grouping.finish()?;
++            Ok(reads.unmapped_reads)
+         });
+ 
+         // Persistent worker pool: each pulls minibatches until the queue closes.
+@@ -1270,7 +1328,7 @@ where
+         }
+         drop(rx); // workers hold their own clones; lets the queue disconnect
+ 
+-        reader
++        let unmapped_reads = reader
+             .join()
+             .map_err(|_| anyhow::anyhow!("alignment reader thread panicked"))??;
+ 
+@@ -1284,7 +1342,7 @@ where
+             cfg.gc_bins,
+             cfg.pos_bias,
+         );
+-        let mut total = 0u64;
++        let mut total = unmapped_reads;
+         let mut total_mapped = 0u64;
+         let mut total_orphan = 0u64;
+         let mut total_compat = 0u64;
+@@ -1308,9 +1366,9 @@ where
+         acc.seq_obs = merged.seq_obs;
+         acc.gc_obs = merged.gc_obs;
+         acc.pos_obs = merged.pos_obs;
+-        // num_processed = every aligned fragment in the BAM; num_mapped = those
+-        // with a surviving strand-compatible placement (assigned to an eq-class).
+-        // They differ only for stranded libraries; matches reads-mode (#1025).
++        // num_processed = every fragment in the BAM, aligned or not; num_mapped =
++        // those with a surviving strand-compatible placement (assigned to an
++        // eq-class). Matches reads-mode (#1025).
+         acc.num_processed = total;
+         acc.num_mapped = total_mapped;
+         acc.num_orphan = total_orphan;
+@@ -1355,6 +1413,17 @@ fn peek_alignment_is_paired(path: &Path) -> Result<Option<bool>> {
+     }
+ }
+ 
++/// Whether a RAD writer's library is paired: under `-l A` the input decides,
++/// otherwise a single-end `-l` says no and anything else says yes.
++pub(crate) fn rad_library_is_paired(path: &Path, lib_type: &str) -> Result<bool> {
++    let peeked = if LibraryFormat::is_auto(lib_type) {
++        peek_alignment_is_paired(path)?
++    } else {
++        None
++    };
++    Ok(peeked.unwrap_or(!matches!(lib_type, "U" | "SF" | "SR" | "S")))
++}
++
+ fn stream_online_pass(bam_path: &Path, cfg: &PassCfg, acc: &mut PassAccum) -> Result<()> {
+     if is_sam_path(bam_path) {
+         let mut reader = open_sam_reader(bam_path)?;
+@@ -1995,6 +2064,60 @@ pub fn parse_source_programs(lines: &[String]) -> Vec<SourceProgram> {
+         .collect()
+ }
+ 
++/// Spots input whose mates are not next to each other, which the header check
++/// below cannot do when the header says nothing (`SO:unknown`, or no `@HD`). Each
++/// mate then forms a fragment of its own, so every count doubles while each record
++/// looks like an orphan. Tallied on the reader thread, from the flags
++/// [`ReadGrouper`] has already read.
++#[derive(Default)]
++pub(crate) struct GroupingCheck {
++    fragments: u64,
++    /// fragments with a record whose mate is marked mapped, but no such mate
++    split: u64,
++    first: bool,
++    last: bool,
++    expects_mate: bool,
++}
++
++impl GroupingCheck {
++    /// One mapped record of the current read.
++    fn record(&mut self, flags: sam::alignment::record::Flags) {
++        self.first |= flags.is_first_segment();
++        self.last |= flags.is_last_segment();
++        self.expects_mate |= flags.is_segmented() && !flags.is_mate_unmapped();
++    }
++
++    /// The current read, which had at least one mapped record, is complete.
++    fn end_read(&mut self) {
++        self.fragments += 1;
++        self.split += u64::from(self.expects_mate && !(self.first && self.last));
++        (self.first, self.last, self.expects_mate) = (false, false, false);
++    }
++
++    /// Refuses input where at least half the fragments are split: that is not a
++    /// filtered BAM but one in the wrong order, and its numbers would be wrong.
++    /// A smaller share can be real (a filter that kept one mate), so it only warns.
++    pub(crate) fn finish(&self) -> Result<()> {
++        let Self {
++            fragments, split, ..
++        } = *self;
++        let hint = "Records of one read must be consecutive: group them by name with \
++                    `samtools collate` or `samtools sort -n`";
++        anyhow::ensure!(
++            split * 2 < fragments || fragments == 0,
++            "{split} of {fragments} fragments have a mate marked as mapped that is not next \
++             to them, so the input is not grouped by read name. {hint}."
++        );
++        if split * 20 >= fragments && split > 0 {
++            tracing::warn!(
++                "{split} of {fragments} fragments have a mate marked as mapped that is not next \
++                 to them. They are quantified as orphans. If the mates are really there: {hint}."
++            );
++        }
++        Ok(())
++    }
++}
++
+ fn coordinate_sorted_unusable(header: &noodles_sam::Header) -> bool {
+     let Some(hd) = header.header() else {
+         return false;
+@@ -2786,6 +2909,25 @@ fn warn_mass_on_unreported_refs(res: &AlignQuantResult, rows: &[usize]) {
+     );
+ }
+ 
++impl AlignQuantResult {
++    /// The references that get an output row: everything except the
++    /// RAD-recorded decoy block.
++    pub fn quant_rows(&self) -> Vec<usize> {
++        let (first_decoy, num_decoys) = self
++            .provenance
++            .index
++            .as_ref()
++            .map(|ix| {
++                (
++                    ix.first_decoy_index.map(|v| v as usize),
++                    ix.num_decoys.unwrap_or(0) as usize,
++                )
++            })
++            .unwrap_or((None, 0));
++        salmon_core::quant_row_indices(self.names.len(), first_decoy, num_decoys).collect()
++    }
++}
++
+ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()> {
+     let dir = &opts.output_dir;
+     std::fs::create_dir_all(dir.join("aux_info")).context("creating output dirs")?;
+@@ -2797,19 +2939,7 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+     // the recorded boundary (piscem, BAM-derived, or written before the
+     // boundary tags existed) has no decoys to exclude and emits every row, as
+     // before.
+-    let (first_decoy, num_decoys) = res
+-        .provenance
+-        .index
+-        .as_ref()
+-        .map(|ix| {
+-            (
+-                ix.first_decoy_index.map(|v| v as usize),
+-                ix.num_decoys.unwrap_or(0) as usize,
+-            )
+-        })
+-        .unwrap_or((None, 0));
+-    let rows: Vec<usize> =
+-        salmon_core::quant_row_indices(res.names.len(), first_decoy, num_decoys).collect();
++    let rows = res.quant_rows();
+     warn_mass_on_unreported_refs(res, &rows);
+ 
+     // quant.sf (EffectiveLength + NumReads at --sigDigits decimals; TPM at 6).
+@@ -3266,10 +3396,9 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+             .context("writing bias_models.txt")?;
+     }
+     std::fs::create_dir_all(dir.join("logs")).context("creating logs")?;
+-    // In alignment mode the input records are already aligned, so `num_processed`
+-    // is the count of aligned fragments and `num_mapped` is those with a strand-
+-    // compatible placement that were quantified; label them accordingly so a
+-    // <100% rate on a stranded library is not read as lost alignments.
++    // In alignment mode `num_processed` is every fragment in the input, aligned or
++    // not, and `num_mapped` is those with a strand-compatible placement that were
++    // quantified; label them accordingly.
+     // This writer serves every RAD-based driver, so the log must describe the run
+     // the *user* asked for. It used to hard-code "alignment mode" and alignment
+     // wording, so a default reads run — the 2.6.0 default — was labelled as
+@@ -3293,8 +3422,8 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         ("observed fragments", "mapped fragments", "mapping rate")
+     } else {
+         (
+-            "aligned fragments",
+-            "strand-compatible (quantified)",
++            "observed fragments",
++            "aligned and strand-compatible (quantified)",
+             "compatible rate",
+         )
+     };
+diff --git a/crates/salmon-align/src/rad.rs b/crates/salmon-align/src/rad.rs
+index 5c58ee9aa..de590c363 100644
+--- a/crates/salmon-align/src/rad.rs
++++ b/crates/salmon-align/src/rad.rs
+@@ -171,7 +171,12 @@ impl RadFragment for SalmonBulkRecord {
+             score: h.score,
+             is_fw: h.is_fw,
+             mate_fw: h.mate_fw,
+-            status,
++            // See `SalmonBulkRecord::from_placements`.
++            status: match status {
++                MateStatus::PairedEndLeft if h.mate_fw => MateStatus::PairedEndRight,
++                MateStatus::PairedEndRight if h.mate_fw => MateStatus::PairedEndLeft,
++                s => s,
++            },
+             pos: h.pos,
+             frag_len: h.frag_len,
+         }));
+@@ -590,6 +595,30 @@ fn score_weight_basis(scored: bool, score_kind: u8, score_exp: f64, best: i32, s
+     }
+ }
+ 
++/// The best score among the placements the filters below keep. A placement they
++/// drop anyway must not set the bar for `--hardFilter`, or a fragment whose top
++/// score is on the wrong strand is lost whole.
++fn best_kept_score(
++    placements: &[RadPlacement],
++    discard_orphans: bool,
++    expected_format: Option<LibraryFormat>,
++    ignore_incompat: bool,
++) -> i32 {
++    placements
++        .iter()
++        .filter(|p| !(discard_orphans && is_orphan(p.status)))
++        .filter(|p| match expected_format {
++            Some(exp) if ignore_incompat => {
++                let (obs, is_fw, status) = rad_frag_format(p);
++                is_compatible(exp, obs, is_fw, status)
++            }
++            _ => true,
++        })
++        .map(|p| p.score)
++        .max()
++        .unwrap_or(0)
++}
++
+ /// Weight one fragment's placements and add the equivalence class. Returns
+ /// `true` if the fragment was assigned (had a surviving placement). A trimmed
+ /// analog of [`crate::process_fragment`] with no error model, bias, or online
+@@ -622,7 +651,12 @@ fn process_rad_fragment(
+     // any filtering, since it reports what was observed rather than what was
+     // kept.
+     let mut fmt_mask: u16 = 0;
+-    let best = placements.iter().map(|p| p.score).max().unwrap_or(0);
++    let best = best_kept_score(
++        placements,
++        cfg.discard_orphans,
++        cfg.expected_format,
++        cfg.ignore_incompat,
++    );
+     let at = |snap: &[f64], i: usize| -> f64 {
+         if snap.is_empty() {
+             0.0
+@@ -1518,7 +1552,12 @@ fn collect_bias_fragment(
+     if placements.is_empty() {
+         return;
+     }
+-    let best = placements.iter().map(|p| p.score).max().unwrap_or(0);
++    let best = best_kept_score(
++        placements,
++        cfg.discard_orphans,
++        cfg.expected_format,
++        cfg.ignore_incompat,
++    );
+     let at = |snap: &[f64], i: usize| -> f64 {
+         if snap.is_empty() {
+             0.0
+diff --git a/crates/salmon-align/tests/deterministic_bam.rs b/crates/salmon-align/tests/deterministic_bam.rs
+index 80f2b8693..e2ad401a6 100644
+--- a/crates/salmon-align/tests/deterministic_bam.rs
++++ b/crates/salmon-align/tests/deterministic_bam.rs
+@@ -579,3 +579,242 @@ fn no_single_frag_prob_changes_orphan_weighting_on_the_rad_path() {
+         "flat: equal orphan weights leave effective length to decide: {flat:?}"
+     );
+ }
++
++/// `--hardFilter` keeps a fragment's best placements. A wrong-strand placement
++/// that `-l` drops anyway must not set that bar, or the fragment is lost whole.
++#[test]
++fn hard_filter_ignores_the_score_of_a_wrong_strand_placement() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = dir.path().join("hf.sam");
++    let mut f = std::fs::File::create(&sam).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:queryname").unwrap();
++    writeln!(f, "@SQ\tSN:txA\tLN:5000").unwrap();
++    writeln!(f, "@SQ\tSN:txB\tLN:5000").unwrap();
++    for i in 0..1000 {
++        let l = 1 + (i * 3) % 3000;
++        let r = l + 200;
++        // ISF on txA, worse score; ISR on txB, better score.
++        writeln!(
++            f,
++            "r{i}\t99\ttxA\t{l}\t60\t100M\t=\t{r}\t300\t*\t*\tAS:i:-10"
++        )
++        .unwrap();
++        writeln!(
++            f,
++            "r{i}\t147\ttxA\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*\tAS:i:-10"
++        )
++        .unwrap();
++        writeln!(
++            f,
++            "r{i}\t339\ttxB\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*\tAS:i:0"
++        )
++        .unwrap();
++        writeln!(
++            f,
++            "r{i}\t419\ttxB\t{l}\t60\t100M\t=\t{r}\t300\t*\t*\tAS:i:0"
++        )
++        .unwrap();
++    }
++    drop(f);
++    let out = dir.path().join("q");
++    std::fs::create_dir_all(&out).unwrap();
++    let rad = out.join("aln.rad");
++    let mut opts = opts_for(&sam, &out);
++    opts.lib_type = "ISF".to_string();
++    opts.hard_filter = true;
++    write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
++    let res = quantify_rad(&opts, &rad).unwrap();
++    let counts = quant_counts(&out);
++    let get = |n: &str| counts.iter().find(|(x, _)| x == n).unwrap().1;
++    assert_eq!(res.num_mapped, 1000);
++    assert!(
++        (get("txA") - 1000.0).abs() < 1e-6 && get("txB") < 1e-6,
++        "{counts:?}"
++    );
++}
++
++/// Quantify `body` (SAM records over txA and txB) under `lib`, returning the
++/// counts of txA and txB and `num_mapped`.
++fn quant_records(dir: &Path, lib: &str, body: &str) -> (f64, f64, u64) {
++    let sam = dir.join("mix.sam");
++    std::fs::write(
++        &sam,
++        format!("@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:txA\tLN:5000\n@SQ\tSN:txB\tLN:5000\n{body}"),
++    )
++    .unwrap();
++    let out = dir.join("q");
++    std::fs::create_dir_all(&out).unwrap();
++    let rad = out.join("aln.rad");
++    let mut opts = opts_for(&sam, &out);
++    opts.lib_type = lib.to_string();
++    write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
++    let res = quantify_rad(&opts, &rad).unwrap();
++    let counts = quant_counts(&out);
++    let get = |n: &str| counts.iter().find(|(x, _)| x == n).unwrap().1;
++    (get("txA"), get("txB"), res.num_mapped)
++}
++
++/// R1 alone on txA and R2 alone on txB: each placement must be judged on its
++/// own mate's strand, whatever the other one is. Both agree with ISR here, so
++/// neither may be filtered and the two transcripts are symmetric.
++#[test]
++fn left_and_right_orphans_of_one_fragment_keep_their_own_side() {
++    let dir = tempfile::tempdir().unwrap();
++    let mut body = String::new();
++    for i in 0..1000 {
++        // Mid-transcript, so neither side's weight is cut by a transcript end.
++        let p = 2000 + (i * 3) % 1000;
++        body += &format!("r{i}\t89\ttxA\t{p}\t60\t100M\t*\t0\t0\t*\t*\tAS:i:0\n");
++        body += &format!("r{i}\t137\ttxB\t{p}\t60\t100M\t*\t0\t0\t*\t*\tAS:i:0\n");
++    }
++    let (a, b, mapped) = quant_records(dir.path(), "ISR", &body);
++    assert_eq!(mapped, 1000);
++    assert!((a - 500.0).abs() < 1.0, "txA={a} txB={b}");
++    assert!((b - 500.0).abs() < 1.0, "txA={a} txB={b}");
++}
++
++/// A proper pair on txA beats an orphan on txB: the orphan's read length must
++/// not be read back as a fragment length. It is the pairs' 300 here, so that
++/// misreading would give txB as much weight as txA.
++#[test]
++fn an_orphan_beside_a_proper_pair_takes_no_mass() {
++    let dir = tempfile::tempdir().unwrap();
++    let mut body = String::new();
++    for i in 0..500 {
++        let l = 1 + (i * 3) % 3000;
++        let r = l + 200;
++        body += &format!("r{i}\t99\ttxA\t{l}\t60\t100M\t=\t{r}\t300\t*\t*\tAS:i:0\n");
++        body += &format!("r{i}\t147\ttxA\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*\tAS:i:0\n");
++        body += &format!("r{i}\t73\ttxB\t{l}\t60\t300M\t*\t0\t0\t*\t*\tAS:i:0\n");
++    }
++    let (a, b, mapped) = quant_records(dir.path(), "IU", &body);
++    assert_eq!(mapped, 500);
++    assert!((a - 500.0).abs() < 1.0 && b < 1.0, "txA={a} txB={b}");
++}
++
++/// Single-end SAM: `n_a` forward reads on txA, `n_b` reverse reads on txB, so
++/// the library is stranded (SF) and txB's reads are all antisense.
++fn write_single_end_sam(dir: &Path, n_a: usize, n_b: usize) -> PathBuf {
++    let path = dir.join("se.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:queryname").unwrap();
++    writeln!(f, "@SQ\tSN:txA\tLN:5000").unwrap();
++    writeln!(f, "@SQ\tSN:txB\tLN:5000").unwrap();
++    for i in 0..n_a + n_b {
++        let (tx, flag) = if i < n_a { ("txA", 0) } else { ("txB", 16) };
++        let p = 1 + (i * 7) % 4000;
++        writeln!(
++            f,
++            "r{i}\t{flag}\t{tx}\t{p}\t60\t100M\t*\t0\t0\t*\t*\tAS:i:0"
++        )
++        .unwrap();
++    }
++    path
++}
++
++fn meta_info(out: &Path) -> serde_json::Value {
++    let text = std::fs::read_to_string(out.join("aux_info/meta_info.json")).unwrap();
++    serde_json::from_str(&text).unwrap()
++}
++
++/// `-l A` on a stranded single-end BAM must find the strand from the reads, as
++/// `-l SF` is told it, and filter antisense reads the same way.
++#[test]
++fn auto_detects_strand_of_a_single_end_bam() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = write_single_end_sam(dir.path(), 1500, 500);
++    let quant = |lib: &str| {
++        let out = dir.path().join(lib);
++        std::fs::create_dir_all(&out).unwrap();
++        let rad = out.join("aln.rad");
++        let mut opts = opts_for(&sam, &out);
++        opts.lib_type = lib.to_string();
++        write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
++        let res = quantify_rad(&opts, &rad).unwrap();
++        (res.num_mapped, quant_counts(&out), meta_info(&out))
++    };
++
++    let (auto_mapped, auto_counts, auto_meta) = quant("A");
++    let (sf_mapped, sf_counts, sf_meta) = quant("SF");
++
++    assert_eq!(auto_meta["detected_library_type"], "SF");
++    assert_eq!(auto_mapped, sf_mapped);
++    assert_eq!(auto_counts, sf_counts);
++    assert_eq!(
++        auto_meta["frag_length_source"],
++        sf_meta["frag_length_source"]
++    );
++}
++
++/// A single-end read is not an orphan, so `--discardOrphans` under `-l A` must
++/// not empty the run.
++#[test]
++fn discard_orphans_keeps_a_single_end_bam_under_auto() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = write_single_end_sam(dir.path(), 300, 0);
++    let out = dir.path().join("q");
++    std::fs::create_dir_all(&out).unwrap();
++    let rad = out.join("aln.rad");
++    let mut opts = opts_for(&sam, &out);
++    opts.lib_type = "A".to_string();
++    opts.discard_orphans = true;
++    write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
++    let res = quantify_rad(&opts, &rad).unwrap();
++    assert_eq!(res.num_mapped, 300);
++}
++
++/// The genome path takes the same answer from the projection: reads running
++/// with the transcript are sense, on either genomic strand.
++#[test]
++fn auto_detects_strand_of_a_single_end_genome_bam() {
++    let dir = tempfile::tempdir().unwrap();
++    let gtf = dir.path().join("a.gtf");
++    let mut f = std::fs::File::create(&gtf).unwrap();
++    for (tx, start, end, strand) in [("txA", 1001, 3000, '+'), ("txB", 5001, 7000, '-')] {
++        let attrs = format!("gene_id \"g{tx}\"; transcript_id \"{tx}\";");
++        for kind in ["transcript", "exon"] {
++            writeln!(
++                f,
++                "chr1\tt\t{kind}\t{start}\t{end}\t.\t{strand}\t.\t{attrs}"
++            )
++            .unwrap();
++        }
++    }
++    let sam = dir.path().join("g.sam");
++    let mut f = std::fs::File::create(&sam).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:queryname").unwrap();
++    writeln!(f, "@SQ\tSN:chr1\tLN:10000").unwrap();
++    for i in 0..200 {
++        let (flag, p) = if i % 2 == 0 { (0, 1001) } else { (16, 5001) };
++        writeln!(
++            f,
++            "r{i}\t{flag}\tchr1\t{}\t60\t100M\t*\t0\t0\t*\t*\tAS:i:0",
++            p + i
++        )
++        .unwrap();
++    }
++
++    let out = dir.path().join("q");
++    std::fs::create_dir_all(&out).unwrap();
++    let rad = out.join("aln.rad");
++    let gp = salmon_align::GenomeProjectOptions {
++        bam: sam.clone(),
++        annotation: gtf,
++        genome_fasta: None,
++        lib_type: "A".to_string(),
++        junc_miss_discount: None,
++        bias: false,
++        fld_mean: 250.0,
++        fld_sd: 25.0,
++        fld_max: 1000,
++        bias_seed_em_iters: 0,
++        em: Default::default(),
++        rad_codec: ChunkCodec::None,
++    };
++    salmon_align::project_genome_bam_to_rad(&gp, &rad).unwrap();
++    let mut opts = opts_for(&sam, &out);
++    opts.lib_type = "A".to_string();
++    let res = quantify_rad(&opts, &rad).unwrap();
++    assert_eq!(res.num_mapped, 200);
++    assert_eq!(meta_info(&out)["detected_library_type"], "SF");
++}
+diff --git a/crates/salmon-align/tests/stranded_num_mapped.rs b/crates/salmon-align/tests/stranded_num_mapped.rs
+index bc0a56083..f4e996e28 100644
+--- a/crates/salmon-align/tests/stranded_num_mapped.rs
++++ b/crates/salmon-align/tests/stranded_num_mapped.rs
+@@ -295,3 +295,76 @@ fn align_auto_library_type_detects_from_alignments() {
+     let bias = v["strand_mapping_bias"].as_f64().unwrap();
+     assert!((bias - 0.96).abs() < 1e-12, "bias {bias} != 0.96");
+ }
++
++/// Mates apart (a position-sorted file whose header does not say so) make every
++/// mate a fragment of its own, which doubled NumReads with no error naming why.
++#[test]
++fn input_not_grouped_by_read_name_is_refused() {
++    let tmp = tempfile::tempdir().unwrap();
++    let path = tmp.path().join("aln.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:unknown").unwrap();
++    writeln!(f, "@SQ\tSN:tx0\tLN:5000").unwrap();
++    for i in 0..4 {
++        let (l, r) = (1 + i * 400, 201 + i * 400);
++        writeln!(f, "f{i}\t99\ttx0\t{l}\t60\t100M\t=\t{r}\t300\t*\t*").unwrap();
++    }
++    for i in 0..4 {
++        let (l, r) = (1 + i * 400, 201 + i * 400);
++        writeln!(f, "f{i}\t147\ttx0\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*").unwrap();
++    }
++    drop(f);
++
++    let mut opts = AlignQuantOptions::new(path, tmp.path().join("out"));
++    opts.lib_type = "IU".to_string();
++    opts.no_error_model = true;
++    let online = quantify_alignments(&opts).unwrap_err();
++    let rad = tmp.path().join("a.rad");
++    let default = salmon_align::write_alignment_rad(&opts, &rad, salmon_rad::ChunkCodec::None)
++        .map(|_| ())
++        .unwrap_err();
++    for err in [online, default] {
++        let err = format!("{err:#}");
++        assert!(err.contains("not grouped by read name"), "{err}");
++    }
++}
++
++/// Unmapped records (bowtie2's default, STAR's `--outSAMunmapped Within`) are
++/// fragments the aligner saw and could not place, so they count against the
++/// mapping rate. Dropped at the reader, a 25% library reported 100%, on both the
++/// default path and `--online`.
++#[test]
++fn unmapped_fragments_count_against_the_mapping_rate() {
++    let tmp = tempfile::tempdir().unwrap();
++    let path = tmp.path().join("aln.sam");
++    let mut f = std::fs::File::create(&path).unwrap();
++    writeln!(f, "@HD\tVN:1.6\tSO:unsorted").unwrap();
++    writeln!(f, "@SQ\tSN:tx0\tLN:5000").unwrap();
++    for i in 0..2 {
++        let (l, r) = (1 + i * 400, 201 + i * 400);
++        writeln!(f, "m{i}\t99\ttx0\t{l}\t60\t100M\t=\t{r}\t300\t*\t*").unwrap();
++        writeln!(f, "m{i}\t147\ttx0\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*").unwrap();
++    }
++    for i in 0..6 {
++        writeln!(f, "u{i}\t77\t*\t0\t0\t*\t*\t0\t0\t*\t*").unwrap();
++        writeln!(f, "u{i}\t141\t*\t0\t0\t*\t*\t0\t0\t*\t*").unwrap();
++    }
++    drop(f);
++
++    let online = run(&path, &tmp.path().join("online"), "IU");
++    assert_eq!(
++        (online.num_processed, online.num_mapped),
++        (8, 2),
++        "--online"
++    );
++
++    let mut opts = AlignQuantOptions::new(path, tmp.path().join("rad_out"));
++    opts.lib_type = "IU".to_string();
++    opts.no_error_model = true;
++    let rad = tmp.path().join("a.rad");
++    let summary =
++        salmon_align::write_alignment_rad(&opts, &rad, salmon_rad::ChunkCodec::None).unwrap();
++    assert_eq!((summary.num_processed, summary.num_mapped), (8, 2), "RAD");
++    let res = salmon_align::quantify_rad(&opts, &rad).unwrap();
++    assert_eq!((res.num_processed, res.num_mapped), (8, 2), "requant");
++}
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index 42db8a26f..ac8c65f54 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -340,7 +340,7 @@ struct IndexArgs {
+     /// Output index directory.
+     #[arg(short = 'i', long = "index", required = true)]
+     index: PathBuf,
+-    /// K-mer length (odd, ≤ 31 recommended).
++    /// K-mer length (odd, at most 31).
+     #[arg(short = 'k', long = "kmerLen", default_value_t = 31)]
+     kmer_len: usize,
+     /// Minimizer length (0 = auto; 19 for the default k=31).
+@@ -466,7 +466,7 @@ struct QuantArgs {
+     genome: Option<PathBuf>,
+     /// Genome-alignment projection: penalty multiplier per junction mismatch
+     /// (bramble `junc_miss_discount`; default 1.0 = no penalty).
+-    #[arg(long = "juncMissDiscount", value_name = "F", requires = "annotation")]
++    #[arg(long = "juncMissDiscount", value_name = "F", requires = "annotation", value_parser = parse_non_negative_f64)]
+     junc_miss_discount: Option<f64>,
+     /// Library type (e.g. IU, ISR, A for auto).
+     #[arg(short = 'l', long = "libType", default_value = "A")]
+@@ -548,7 +548,7 @@ struct QuantArgs {
+     #[arg(long = "rangeFactorizationBins", default_value_t = 4)]
+     range_factorization_bins: u32,
+     /// Prior weight for strand-incompatible mappings (0 drops them).
+-    #[arg(long = "incompatPrior", default_value_t = 0.0)]
++    #[arg(long = "incompatPrior", default_value_t = 0.0, value_parser = parse_unit_f64)]
+     incompat_prior: f64,
+     /// Dump equivalence classes to aux_info/eq_classes.txt.gz (salmon format).
+     #[arg(long = "dumpEq")]
+@@ -696,12 +696,12 @@ struct QuantArgs {
+     /// Minimum alignment score as a fraction of the perfect score (default 0.65).
+     /// Option-typed so passing it under `--sketch` — which computes no alignment
+     /// scores — can warn instead of being silently inert (#1140).
+-    #[arg(long = "minScoreFraction")]
++    #[arg(long = "minScoreFraction", value_parser = parse_unit_f32)]
+     min_score_fraction: Option<f32>,
+     /// Orphan chain sub-optimality threshold (salmon's `orphanChainSubThresh`).
+     /// `0.0` (default) aligns every orphan candidate (more sensitive than salmon's
+     /// 0.95, which prunes low-chain-coverage orphans before alignment).
+-    #[arg(long = "orphanChainSubThresh")]
++    #[arg(long = "orphanChainSubThresh", value_parser = parse_unit_f32)]
+     orphan_chain_sub_thresh: Option<f32>,
+     /// Score the full read with one DP instead of PuffAligner-style inter-MEM-gap scoring.
+     #[arg(long = "fullLengthAlignment")]
+@@ -738,14 +738,14 @@ struct QuantArgs {
+     /// Consensus slack: a target is kept only if its best chain score is at least
+     /// `(1 - slack)` of the max chain score for that mate (salmon default 0.35;
+     /// `1.0` keeps every target).
+-    #[arg(long = "consensusSlack")]
++    #[arg(long = "consensusSlack", value_parser = parse_unit_f32)]
+     consensus_slack: Option<f32>,
+     /// Skip k-mers whose unitig occurs in more than this many references
+     /// (repetitive-hit guard; salmon's `maxOccsPerHit`).
+     #[arg(long = "maxOccsPerHit")]
+     max_occs_per_hit: Option<usize>,
+     /// VBEM per-feature Dirichlet prior weight.
+-    #[arg(long = "vbPrior", default_value_t = 1e-2)]
++    #[arg(long = "vbPrior", default_value_t = 1e-2, value_parser = parse_positive_f64)]
+     vb_prior: f64,
+     /// EM/VBEM convergence acceleration. `squarem` needs fewer M-steps for a given
+     /// accuracy (with VBEM it pays off at tighter tolerances); `daarem` requires
+@@ -776,7 +776,7 @@ struct QuantArgs {
+     fld_sd: Option<f64>,
+     /// Maximum fragment length tracked by the fragment-length distribution
+     /// [default: 1000].
+-    #[arg(long = "fldMax")]
++    #[arg(long = "fldMax", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+     fld_max: Option<usize>,
+     /// Where the fragment-length distribution comes from when quantifying a RAD
+     /// (`--rad` only) [default: baked].
+@@ -792,7 +792,7 @@ struct QuantArgs {
+     /// Online-phase forgetting factor in (0.5, 1.0]; default 0.65. Online-path
+     /// only (--online, deprecated): ignored with a warning under the default
+     /// deterministic mode.
+-    #[arg(short = 'f', long = "forgettingFactor")]
++    #[arg(short = 'f', long = "forgettingFactor", value_parser = parse_forgetting_factor)]
+     forgetting_factor: Option<f64>,
+     /// Initialize the optimizer uniformly. In reads mode (one-pass and
+     /// --deterministic) the optimizer already starts uniform, so this is the
+@@ -835,16 +835,16 @@ struct QuantArgs {
+     discard_orphans_quasi: bool,
+     /// An alignment to an annotated transcript is invalid if its score is
+     /// `< decoyThreshold * bestDecoyScore` (selective-alignment mode).
+-    #[arg(long = "decoyThreshold")]
++    #[arg(long = "decoyThreshold", value_parser = parse_non_negative_f64)]
+     decoy_threshold: Option<f64>,
+     /// Drop any mapping whose alignment probability
+     /// `exp(-scoreExp * (best - score))` is below this (selective-alignment mode).
+-    #[arg(long = "minAlnProb")]
++    #[arg(long = "minAlnProb", value_parser = parse_unit_f64)]
+     min_aln_prob: Option<f64>,
+     /// Soft-weight decay: a mapping's probability is proportional to
+     /// `exp(-scoreExp * (bestScore - score))`. Larger downweights sub-optimal
+     /// mappings more steeply. (salmon's --scoreExp; default 1.0)
+-    #[arg(long = "scoreExp")]
++    #[arg(long = "scoreExp", value_parser = parse_non_negative_f64)]
+     score_exp: Option<f64>,
+     /// Instead of soft-weighting multimapping locations by alignment score, keep
+     /// only the best-scoring mapping(s), each with equal weight.
+@@ -869,13 +869,13 @@ struct QuantArgs {
+     /// Per-target pre-merge chain sub-optimality threshold: keep chains scoring
+     /// `>= best_chain_score * thresh` (selective-alignment mode). Range [0,1].
+     /// Rust default 0.8 (salmon's default is 0.75).
+-    #[arg(long = "preMergeChainSubThresh")]
++    #[arg(long = "preMergeChainSubThresh", value_parser = parse_unit_f32)]
+     pre_merge_chain_sub_thresh: Option<f32>,
+     /// Post-merge concordant chain-pair sub-optimality threshold: after pairing,
+     /// keep pairs whose read-coverage is `>= best_pair_coverage * thresh`
+     /// (paired-end, selective-alignment mode). Range [0,1]. Default 0.0 (off);
+     /// salmon's default is 0.9, thresholded on chain score rather than coverage.
+-    #[arg(long = "postMergeChainSubThresh")]
++    #[arg(long = "postMergeChainSubThresh", value_parser = parse_unit_f32)]
+     post_merge_chain_sub_thresh: Option<f32>,
+     /// Fragment-length sampling stride for the GC bias eff-length convolution.
+     /// Larger = faster bias correction, coarser. (salmon's --biasSpeedSamp)
+@@ -991,6 +991,37 @@ fn parse_positive_f64(s: &str) -> Result<f64, String> {
+     }
+ }
+ 
++fn parse_non_negative_f64(s: &str) -> Result<f64, String> {
++    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
++    if v.is_finite() && v >= 0.0 {
++        Ok(v)
++    } else {
++        Err(format!("must be a number of at least 0 (got {s})"))
++    }
++}
++
++fn parse_unit_f64(s: &str) -> Result<f64, String> {
++    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
++    if (0.0..=1.0).contains(&v) {
++        Ok(v)
++    } else {
++        Err(format!("must be between 0 and 1 (got {s})"))
++    }
++}
++
++fn parse_unit_f32(s: &str) -> Result<f32, String> {
++    parse_unit_f64(s).map(|v| v as f32)
++}
++
++fn parse_forgetting_factor(s: &str) -> Result<f64, String> {
++    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
++    if v > 0.5 && v <= 1.0 {
++        Ok(v)
++    } else {
++        Err(format!("must be in (0.5, 1.0] (got {s})"))
++    }
++}
++
+ /// Resolve the `--sparseSeeds` / `--uniMEMs` / `--refMEMs` flags into a seeding
+ /// mode (clap enforces they are mutually exclusive). The default is uni-MEM
+ /// seeding (`--uniMEMs`): it is faster than sparse k-mer seeding and at least as
+@@ -1109,12 +1140,23 @@ const UNMATCHED_TXP_FILE: &str = "genemap_unmatched_txps.json";
+ fn write_gene_level(
+     out_dir: &std::path::Path,
+     gene_map: &GeneMapOpts,
++    rows: &[usize],
+     names: &[String],
+     lengths: &[u32],
+     eff_lengths: &[f64],
+     tpm: &[f64],
+     counts: &[f64],
+ ) -> Result<()> {
++    // The same rows as quant.sf: a decoy is neither a gene nor a transcript the
++    // annotation failed to cover.
++    fn pick<T: Clone>(rows: &[usize], v: &[T]) -> Vec<T> {
++        rows.iter().map(|&i| v[i].clone()).collect()
++    }
++    let names = &pick(rows, names)[..];
++    let lengths = &pick(rows, lengths)[..];
++    let eff_lengths = &pick(rows, eff_lengths)[..];
++    let tpm = &pick(rows, tpm)[..];
++    let counts = &pick(rows, counts)[..];
+     // Parsed up front by `load_gene_map`, so nothing here can fail on a bad path.
+     let map = &gene_map.map;
+     // Listed by name rather than only counted, so the failure survives a lost
+@@ -1587,6 +1629,7 @@ fn run_deterministic(
+         write_gene_level(
+             out_dir,
+             gm,
++            &res.quant_rows(),
+             &res.names,
+             &res.lengths,
+             &res.eff_lengths,
+@@ -1677,7 +1720,7 @@ fn run_deterministic_align(
+         0.0
+     };
+     tracing::info!(
+-        "deterministic: wrote {} / {} aligned fragments ({:.2}%) to the intermediate RAD; quantifying",
++        "deterministic: wrote {} / {} fragments ({:.2}%) to the intermediate RAD; quantifying",
+         summary.num_mapped,
+         summary.num_processed,
+         pct
+@@ -1729,6 +1772,7 @@ fn run_deterministic_align(
+         write_gene_level(
+             &out_dir,
+             gm,
++            &res.quant_rows(),
+             &res.names,
+             &res.lengths,
+             &res.eff_lengths,
+@@ -1868,6 +1912,7 @@ fn run_genome_project(
+         write_gene_level(
+             &out_dir,
+             gm,
++            &res.quant_rows(),
+             &res.names,
+             &res.lengths,
+             &res.eff_lengths,
+@@ -2477,7 +2522,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         // stranded library reads as "strand-incompatible", not "lost alignments".
+         if res.num_processed > res.num_mapped {
+             tracing::info!(
+-                "{} aligned fragments; {} strand-compatible and quantified ({:.2}%); \
++                "{} fragments; {} aligned, strand-compatible and quantified ({:.2}%); \
+                  {} dropped as incompatible with library type {}; {} equivalence classes",
+                 res.num_processed,
+                 res.num_mapped,
+@@ -2488,7 +2533,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             );
+         } else {
+             tracing::info!(
+-                "{} aligned fragments, all strand-compatible and quantified; {} equivalence classes",
++                "{} fragments, all aligned, strand-compatible and quantified; {} equivalence classes",
+                 res.num_processed,
+                 res.num_eq_classes
+             );
+@@ -2507,6 +2552,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             write_gene_level(
+                 &out_dir,
+                 gm,
++                &res.quant_rows(),
+                 &res.names,
+                 &res.lengths,
+                 &res.eff_lengths,
+@@ -2658,6 +2704,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             write_gene_level(
+                 &out_dir,
+                 gm,
++                &res.quant_rows(),
+                 &res.names,
+                 &res.lengths,
+                 &res.eff_lengths,
+@@ -2814,7 +2861,8 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     opts.mates2 = args.mates2;
+     opts.unmated = args.unmated;
+     opts.lib_type = args.lib_type;
+-    opts.num_threads = args.threads;
++    // 0 means "all cores" further down, so it stays 0; anything else takes the cap.
++    opts.num_threads = if args.threads == 0 { 0 } else { nthreads };
+     opts.decoder = piscem_rs::io::calibrate::DecoderPreference::parse(
+         args.decoder.as_deref().unwrap_or("auto"),
+     )
+@@ -3065,6 +3113,8 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         write_gene_level(
+             &out_dir,
+             gm,
++            &salmon_core::quant_row_indices(res.names.len(), res.first_decoy_index, res.num_decoys)
++                .collect::<Vec<_>>(),
+             &res.names,
+             &res.lengths,
+             &res.eff_lengths,
+diff --git a/crates/salmon-cli/tests/decoy_bias.rs b/crates/salmon-cli/tests/decoy_bias.rs
+index 172c75a1f..731f4ab3b 100644
+--- a/crates/salmon-cli/tests/decoy_bias.rs
++++ b/crates/salmon-cli/tests/decoy_bias.rs
+@@ -141,4 +141,46 @@ fn decoys_are_excluded_and_mass_is_conserved_with_bias() {
+         !err.contains("excluded from quant.sf"),
+         "the unreported-mass guard must not fire here: {err}"
+     );
++
++    // Gene-level output reports the same rows as quant.sf, in both reads paths: a
++    // decoy is neither a gene nor a transcript the annotation failed to cover.
++    let gene_map = dir.path().join("t2g.tsv");
++    std::fs::write(&gene_map, "txA\tG1\ntxB\tG1\ntxC\tG2\n").unwrap();
++    for (name, extra) in [("genes", &[][..]), ("genes_online", &["--online"][..])] {
++        let out = dir.path().join(name);
++        let run = Command::new(SALMON)
++            .args(["quant", "-i"])
++            .arg(&index)
++            .args(["-l", "IU", "-1"])
++            .arg(&p1)
++            .arg("-2")
++            .arg(&p2)
++            .args(["-p", "2", "-g"])
++            .arg(&gene_map)
++            .args(extra)
++            .arg("-o")
++            .arg(&out)
++            .output()
++            .unwrap();
++        assert!(
++            run.status.success(),
++            "{}",
++            String::from_utf8_lossy(&run.stderr)
++        );
++        let genes = std::fs::read_to_string(out.join("quant.genes.sf")).unwrap();
++        let names: Vec<&str> = genes
++            .lines()
++            .skip(1)
++            .map(|l| l.split('\t').next().unwrap())
++            .collect();
++        assert_eq!(names, ["G1", "G2"], "{name}: {genes}");
++        assert!(
++            !out.join("aux_info/genemap_unmatched_txps.json").exists(),
++            "{name}: every transcript is in the map, and a decoy is not a transcript"
++        );
++        assert!(
++            !String::from_utf8_lossy(&run.stderr).contains("no entry in the gene map"),
++            "{name}: a decoy must not count against the gene map"
++        );
++    }
+ }
+diff --git a/crates/salmon-cli/tests/input_validation.rs b/crates/salmon-cli/tests/input_validation.rs
+index eaeec5fbe..414ca2d3b 100644
+--- a/crates/salmon-cli/tests/input_validation.rs
++++ b/crates/salmon-cli/tests/input_validation.rs
+@@ -922,3 +922,103 @@ fn online_only_knobs_warn_without_online_and_agree_in_number() {
+         "under --online the knob is honoured, not warned about"
+     );
+ }
++
++/// `-p` above the machine's threads is capped with a warning. The cap must reach
++/// mapping too, not only the EM's pool, or the bad scheduler variable it warns
++/// about still oversubscribes the node.
++#[test]
++fn an_oversized_thread_count_is_capped_for_mapping_too() {
++    let dir = tempfile::tempdir().unwrap();
++    let fx = fixture(dir.path());
++    let out = dir.path().join("q");
++    let o = run(&[
++        os("quant"),
++        os("-l"),
++        os("A"),
++        os("-p"),
++        os("100000"),
++        os("-i"),
++        fx.index.as_os_str(),
++        os("-1"),
++        fx.r1.as_os_str(),
++        os("-2"),
++        fx.r2.as_os_str(),
++        os("-o"),
++        out.as_os_str(),
++    ]);
++    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
++    let info = std::fs::read_to_string(out.join("cmd_info.json")).unwrap();
++    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
++    let available = std::thread::available_parallelism().unwrap().get() as u64;
++    assert_eq!(info["threads"], available);
++}
++
++/// A number out of range used to run anyway: `--vbPrior NaN` kept 6931 of 10000
++/// reads with exit 0, and `--fldMax 0` moved TPMs with no warning.
++#[test]
++fn numeric_flags_out_of_range_are_refused() {
++    for (flag, value) in [
++        ("--vbPrior", "NaN"),
++        ("--vbPrior", "0"),
++        ("--vbPrior", "-1"),
++        ("--fldMax", "0"),
++        ("--incompatPrior", "NaN"),
++        ("--incompatPrior", "2"),
++        ("--scoreExp", "inf"),
++        ("--scoreExp", "-1"),
++        ("--minScoreFraction", "1.5"),
++        ("--orphanChainSubThresh", "NaN"),
++        ("--consensusSlack", "-0.1"),
++        ("--preMergeChainSubThresh", "2"),
++        ("--postMergeChainSubThresh", "2"),
++        ("--minAlnProb", "NaN"),
++        ("--decoyThreshold", "NaN"),
++        ("--forgettingFactor", "0.5"),
++        ("--forgettingFactor", "1.5"),
++    ] {
++        // `=`, so clap hands a negative value to the parser rather than reading
++        // it as another flag.
++        let arg = format!("{flag}={value}");
++        let o = run(&[
++            os("quant"),
++            os("-i"),
++            os("no-index"),
++            os("-l"),
++            os("A"),
++            os("-r"),
++            os("no-reads"),
++            os("-o"),
++            os("no-output"),
++            os(&arg),
++        ]);
++        let err = String::from_utf8_lossy(&o.stderr);
++        assert_eq!(o.status.code(), Some(2), "{flag} {value}: {err}");
++        assert!(err.contains(flag), "{flag} {value}: {err}");
++    }
++}
++
++/// Above k = 31 the build panicked after writing files; `m >= k` failed after
++/// writing them too. Both are known before any work starts.
++#[test]
++fn an_impossible_k_or_m_is_refused_before_writing_anything() {
++    let dir = tempfile::tempdir().unwrap();
++    let fasta = dir.path().join("t.fa");
++    std::fs::write(&fasta, format!(">t1\n{}\n", sequence(1, 2000))).unwrap();
++    for args in [["-k", "33", "-m", "0"], ["-k", "21", "-m", "21"]] {
++        let index = dir.path().join("i");
++        let o = run(&[
++            os("index"),
++            os("-t"),
++            fasta.as_os_str(),
++            os("-i"),
++            index.as_os_str(),
++            os(args[0]),
++            os(args[1]),
++            os(args[2]),
++            os(args[3]),
++        ]);
++        let err = String::from_utf8_lossy(&o.stderr);
++        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
++        assert!(!index.exists(), "{args:?} wrote {}", index.display());
++    }
++}
+diff --git a/crates/salmon-core/src/quantmerge.rs b/crates/salmon-core/src/quantmerge.rs
+index 3100e2bef..d091355f6 100644
+--- a/crates/salmon-core/src/quantmerge.rs
++++ b/crates/salmon-core/src/quantmerge.rs
+@@ -11,10 +11,13 @@
+ //! Values are copied through as text rather than parsed and reformatted, so the
+ //! merged matrix contains the same digits the individual files did.
+ 
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::io::{self, BufRead, Write};
+ use std::path::{Path, PathBuf};
+ 
++/// Columns in a `quant.sf` row; see [`MergeColumn::index`].
++const QUANT_COLUMNS: usize = 5;
++
+ /// Which `quant.sf` column to merge.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum MergeColumn {
+@@ -68,6 +71,10 @@ impl MergeColumn {
+ /// the same target set. Rather than failing or silently dropping rows, the union
+ /// of targets is emitted and the gaps are filled with the caller's `missing`
+ /// placeholder (typically `NA`), which is both visible and easy to filter.
++///
++/// Damage is different from absence, so these are errors, reported before the
++/// output is created: an empty or repeated sample name, a row with too few
++/// columns, and a target appearing twice in one file.
+ pub fn merge_quants(
+     quant_files: &[PathBuf],
+     names: &[String],
+@@ -77,6 +84,20 @@ pub fn merge_quants(
+ ) -> io::Result<usize> {
+     // Caller-side invariant: one display name per input file.
+     assert_eq!(quant_files.len(), names.len());
++    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
++    let mut seen_names = HashSet::new();
++    for n in names {
++        if n.is_empty() {
++            return Err(invalid(
++                "a sample has an empty name; pass --names to name the samples".to_string(),
++            ));
++        }
++        if !seen_names.insert(n) {
++            return Err(invalid(format!(
++                "two samples are both named \"{n}\"; pass --names to tell them apart"
++            )));
++        }
++    }
+     let nsamp = quant_files.len();
+     let col = column.index();
+ 
+@@ -102,9 +123,14 @@ pub fn merge_quants(
+                 continue;
+             }
+             let toks: Vec<&str> = line.split('\t').collect();
+-            // Truncated row: skip rather than index out of bounds.
+-            if toks.len() <= col {
+-                continue;
++            // `NA` means "not in this sample", so a damaged row must not become one.
++            if toks.len() < QUANT_COLUMNS {
++                return Err(invalid(format!(
++                    "{} line {}: expected {QUANT_COLUMNS} columns, found {}",
++                    qf.display(),
++                    lineno + 1,
++                    toks.len()
++                )));
+             }
+             let name = toks[0];
+             // First time this target is seen anywhere: record its position in
+@@ -113,6 +139,13 @@ pub fn merge_quants(
+                 order.push(name.to_string());
+                 vec![None; nsamp]
+             });
++            if entry[s].is_some() {
++                return Err(invalid(format!(
++                    "{} line {}: target {name} appears twice",
++                    qf.display(),
++                    lineno + 1
++                )));
++            }
+             entry[s] = Some(toks[col].to_string());
+         }
+     }
+@@ -204,4 +237,63 @@ mod tests {
+         assert_eq!(lines[3], "t3\tNA\t1.0");
+         assert_eq!(n, 2);
+     }
++
++    const HEADER: &str = "Name\tLength\tEffectiveLength\tTPM\tNumReads\n";
++
++    /// Merge one file per `bodies` entry under `names`, in a directory of its own.
++    fn merge_in(tag: &str, bodies: &[&str], names: &[&str]) -> (io::Result<usize>, PathBuf) {
++        let dir = std::env::temp_dir().join(format!("qm_{}_{tag}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let files: Vec<PathBuf> = bodies
++            .iter()
++            .enumerate()
++            .map(|(i, b)| {
++                let f = dir.join(format!("{i}.sf"));
++                std::fs::write(&f, format!("{HEADER}{b}")).unwrap();
++                f
++            })
++            .collect();
++        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
++        let out = dir.join("merged.tsv");
++        (
++            merge_quants(&files, &names, MergeColumn::Tpm, "NA", &out),
++            out,
++        )
++    }
++
++    /// Two columns with one name cannot be told apart downstream, and an empty
++    /// one (`--quants .`) has no name at all.
++    #[test]
++    fn duplicate_or_empty_sample_names_are_refused() {
++        let row = "t1\t100\t80.0\t10.5\t5\n";
++        let (r, out) = merge_in("dup", &[row, row], &["quant", "quant"]);
++        let e = r.unwrap_err().to_string();
++        assert!(e.contains("quant"), "{e}");
++        assert!(!out.exists());
++        let (r, out) = merge_in("empty", &[row], &[""]);
++        assert!(r.is_err());
++        assert!(!out.exists());
++    }
++
++    /// A damaged row used to become `NA`, which reads as "target not in sample".
++    #[test]
++    fn a_short_row_is_refused_and_named() {
++        let (r, out) = merge_in("short", &["t1\t100\t80.0\n"], &["A"]);
++        let e = r.unwrap_err().to_string();
++        assert!(e.contains("0.sf") && e.contains("line 2"), "{e}");
++        assert!(!out.exists());
++        // Short only in a column not being merged is still a damaged file.
++        let (r, _) = merge_in("short2", &["t1\t100\t80.0\t10.5\n"], &["A"]);
++        assert!(r.is_err());
++    }
++
++    /// The later row used to overwrite the earlier one silently.
++    #[test]
++    fn a_target_repeated_in_one_sample_is_refused() {
++        let body = "t1\t100\t80.0\t10.5\t5\nt1\t100\t80.0\t99.0\t7\n";
++        let (r, out) = merge_in("rep", &[body], &["A"]);
++        let e = r.unwrap_err().to_string();
++        assert!(e.contains("t1") && e.contains("line 3"), "{e}");
++        assert!(!out.exists());
++    }
+ }
+diff --git a/crates/salmon-index/src/lib.rs b/crates/salmon-index/src/lib.rs
+index 9ef50247f..32c48c6a3 100644
+--- a/crates/salmon-index/src/lib.rs
++++ b/crates/salmon-index/src/lib.rs
+@@ -63,6 +63,9 @@ const INDEX_PREFIX: &str = "index";
+ const INFO_FILE: &str = "info.json";
+ /// Concatenated reference sequences (forward strand), in transcript-id order.
+ const REFSEQ_FILE: &str = "refseq.bin";
++/// Where `REFSEQ_FILE` is staged, so a rebuild that fails on bad input leaves
++/// the existing store untouched.
++const REFSEQ_STAGED_FILE: &str = "refseq.bin.partial";
+ /// Per-reference offsets into `REFSEQ_FILE` (`num_refs + 1` entries).
+ const REFSEQ_OFFSETS_FILE: &str = "refseq_offsets.json";
+ 
+@@ -638,6 +641,8 @@ fn preprocess_fasta(
+         let mut duplicate_clusters: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+         // Tracks whether a decoy has been seen, to enforce the "decoys last" rule.
+         let mut saw_decoy = false;
++        // Names from the decoy list not yet found in the input.
++        let mut unmatched_decoys = decoy_names.clone();
+         // Exact original (pure-ACGT) sequence -> name of the first transcript that
+         // carried it. salmon collapses transcripts whose *processed* sequences match;
+         // because it randomizes non-ACGT bases with a position-advancing RNG, two
+@@ -652,6 +657,7 @@ fn preprocess_fasta(
+         // transcriptome. salmon itself keys on a 64-bit digest; at 128 bits an
+         // accidental collision among even 10^9 sequences has probability ~10^-21.
+         let mut seen: ahash::AHashMap<u128, Vec<u8>> = ahash::AHashMap::new();
++        let mut names_seen: ahash::AHashSet<Vec<u8>> = ahash::AHashSet::new();
+         'records: for path in inputs {
+             let mut reader = open_fasta(path, threads)?;
+             while let Some(rec) = reader.next() {
+@@ -661,6 +667,15 @@ fn preprocess_fasta(
+                 let id = rec.id();
+                 let name = processed_name(id, gencode);
+                 let orig = rec.seq();
++                // Everything downstream identifies a reference by name: two with one
++                // name become rows that gene maps and `quantmerge` cannot tell apart.
++                if !names_seen.insert(name.to_vec()) {
++                    anyhow::bail!(
++                        "reference name {:?} appears more than once in the FASTA input; \
++                         names must be unique",
++                        String::from_utf8_lossy(name)
++                    );
++                }
+                 let is_decoy = decoy_names.contains(name);
+                 // salmon requires every decoy record to appear, contiguously, at the
+                 // end of the input — reject a real transcript after any decoy.
+@@ -670,6 +685,7 @@ fn preprocess_fasta(
+                 // when the only symptom is wrong abundances.
+                 if is_decoy {
+                     saw_decoy = true;
++                    unmatched_decoys.remove(name);
+                 } else if saw_decoy {
+                     anyhow::bail!(
+                         "non-decoy reference {:?} appears after a decoy; decoy records must be \
+@@ -815,6 +831,21 @@ fn preprocess_fasta(
+         let refseq = refseq_writer
+             .join()
+             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
++        // Without this, a list that matches nothing builds "successfully" and
++        // quantifies the genome as if it were a transcript.
++        if !unmatched_decoys.is_empty() {
++            let mut names: Vec<_> = unmatched_decoys
++                .iter()
++                .map(|n| String::from_utf8_lossy(n))
++                .collect();
++            names.sort();
++            anyhow::bail!(
++                "{} name(s) in the decoy list match no reference in the FASTA, e.g. {:?}. \
++                 Names must be the header up to the first space, with no leading `>`.",
++                names.len(),
++                &names[..names.len().min(5)]
++            );
++        }
+         Ok(PreprocessResult {
+             replaced,
+             duplicate_clusters,
+@@ -989,8 +1020,11 @@ fn finish_refseq_store(
+             "index reference order differs from the preprocessed order; \
+              rebuilding {REFSEQ_FILE} from the cleaned FASTA"
+         );
++        let _ = std::fs::remove_file(dir.join(REFSEQ_STAGED_FILE));
+         return write_refseq_store(dir, std::slice::from_ref(&cleaned.to_path_buf()), idx);
+     }
++    std::fs::rename(dir.join(REFSEQ_STAGED_FILE), dir.join(REFSEQ_FILE))
++        .with_context(|| format!("writing {REFSEQ_FILE}"))?;
+     std::fs::write(
+         dir.join(REFSEQ_OFFSETS_FILE),
+         serde_json::to_vec(&staged.offsets)?,
+@@ -1069,15 +1103,22 @@ fn write_duplicate_clusters(dir: &Path, clusters: &[(Vec<u8>, Vec<u8>)]) -> Resu
+ ///
+ /// The whole build in order: validate options, read the decoy list, preprocess
+ /// the FASTA, build the cDBG (stage 1), build the SSHash index (stage 2), locate
+-/// and verify the decoy block, write `info.json` and the reference-sequence
+-/// store, and clean up intermediates.
++/// and verify the decoy block, write the reference-sequence store and `info.json`,
++/// and clean up intermediates.
+ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
+     anyhow::ensure!(!opts.transcripts.is_empty(), "no transcript files provided");
+-    // 63 is the largest k that fits in a 2-bit-per-base 128-bit word; odd is
++    // tiny-dict panics above 31, after the build has written files; odd is
+     // required so no k-mer equals its own reverse complement.
+     anyhow::ensure!(
+-        opts.k >= 1 && opts.k <= 63 && opts.k % 2 == 1,
+-        "k must be odd in [1, 63]"
++        opts.k >= 1 && opts.k <= 31 && opts.k % 2 == 1,
++        "k must be odd in [1, 31], got {}",
++        opts.k
++    );
++    anyhow::ensure!(
++        opts.m < opts.k,
++        "the minimizer length must be less than k, got m={}, k={}",
++        opts.m,
++        opts.k
+     );
+ 
+     std::fs::create_dir_all(&opts.output_dir)
+@@ -1134,7 +1175,8 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
+         // FixFasta behavior); decoys keep their non-ACGT bases (e.g. genome N-runs) so
+         // Cuttlefish splits the graph on them instead of tiling random replacements.
+         let cleaned = intermediate_dir.join("cleaned_refs.fa");
+-        let refseq = RefseqWriter::create(&opts.output_dir.join(REFSEQ_FILE), opts.k)?;
++        let refseq_staged = opts.output_dir.join(REFSEQ_STAGED_FILE);
++        let refseq = RefseqWriter::create(&refseq_staged, opts.k)?;
+         let pre = preprocess_fasta(
+             &opts.transcripts,
+             &cleaned,
+@@ -1147,7 +1189,19 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
+             opts.k,
+             hash_feed,
+         )
+-        .context("preprocessing reference FASTA (non-ACGT replacement, dedup)")?;
++        .context("preprocessing reference FASTA (non-ACGT replacement, dedup)")
++        .inspect_err(|_| {
++            let _ = std::fs::remove_file(&refseq_staged);
++        })?;
++        // The input is good, so the rebuild is committed: from here the directory
++        // holds a mix of old and new files until the final `info.json` is written.
++        // An index with no `info.json` refuses to load, which is the safe failure.
++        match std::fs::remove_file(opts.output_dir.join(INFO_FILE)) {
++            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
++                return Err(e).context("removing the previous info.json");
++            }
++            _ => {}
++        }
+         // Everything below reports what the preprocessing did. Silent transformation
+         // of a user's reference would be indefensible, so each rule that fired is
+         // logged, with the destructive ones (dropped references) as warnings.
+@@ -1360,12 +1414,13 @@ pub fn build(opts: &IndexBuildOptions) -> Result<IndexInfo> {
+             decoy_seq_hash: h.decoy_seq_hash,
+             decoy_name_hash: h.decoy_name_hash,
+         };
+-        write_info(&opts.output_dir, &info)?;
+ 
+         // Persist the (cleaned) reference sequences (piscem does not retain them) so
+         // the selective-alignment step fetches windows matching the indexed k-mers.
+         finish_refseq_store(&opts.output_dir, pre.refseq, &cleaned, &idx)
+             .context("writing reference sequence store")?;
++        // Last, because it is what marks the index complete.
++        write_info(&opts.output_dir, &info)?;
+ 
+         if !opts.keep_intermediate {
+             remove_cdbg_intermediates(&cdbg_prefix);
+@@ -1709,6 +1764,19 @@ impl SalmonIndex {
+                     .with_context(|| format!("reading {REFSEQ_OFFSETS_FILE}"))?,
+             )?
+         };
++        // A store that disagrees with the index would panic at the first slice or,
++        // worse, align reads against the wrong bases.
++        if load_refseq != RefseqLoad::None {
++            let store_len = std::fs::metadata(dir.join(REFSEQ_FILE))
++                .with_context(|| format!("reading {REFSEQ_FILE}"))?
++                .len();
++            anyhow::ensure!(
++                ref_offsets.len() == inner.num_refs() + 1 && ref_offsets.last() == Some(&store_len),
++                "{} is damaged: {REFSEQ_FILE} does not match the index. Rebuild it with \
++                 `salmon index`.",
++                dir.display()
++            );
++        }
+         let mut packed = packed;
+         if !packed.bits.is_empty() {
+             let other = &packed.other;
+@@ -1886,6 +1954,35 @@ mod tests {
+         path
+     }
+ 
++    /// Two records named `t1` gave two `t1` rows in `quant.sf`, which gene maps
++    /// and `quantmerge` cannot tell apart. Refused whether or not the sequences
++    /// match, and however the build treats duplicate sequences.
++    #[test]
++    fn a_repeated_transcript_name_is_refused() {
++        let random = |mut x: u64| -> String {
++            (0..300)
++                .map(|_| {
++                    x = x
++                        .wrapping_mul(6364136223846793005)
++                        .wrapping_add(1442695040888963407);
++                    ['A', 'C', 'G', 'T'][(x >> 33) as usize & 3]
++                })
++                .collect()
++        };
++        let (a, b) = (random(1), random(2));
++        for (keep_duplicates, second) in [(false, &b), (false, &a), (true, &a)] {
++            let tmp = tempfile::tempdir().unwrap();
++            let fasta = tmp.path().join("t.fa");
++            std::fs::write(&fasta, format!(">t1\n{a}\n>t2\n{b}\n>t1 again\n{second}\n")).unwrap();
++            let mut opts = IndexBuildOptions::new(vec![fasta], tmp.path().join("idx"));
++            opts.threads = 1;
++            opts.keep_duplicates = keep_duplicates;
++            let err = build(&opts).map(|_| ()).unwrap_err();
++            let msg = format!("{err:#}");
++            assert!(msg.contains("\"t1\""), "{msg}");
++        }
++    }
++
+     /// The end-to-end contract: a build produces a loadable index whose names,
+     /// lengths and stored sequences all agree, and which leaves no intermediates
+     /// behind.
+@@ -1931,6 +2028,43 @@ mod tests {
+         }
+     }
+ 
++    /// A rebuild that fails on bad input must leave the existing index working.
++    #[test]
++    fn failed_rebuild_keeps_the_existing_index() {
++        let tmp = tempfile::tempdir().unwrap();
++        let fasta = write_fasta(tmp.path());
++        let out = tmp.path().join("idx");
++        let mut opts = IndexBuildOptions::new(vec![fasta], out.clone());
++        opts.threads = 1;
++        build(&opts).expect("index build");
++        let before = std::fs::read(out.join(REFSEQ_FILE)).unwrap();
++
++        opts.transcripts = vec![tmp.path().join("typo.fa")];
++        assert!(build(&opts).is_err());
++
++        assert_eq!(std::fs::read(out.join(REFSEQ_FILE)).unwrap(), before);
++        assert!(!out.join(REFSEQ_STAGED_FILE).exists());
++        assert_eq!(SalmonIndex::load(&out).expect("index load").num_refs(), 3);
++    }
++
++    /// A store cut short (by anything) is refused at load rather than panicking
++    /// at the first read that lands in the missing bases.
++    #[test]
++    fn a_truncated_reference_store_is_refused() {
++        let tmp = tempfile::tempdir().unwrap();
++        let fasta = write_fasta(tmp.path());
++        let out = tmp.path().join("idx");
++        let mut opts = IndexBuildOptions::new(vec![fasta], out.clone());
++        opts.threads = 1;
++        build(&opts).expect("index build");
++        std::fs::write(out.join(REFSEQ_FILE), b"").unwrap();
++        let err = SalmonIndex::load(&out)
++            .err()
++            .expect("must refuse")
++            .to_string();
++        assert!(err.contains("damaged"), "{err}");
++    }
++
+     /// The sshash scratch dir honors an explicit override and the
+     /// `keep_intermediate` flag: with `keep_intermediate` it survives at the
+     /// overridden location; without it, it is pruned. In neither case does a
+@@ -2082,6 +2216,21 @@ mod tests {
+         );
+     }
+ 
++    /// A decoy list that names something absent from the FASTA is a mismatch to
++    /// report, not a reason to index the genome as transcripts.
++    #[test]
++    fn unmatched_decoy_names_are_refused() {
++        let tmp = tempfile::tempdir().unwrap();
++        let fasta = write_fasta(tmp.path());
++        let decoys = tmp.path().join("decoys.txt");
++        std::fs::write(&decoys, ">t3\n").unwrap();
++        let mut opts = IndexBuildOptions::new(vec![fasta], tmp.path().join("idx"));
++        opts.threads = 1;
++        opts.decoys = Some(decoys);
++        let err = format!("{:#}", build(&opts).unwrap_err());
++        assert!(err.contains(">t3"), "{err}");
++    }
++
+     /// An index too old to trust must be refused with a message that says what to
+     /// do, rather than loaded and quietly mis-quantified.
+     #[test]
+diff --git a/crates/salmon-model/src/fld.rs b/crates/salmon-model/src/fld.rs
+index 709b04731..41ba5c297 100644
+--- a/crates/salmon-model/src/fld.rs
++++ b/crates/salmon-model/src/fld.rs
+@@ -694,6 +694,18 @@ impl DiscreteFld {
+         self.fmt_counts[fmt.format_id() as usize].fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    /// Record the strand of one uniquely-mapped single-end read, for `-l A`.
++    /// Such a read has no fragment length, so only the format tally moves.
++    pub fn add_single_end(&self, is_fw: bool) {
++        let strand = if is_fw {
++            ReadStrandedness::S
++        } else {
++            ReadStrandedness::A
++        };
++        let fmt = LibraryFormat::new(ReadType::SingleEnd, ReadOrientation::None, strand);
++        self.fmt_counts[fmt.format_id() as usize].fetch_add(1, Ordering::Relaxed);
++    }
++
+     /// Add a fragment length to its orientation bucket, without the format
+     /// tally; returns the observed format.
+     fn add_len(&self, len: usize, is_fw: bool, mate_fw: bool) -> LibraryFormat {
+@@ -747,7 +759,7 @@ impl DiscreteFld {
+     /// Build the FLD from the majority-orientation bucket (deterministically, in
+     /// fixed length order) and infer the library format from the format tally.
+     /// `fld_mean`/`fld_sd` seed the prior. Returns the cached FLD and the detected
+-    /// format (`None` when no proper pairs were seen).
++    /// format (`None` when no proper pairs or single-end reads were seen).
+     pub fn finish(
+         &self,
+         fld_mean: f64,
+@@ -780,8 +792,22 @@ impl DiscreteFld {
+             .iter()
+             .map(|a| a.load(Ordering::Relaxed))
+             .collect();
+-        let detected = if tally.iter().sum::<u64>() > 0 {
+-            Some(crate::infer_format_from_counts(&tally, ReadType::PairedEnd))
++        let total = tally.iter().sum::<u64>();
++        let detected = if total > 0 {
++            let single_end: u64 = tally
++                .iter()
++                .enumerate()
++                .filter(|(id, _)| {
++                    LibraryFormat::from_format_id(*id as u8).read_type == ReadType::SingleEnd
++                })
++                .map(|(_, &c)| c)
++                .sum();
++            let read_type = if single_end > total - single_end {
++                ReadType::SingleEnd
++            } else {
++                ReadType::PairedEnd
++            };
++            Some(crate::infer_format_from_counts(&tally, read_type))
+         } else {
+             None
+         };
+diff --git a/crates/salmon-quant/src/processor.rs b/crates/salmon-quant/src/processor.rs
+index bc5f6f059..5d39ce11b 100644
+--- a/crates/salmon-quant/src/processor.rs
++++ b/crates/salmon-quant/src/processor.rs
+@@ -1704,7 +1704,6 @@ fn flush_bam(proc: &mut QuantProcessor) -> paraseq::Result<()> {
+ /// otherwise. `score` is recorded for the selective-alignment profile and
+ /// ignored when writing the sketch profile.
+ fn build_rad_record(placements: &[ScoredMapping]) -> salmon_rad::SalmonBulkRecord {
+-    let frag_type = salmon_rad::frag_map_type::fragment_level(placements.iter().map(|m| m.status));
+     let hits = placements
+         .iter()
+         .map(|m| {
+@@ -1740,7 +1739,7 @@ fn build_rad_record(placements: &[ScoredMapping]) -> salmon_rad::SalmonBulkRecor
+             )
+         })
+         .collect();
+-    salmon_rad::SalmonBulkRecord::new(frag_type, hits)
++    salmon_rad::SalmonBulkRecord::from_placements(placements.iter().map(|m| m.status), hits)
+ }
+ 
+ /// Flush this thread's accumulated RAD records as one chunk to the shared writer.
+diff --git a/crates/salmon-rad/src/record.rs b/crates/salmon-rad/src/record.rs
+index 3324cc423..59956c56b 100644
+--- a/crates/salmon-rad/src/record.rs
++++ b/crates/salmon-rad/src/record.rs
+@@ -30,6 +30,7 @@ use libradicl::rad_types::TagSection;
+ use libradicl::record::{MappedRecord, RecordContext};
+ 
+ use crate::{RadHit, RadProfile};
++use salmon_core::MateStatus;
+ 
+ /// Parsing context for [`SalmonBulkRecord`]: which profile (and hence whether a
+ /// per-hit `alignment_score` is present).
+@@ -99,6 +100,31 @@ impl SalmonBulkRecord {
+             refs: std::cell::OnceCell::new(),
+         }
+     }
++
++    /// Build a record from a fragment's placements: their statuses and their
++    /// hits, in the same order.
++    ///
++    /// A record has one `frag_type`, but one fragment can be a left orphan on
++    /// one transcript and a right orphan on another. The strand filters need to
++    /// know which, so a hit of the side `frag_type` does not name sets its
++    /// `mate_fw` bit, which an orphan hit otherwise leaves unset. See
++    /// [`RadHit::for_placement`].
++    pub fn from_placements<I>(statuses: I, mut hits: Vec<RadHit>) -> Self
++    where
++        I: IntoIterator<Item = MateStatus>,
++        I::IntoIter: Clone,
++    {
++        use crate::frag_map_type::{fragment_level, from_mate_status, LEFT_ORPHAN, RIGHT_ORPHAN};
++        let statuses = statuses.into_iter();
++        let frag_type = fragment_level(statuses.clone());
++        if matches!(frag_type, LEFT_ORPHAN | RIGHT_ORPHAN) {
++            for (hit, status) in hits.iter_mut().zip(statuses) {
++                let code = from_mate_status(status);
++                hit.mate_fw = matches!(code, LEFT_ORPHAN | RIGHT_ORPHAN) && code != frag_type;
++            }
++        }
++        Self::new(frag_type, hits)
++    }
+ }
+ 
+ // `MappedRecord` is libradicl's interface for "a thing that can be read from and
+diff --git a/crates/salmon-rad/tests/roundtrip.rs b/crates/salmon-rad/tests/roundtrip.rs
+index 3ff6f94c2..3c0e631b2 100644
+--- a/crates/salmon-rad/tests/roundtrip.rs
++++ b/crates/salmon-rad/tests/roundtrip.rs
+@@ -525,3 +525,22 @@ fn source_programs_round_trip() {
+         other => panic!("mapping_type should be a string, got {other:?}"),
+     }
+ }
++
++/// One fragment's left and right orphans keep their sides in the encoded hit,
++/// and a one-sided record stays byte-identical to what older RADs hold.
++#[test]
++fn mixed_orphan_sides_are_marked_in_the_encoded_hit() {
++    use salmon_core::MateStatus::{PairedEndLeft, PairedEndRight};
++    let hit = |tid| RadHit::for_placement(tid, true, false, 10, false, 0, 100, 5);
++    let hits = || vec![hit(0), hit(1)];
++
++    let mixed = SalmonBulkRecord::from_placements([PairedEndLeft, PairedEndRight], hits());
++    assert_eq!(mixed.frag_type, frag_map_type::RIGHT_ORPHAN);
++    let decoded = |h: &RadHit| RadHit::decode_ori_ref(h.compressed_ori_ref());
++    assert_eq!(decoded(&mixed.hits[0]), (0, true, true));
++    assert_eq!(decoded(&mixed.hits[1]), (1, true, false));
++
++    let one_side = SalmonBulkRecord::from_placements([PairedEndLeft, PairedEndLeft], hits());
++    assert_eq!(one_side.frag_type, frag_map_type::LEFT_ORPHAN);
++    assert_eq!(one_side.hits, hits());
++}

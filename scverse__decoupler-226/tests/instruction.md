@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Updated the rankby_obsm function to optionally accept keys to test as…
+
+## Description
+
+Updated the rankby_obsm function to optionally accept keys to test as an argument.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `545c96aaf4e1`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

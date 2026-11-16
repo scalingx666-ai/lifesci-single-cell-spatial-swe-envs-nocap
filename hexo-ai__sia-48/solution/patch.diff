@@ -1,0 +1,300 @@
+diff --git a/sia/agent_impls/pydantic_ai.py b/sia/agent_impls/pydantic_ai.py
+index d6497bd..f8be452 100644
+--- a/sia/agent_impls/pydantic_ai.py
++++ b/sia/agent_impls/pydantic_ai.py
+@@ -14,6 +14,7 @@
+ import os
+ import subprocess
+ from datetime import datetime
++from json import JSONDecodeError
+ 
+ from sia.agent_impls.base import register
+ from sia.config import Config
+@@ -22,6 +23,47 @@
+ logger = get_logger(__name__)
+ 
+ 
++class MalformedProviderResponseError(RuntimeError):
++    """Raised when a provider returns a successful HTTP response that is not valid JSON."""
++
++
++def _require_provider_api_key(provider):
++    """Return the configured provider API key, failing before SDK fallback env vars can leak in."""
++    api_key = os.getenv(provider.api_key_env)
++    if not api_key:
++        raise RuntimeError(
++            f"Missing API key for provider {provider.name} ({provider.provider_id}). "
++            f"Set ${provider.api_key_env} before using this profile."
++        )
++    return api_key
++
++
++def _is_openrouter_provider(provider) -> bool:
++    base_url = (provider.base_url or "").rstrip("/")
++    return provider.provider_id == "openrouter" or base_url == "https://openrouter.ai/api/v1"
++
++
++def _describe_provider(model_name, provider) -> str:
++    if provider is None:
++        return f"model={model_name!r}, provider=<native PydanticAI resolution>"
++    return (
++        f"model={model_name!r}, provider={provider.name} ({provider.provider_id}), "
++        f"client_kind={provider.client_kind}, base_url={provider.base_url or '<native>'}, "
++        f"api_key_env=${provider.api_key_env}"
++    )
++
++
++def _malformed_response_message(model_name, provider, exc: JSONDecodeError) -> str:
++    return (
++        "Provider returned a 200 response body that the OpenAI SDK could not parse as JSON. "
++        f"{_describe_provider(model_name, provider)}. "
++        f"JSON error: {exc.msg} at line {exc.lineno} column {exc.colno}. "
++        "Check that the selected model supports OpenAI-compatible chat/tool calls on this provider, "
++        "that the configured API key belongs to that provider, and retry; this is usually a provider "
++        "compatibility or transient gateway response issue rather than an agent tool error."
++    )
++
++
+ def _resolve_model(model_name, provider=None):
+     """Resolve the model spec for PydanticAI.
+ 
+@@ -32,12 +74,20 @@ def _resolve_model(model_name, provider=None):
+     if not isinstance(model_name, str) or provider is None:
+         return model_name
+     if provider.client_kind == "openai" and provider.base_url:
++        api_key = _require_provider_api_key(provider)
++
+         from pydantic_ai.models.openai import OpenAIChatModel
++
++        if _is_openrouter_provider(provider):
++            from pydantic_ai.providers.openrouter import OpenRouterProvider
++
++            return OpenAIChatModel(model_name, provider=OpenRouterProvider(api_key=api_key))
++
+         from pydantic_ai.providers.openai import OpenAIProvider
+ 
+         return OpenAIChatModel(
+             model_name,
+-            provider=OpenAIProvider(base_url=provider.base_url, api_key=os.getenv(provider.api_key_env)),
++            provider=OpenAIProvider(base_url=provider.base_url, api_key=api_key),
+         )
+     return model_name
+ 
+@@ -126,6 +176,12 @@ async def run_agent_pydantic_ai(model_name, max_turns, prompt, agent_working_dir
+         logger.debug(f"{'=' * 80}")
+         logger.info(f"Execution complete in {elapsed_time:.2f} seconds")
+ 
++    except JSONDecodeError as e:
++        message = _malformed_response_message(model_name, provider, e)
++        logger.error(f"\n{'!' * 80}")
++        logger.error(f"ERROR: {message}")
++        logger.error(f"{'!' * 80}", exc_info=True)
++        raise MalformedProviderResponseError(message) from e
+     except Exception as e:
+         logger.error(f"\n{'!' * 80}")
+         logger.error(f"ERROR: {e!s}")
+diff --git a/sia/prompts.py b/sia/prompts.py
+index 4ca47a7..a8c1b39 100644
+--- a/sia/prompts.py
++++ b/sia/prompts.py
+@@ -701,6 +701,7 @@ def build_meta_prompt(
+ 6. Do NOT attempt to write to or modify files inside the dataset directory. It is READ-ONLY.
+ 7. The target_agent.py should use only the "{task_model}" model when invoking the language model (do not use any other model).
+ 8. DO NOT hardcode any specific dataset paths in the target_agent.py code. The paths will be provided at runtime via command-line arguments and MUST be passed to {task_model} in the prompt.
++9. Any network/API call made by target_agent.py MUST use a finite request timeout of 60 seconds or less, and retry no more than 2 times before recording an error for that sample. Do not let one stalled model response block the entire run indefinitely.
+ 
+ Example invocation (paths will vary at runtime):
+     python target_agent.py --dataset_dir /path/to/dataset --working_dir /path/to/working
+@@ -730,12 +731,15 @@ def build_target_client_setup(provider: Provider, task_model: str) -> str:
+     client = OpenAI(
+         base_url="{provider.base_url}",
+         api_key=os.environ["{provider.api_key_env}"],
++        timeout=60.0,
+     )
+ 
+ Call client.chat.completions.create(model="{task_model}", ...) using OpenAI-style
+ messages (and OpenAI function calling / response_format where the reference uses
+ structured output). Do NOT compute a dollar cost: per-provider pricing is unknown, so
+ set any cost field to 0 (token counts from the API response are still fine to record).
++Pass a finite timeout to every request if the client method supports it, and cap
++retries at 2 so a stalled provider response cannot hang the whole evaluation.
+ 
+ """
+ 
+diff --git a/sia/tasks/gpqa/reference/reference_target_agent.py b/sia/tasks/gpqa/reference/reference_target_agent.py
+index 73c4729..0461368 100644
+--- a/sia/tasks/gpqa/reference/reference_target_agent.py
++++ b/sia/tasks/gpqa/reference/reference_target_agent.py
+@@ -32,6 +32,8 @@
+ DATASET_LABEL = "diamond_qna"
+ CONCURRENCY = 5
+ MODEL_PRICING = {"input": 0.0, "output": 0.0}
++REQUEST_TIMEOUT = 60.0
++MAX_RETRIES = 2
+ 
+ 
+ # -----------------------------------------------------------------------------
+@@ -52,7 +54,7 @@ def setup_client() -> AsyncOpenAI:
+     api_key = os.getenv("TINKER_API_KEY")
+     if not api_key:
+         raise SystemExit("Set TINKER_API_KEY environment variable.")
+-    return AsyncOpenAI(api_key=api_key, base_url=TINKER_BASE_URL)
++    return AsyncOpenAI(api_key=api_key, base_url=TINKER_BASE_URL, timeout=REQUEST_TIMEOUT)
+ 
+ 
+ # -----------------------------------------------------------------------------
+@@ -125,13 +127,14 @@ async def get_answer_async(
+             model_answer_raw, model_answer = "", ""
+             input_tokens, output_tokens = 0, 0
+ 
+-            for attempt in range(3):
++            for attempt in range(MAX_RETRIES + 1):
+                 try:
+                     response = await client.chat.completions.create(
+                         model=MODEL_NAME,
+                         messages=[{"role": "user", "content": prompt}],
+                         temperature=0.0,
+                         max_tokens=1000,
++                        timeout=REQUEST_TIMEOUT,
+                         # Some models might not support json_object mode, but Tinker usually does
+                         response_format={"type": "json_object"}
+                     )
+@@ -148,7 +151,7 @@ async def get_answer_async(
+                     output_tokens = usage.completion_tokens
+                     break
+                 except Exception as e:
+-                    if attempt == 2:
++                    if attempt == MAX_RETRIES:
+                         raise
+                     await asyncio.sleep(2**attempt)
+             
+diff --git a/tests/golden/meta_prompt.txt b/tests/golden/meta_prompt.txt
+index fe9bfc1..3f75160 100644
+--- a/tests/golden/meta_prompt.txt
++++ b/tests/golden/meta_prompt.txt
+@@ -68,6 +68,7 @@ CRITICAL RULES - FOLLOW EXACTLY:
+ 6. Do NOT attempt to write to or modify files inside the dataset directory. It is READ-ONLY.
+ 7. The target_agent.py should use only the "claude-haiku-4-5-20251001" model when invoking the language model (do not use any other model).
+ 8. DO NOT hardcode any specific dataset paths in the target_agent.py code. The paths will be provided at runtime via command-line arguments and MUST be passed to claude-haiku-4-5-20251001 in the prompt.
++9. Any network/API call made by target_agent.py MUST use a finite request timeout of 60 seconds or less, and retry no more than 2 times before recording an error for that sample. Do not let one stalled model response block the entire run indefinitely.
+ 
+ Example invocation (paths will vary at runtime):
+     python target_agent.py --dataset_dir /path/to/dataset --working_dir /path/to/working
+diff --git a/tests/golden/meta_prompt_openai.txt b/tests/golden/meta_prompt_openai.txt
+index 9b1a77c..cbaa3db 100644
+--- a/tests/golden/meta_prompt_openai.txt
++++ b/tests/golden/meta_prompt_openai.txt
+@@ -11,12 +11,15 @@ refactor your target_agent.py to use the `openai` SDK configured for this provid
+     client = OpenAI(
+         base_url="https://api.tokenfactory.us-central1.nebius.com/v1/",
+         api_key=os.environ["NEBIUS_API_KEY"],
++        timeout=60.0,
+     )
+ 
+ Call client.chat.completions.create(model="moonshotai/Kimi-K2.6", ...) using OpenAI-style
+ messages (and OpenAI function calling / response_format where the reference uses
+ structured output). Do NOT compute a dollar cost: per-provider pricing is unknown, so
+ set any cost field to 0 (token counts from the API response are still fine to record).
++Pass a finite timeout to every request if the client method supports it, and cap
++retries at 2 so a stalled provider response cannot hang the whole evaluation.
+ 
+ You are a meta-agent. Your task is to create a target agent which can execute a task. Go ahead and create a target_agent.py for the target agent, which in turn can solve the given task.
+ 
+@@ -88,6 +91,7 @@ CRITICAL RULES - FOLLOW EXACTLY:
+ 6. Do NOT attempt to write to or modify files inside the dataset directory. It is READ-ONLY.
+ 7. The target_agent.py should use only the "moonshotai/Kimi-K2.6" model when invoking the language model (do not use any other model).
+ 8. DO NOT hardcode any specific dataset paths in the target_agent.py code. The paths will be provided at runtime via command-line arguments and MUST be passed to moonshotai/Kimi-K2.6 in the prompt.
++9. Any network/API call made by target_agent.py MUST use a finite request timeout of 60 seconds or less, and retry no more than 2 times before recording an error for that sample. Do not let one stalled model response block the entire run indefinitely.
+ 
+ Example invocation (paths will vary at runtime):
+     python target_agent.py --dataset_dir /path/to/dataset --working_dir /path/to/working
+diff --git a/tests/test_agent_impls.py b/tests/test_agent_impls.py
+index a6252c2..bd42dd2 100644
+--- a/tests/test_agent_impls.py
++++ b/tests/test_agent_impls.py
+@@ -1,6 +1,7 @@
+ """Tests for the agent-impl registry and the PydanticAI agent impl."""
+ 
+ import asyncio
++import json
+ 
+ import pytest
+ 
+@@ -57,6 +58,77 @@ def test_pydantic_ai_model_passthrough():
+     assert _resolve_model("openai:gpt-4o", None) == "openai:gpt-4o"
+ 
+ 
++def test_pydantic_ai_openrouter_uses_native_provider(monkeypatch):
++    pytest.importorskip("pydantic_ai")
++    from sia.agent_impls.pydantic_ai import _resolve_model
++    from sia.providers import Provider
++
++    monkeypatch.setenv("OPENROUTER_TEST_KEY", "test-key")
++    provider = Provider(
++        provider_id="openrouter",
++        name="OpenRouter",
++        client_kind="openai",
++        base_url="https://openrouter.ai/api/v1",
++        api_key_env="OPENROUTER_TEST_KEY",
++    )
++
++    model = _resolve_model("z-ai/glm-5.2", provider)
++    assert model.system == "openrouter"
++    assert model.base_url.rstrip("/") == "https://openrouter.ai/api/v1"
++
++
++def test_pydantic_ai_openai_compatible_provider_requires_configured_api_key(monkeypatch):
++    from sia.agent_impls.pydantic_ai import _resolve_model
++    from sia.providers import Provider
++
++    monkeypatch.delenv("SIA_MISSING_TEST_KEY", raising=False)
++    provider = Provider(
++        provider_id="custom",
++        name="Custom",
++        client_kind="openai",
++        base_url="https://example.test/v1",
++        api_key_env="SIA_MISSING_TEST_KEY",
++    )
++
++    with pytest.raises(RuntimeError, match="SIA_MISSING_TEST_KEY"):
++        _resolve_model("custom/model", provider)
++
++
++def test_pydantic_ai_impl_wraps_malformed_provider_json(tmp_path, monkeypatch):
++    pytest.importorskip("pydantic_ai")
++    import pydantic_ai
++
++    from sia.agent_impls.pydantic_ai import MalformedProviderResponseError, run_agent_pydantic_ai
++    from sia.providers import Provider
++
++    class BoomAgent:
++        def __init__(self, model, tools):
++            self.model = model
++            self.tools = tools
++
++        async def run(self, prompt, usage_limits):
++            raise json.JSONDecodeError("Expecting value", "not-json", 0)
++
++    monkeypatch.setattr(pydantic_ai, "Agent", BoomAgent)
++    monkeypatch.setenv("OPENROUTER_TEST_KEY", "test-key")
++    provider = Provider(
++        provider_id="openrouter",
++        name="OpenRouter",
++        client_kind="openai",
++        base_url="https://openrouter.ai/api/v1",
++        api_key_env="OPENROUTER_TEST_KEY",
++    )
++
++    with pytest.raises(MalformedProviderResponseError) as exc_info:
++        asyncio.run(run_agent_pydantic_ai("z-ai/glm-5.2", "5", "prompt", str(tmp_path), provider=provider))
++
++    message = str(exc_info.value)
++    assert "Provider returned a 200 response body" in message
++    assert "z-ai/glm-5.2" in message
++    assert "OpenRouter" in message
++    assert "$OPENROUTER_TEST_KEY" in message
++
++
+ def test_openhands_model_gets_openai_prefix_for_compatible_provider():
+     """An OpenAI-compatible provider (base_url) gets an explicit litellm 'openai/' prefix."""
+     from sia.agent_impls.openhands import _resolve_model

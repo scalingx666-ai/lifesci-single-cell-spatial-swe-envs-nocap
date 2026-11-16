@@ -1,0 +1,359 @@
+diff --git a/docs/release-notes/0.15.1.md b/docs/release-notes/0.15.1.md
+index 9626682b7..bc27a00ee 100644
+--- a/docs/release-notes/0.15.1.md
++++ b/docs/release-notes/0.15.1.md
+@@ -8,6 +8,7 @@
+ ```{rubric} Bug fixes
+ ```
+ * Fixes `tl.rank_genes_groups` returning NaN/zero `logfoldchanges`/`pvals` with `groups=[subset]` and `reference='rest'` {pr}`651` {smaller}`S Dicks`
++* Fixes `pp.bbknn` connectivities diverging from upstream `bbknn`: per-batch neighbours are now sorted by distance before `fuzzy_simplicial_set` (so weights no longer collapse near 1.0), and the default `trim` matches upstream (`10 * neighbors_within_batch * n_batches`). Trimming kernel no longer crashes for large `trim`, and a new block-cooperative sort kernel is auto-dispatched for large `trim` for substantial speedups {pr}`659` {smaller}`S Dicks`
+ * Fixes float64 precision loss in `pp.normalize_pearson_residuals` on CSR/CSC input {pr}`658` {smaller}`A Mikaeili & S Dicks`
+ 
+ ```{rubric} Misc
+diff --git a/src/rapids_singlecell/_cuda/bbknn/bbknn.cu b/src/rapids_singlecell/_cuda/bbknn/bbknn.cu
+index fc059d9d8..4d4b71482 100644
+--- a/src/rapids_singlecell/_cuda/bbknn/bbknn.cu
++++ b/src/rapids_singlecell/_cuda/bbknn/bbknn.cu
+@@ -6,20 +6,54 @@
+ using namespace nb::literals;
+ 
+ constexpr int BLOCK_SIZE = 64;
++// Block-cooperative sort kernel: BLOCK_THREADS * ITEMS_PER_THREAD = 2048.
++// Rows larger than this must use the per-thread kernel (kernel 1).
++constexpr int SORT_BLOCK_THREADS = 128;
++constexpr int SORT_ITEMS_PER_THREAD = 16;
++constexpr int SORT_TILE_SIZE = SORT_BLOCK_THREADS * SORT_ITEMS_PER_THREAD;
+ 
+ static inline void launch_find_top_k_per_row(const float* data,
+                                              const int* indptr, int n_rows,
+                                              int trim, float* vals,
+                                              cudaStream_t stream) {
+-    dim3 block(BLOCK_SIZE);
+-    dim3 grid((n_rows + BLOCK_SIZE - 1) / BLOCK_SIZE);
+-    size_t shared_mem_size = static_cast<size_t>(BLOCK_SIZE) *
+-                             static_cast<size_t>(trim) * sizeof(float);
++    // Each thread keeps its row's top-`trim` values in shared memory, so the
++    // per-block shared-mem request is BLOCK_SIZE * trim * sizeof(float).
++    // The default per-block shared-mem cap is ~48 KB; halve the block size
++    // until the request fits so the launch succeeds for any reasonable trim.
++    constexpr size_t SHARED_MEM_BUDGET = 48 * 1024;
++    const size_t per_thread_bytes = static_cast<size_t>(trim) * sizeof(float);
++    int block_size = BLOCK_SIZE;
++    while (block_size > 1 &&
++           static_cast<size_t>(block_size) * per_thread_bytes >
++               SHARED_MEM_BUDGET) {
++        block_size /= 2;
++    }
++    if (static_cast<size_t>(block_size) * per_thread_bytes >
++        SHARED_MEM_BUDGET) {
++        throw std::runtime_error(
++            "find_top_k_per_row: trim too large for shared-memory budget; "
++            "use find_top_k_per_row_sorted instead");
++    }
++    dim3 block(block_size);
++    dim3 grid((n_rows + block_size - 1) / block_size);
++    size_t shared_mem_size = static_cast<size_t>(block_size) * per_thread_bytes;
+     find_top_k_per_row_kernel<<<grid, block, shared_mem_size, stream>>>(
+         data, indptr, n_rows, trim, vals);
+     CUDA_CHECK_LAST_ERROR(find_top_k_per_row_kernel);
+ }
+ 
++static inline void launch_find_top_k_per_row_sorted(const float* data,
++                                                    const int* indptr,
++                                                    int n_rows, int trim,
++                                                    float* vals,
++                                                    cudaStream_t stream) {
++    dim3 block(SORT_BLOCK_THREADS);
++    dim3 grid(n_rows);
++    find_top_k_per_row_sorted_kernel<SORT_BLOCK_THREADS, SORT_ITEMS_PER_THREAD>
++        <<<grid, block, 0, stream>>>(data, indptr, n_rows, trim, vals);
++    CUDA_CHECK_LAST_ERROR(find_top_k_per_row_sorted_kernel);
++}
++
+ static inline void launch_cut_smaller(int* indptr, int* index, float* data,
+                                       float* vals, int n_rows,
+                                       cudaStream_t stream) {
+@@ -43,6 +77,20 @@ void register_bindings(nb::module_& m) {
+         "data"_a, "indptr"_a, nb::kw_only(), "n_rows"_a, "trim"_a, "vals"_a,
+         "stream"_a = 0);
+ 
++    m.def(
++        "find_top_k_per_row_sorted",
++        [](gpu_array_c<const float, Device> data,
++           gpu_array_c<const int, Device> indptr, int n_rows, int trim,
++           gpu_array_c<float, Device> vals, std::uintptr_t stream) {
++            launch_find_top_k_per_row_sorted(data.data(), indptr.data(), n_rows,
++                                             trim, vals.data(),
++                                             (cudaStream_t)stream);
++        },
++        "data"_a, "indptr"_a, nb::kw_only(), "n_rows"_a, "trim"_a, "vals"_a,
++        "stream"_a = 0);
++
++    m.def("sort_tile_size", []() { return SORT_TILE_SIZE; });
++
+     m.def(
+         "cut_smaller",
+         [](gpu_array_c<int, Device> indptr, gpu_array_c<int, Device> index,
+diff --git a/src/rapids_singlecell/_cuda/bbknn/kernels_bbknn.cuh b/src/rapids_singlecell/_cuda/bbknn/kernels_bbknn.cuh
+index 698d31a2f..03ba1ace6 100644
+--- a/src/rapids_singlecell/_cuda/bbknn/kernels_bbknn.cuh
++++ b/src/rapids_singlecell/_cuda/bbknn/kernels_bbknn.cuh
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
++#include <cub/block/block_radix_sort.cuh>
+ #include <cuda_runtime.h>
++#include <math_constants.h>
+ 
+ __global__ void find_top_k_per_row_kernel(const float* __restrict__ data,
+                                           const int* __restrict__ indptr,
+@@ -49,6 +51,59 @@ __global__ void find_top_k_per_row_kernel(const float* __restrict__ data,
+     vals[row] = top_k[min_index];
+ }
+ 
++// Block-cooperative variant: one CUDA block per row, sorts the row with
++// BlockRadixSort, returns the `trim`-th largest as the cut value. Shared
++// memory is the CUB sort temp storage only, independent of `trim`, so it
++// scales to large `trim` values where the per-thread top-k kernel runs out
++// of shared memory. Requires every row to fit in BLOCK_THREADS *
++// ITEMS_PER_THREAD.
++template <int BLOCK_THREADS, int ITEMS_PER_THREAD>
++__global__ void find_top_k_per_row_sorted_kernel(const float* __restrict__ data,
++                                                 const int* __restrict__ indptr,
++                                                 const int n_rows,
++                                                 const int trim,
++                                                 float* __restrict__ vals) {
++    int row = blockIdx.x;
++    if (row >= n_rows) {
++        return;
++    }
++
++    int start = indptr[row];
++    int end = indptr[row + 1];
++    int length = end - start;
++
++    if (length <= trim) {
++        if (threadIdx.x == 0) {
++            vals[row] = 0.0f;  // insufficient elements
++        }
++        return;
++    }
++
++    using BlockRadixSort =
++        cub::BlockRadixSort<float, BLOCK_THREADS, ITEMS_PER_THREAD>;
++    __shared__ typename BlockRadixSort::TempStorage temp_storage;
++
++    float thread_keys[ITEMS_PER_THREAD];
++#pragma unroll
++    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
++        int idx = threadIdx.x * ITEMS_PER_THREAD + i;
++        // Pad out-of-range with -inf so they sort to the bottom of a
++        // descending sort and never appear among the trim largest.
++        thread_keys[i] = (idx < length) ? data[start + idx] : -CUDART_INF_F;
++    }
++
++    BlockRadixSort(temp_storage).SortDescending(thread_keys);
++
++    // After SortDescending with blocked arrangement, sorted index i lives at
++    // thread (i / ITEMS_PER_THREAD), local slot (i % ITEMS_PER_THREAD).
++    int target_idx = trim - 1;
++    int target_thread = target_idx / ITEMS_PER_THREAD;
++    int target_item = target_idx % ITEMS_PER_THREAD;
++    if (threadIdx.x == target_thread) {
++        vals[row] = thread_keys[target_item];
++    }
++}
++
+ __global__ void cut_smaller_kernel(const int* __restrict__ indptr,
+                                    const int* __restrict__ index,
+                                    float* __restrict__ data,
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/__init__.py b/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
+index af4458c45..00d74bbfd 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
+@@ -407,8 +407,16 @@ def bbknn(
+         knn_indices[:, col_range] = ind_to[sub_ind]
+         knn_dist[:, col_range] = sub_dist
+ 
++    # Sort each row so neighbors are ordered closest-first across all batches.
++    # fuzzy_simplicial_set uses the first non-zero distance per row as the
++    # local-connectivity rho; unsorted input collapses sigma and weights.
++    order = cp.argsort(knn_dist, axis=1)
++    row_idx = cp.arange(n_obs)[:, None]
++    knn_dist = knn_dist[row_idx, order]
++    knn_indices = knn_indices[row_idx, order]
++
+     if trim is None:
+-        trim = 10 * neighbors_within_batch
++        trim = 10 * total_neighbors
+ 
+     params = dict(
+         n_neighbors=total_neighbors,
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py b/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py
+index c8f3878c9..e180a64b7 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_helper/__init__.py
+@@ -130,30 +130,63 @@ def _fix_self_distances(knn_dist: cp.ndarray, metric: _Metrics) -> cp.ndarray:
+     return knn_dist
+ 
+ 
+-def _trimming(cnts: cp_sparse.csr_matrix, trim: int) -> cp_sparse.csr_matrix:
++# Empirically, the block-cooperative CUB sort kernel is faster for trim >= 100;
++# below this threshold the per-thread top-k kernel has less launch overhead.
++_TRIM_SORT_THRESHOLD = 100
++
++
++def _trimming(
++    cnts: cp_sparse.csr_matrix,
++    trim: int,
++    *,
++    kernel: str = "auto",
++) -> cp_sparse.csr_matrix:
+     from rapids_singlecell._cuda._bbknn_cuda import (
+         cut_smaller,
+         find_top_k_per_row,
++        find_top_k_per_row_sorted,
++        sort_tile_size,
+     )
+ 
+     n_rows = cnts.shape[0]
+     vals_gpu = cp.zeros(n_rows, dtype=cp.float32)
++    stream = cp.cuda.get_current_stream().ptr
++
++    if kernel == "auto":
++        if trim >= _TRIM_SORT_THRESHOLD:
++            max_row_nnz = int(cp.diff(cnts.indptr).max().get())
++            kernel = "sorted" if max_row_nnz <= sort_tile_size() else "thread"
++        else:
++            kernel = "thread"
++
++    if kernel == "sorted":
++        find_top_k_per_row_sorted(
++            cnts.data,
++            cnts.indptr,
++            n_rows=n_rows,
++            trim=trim,
++            vals=vals_gpu,
++            stream=stream,
++        )
++    elif kernel == "thread":
++        find_top_k_per_row(
++            cnts.data,
++            cnts.indptr,
++            n_rows=n_rows,
++            trim=trim,
++            vals=vals_gpu,
++            stream=stream,
++        )
++    else:
++        raise ValueError(f"Unknown trim kernel: {kernel!r}")
+ 
+-    find_top_k_per_row(
+-        cnts.data,
+-        cnts.indptr,
+-        n_rows=cnts.shape[0],
+-        trim=trim,
+-        vals=vals_gpu,
+-        stream=cp.cuda.get_current_stream().ptr,
+-    )
+     cut_smaller(
+         cnts.indptr,
+         cnts.indices,
+         cnts.data,
+         vals=vals_gpu,
+-        n_rows=cnts.shape[0],
+-        stream=cp.cuda.get_current_stream().ptr,
++        n_rows=n_rows,
++        stream=stream,
+     )
+     cnts.eliminate_zeros()
+     return cnts
+diff --git a/tests/test_neighbors.py b/tests/test_neighbors.py
+index 172e106aa..41c061ba7 100644
+--- a/tests/test_neighbors.py
++++ b/tests/test_neighbors.py
+@@ -144,13 +144,81 @@ def test_bbknn():
+     assert counter / b_stop > 0.9
+ 
+ 
+-def test_trimming():
++def test_bbknn_distances_sorted_per_row():
++    # fuzzy_simplicial_set uses the first non-zero distance per row as rho;
++    # unsorted per-batch columns break sigma estimation and collapse weights.
++    adata = pbmc68k_reduced()
++    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
++    dists = adata.obsp["distances"]
++    for start, stop in itertools.pairwise(dists.indptr):
++        row = dists.data[start:stop]
++        assert np.all(np.diff(row) >= 0), "bbknn distance rows must be sorted ascending"
++
++
++def test_bbknn_connectivities_not_collapsed():
++    # Regression: before the per-row sort fix, mean connectivity on this
++    # dataset was ~0.85 with most weights pinned near 1.0. With sorted input
++    # the distribution spreads out properly.
++    adata = pbmc68k_reduced()
++    bbknn(adata, n_pcs=15, batch_key="phase", algorithm="brute")
++    weights = adata.obsp["connectivities"].data
++    # Regression bounds chosen vs pre-fix behaviour (mean ~0.60, >0.99 frac ~0.28
++    # on this dataset). Anything close to those values indicates sigma estimation
++    # has broken again. Healthy distribution on the same dataset is mean ~0.50.
++    assert weights.mean() < 0.7
++    assert (weights > 0.99).mean() < 0.5
++
++
++def test_bbknn_trim_default_matches_upstream():
++    # bbknn upstream defaults trim = 10 * total_neighbors
++    # (= 10 * neighbors_within_batch * n_batches).
++    adata = pbmc68k_reduced()
++    n_batches = adata.obs["phase"].nunique()
++    neighbors_within_batch = 3
++    bbknn(
++        adata,
++        n_pcs=15,
++        batch_key="phase",
++        algorithm="brute",
++        neighbors_within_batch=neighbors_within_batch,
++    )
++    assert (
++        adata.uns["neighbors"]["params"]["trim"]
++        == 10 * neighbors_within_batch * n_batches
++    )
++
++
++@pytest.mark.parametrize("trim", [5, 240])
++def test_trimming(trim):
++    # trim=5: typical case.
++    # trim=240: exercises the kernel's adaptive block-size path. A static
++    # BLOCK_SIZE=64 would request 60 KB of dynamic shared memory and fail to
++    # launch (default per-block cap is ~48 KB).
++    adata = pbmc68k_reduced()
++    cnts_gpu = X_to_GPU(adata.obsp["connectivities"]).astype(np.float32)
++    cnts_cpu = adata.obsp["connectivities"].astype(np.float32)
++
++    cnts_cpu = trimming_cpu(cnts_cpu, trim)
++    cnts_gpu = trimming_gpu(cnts_gpu, trim)
++
++    cp.testing.assert_array_equal(cnts_cpu.data, cnts_gpu.data)
++    cp.testing.assert_array_equal(cnts_cpu.indices, cnts_gpu.indices)
++    cp.testing.assert_array_equal(cnts_cpu.indptr, cnts_gpu.indptr)
++
++
++@pytest.mark.parametrize("trim", [5, 50, 240])
++@pytest.mark.parametrize("kernel", ["thread", "sorted"])
++def test_trimming_kernels_agree(trim, kernel):
++    # Both trim kernels must produce identical results to the CPU reference
++    # (bbknn.matrix.trimming) on the same input. The "thread" kernel keeps a
++    # per-thread top-k in shared memory; the "sorted" kernel does one block
++    # per row with BlockRadixSort.
+     adata = pbmc68k_reduced()
+     cnts_gpu = X_to_GPU(adata.obsp["connectivities"]).astype(np.float32)
+     cnts_cpu = adata.obsp["connectivities"].astype(np.float32)
+ 
+-    cnts_cpu = trimming_cpu(cnts_cpu, 5)
+-    cnts_gpu = trimming_gpu(cnts_gpu, 5)
++    cnts_cpu = trimming_cpu(cnts_cpu, trim)
++    cnts_gpu = trimming_gpu(cnts_gpu, trim, kernel=kernel)
+ 
+     cp.testing.assert_array_equal(cnts_cpu.data, cnts_gpu.data)
+     cp.testing.assert_array_equal(cnts_cpu.indices, cnts_gpu.indices)

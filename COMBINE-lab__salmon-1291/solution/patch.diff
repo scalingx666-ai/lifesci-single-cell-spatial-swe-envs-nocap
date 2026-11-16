@@ -1,0 +1,704 @@
+diff --git a/crates/salmon-infer/src/lib.rs b/crates/salmon-infer/src/lib.rs
+index 51d8fe87..d92abeed 100644
+--- a/crates/salmon-infer/src/lib.rs
++++ b/crates/salmon-infer/src/lib.rs
+@@ -388,24 +388,6 @@ pub fn optimize(
+     optimize_packed_with_init(&packed, opts, true, InitAlphas::NONE, eff_lens)
+ }
+ 
+-/// As [`optimize`], but warm-starts the abundances from `init_alphas` (per
+-/// transcript id) when its length matches `num_txps` — used to seed the EM with
+-/// salmon's count-blended initialization (online estimates blended with uniform),
+-/// which reduces the iteration count to convergence.
+-///
+-/// A warm start does not change where the EM lands, only how quickly it gets
+-/// there: starting near the answer skips the iterations spent travelling.
+-pub fn optimize_with_init(
+-    eq: &CollapsedEqClasses,
+-    num_txps: usize,
+-    opts: &EmOptions,
+-    init_alphas: InitAlphas<'_>,
+-    eff_lens: EffLens<'_>,
+-) -> EmResult {
+-    let packed = PackedEqClasses::from_collapsed(eq, num_txps);
+-    optimize_packed_with_init(&packed, opts, true, init_alphas, eff_lens)
+-}
+-
+ /// Core convergence loop over a [`PackedEqClasses`]. `parallel` selects the
+ /// rayon M-step (for the single main run) vs. the sequential one (used by
+ /// bootstrap, which parallelizes across replicates instead). The per-class
+@@ -593,97 +575,65 @@ pub(crate) fn run_em_counts(
+     // `with_ll` additionally returns the data term of the objective at `src`
+     // (only DAAREM asks for it); the kernels are monomorphized on it, so the
+     // plain and SQUAREM paths run exactly the code they always did.
+-    //
+-    // `rel_diff_cutoff` asks for the convergence criterion between `src` and
+-    // `dst` as well, returned second (`-inf` when not asked for). The parallel
+-    // kernels evaluate it on each output as they write it; the sequential ones
+-    // in a pass afterwards.
+-    let mut step =
+-        |src: &[f64], dst: &mut [f64], with_ll: bool, rel_diff_cutoff: Option<f64>| -> (f64, f64) {
+-            let check = rel_diff_cutoff.map(|cutoff| packed::RelDiffCheck {
+-                alpha_in: src,
+-                cutoff,
+-            });
+-            let seq_check = |dst: &[f64]| {
+-                rel_diff_cutoff.map_or(f64::NEG_INFINITY, |c| max_rel_diff(src, dst, c))
++    let mut step = |src: &[f64], dst: &mut [f64], with_ll: bool| -> f64 {
++        macro_rules! dispatch {
++            ($ll:literal) => {
++                match (opts.use_vbem, parallel) {
++                    (false, true) => packed::em_step_par::<$ll>(
++                        p,
++                        counts,
++                        src,
++                        dst,
++                        &mut shards,
++                        plan.as_ref().expect("parallel implies a shard plan"),
++                    ),
++                    (false, false) => packed::em_step_seq::<$ll>(p, counts, src, dst, &mut scratch),
++                    (true, true) => packed::vbem_step_par::<$ll>(
++                        p,
++                        counts,
++                        &prior_alphas,
++                        src,
++                        dst,
++                        expectations
++                            .as_mut()
++                            .expect("parallel VBEM has expectations"),
++                        &mut shards,
++                        plan.as_ref().expect("parallel implies a shard plan"),
++                    ),
++                    (true, false) => packed::vbem_step_seq::<$ll>(
++                        p,
++                        counts,
++                        &prior_alphas,
++                        src,
++                        dst,
++                        &mut exp_theta,
++                        &mut scratch,
++                    ),
++                }
+             };
+-            macro_rules! dispatch {
+-                ($ll:literal) => {
+-                    match (opts.use_vbem, parallel) {
+-                        (false, true) => packed::em_step_par::<$ll>(
+-                            p,
+-                            counts,
+-                            src,
+-                            dst,
+-                            &mut shards,
+-                            plan.as_ref().expect("parallel implies a shard plan"),
+-                            check,
+-                        ),
+-                        (false, false) => {
+-                            let ll = packed::em_step_seq::<$ll>(p, counts, src, dst, &mut scratch);
+-                            (ll, seq_check(dst))
+-                        }
+-                        (true, true) => packed::vbem_step_par::<$ll>(
+-                            p,
+-                            counts,
+-                            &prior_alphas,
+-                            src,
+-                            dst,
+-                            expectations
+-                                .as_mut()
+-                                .expect("parallel VBEM has expectations"),
+-                            &mut shards,
+-                            plan.as_ref().expect("parallel implies a shard plan"),
+-                            check,
+-                        ),
+-                        (true, false) => {
+-                            let ll = packed::vbem_step_seq::<$ll>(
+-                                p,
+-                                counts,
+-                                &prior_alphas,
+-                                src,
+-                                dst,
+-                                &mut exp_theta,
+-                                &mut scratch,
+-                            );
+-                            (ll, seq_check(dst))
+-                        }
+-                    }
+-                };
+-            }
+-            if with_ll {
+-                dispatch!(true)
+-            } else {
+-                dispatch!(false)
+-            }
+-        };
++        }
++        if with_ll {
++            dispatch!(true)
++        } else {
++            dispatch!(false)
++        }
++    };
+ 
+     let mut converged = false;
+     let mut it = 0u32;
+     match opts.accel {
+         EmAccel::None => {
+-            // The textbook loop: one M-step, check whether anything moved, repeat.
+-            // Once the check is due it rides along with the M-step.
+-            while it < opts.max_iter {
+-                let check = (it + 1 >= min_iter).then_some(opts.alpha_check_cutoff);
+-                let (_, d) = step(&alphas, &mut alphas_prime, false, check);
+-                it += 1;
+-                if it >= min_iter {
+-                    // Swap rather than copy: the buffers just exchange roles, so
+-                    // no data movement is needed.
+-                    std::mem::swap(&mut alphas, &mut alphas_prime);
+-                    if d < opts.rel_diff_tol {
+-                        converged = true;
+-                        break;
+-                    }
+-                } else {
+-                    std::mem::swap(&mut alphas, &mut alphas_prime);
+-                }
++            // Reached only with nothing for the component engine above to do: no
++            // iterations allowed, which leaves the start as it is, or no classes,
++            // where an M-step has no mass to give anyone.
++            if opts.max_iter > 0 {
++                alphas.fill(0.0);
++                converged = true;
+             }
+         }
+         EmAccel::Squarem => {
+             let mut f = |src: &[f64], dst: &mut [f64]| {
+-                step(src, dst, false, None);
++                step(src, dst, false);
+             };
+             converged = squarem_loop(
+                 &mut f,
+@@ -703,7 +653,7 @@ pub(crate) fn run_em_counts(
+             // data term comes out of the kernel, the rest is O(num_txps).
+             let n_total = counts.iter().sum::<u64>() as f64;
+             let mut f = |src: &[f64], dst: &mut [f64]| -> f64 {
+-                let (data, _) = step(src, dst, true, None);
++                let data = step(src, dst, true);
+                 if opts.use_vbem {
+                     data + vbem_objective_prior_term(src, &prior_alphas, parallel)
+                 } else {
+@@ -1443,4 +1393,31 @@ mod tests {
+         let res = optimize(&eq, 2, &EmOptions::default(), EffLens::NONE);
+         assert!(res.alphas[1] > res.alphas[0], "{:?}", res.alphas);
+     }
++
++    /// The two cases with no components to iterate: no classes, and no iterations
++    /// allowed. The component engine is the only M-step loop an unaccelerated run
++    /// has, so these are answered without one.
++    #[test]
++    fn empty_input_and_zero_iterations_need_no_m_step() {
++        let empty = PackedEqClasses::from_collapsed(&CollapsedEqClasses::default(), 3);
++        let real =
++            PackedEqClasses::from_collapsed(&build(&[(vec![0, 1], 10), (vec![1, 2], 20)], 3), 3);
++        for use_vbem in [false, true] {
++            let opts = |max_iter| EmOptions {
++                use_vbem,
++                max_iter,
++                ..EmOptions::default()
++            };
++            let r = optimize_packed(&empty, &opts(1000), false);
++            assert_eq!(r.alphas, [0.0; 3]);
++            assert!(r.converged);
++            let r = optimize_packed(&empty, &opts(0), false);
++            assert_eq!((r.alphas, r.iters, r.converged), (vec![0.0; 3], 0, false));
++            let r = optimize_packed(&real, &opts(0), false);
++            assert_eq!(
++                (r.alphas, r.iters, r.converged),
++                (vec![5.0, 15.0, 10.0], 0, false)
++            );
++        }
++    }
+ }
+diff --git a/crates/salmon-infer/src/packed.rs b/crates/salmon-infer/src/packed.rs
+index 6cd60bec..375e742f 100644
+--- a/crates/salmon-infer/src/packed.rs
++++ b/crates/salmon-infer/src/packed.rs
+@@ -700,61 +700,13 @@ impl<'a> DisjointOut<'a> {
+     }
+ }
+ 
+-/// The convergence check an M-step can evaluate on its output as it writes it:
+-/// the input it is measured against, and [`crate::max_rel_diff`]'s cutoff.
+-#[derive(Clone, Copy)]
+-pub(crate) struct RelDiffCheck<'a> {
+-    pub(crate) alpha_in: &'a [f64],
+-    pub(crate) cutoff: f64,
+-}
+-
+-impl RelDiffCheck<'_> {
+-    /// Fold transcript `tid`'s output `a_out` into the running maximum `max_d`,
+-    /// exactly as [`crate::max_rel_diff`] does.
+-    #[inline]
+-    fn fold(&self, max_d: f64, tid: usize, a_out: f64) -> f64 {
+-        let a_in = self.alpha_in[tid];
+-        if a_in > self.cutoff && a_out > 0.0 {
+-            let d = (a_out - a_in).abs() / a_out;
+-            if d > max_d {
+-                return d;
+-            }
+-        }
+-        max_d
+-    }
+-}
+-
+-/// The larger of two partial maxima of the convergence criterion. Neither is
+-/// ever NaN (the criterion never admits one), so maxima combine in any order.
+-#[inline]
+-fn max_of(a: f64, b: f64) -> f64 {
+-    if b > a {
+-        b
+-    } else {
+-        a
+-    }
+-}
+-
+ /// Write shard `s`'s exclusive transcripts (see [`ShardPlan::exclusive`]) from
+-/// its finished accumulator, returning the convergence criterion over them
+-/// when `check` asks for it (else `-inf`).
++/// its finished accumulator.
+ #[inline]
+-fn write_exclusive(
+-    plan: &ShardPlan,
+-    s: usize,
+-    buf: &[f64],
+-    out: &DisjointOut,
+-    check: Option<RelDiffCheck>,
+-) -> f64 {
+-    let mut max_d = f64::NEG_INFINITY;
++fn write_exclusive(plan: &ShardPlan, s: usize, buf: &[f64], out: &DisjointOut) {
+     for &(local, tid) in plan.exclusive(s) {
+-        let v = buf[local as usize];
+-        out.write(tid as usize, v);
+-        if let Some(c) = check {
+-            max_d = c.fold(max_d, tid as usize, v);
+-        }
++        out.write(tid as usize, buf[local as usize]);
+     }
+-    max_d
+ }
+ 
+ /// Sum the shard accumulators of the transcripts several shards touch into
+@@ -765,34 +717,18 @@ fn write_exclusive(
+ /// ascending shard order from the plan's inverted index. Total work is the
+ /// number of shared contributions — where an early dense reduction cost
+ /// `nshards × num_txps` regardless of the data.
+-///
+-/// Returns the convergence criterion over the shared transcripts when `check`
+-/// asks for it, else `-inf`.
+-fn reduce_shards_sparse(
+-    shards: &[Vec<f64>],
+-    plan: &ShardPlan,
+-    out: &DisjointOut,
+-    check: Option<RelDiffCheck>,
+-) -> f64 {
+-    plan.shared
+-        .par_chunks(REFERENCED_CHUNK)
+-        .map(|tids| {
+-            let mut max_d = f64::NEG_INFINITY;
+-            for &tid in tids {
+-                let lo = plan.contrib_start[tid as usize] as usize;
+-                let hi = plan.contrib_start[tid as usize + 1] as usize;
+-                let mut s = 0.0;
+-                for contributor in &plan.contributors[lo..hi] {
+-                    s += shards[contributor.shard as usize][contributor.local as usize];
+-                }
+-                out.write(tid as usize, s);
+-                if let Some(c) = check {
+-                    max_d = c.fold(max_d, tid as usize, s);
+-                }
++fn reduce_shards_sparse(shards: &[Vec<f64>], plan: &ShardPlan, out: &DisjointOut) {
++    plan.shared.par_chunks(REFERENCED_CHUNK).for_each(|tids| {
++        for &tid in tids {
++            let lo = plan.contrib_start[tid as usize] as usize;
++            let hi = plan.contrib_start[tid as usize + 1] as usize;
++            let mut s = 0.0;
++            for contributor in &plan.contributors[lo..hi] {
++                s += shards[contributor.shard as usize][contributor.local as usize];
+             }
+-            max_d
+-        })
+-        .reduce(|| f64::NEG_INFINITY, max_of)
++            out.write(tid as usize, s);
++        }
++    });
+ }
+ 
+ /// Parallel EM M-step. Each shard owns a private compressed buffer containing
+@@ -817,8 +753,7 @@ pub(crate) fn em_step_par<const LL: bool>(
+     alpha_out: &mut [f64],
+     shards: &mut [Vec<f64>],
+     plan: &ShardPlan,
+-    check: Option<RelDiffCheck>,
+-) -> (f64, f64) {
++) -> f64 {
+     let out = DisjointOut::new(alpha_out);
+     let parts = shards.par_iter_mut().enumerate().map(|(s, buf)| {
+         let mut ll = 0.0;
+@@ -857,32 +792,25 @@ pub(crate) fn em_step_par<const LL: bool>(
+                 buf[locals[0] as usize] += count;
+             }
+         }
+-        (ll, write_exclusive(plan, s, buf, &out, check))
++        write_exclusive(plan, s, buf, &out);
++        ll
+     });
+-    let (ll, exclusive_d) = sum_shard_parts::<LL>(parts);
+-    let shared_d = reduce_shards_sparse(shards, plan, &out, check);
+-    (ll, max_of(exclusive_d, shared_d))
++    let ll = sum_shard_parts::<LL>(parts);
++    reduce_shards_sparse(shards, plan, &out);
++    ll
+ }
+ 
+-/// Drive the per-shard closures, each returning its objective partial and its
+-/// convergence-criterion partial. The objective partials, when requested, are
+-/// added in shard order (`collect` preserves order, so the grouping of the
+-/// floating-point sum is fixed by the data-derived plan, not by scheduling);
+-/// the criterion is a maximum, which any order gives exactly.
+-fn sum_shard_parts<const LL: bool>(
+-    parts: impl IndexedParallelIterator<Item = (f64, f64)>,
+-) -> (f64, f64) {
++/// Drive the per-shard closures, each returning its objective partial. The
++/// partials, when requested, are added in shard order (`collect` preserves order,
++/// so the grouping of the floating-point sum is fixed by the data-derived plan,
++/// not by scheduling).
++fn sum_shard_parts<const LL: bool>(parts: impl IndexedParallelIterator<Item = f64>) -> f64 {
+     if LL {
+-        let v: Vec<(f64, f64)> = parts.collect();
+-        (
+-            v.iter().map(|&(ll, _)| ll).sum(),
+-            v.iter().fold(f64::NEG_INFINITY, |m, &(_, d)| max_of(m, d)),
+-        )
++        let v: Vec<f64> = parts.collect();
++        v.iter().sum()
+     } else {
+-        (
+-            0.0,
+-            parts.map(|(_, d)| d).reduce(|| f64::NEG_INFINITY, max_of),
+-        )
++        parts.for_each(|_| ());
++        0.0
+     }
+ }
+ 
+@@ -1057,8 +985,7 @@ pub(crate) fn vbem_step_par<const LL: bool>(
+     expectations: &mut Expectations,
+     shards: &mut [Vec<f64>],
+     plan: &ShardPlan,
+-    check: Option<RelDiffCheck>,
+-) -> (f64, f64) {
++) -> f64 {
+     // Computed once, before the parallel region: it depends on a global sum over
+     // all transcripts, so it cannot be sharded.
+     fill_exp_theta_par(alpha_in, prior_alphas, plan, expectations);
+@@ -1104,11 +1031,12 @@ pub(crate) fn vbem_step_par<const LL: bool>(
+                 buf[locals[0] as usize] += count;
+             }
+         }
+-        (ll, write_exclusive(plan, s, buf, &out, check))
++        write_exclusive(plan, s, buf, &out);
++        ll
+     });
+-    let (ll, exclusive_d) = sum_shard_parts::<LL>(parts);
+-    let shared_d = reduce_shards_sparse(shards, plan, &out, check);
+-    (ll, max_of(exclusive_d, shared_d))
++    let ll = sum_shard_parts::<LL>(parts);
++    reduce_shards_sparse(shards, plan, &out);
++    ll
+ }
+ 
+ #[cfg(test)]
+@@ -1477,7 +1405,6 @@ mod shard_plan_determinism {
+             &mut em_out,
+             &mut em_shards,
+             &plan,
+-            None,
+         );
+         assert!(em_reference
+             .iter()
+@@ -1497,7 +1424,6 @@ mod shard_plan_determinism {
+             &mut expectations,
+             &mut vb_shards,
+             &plan,
+-            None,
+         );
+         assert!(vb_reference
+             .iter()
+diff --git a/crates/salmon-model/src/lib.rs b/crates/salmon-model/src/lib.rs
+index bb3b8061..afa8d766 100644
+--- a/crates/salmon-model/src/lib.rs
++++ b/crates/salmon-model/src/lib.rs
+@@ -76,4 +76,4 @@ pub use libdetect::{infer_format_from_counts, LibraryTypeDetector};
+ pub use posbias::{
+     compute_length_quantiles, length_class_index, SimplePosBias, NUM_LENGTH_CLASSES, NUM_POS_BINS,
+ };
+-pub use seqbias::{build_expected, corrected_effective_length, LogBiasTable, SBModel};
++pub use seqbias::{build_expected, LogBiasTable, SBModel};
+diff --git a/crates/salmon-model/src/seqbias.rs b/crates/salmon-model/src/seqbias.rs
+index 03afcd46..ee978e6c 100644
+--- a/crates/salmon-model/src/seqbias.rs
++++ b/crates/salmon-model/src/seqbias.rs
+@@ -439,96 +439,6 @@ where
+     (exp_fw, exp_rc)
+ }
+ 
+-/// Bias-corrected effective length of one transcript, matching salmon's
+-/// `updateEffectiveLengths` (`src/util/SalmonUtils.cpp`).
+-///
+-/// `cdf` is the linear cumulative FLD; `fld_low`/`fld_high` the 0.5%/99.5%
+-/// fragment-length quantiles (from [`fld_cdf_and_bounds`]). `elen` is the
+-/// transcript's *unbiased* effective length (used for the lower barrier and the
+-/// `unprocessedLen` guard). `stride` subsamples fragment lengths
+-/// ([`FLD_SAMP_STRIDE`] matches salmon).
+-///
+-/// Per-position 5'/3' bias factors `exp(obsLog − expLog)` are placed at the
+-/// fragment *read-start* (`fragStart + contextBefore`), the 3' factors reversed
+-/// to forward fragment-end coordinates, then convolved with the conditional FLD:
+-/// `effLen = Σ_l flWeight(l) · Σ_s fw[s]·rc[s+l−1]`. The result is floored at
+-/// `min(elen, max(1, unprocessedLen))` (salmon's lower "barrier"; there is no
+-/// upper cap, so a strongly-biased transcript's effLen can exceed its length).
+-#[allow(clippy::too_many_arguments)]
+-pub fn corrected_effective_length(
+-    seq: &[u8],
+-    cdf: &[f64],
+-    fld_low: usize,
+-    fld_high: usize,
+-    obs_fw: &SBModel,
+-    exp_fw: &SBModel,
+-    obs_rc: &SBModel,
+-    exp_rc: &SBModel,
+-    elen: f64,
+-    stride: usize,
+-) -> f64 {
+-    let k = CONTEXT_LENGTH;
+-    let cu = CONTEXT_LEFT; // contextBefore(false)
+-    let ref_len = seq.len();
+-    let unprocessed = (ref_len as i32 - elen as i32).max(0);
+-    let cdf_max_arg = (cdf.len() - 1).min(ref_len);
+-    let cdf_max_val = cdf[cdf_max_arg];
+-    if ref_len < k || unprocessed <= 0 || cdf_max_val < MIN_CDF_MASS {
+-        return elen;
+-    }
+-    let cond = |x: i32| conditional_cdf(cdf, cdf_max_arg, cdf_max_val, x);
+-
+-    // Per-position 5' and 3' sequence-bias factors, placed at the read-start.
+-    let rc_seq = revcomp_bytes(seq);
+-    let mut fw = vec![1.0f64; ref_len];
+-    let mut rc = vec![1.0f64; ref_len];
+-    for frag_start in 0..(ref_len - k) {
+-        let read_start = frag_start + cu;
+-        if read_start < ref_len {
+-            fw[read_start] =
+-                log_bias(obs_fw, exp_fw, &seq[frag_start..frag_start + k], false).exp();
+-            rc[read_start] =
+-                log_bias(obs_rc, exp_rc, &rc_seq[frag_start..frag_start + k], false).exp();
+-        }
+-    }
+-    rc.reverse(); // align RC factors with forward fragment-end coordinates
+-
+-    // Convolve the bias factors with the conditional FLD over [fld_low, fld_high].
+-    let stride = stride.max(1) as i32;
+-    let max_len = (ref_len as i32).min(fld_high as i32 + 1);
+-    let mut fl = fld_low.max(1) as i32; // a zero-length fragment has no end base
+-    let mut done = fl >= max_len;
+-    let sp = if fl > 0 { fl - 1 } else { 0 };
+-    let mut prev_mass = cond(sp);
+-    let mut eff = 0.0f64;
+-    while !done {
+-        if fl >= max_len {
+-            done = true;
+-            fl = max_len - 1;
+-        }
+-        let fl_weight = cond(fl) - prev_mass;
+-        prev_mass = cond(fl);
+-        let mut mass = 0.0f64;
+-        let mut kstart = 0i32;
+-        while kstart < ref_len as i32 - fl {
+-            let frag_start = kstart as usize;
+-            let frag_end = (kstart + fl - 1) as usize;
+-            if frag_end < ref_len {
+-                mass += fw[frag_start] * rc[frag_end];
+-            } else {
+-                break;
+-            }
+-            kstart += 1;
+-        }
+-        eff += fl_weight * mass;
+-        fl += stride;
+-    }
+-
+-    // Lower barrier (salmon default; no upper cap).
+-    let offset = (unprocessed as f64).max(1.0);
+-    eff.max(elen.min(offset))
+-}
+-
+ /// Bias-corrected effective length when the per-fragment factor is **separable**
+ /// as `a[start]·b[end]`. This holds for any combination of sequence and
+ /// positional bias (each contributes an independent 5′ start factor and 3′ end
+@@ -609,65 +519,6 @@ pub fn eff_len_from_xcorr(
+     }
+ }
+ 
+-/// FFT form of [`corrected_effective_length`] (sequence-only): builds the 5′/3′
+-/// sequence factor arrays, then evaluates the length sweep as their
+-/// cross-correlation via [`eff_len_from_xcorr`]. Kept as the validated
+-/// seq-only reference (the combined no-GC path in [`crate::bias`] builds the
+-/// same factors, optionally fused with positional bias, and calls the same
+-/// core). Numerically identical to [`corrected_effective_length`] up to FFT
+-/// round-off.
+-#[allow(clippy::too_many_arguments)]
+-pub fn corrected_effective_length_fft(
+-    seq: &[u8],
+-    cdf: &[f64],
+-    fld_low: usize,
+-    fld_high: usize,
+-    obs_fw: &SBModel,
+-    exp_fw: &SBModel,
+-    obs_rc: &SBModel,
+-    exp_rc: &SBModel,
+-    elen: f64,
+-    stride: usize,
+-    no_length_threshold: bool,
+-) -> f64 {
+-    let k = CONTEXT_LENGTH;
+-    let cu = CONTEXT_LEFT;
+-    let ref_len = seq.len();
+-    let unprocessed = (ref_len as i32 - elen as i32).max(0);
+-    let cdf_max_arg = (cdf.len() - 1).min(ref_len);
+-    let cdf_max_val = cdf[cdf_max_arg];
+-    if ref_len < k || unprocessed <= 0 || cdf_max_val < MIN_CDF_MASS {
+-        return elen;
+-    }
+-    let cond = |x: i32| conditional_cdf(cdf, cdf_max_arg, cdf_max_val, x);
+-
+-    let rc_seq = revcomp_bytes(seq);
+-    let mut fw = vec![1.0f64; ref_len];
+-    let mut rc = vec![1.0f64; ref_len];
+-    for frag_start in 0..(ref_len - k) {
+-        let read_start = frag_start + cu;
+-        if read_start < ref_len {
+-            fw[read_start] =
+-                log_bias(obs_fw, exp_fw, &seq[frag_start..frag_start + k], false).exp();
+-            rc[read_start] =
+-                log_bias(obs_rc, exp_rc, &rc_seq[frag_start..frag_start + k], false).exp();
+-        }
+-    }
+-    rc.reverse();
+-
+-    eff_len_from_xcorr(
+-        &fw,
+-        &rc,
+-        cond,
+-        fld_low,
+-        fld_high,
+-        elen,
+-        unprocessed,
+-        stride,
+-        no_length_threshold,
+-    )
+-}
+-
+ /// Log bias of `observed` relative to `expected` for a context:
+ /// `log P_obs(context) - log P_exp(context)`. The fragment-level bias weight is
+ /// `exp` of this.
+@@ -961,13 +812,21 @@ mod tests {
+         pmf[100] = 1.0;
+         let (cdf, lo, hi) = fld_cdf_and_bounds(&pmf);
+         // unbiased effLen at point-mass 100 on a 400nt transcript = 400 - 100 = 300
+-        let eff = corrected_effective_length(&seq, &cdf, lo, hi, &obs, &exp, &obs, &exp, 300.0, 1);
++        let table = LogBiasTable::new(&obs, &exp);
++        let bias = crate::BiasInputs {
++            seq: Some((&table, &table, &seq)),
++            ..Default::default()
++        };
++        let eff =
++            crate::corrected_effective_length_full(seq.len(), &cdf, lo, hi, &bias, 300.0, 1, false);
+         assert!((eff - 300.0).abs() < 1e-6, "got {eff}");
+     }
+ 
+     /// The FFT path exists purely to be faster, so it has to agree with the
+     /// direct scalar convolution to within floating-point round-off — including
+     /// the fiddly boundary term the scalar loop excludes and the FFT includes.
++    /// GC bias is what selects the scalar path, so a GC model whose every ratio is
++    /// 1 reaches it without changing the answer.
+     #[test]
+     fn fft_matches_exact_scalar_corrected_eff_len() {
+         // Build a genuinely biased obs/exp pair (so per-position factors != 1),
+@@ -1002,15 +861,50 @@ mod tests {
+         }
+         let (cdf, lo, hi) = fld_cdf_and_bounds(&pmf);
+ 
++        let table = LogBiasTable::new(&obs, &exp);
++        let (mut gc_obs, mut gc_exp) = (
++            crate::GcFragModel::new(
++                crate::gcbias::DEFAULT_COND_BINS,
++                crate::gcbias::DEFAULT_GC_BINS,
++            ),
++            crate::GcFragModel::new(
++                crate::gcbias::DEFAULT_COND_BINS,
++                crate::gcbias::DEFAULT_GC_BINS,
++            ),
++        );
++        for ctx in 0..=100 {
++            for gc in 0..=100 {
++                gc_obs.inc(gc, ctx, 1.0);
++                gc_exp.inc(gc, ctx, 1.0);
++            }
++        }
++        let neutral_gc = crate::gc_ratio(&mut gc_obs, &mut gc_exp, 1000.0);
++        let prefix = crate::gc_prefix(&seq);
++        let seq_only = crate::BiasInputs {
++            seq: Some((&table, &table, &seq)),
++            ..Default::default()
++        };
++        let with_gc = crate::BiasInputs {
++            gc: Some((&neutral_gc, crate::GcView::Dense(&prefix))),
++            ..seq_only
++        };
++
+         // FFT must match the scalar at the SAME stride (drop-in, not an accuracy
+         // change) — check both the exact (stride=1) and strided (stride=5) cases.
+         for stride in [1usize, 5] {
+-            let scalar = corrected_effective_length(
+-                &seq, &cdf, lo, hi, &obs, &exp, &obs, &exp, 1200.0, stride,
+-            );
+-            let fft = corrected_effective_length_fft(
+-                &seq, &cdf, lo, hi, &obs, &exp, &obs, &exp, 1200.0, stride, false,
+-            );
++            let run = |bias: &crate::BiasInputs| {
++                crate::corrected_effective_length_full(
++                    seq.len(),
++                    &cdf,
++                    lo,
++                    hi,
++                    bias,
++                    1200.0,
++                    stride,
++                    false,
++                )
++            };
++            let (scalar, fft) = (run(&with_gc), run(&seq_only));
+             let rel = (scalar - fft).abs() / scalar.abs();
+             assert!(
+                 rel < 1e-9,
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index ff53c9b6..b7e1431c 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -1021,8 +1021,8 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     }
+     // The packed CSR layout is built ONCE and reused by every consumer below: the
+     // burn-in EM, the warm-started EM after bias correction, and bootstrap /
+-    // Gibbs. `optimize`/`optimize_with_init` each build their own internally, so
+-    // going through them meant re-copying labels, counts and weights (hundreds of
++    // Gibbs. `optimize` builds its own internally, so
++    // going through it meant re-copying labels, counts and weights (hundreds of
+     // MB on a human-scale run) two to three times over data that is bit-identical
+     // apart from `combined`, which `refresh_combined` rewrites in place.
+     //

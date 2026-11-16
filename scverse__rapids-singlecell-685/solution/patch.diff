@@ -1,0 +1,770 @@
+diff --git a/docs/release-notes/0.15.2.md b/docs/release-notes/0.15.2.md
+index 61a7e1638..327b4e25a 100644
+--- a/docs/release-notes/0.15.2.md
++++ b/docs/release-notes/0.15.2.md
+@@ -8,6 +8,10 @@
+ * Add ``wasserstein`` metric to {class}`~rapids_singlecell.ptg.Distance` {pr}`683` {smaller}`S Dicks`
+ * ``tl.draw_graph`` now exposes the ``random_state`` parameter of ``cugraph.layout.force_atlas2`` {pr}`681` {smaller}`J Pintar`
+ 
++```{rubric} Performance
++```
++* {func}`~rapids_singlecell.get.aggregate` only computes the buffers the requested metrics need via metric-templated CUDA kernels, up to ~3.7x faster for single-metric requests on sparse data {pr}`685` {smaller}`S Dicks`
++
+ ```{rubric} Bug fixes
+ ```
+ * Fixes per-batch clip threshold in `pp.highly_variable_genes(flavor="pearson_residuals", batch_key=...)`: each batch now uses its own `sqrt(n_cells_in_batch)` instead of silently reusing the first batch's value {pr}`674` {smaller}`A Mikaeili`
+diff --git a/src/rapids_singlecell/_cuda/aggr/aggr.cu b/src/rapids_singlecell/_cuda/aggr/aggr.cu
+index fc4458bce..bc1b0a164 100644
+--- a/src/rapids_singlecell/_cuda/aggr/aggr.cu
++++ b/src/rapids_singlecell/_cuda/aggr/aggr.cu
+@@ -1,4 +1,8 @@
+ #include <cuda_runtime.h>
++#include <nanobind/stl/optional.h>
++
++#include <optional>
++
+ #include "../nb_types.h"
+ 
+ #include "kernels_aggr.cuh"
+@@ -8,54 +12,79 @@ using namespace nb::literals;
+ constexpr int BLOCK_SIZE_SPARSE = 64;
+ constexpr int BLOCK_SIZE_DENSE = 256;
+ 
+-template <typename T, typename IdxT>
+-static inline void launch_csr_aggr(const IdxT* indptr, const IdxT* index,
+-                                   const T* data, double* out, const int* cats,
+-                                   const bool* mask, size_t n_cells,
+-                                   size_t n_genes, size_t n_groups,
+-                                   cudaStream_t stream) {
+-    dim3 grid((unsigned)n_cells);
++// Expand a runtime accumulator mask (1..7) into a compile-time MASK template
++// argument. Each kernel instantiation emits only the requested atomicAdds, so
++// inactive (null) output buffers are never written. Mask 0 means no output
++// buffer was provided, which is always a caller bug.
++#define AGGR_DISPATCH_MASK(active, LAUNCH)                                   \
++    switch (active) {                                                        \
++        case 1:                                                              \
++            LAUNCH(1);                                                       \
++            break;                                                           \
++        case 2:                                                              \
++            LAUNCH(2);                                                       \
++            break;                                                           \
++        case 3:                                                              \
++            LAUNCH(3);                                                       \
++            break;                                                           \
++        case 4:                                                              \
++            LAUNCH(4);                                                       \
++            break;                                                           \
++        case 5:                                                              \
++            LAUNCH(5);                                                       \
++            break;                                                           \
++        case 6:                                                              \
++            LAUNCH(6);                                                       \
++            break;                                                           \
++        case 7:                                                              \
++            LAUNCH(7);                                                       \
++            break;                                                           \
++        default:                                                             \
++            throw std::runtime_error(                                        \
++                "aggr: at least one of out_sum/out_count/out_sqsum must be " \
++                "provided");                                                 \
++    }
++
++template <typename T, typename IdxT, int MASK>
++static inline void launch_sparse_aggr(bool is_csc, const IdxT* indptr,
++                                      const IdxT* index, const T* data,
++                                      double* out_sum, double* out_count,
++                                      double* out_sqsum, const int* cats,
++                                      const bool* mask, size_t n_cells,
++                                      size_t n_genes, cudaStream_t stream) {
+     dim3 block(BLOCK_SIZE_SPARSE);
+-    csr_aggr_kernel<T, IdxT><<<grid, block, 0, stream>>>(
+-        indptr, index, data, out, cats, mask, n_cells, n_genes, n_groups);
+-    CUDA_CHECK_LAST_ERROR(csr_aggr_kernel);
++    if (is_csc) {
++        dim3 grid((unsigned)n_genes);
++        csc_aggr_kernel<T, IdxT, MASK><<<grid, block, 0, stream>>>(
++            indptr, index, data, out_sum, out_count, out_sqsum, cats, mask,
++            n_cells, n_genes);
++        CUDA_CHECK_LAST_ERROR(csc_aggr_kernel);
++    } else {
++        dim3 grid((unsigned)n_cells);
++        csr_aggr_kernel<T, IdxT, MASK><<<grid, block, 0, stream>>>(
++            indptr, index, data, out_sum, out_count, out_sqsum, cats, mask,
++            n_cells, n_genes);
++        CUDA_CHECK_LAST_ERROR(csr_aggr_kernel);
++    }
+ }
+ 
+-template <typename T, typename IdxT>
+-static inline void launch_csc_aggr(const IdxT* indptr, const IdxT* index,
+-                                   const T* data, double* out, const int* cats,
+-                                   const bool* mask, size_t n_cells,
+-                                   size_t n_genes, size_t n_groups,
+-                                   cudaStream_t stream) {
+-    dim3 grid((unsigned)n_genes);
+-    dim3 block(BLOCK_SIZE_SPARSE);
+-    csc_aggr_kernel<T, IdxT><<<grid, block, 0, stream>>>(
+-        indptr, index, data, out, cats, mask, n_cells, n_genes, n_groups);
+-    CUDA_CHECK_LAST_ERROR(csc_aggr_kernel);
+-}
+-
+-template <typename T>
+-static inline void launch_dense_aggr_C(const T* data, double* out,
+-                                       const int* cats, const bool* mask,
+-                                       size_t n_cells, size_t n_genes,
+-                                       size_t n_groups, cudaStream_t stream) {
++template <typename T, int MASK>
++static inline void launch_dense_aggr(bool is_fortran, const T* data,
++                                     double* out_sum, double* out_count,
++                                     double* out_sqsum, const int* cats,
++                                     const bool* mask, size_t n_cells,
++                                     size_t n_genes, cudaStream_t stream) {
+     dim3 block(BLOCK_SIZE_DENSE);
+     dim3 grid(strided_grid((long long)n_cells * n_genes, BLOCK_SIZE_DENSE));
+-    dense_aggr_kernel_C<T><<<grid, block, 0, stream>>>(
+-        data, out, cats, mask, n_cells, n_genes, n_groups);
+-    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_C);
+-}
+-
+-template <typename T>
+-static inline void launch_dense_aggr_F(const T* data, double* out,
+-                                       const int* cats, const bool* mask,
+-                                       size_t n_cells, size_t n_genes,
+-                                       size_t n_groups, cudaStream_t stream) {
+-    dim3 block(BLOCK_SIZE_DENSE);
+-    dim3 grid(strided_grid((long long)n_cells * n_genes, BLOCK_SIZE_DENSE));
+-    dense_aggr_kernel_F<T><<<grid, block, 0, stream>>>(
+-        data, out, cats, mask, n_cells, n_genes, n_groups);
+-    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_F);
++    if (is_fortran) {
++        dense_aggr_kernel_F<T, MASK><<<grid, block, 0, stream>>>(
++            data, out_sum, out_count, out_sqsum, cats, mask, n_cells, n_genes);
++        CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_F);
++    } else {
++        dense_aggr_kernel_C<T, MASK><<<grid, block, 0, stream>>>(
++            data, out_sum, out_count, out_sqsum, cats, mask, n_cells, n_genes);
++        CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_C);
++    }
+ }
+ 
+ template <typename T, typename IdxT, typename OutIdxT>
+@@ -89,25 +118,29 @@ void def_sparse_aggr(nb::module_& m) {
+         "sparse_aggr",
+         [](gpu_array_c<const IdxT, Device> indptr,
+            gpu_array_c<const IdxT, Device> index,
+-           gpu_array_c<const T, Device> data, gpu_array_c<double, Device> out,
++           gpu_array_c<const T, Device> data,
++           std::optional<gpu_array_c<double, Device>> out_sum,
++           std::optional<gpu_array_c<double, Device>> out_count,
++           std::optional<gpu_array_c<double, Device>> out_sqsum,
+            gpu_array_c<const int, Device> cats,
+            gpu_array_c<const bool, Device> mask, size_t n_cells, size_t n_genes,
+-           size_t n_groups, bool is_csc, std::uintptr_t stream) {
+-            if (is_csc) {
+-                launch_csc_aggr<T, IdxT>(indptr.data(), index.data(),
+-                                         data.data(), out.data(), cats.data(),
+-                                         mask.data(), n_cells, n_genes,
+-                                         n_groups, (cudaStream_t)stream);
+-            } else {
+-                launch_csr_aggr<T, IdxT>(indptr.data(), index.data(),
+-                                         data.data(), out.data(), cats.data(),
+-                                         mask.data(), n_cells, n_genes,
+-                                         n_groups, (cudaStream_t)stream);
+-            }
++           bool is_csc, std::uintptr_t stream) {
++            double* ps = out_sum ? out_sum->data() : nullptr;
++            double* pc = out_count ? out_count->data() : nullptr;
++            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
++            int active = (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) |
++                         (pq ? AGGR_SQSUM : 0);
++#define LAUNCH(M)                                                     \
++    launch_sparse_aggr<T, IdxT, M>(                                   \
++        is_csc, indptr.data(), index.data(), data.data(), ps, pc, pq, \
++        cats.data(), mask.data(), n_cells, n_genes, (cudaStream_t)stream)
++            AGGR_DISPATCH_MASK(active, LAUNCH);
++#undef LAUNCH
+         },
+-        "indptr"_a, "index"_a, "data"_a, nb::kw_only(), "out"_a, "cats"_a,
+-        "mask"_a, "n_cells"_a, "n_genes"_a, "n_groups"_a, "is_csc"_a,
+-        "stream"_a = 0);
++        "indptr"_a, "index"_a, "data"_a, nb::kw_only(),
++        "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
++        "out_sqsum"_a = nb::none(), "cats"_a, "mask"_a, "n_cells"_a,
++        "n_genes"_a, "is_csc"_a, "stream"_a = 0);
+ }
+ 
+ template <typename T, typename DataContig, typename Device>
+@@ -115,21 +148,28 @@ void def_dense_aggr(nb::module_& m) {
+     m.def(
+         "dense_aggr",
+         [](gpu_array_contig<const T, Device, DataContig> data,
+-           gpu_array_c<double, Device> out, gpu_array_c<const int, Device> cats,
++           std::optional<gpu_array_c<double, Device>> out_sum,
++           std::optional<gpu_array_c<double, Device>> out_count,
++           std::optional<gpu_array_c<double, Device>> out_sqsum,
++           gpu_array_c<const int, Device> cats,
+            gpu_array_c<const bool, Device> mask, size_t n_cells, size_t n_genes,
+-           size_t n_groups, bool is_fortran, std::uintptr_t stream) {
+-            if constexpr (std::is_same_v<DataContig, nb::f_contig>) {
+-                launch_dense_aggr_F<T>(data.data(), out.data(), cats.data(),
+-                                       mask.data(), n_cells, n_genes, n_groups,
+-                                       (cudaStream_t)stream);
+-            } else {
+-                launch_dense_aggr_C<T>(data.data(), out.data(), cats.data(),
+-                                       mask.data(), n_cells, n_genes, n_groups,
+-                                       (cudaStream_t)stream);
+-            }
++           bool is_fortran, std::uintptr_t stream) {
++            double* ps = out_sum ? out_sum->data() : nullptr;
++            double* pc = out_count ? out_count->data() : nullptr;
++            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
++            int active = (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) |
++                         (pq ? AGGR_SQSUM : 0);
++            constexpr bool is_f = std::is_same_v<DataContig, nb::f_contig>;
++#define LAUNCH(M)                                                       \
++    launch_dense_aggr<T, M>(is_f, data.data(), ps, pc, pq, cats.data(), \
++                            mask.data(), n_cells, n_genes,              \
++                            (cudaStream_t)stream)
++            AGGR_DISPATCH_MASK(active, LAUNCH);
++#undef LAUNCH
+         },
+-        "data"_a, nb::kw_only(), "out"_a, "cats"_a, "mask"_a, "n_cells"_a,
+-        "n_genes"_a, "n_groups"_a, "is_fortran"_a, "stream"_a = 0);
++        "data"_a, nb::kw_only(), "out_sum"_a = nb::none(),
++        "out_count"_a = nb::none(), "out_sqsum"_a = nb::none(), "cats"_a,
++        "mask"_a, "n_cells"_a, "n_genes"_a, "is_fortran"_a, "stream"_a = 0);
+ }
+ 
+ template <typename T, typename IdxT, typename OutIdxT, typename Device>
+diff --git a/src/rapids_singlecell/_cuda/aggr/kernels_aggr.cuh b/src/rapids_singlecell/_cuda/aggr/kernels_aggr.cuh
+index de06126f9..dcd187ba9 100644
+--- a/src/rapids_singlecell/_cuda/aggr/kernels_aggr.cuh
++++ b/src/rapids_singlecell/_cuda/aggr/kernels_aggr.cuh
+@@ -2,39 +2,44 @@
+ 
+ #include <cuda_runtime.h>
+ 
++// Compile-time selector for which raw accumulators a kernel writes. Combined as
++// a bitmask so each kernel instantiation emits only the atomicAdds (and only
++// touches the output buffers) that the caller actually requested. A null buffer
++// pointer is never dereferenced because its bit is absent from MASK.
++constexpr int AGGR_SUM = 1;    // sum of values
++constexpr int AGGR_COUNT = 2;  // count of nonzero entries
++constexpr int AGGR_SQSUM = 4;  // sum of squared values
++
+ // sparse -> dense aggregate (CSR by cells), mask per cell, cats per cell
+-template <typename T, typename IdxT>
+-__global__ void csr_aggr_kernel(const IdxT* __restrict__ indptr,
+-                                const IdxT* __restrict__ index,
+-                                const T* __restrict__ data,
+-                                double* __restrict__ out,
+-                                const int* __restrict__ cats,
+-                                const bool* __restrict__ mask, size_t n_cells,
+-                                size_t n_genes, size_t n_groups) {
++template <typename T, typename IdxT, int MASK>
++__global__ void csr_aggr_kernel(
++    const IdxT* __restrict__ indptr, const IdxT* __restrict__ index,
++    const T* __restrict__ data, double* __restrict__ out_sum,
++    double* __restrict__ out_count, double* __restrict__ out_sqsum,
++    const int* __restrict__ cats, const bool* __restrict__ mask, size_t n_cells,
++    size_t n_genes) {
+     size_t cell = blockIdx.x;
+     if (cell >= n_cells || !mask[cell]) return;
+     IdxT cell_start = indptr[cell];
+     IdxT cell_end = indptr[cell + 1];
+     size_t group = static_cast<size_t>(cats[cell]);
+     for (IdxT p = cell_start + threadIdx.x; p < cell_end; p += blockDim.x) {
+-        size_t gene_pos = static_cast<size_t>(index[p]);
++        size_t idx = group * n_genes + static_cast<size_t>(index[p]);
+         double v = static_cast<double>(data[p]);
+-        atomicAdd(&out[group * n_genes + gene_pos], v);
+-        atomicAdd(&out[group * n_genes + gene_pos + n_genes * n_groups], 1.0);
+-        atomicAdd(&out[group * n_genes + gene_pos + 2 * n_genes * n_groups],
+-                  v * v);
++        if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
++        if constexpr (MASK & AGGR_COUNT) atomicAdd(&out_count[idx], 1.0);
++        if constexpr (MASK & AGGR_SQSUM) atomicAdd(&out_sqsum[idx], v * v);
+     }
+ }
+ 
+ // sparse -> dense aggregate (CSC by genes), mask per cell, cats per cell
+-template <typename T, typename IdxT>
+-__global__ void csc_aggr_kernel(const IdxT* __restrict__ indptr,
+-                                const IdxT* __restrict__ index,
+-                                const T* __restrict__ data,
+-                                double* __restrict__ out,
+-                                const int* __restrict__ cats,
+-                                const bool* __restrict__ mask, size_t n_cells,
+-                                size_t n_genes, size_t n_groups) {
++template <typename T, typename IdxT, int MASK>
++__global__ void csc_aggr_kernel(
++    const IdxT* __restrict__ indptr, const IdxT* __restrict__ index,
++    const T* __restrict__ data, double* __restrict__ out_sum,
++    double* __restrict__ out_count, double* __restrict__ out_sqsum,
++    const int* __restrict__ cats, const bool* __restrict__ mask, size_t n_cells,
++    size_t n_genes) {
+     size_t gene = blockIdx.x;
+     if (gene >= n_genes) return;
+     IdxT gene_start = indptr[gene];
+@@ -43,10 +48,11 @@ __global__ void csc_aggr_kernel(const IdxT* __restrict__ indptr,
+         size_t cell = static_cast<size_t>(index[p]);
+         if (!mask[cell]) continue;
+         size_t group = static_cast<size_t>(cats[cell]);
++        size_t idx = group * n_genes + gene;
+         double v = static_cast<double>(data[p]);
+-        atomicAdd(&out[group * n_genes + gene], v);
+-        atomicAdd(&out[group * n_genes + gene + n_genes * n_groups], 1.0);
+-        atomicAdd(&out[group * n_genes + gene + 2 * n_genes * n_groups], v * v);
++        if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
++        if constexpr (MASK & AGGR_COUNT) atomicAdd(&out_count[idx], 1.0);
++        if constexpr (MASK & AGGR_SQSUM) atomicAdd(&out_sqsum[idx], v * v);
+     }
+ }
+ 
+@@ -93,13 +99,14 @@ __global__ void sparse_var_kernel(const IdxT* __restrict__ indptr,
+ }
+ 
+ // dense C-order aggregator
+-template <typename T>
++template <typename T, int MASK>
+ __global__ void dense_aggr_kernel_C(const T* __restrict__ data,
+-                                    double* __restrict__ out,
++                                    double* __restrict__ out_sum,
++                                    double* __restrict__ out_count,
++                                    double* __restrict__ out_sqsum,
+                                     const int* __restrict__ cats,
+                                     const bool* __restrict__ mask,
+-                                    size_t n_cells, size_t n_genes,
+-                                    size_t n_groups) {
++                                    size_t n_cells, size_t n_genes) {
+     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+     size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+     size_t N = n_cells * n_genes;
+@@ -110,11 +117,12 @@ __global__ void dense_aggr_kernel_C(const T* __restrict__ data,
+             size_t group = static_cast<size_t>(cats[cell]);
+             double v = static_cast<double>(data[cell * n_genes + gene]);
+             if (v != 0.0) {
+-                atomicAdd(&out[group * n_genes + gene], v);
+-                atomicAdd(&out[group * n_genes + gene + n_genes * n_groups],
+-                          1.0);
+-                atomicAdd(&out[group * n_genes + gene + 2 * n_genes * n_groups],
+-                          v * v);
++                size_t idx = group * n_genes + gene;
++                if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
++                if constexpr (MASK & AGGR_COUNT)
++                    atomicAdd(&out_count[idx], 1.0);
++                if constexpr (MASK & AGGR_SQSUM)
++                    atomicAdd(&out_sqsum[idx], v * v);
+             }
+         }
+         i += stride;
+@@ -122,13 +130,14 @@ __global__ void dense_aggr_kernel_C(const T* __restrict__ data,
+ }
+ 
+ // dense F-order aggregator
+-template <typename T>
++template <typename T, int MASK>
+ __global__ void dense_aggr_kernel_F(const T* __restrict__ data,
+-                                    double* __restrict__ out,
++                                    double* __restrict__ out_sum,
++                                    double* __restrict__ out_count,
++                                    double* __restrict__ out_sqsum,
+                                     const int* __restrict__ cats,
+                                     const bool* __restrict__ mask,
+-                                    size_t n_cells, size_t n_genes,
+-                                    size_t n_groups) {
++                                    size_t n_cells, size_t n_genes) {
+     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+     size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+     size_t N = n_cells * n_genes;
+@@ -139,11 +148,12 @@ __global__ void dense_aggr_kernel_F(const T* __restrict__ data,
+             size_t group = static_cast<size_t>(cats[cell]);
+             double v = static_cast<double>(data[gene * n_cells + cell]);
+             if (v != 0.0) {
+-                atomicAdd(&out[group * n_genes + gene], v);
+-                atomicAdd(&out[group * n_genes + gene + n_genes * n_groups],
+-                          1.0);
+-                atomicAdd(&out[group * n_genes + gene + 2 * n_genes * n_groups],
+-                          v * v);
++                size_t idx = group * n_genes + gene;
++                if constexpr (MASK & AGGR_SUM) atomicAdd(&out_sum[idx], v);
++                if constexpr (MASK & AGGR_COUNT)
++                    atomicAdd(&out_count[idx], 1.0);
++                if constexpr (MASK & AGGR_SQSUM)
++                    atomicAdd(&out_sqsum[idx], v * v);
+             }
+         }
+         i += stride;
+diff --git a/src/rapids_singlecell/get/_aggregated.py b/src/rapids_singlecell/get/_aggregated.py
+index 82e329529..99e890ce3 100644
+--- a/src/rapids_singlecell/get/_aggregated.py
++++ b/src/rapids_singlecell/get/_aggregated.py
+@@ -22,6 +22,20 @@
+ 
+ Array = Union[cp.ndarray, cp_sparse.csc_matrix, cp_sparse.csr_matrix]  # noqa: UP007
+ AggType = Literal["count_nonzero", "mean", "sum", "var", "sq_sum"]
++_ALL_FUNCS = frozenset(get_args(AggType))
++
++
++def _planes_for_funcs(funcs):
++    """Map requested metrics to the raw accumulator planes they require.
++
++    Returns a ``(need_sum, need_count, need_sqsum)`` tuple. The ``sum`` plane
++    backs ``sum``/``mean``/``var``, the ``count`` plane backs ``count_nonzero``,
++    and the ``sqsum`` plane backs ``var``/``sq_sum``.
++    """
++    need_sum = not funcs.isdisjoint(("sum", "mean", "var"))
++    need_count = "count_nonzero" in funcs
++    need_sqsum = not funcs.isdisjoint(("var", "sq_sum"))
++    return need_sum, need_count, need_sqsum
+ 
+ 
+ class Aggregate:
+@@ -65,68 +79,107 @@ def _get_mask(self):
+         else:
+             return cp.ones(self.data.shape[0], dtype=bool)
+ 
+-    def _build_result(self, sums, counts, sq_sums, dof):
+-        """Compute derived statistics from raw kernel accumulators."""
+-        counts = counts.astype(cp.int32)
+-        means = sums / self.n_cells
+-        var = sq_sums / self.n_cells - means**2
+-        var *= self.n_cells / (self.n_cells - dof)
+-        return {
+-            "sum": sums,
+-            "sq_sum": sq_sums,
+-            "count_nonzero": counts,
+-            "mean": means,
+-            "var": var,
+-        }
+-
+-    def count_mean_var(self, dof: int = 1, split_every: int = 2):
+-        """Dispatch to the appropriate count_mean_var method based on data type."""
++    def _build_result(self, funcs, *, sums, counts, sq_sums, dof):
++        """Compute the requested derived statistics from raw accumulators.
++
++        Only the planes a metric depends on need to be provided: ``sum``/``mean``
++        need ``sums``, ``var`` needs ``sums`` and ``sq_sums``, ``sq_sum`` needs
++        ``sq_sums``, and ``count_nonzero`` needs ``counts``.
++        """
++        results = {}
++        if "sum" in funcs:
++            results["sum"] = sums
++        if "sq_sum" in funcs:
++            results["sq_sum"] = sq_sums
++        if "count_nonzero" in funcs:
++            results["count_nonzero"] = counts.astype(cp.int32)
++        if "mean" in funcs or "var" in funcs:
++            means = sums / self.n_cells
++            if "mean" in funcs:
++                results["mean"] = means
++            if "var" in funcs:
++                var = sq_sums / self.n_cells - means**2
++                var *= self.n_cells / (self.n_cells - dof)
++                results["var"] = var
++        return results
++
++    def count_mean_var(self, funcs=None, *, dof: int = 1, split_every: int = 2):
++        """Dispatch to the appropriate count_mean_var method based on data type.
++
++        ``funcs`` is the set of requested metrics; only the accumulators those
++        metrics need are allocated and computed. ``None`` computes everything.
++        """
++        funcs = _ALL_FUNCS if funcs is None else set(funcs)
+         if isinstance(self.data, DaskArray):
+-            return self.count_mean_var_dask(dof, split_every=split_every)
++            return self.count_mean_var_dask(funcs, dof=dof, split_every=split_every)
+         elif cp_sparse.issparse(self.data):
+-            return self.count_mean_var_sparse(dof)
++            return self.count_mean_var_sparse(funcs, dof=dof)
+         else:
+-            return self.count_mean_var_dense(dof)
++            return self.count_mean_var_dense(funcs, dof=dof)
+ 
+-    def count_mean_var_dask(self, dof: int = 1, split_every: int = 2):
++    def count_mean_var_dask(self, funcs=None, *, dof: int = 1, split_every: int = 2):
+         """
+         This function is used to calculate the sum, mean, and variance of the data matrix.
+         It automatically detects sparse vs dense matrices and uses the appropriate
+-        CUDA kernel for aggregation.
++        CUDA kernel for aggregation. Only the accumulator planes the requested
++        ``funcs`` need are allocated and reduced across blocks.
+         """
+         import dask.array as da
+ 
+         assert dof >= 0
++        funcs = _ALL_FUNCS if funcs is None else set(funcs)
++        need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
++
++        # Compact plane layout: only the requested accumulators, canonical order.
++        plane_order = []
++        if need_sum:
++            plane_order.append("sum")
++        if need_count:
++            plane_order.append("count")
++        if need_sqsum:
++            plane_order.append("sqsum")
++        n_planes = len(plane_order)
++        i_sum = plane_order.index("sum") if need_sum else None
++        i_count = plane_order.index("count") if need_count else None
++        i_sqsum = plane_order.index("sqsum") if need_sqsum else None
++
+         is_sparse = not isinstance(self.data._meta, cp.ndarray)
+         n_groups = self.n_cells.shape[0]
+ 
+         def __aggregate_dask(X_part, mask_part, groupby_part):
+-            out = cp.zeros((1, 3, n_groups, self.data.shape[1]), dtype=cp.float64)
++            out = cp.zeros(
++                (1, n_planes, n_groups, self.data.shape[1]), dtype=cp.float64
++            )
+             gb = groupby_part.ravel()
+             mk = mask_part.ravel()
++            out_sum = out[0, i_sum] if need_sum else None
++            out_count = out[0, i_count] if need_count else None
++            out_sqsum = out[0, i_sqsum] if need_sqsum else None
+ 
+             if is_sparse:
+                 _aggr_cuda.sparse_aggr(
+                     X_part.indptr,
+                     X_part.indices,
+                     X_part.data,
+-                    out=out,
++                    out_sum=out_sum,
++                    out_count=out_count,
++                    out_sqsum=out_sqsum,
+                     cats=gb,
+                     mask=mk,
+                     n_cells=X_part.shape[0],
+                     n_genes=X_part.shape[1],
+-                    n_groups=n_groups,
+                     is_csc=False,
+                 )
+             else:
+                 _aggr_cuda.dense_aggr(
+                     X_part,
+-                    out=out,
++                    out_sum=out_sum,
++                    out_count=out_count,
++                    out_sqsum=out_sqsum,
+                     cats=gb,
+                     mask=mk,
+                     n_cells=X_part.shape[0],
+                     n_genes=X_part.shape[1],
+-                    n_groups=n_groups,
+                     is_fortran=X_part.flags.f_contiguous,
+                 )
+             return out
+@@ -153,7 +206,7 @@ def __aggregate_dask(X_part, mask_part, groupby_part):
+             new_axis=(1, 2),
+             chunks=(
+                 (1,) * self.data.blocks.size,
+-                (3,),
++                (n_planes,),
+                 (n_groups,),
+                 (self.data.shape[1],),
+             ),
+@@ -161,18 +214,29 @@ def __aggregate_dask(X_part, mask_part, groupby_part):
+ 
+         # Compute final aggregated results
+         out = out.sum(axis=0, split_every=split_every).compute()
+-        sums, counts, sq_sums = out[0], out[1], out[2]
+-        return self._build_result(sums, counts, sq_sums, dof)
++        sums = out[i_sum] if need_sum else None
++        counts = out[i_count] if need_count else None
++        sq_sums = out[i_sqsum] if need_sqsum else None
++        return self._build_result(
++            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
++        )
+ 
+-    def count_mean_var_sparse(self, dof: int = 1):
++    def count_mean_var_sparse(self, funcs=None, *, dof: int = 1):
+         """
+         This function is used to calculate the sum, mean, and variance of the sparse data matrix.
+-        It uses a custom cuda-kernel to perform the aggregation.
++        It uses a custom cuda-kernel to perform the aggregation. Only the
++        accumulator planes the requested ``funcs`` need are allocated.
+         """
+ 
+         assert dof >= 0
+-        out = cp.zeros(
+-            (3, self.n_cells.shape[0] * self.data.shape[1]), dtype=cp.float64
++        funcs = _ALL_FUNCS if funcs is None else set(funcs)
++        need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
++        n_groups, n_genes = self.n_cells.shape[0], self.data.shape[1]
++
++        sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
++        counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
++        sq_sums = (
++            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
+         )
+         mask = self._get_mask()
+ 
+@@ -180,20 +244,18 @@ def count_mean_var_sparse(self, dof: int = 1):
+             self.data.indptr,
+             self.data.indices,
+             self.data.data,
+-            out=out,
++            out_sum=sums,
++            out_count=counts,
++            out_sqsum=sq_sums,
+             cats=self.groupby,
+             mask=mask,
+             n_cells=self.data.shape[0],
+-            n_genes=self.data.shape[1],
+-            n_groups=self.n_cells.shape[0],
++            n_genes=n_genes,
+             is_csc=self.data.format == "csc",
+         )
+-        sums, counts, sq_sums = out[0, :], out[1, :], out[2, :]
+-        n_groups, n_genes = self.n_cells.shape[0], self.data.shape[1]
+-        sums = sums.reshape(n_groups, n_genes)
+-        sq_sums = sq_sums.reshape(n_groups, n_genes)
+-        counts = counts.reshape(n_groups, n_genes)
+-        return self._build_result(sums, counts, sq_sums, dof)
++        return self._build_result(
++            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
++        )
+ 
+     def count_mean_var_sparse_sparse(self, funcs, dof: int = 1):
+         """
+@@ -267,6 +329,13 @@ def count_mean_var_sparse_sparse(self, funcs, dof: int = 1):
+                 (sums, indices, indptr),
+                 shape=(self.n_cells.shape[0], self.data.shape[1]),
+             )
++        if "sq_sum" in funcs:
++            sq_sums = cp.zeros(nnz + 1, dtype=cp.float64)
++            _scatter_sum(src_data * src_data, index, sq_sums)
++            results["sq_sum"] = cp_sparse.csr_matrix(
++                (sq_sums, indices, indptr),
++                shape=(self.n_cells.shape[0], self.data.shape[1]),
++            )
+         if "var" in funcs or "mean" in funcs:
+             means = cp.zeros(nnz + 1, dtype=cp.float64)
+             var = cp.zeros(nnz + 1, dtype=cp.float64)
+@@ -306,33 +375,39 @@ def count_mean_var_sparse_sparse(self, funcs, dof: int = 1):
+ 
+         return results
+ 
+-    def count_mean_var_dense(self, dof: int = 1):
++    def count_mean_var_dense(self, funcs=None, *, dof: int = 1):
+         """
+-        This function is used to calculate the sum, mean, and variance of the sparse data matrix.
+-        It uses a custom cuda-kernel to perform the aggregation.
++        This function is used to calculate the sum, mean, and variance of the dense data matrix.
++        It uses a custom cuda-kernel to perform the aggregation. Only the
++        accumulator planes the requested ``funcs`` need are allocated.
+         """
+ 
+         assert dof >= 0
+-        out = cp.zeros((3, self.n_cells.shape[0], self.data.shape[1]), dtype=cp.float64)
++        funcs = _ALL_FUNCS if funcs is None else set(funcs)
++        need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
++        n_groups, n_genes = self.n_cells.shape[0], self.data.shape[1]
+ 
++        sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
++        counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
++        sq_sums = (
++            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
++        )
+         mask = self._get_mask()
+ 
+         _aggr_cuda.dense_aggr(
+             self.data,
+-            out=out,
++            out_sum=sums,
++            out_count=counts,
++            out_sqsum=sq_sums,
+             cats=self.groupby,
+             mask=mask,
+             n_cells=self.data.shape[0],
+-            n_genes=self.data.shape[1],
+-            n_groups=self.n_cells.shape[0],
++            n_genes=n_genes,
+             is_fortran=self.data.flags.f_contiguous,
+         )
+-        sums, counts, sq_sums = out[0], out[1], out[2]
+-        n_groups, n_genes = self.n_cells.shape[0], self.data.shape[1]
+-        sums = sums.reshape(n_groups, n_genes)
+-        sq_sums = sq_sums.reshape(n_groups, n_genes)
+-        counts = counts.reshape(n_groups, n_genes)
+-        return self._build_result(sums, counts, sq_sums, dof)
++        return self._build_result(
++            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
++        )
+ 
+ 
+ def aggregate(
+@@ -457,7 +532,7 @@ def aggregate(
+         split_every = kwargs.pop("split_every", 2)
+         if kwargs:
+             raise TypeError(f"Unexpected keyword arguments: {set(kwargs)}")
+-        result = groupby.count_mean_var(dof, split_every=split_every)
++        result = groupby.count_mean_var(funcs, dof=dof, split_every=split_every)
+     layers = {}
+ 
+     if "sum" in funcs:
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/_core.py b/src/rapids_singlecell/tools/_rank_genes_groups/_core.py
+index 019e126b2..2ccf87b5b 100644
+--- a/src/rapids_singlecell/tools/_rank_genes_groups/_core.py
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/_core.py
+@@ -167,7 +167,12 @@ def _basic_stats(self) -> None:
+         self._compute_stats_in_chunks = False
+ 
+         agg = Aggregate(groupby=self.labels.cat, data=self.X)
+-        result = agg.count_mean_var(dof=1)
++        # Only sum and sq_sum are needed (means/vars are derived locally below);
++        # count_nonzero is only needed when comp_pts is requested.
++        funcs = {"sum", "sq_sum"}
++        if self.comp_pts:
++            funcs.add("count_nonzero")
++        result = agg.count_mean_var(funcs, dof=1)
+ 
+         # Map Aggregate category order → selected groups order
+         cat_names = list(self.labels.cat.categories)
+diff --git a/tests/test_aggregated.py b/tests/test_aggregated.py
+index c56f5195c..43318c284 100644
+--- a/tests/test_aggregated.py
++++ b/tests/test_aggregated.py
+@@ -343,7 +343,7 @@ def test_factors():
+     cp.testing.assert_array_equal(res.layers["sum"], adata.X)
+ 
+ 
+-@pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero"])
++@pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero", "sq_sum"])
+ def test_sparse_vs_dense(metric):
+     adata = pbmc3k_processed().raw.to_adata()
+     rsc.get.anndata_to_GPU(adata)
+diff --git a/tests/test_int64_indptr.py b/tests/test_int64_indptr.py
+index b746537a7..4fb4ba8ec 100644
+--- a/tests/test_int64_indptr.py
++++ b/tests/test_int64_indptr.py
+@@ -743,21 +743,24 @@ def test_sparse_aggr(dtype, is_csc):
+     outs = {}
+     for idx_dtype in (np.int32, np.int64):
+         A = _make_csc(dtype, idx_dtype) if is_csc else _make_csr(dtype, idx_dtype)
+-        out = cp.zeros((3, n_groups, N_COLS), dtype=cp.float64)
++        out_sum = cp.zeros((n_groups, N_COLS), dtype=cp.float64)
++        out_count = cp.zeros((n_groups, N_COLS), dtype=cp.float64)
++        out_sqsum = cp.zeros((n_groups, N_COLS), dtype=cp.float64)
+         _aggr.sparse_aggr(
+             A.indptr,
+             A.indices,
+             A.data,
+-            out=out,
++            out_sum=out_sum,
++            out_count=out_count,
++            out_sqsum=out_sqsum,
+             cats=cats,
+             mask=mask,
+             n_cells=N_ROWS,
+             n_genes=N_COLS,
+-            n_groups=n_groups,
+             is_csc=is_csc,
+             stream=_stream(),
+         )
+-        outs[idx_dtype] = out
++        outs[idx_dtype] = cp.stack([out_sum, out_count, out_sqsum])
+     _eq(outs[np.int32], outs[np.int64])
+ 
+ 

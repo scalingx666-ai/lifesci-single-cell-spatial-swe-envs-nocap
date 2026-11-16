@@ -1,0 +1,15 @@
+# Issue
+
+**Title:** condence code & visuals
+
+## Description
+
+- for now, use `patchwork` to condense visual outputs
+- if we prefer, we can make use of Quarto's `#| layout-ncol`  
+to display plots with separate captions
+- `{.panel-tabset}` would be an alternative if we want to  
+keep the workflow to Xenium/CosMx-only, and hide the other
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `da99bbe8262d`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

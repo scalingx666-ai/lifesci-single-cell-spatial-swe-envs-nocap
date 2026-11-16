@@ -1,0 +1,645 @@
+diff --git a/.github/workflows/R-CMD-check.yaml b/.github/workflows/R-CMD-check.yaml
+index 2e4afc41f..fb76034d6 100644
+--- a/.github/workflows/R-CMD-check.yaml
++++ b/.github/workflows/R-CMD-check.yaml
+@@ -64,11 +64,25 @@ jobs:
+         env:
+           GITHUB_PAT: ${{ github.token }}
+         with:
+-          extra-packages: any::rcmdcheck, any::testthat, any::callr, any::ps, github::immunogenomics/presto
++          extra-packages: any::rcmdcheck, any::testthat, any::callr, any::ps, github::immunogenomics/presto, bioc::speckle
+           needs: check
+           dependencies: '"hard"'
+           cache: false
+ 
++      - name: Verify speckle propeller backend
++        shell: Rscript {0}
++        run: |
++          stopifnot(requireNamespace("speckle", quietly = TRUE))
++          pkgload::load_all(".", quiet = TRUE)
++          for (path in c("tests/testthat/test-propeller-speckle.R",
++                         "tests/testthat/test-proportion-method-contracts.R")) {
++            desc <- if (grepl("method-contracts", path))
++              "virtual samples require opt-in and suppress inferential columns" else NULL
++            results <- testthat::test_file(path, desc = desc, reporter = "summary",
++                                          stop_on_failure = TRUE)
++            stopifnot(!any(as.data.frame(results)$skipped))
++          }
++
+       # Presto is deliberately runtime-optional and therefore is not exposed
+       # as a declared dependency inside R CMD check. Exercise the real GitHub
+       # installation here, before the check process narrows its library view.
+diff --git a/NEWS.md b/NEWS.md
+index 92c1afe5a..f1b74784a 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,5 +1,12 @@
+ # scop (development version)
+ 
++* **change**: `RunPropeller()` now uses speckle's transformed proportions and
++  empirical Bayes moderated tests instead of the internal logit t-test.
++  It supports `transform`, `robust`, and `trend`, records backend results and
++  designs, and blocks on donor IDs for fully paired comparisons. At least
++  two samples per condition are required. SCOP bootstrap intervals remain
++  descriptive intervals for the untransformed proportion ratio.
++
+ * **change**: Database preparation now exposes independent `PrepareGO()`,
+   `PrepareKEGG()`, `PrepareMSigDB()` and other source interfaces. `PrepareDB()`
+   dispatches to these interfaces, with shared annotation caching and conversion.
+diff --git a/R/ProportionTestPlot.R b/R/ProportionTestPlot.R
+index e7689e0e0..a697ac65a 100644
+--- a/R/ProportionTestPlot.R
++++ b/R/ProportionTestPlot.R
+@@ -474,7 +474,11 @@ plot_proportion_effect <- function(
+       "Sample-level cell-type summary"
+     }
+   } else if (identical(unique(as.character(df$method)), "propeller")) {
+-    "Internal logit-transformed sample-proportion test"
++    if ("engine" %in% colnames(df) && all(df$engine == "speckle")) {
++      "Speckle propeller; empirical Bayes moderated test"
++    } else {
++      "Internal logit-transformed sample-proportion test"
++    }
+   } else if (identical(unique(as.character(df$method)), "sccoda")) {
+     "scCODA credible effects"
+   } else {
+diff --git a/R/RunPropeller.R b/R/RunPropeller.R
+index a27a06a7d..52c0cff1b 100644
+--- a/R/RunPropeller.R
++++ b/R/RunPropeller.R
+@@ -3,16 +3,28 @@
+ #' @description
+ #' Method-specific implementation used by [RunProportionTest] when
+ #' `proportion_method = "propeller"`.
+-#' This implementation uses an internal logit-transformed sample-proportion
+-#' t-test (paired when sample IDs occur in both conditions), not the speckle
+-#' implementation of propeller. It stores standardized outputs for plotting.
++#' Uses the optional speckle backend: `getTransformedProps()` computes the
++#' transformed proportions and `propeller.ttest()` performs limma empirical
++#' Bayes moderated tests. Each requested comparison is a two-group test;
++#' multiple conditions produce pairwise results, not an omnibus ANOVA.
++#' P-values, FDR, and `Tstatistic` come from speckle. `obs_log2FD` and bootstrap
++#' intervals describe the ratio of mean untransformed sample proportions,
++#' with a `1e-5` pseudocount; these intervals are not moderated-test intervals.
+ #'
+ #' @md
+ #' @inheritParams RunProportionTest
+ #' @param sample.by Metadata column identifying biological samples. Required
+ #' when calling `RunPropeller()` directly. Fully paired sample IDs across two
+-#' conditions use a paired test; partially paired comparisons are rejected.
+-#' @param n_bootstrap Number of bootstrap iterations for confidence intervals.
++#' conditions add a sample blocking effect to the speckle design matrix;
++#' partially paired comparisons are rejected. At least two biological samples
++#' per condition are required.
++#' @param n_bootstrap Number of sample bootstrap iterations for descriptive
++#' confidence intervals. Paired samples are resampled together. Use zero to
++#' omit bootstrap intervals.
++#' @param transform Proportion transformation, `"logit"` (default) or `"asin"`.
++#' Logit uses speckle's count pseudocount of 0.5 before computing proportions.
++#' @param robust Whether speckle uses robust empirical Bayes variance shrinkage.
++#' @param trend Whether speckle fits a mean-variance trend.
+ #'
+ #' @return A method result bundle used internally by [RunProportionTest].
+ #'
+@@ -26,9 +38,17 @@ RunPropeller <- function(
+   n_bootstrap = 1000,
+   seed = 11,
+   verbose = TRUE,
+-  srt = NULL
++  srt = NULL,
++  transform = c("logit", "asin"),
++  robust = TRUE,
++  trend = FALSE
+ ) {
+   srt <- resolve_deprecated_srt(object, srt, missing(object))
++  transform <- match.arg(transform)
++  if (length(n_bootstrap) != 1L || is.na(n_bootstrap) || !is.finite(n_bootstrap) ||
++      n_bootstrap < 0 || n_bootstrap != as.integer(n_bootstrap)) {
++    stop("n_bootstrap must be a non-negative integer.", call. = FALSE)
++  }
+   meta_data <- validate_proportion_inputs(
+     srt = srt,
+     group.by = group.by,
+@@ -44,15 +64,17 @@ RunPropeller <- function(
+     include_bidirectional = TRUE
+   )
+ 
+-  engine <- "internal_logit_ttest"
++  propeller_check_r()
++  engine <- "speckle"
+ 
+   results_list <- list()
++  backend_results <- list()
+   for (i in seq_len(nrow(comparisons_condition))) {
+     cluster_1 <- comparisons_condition[i, 1]
+     cluster_2 <- comparisons_condition[i, 2]
+     comparison_name <- paste0(cluster_1, "_vs_", cluster_2)
+ 
+-    prop_res <- sample_level_proportion_test(
++    prop_res <- run_propeller_speckle(
+       meta_data = meta_data,
+       group.by = group.by,
+       split.by = split.by,
+@@ -60,30 +82,134 @@ RunPropeller <- function(
+       cluster_1 = cluster_1,
+       cluster_2 = cluster_2,
+       n_bootstrap = n_bootstrap,
+-      transform = "logit",
++      transform = transform,
++      robust = robust,
++      trend = trend,
+       seed = seed + i,
+       verbose = verbose
+     )
+ 
+     results_list[[comparison_name]] <- standardize_proportion_result(
+-      prop_res,
++      prop_res$result,
+       cluster_1 = cluster_1,
+       cluster_2 = cluster_2,
+       comparison_name = comparison_name,
+       method = "propeller"
+     )
++    backend_results[[comparison_name]] <- prop_res$backend
+   }
+ 
+   list(
+     method = "propeller",
+     results = results_list,
+     result_levels = "group",
+-    details = list(engine = engine),
++    details = list(
++      engine = engine,
++      speckle_version = as.character(utils::packageVersion("speckle")),
++      backend_results = backend_results
++    ),
+     parameters = list(
+       sample.by = sample.by,
+       n_bootstrap = n_bootstrap,
+-      transform = "logit",
++      transform = transform,
++      robust = robust,
++      trend = trend,
+       engine = engine
+     )
+   )
+ }
++
++propeller_check_r <- function() {
++  status <- check_r("speckle", verbose = FALSE)
++  if (!isTRUE(status[["speckle"]])) {
++    stop("RunPropeller requires the optional Bioconductor package 'speckle'.", call. = FALSE)
++  }
++  invisible(TRUE)
++}
++
++propeller_get_fun <- function(fun) {
++  out <- get_namespace_fun("speckle", fun)
++  if (!is.function(out)) {
++    stop(sprintf("The installed speckle backend does not provide '%s'.", fun), call. = FALSE)
++  }
++  out
++}
++
++run_propeller_speckle <- function(
++  meta_data, group.by, split.by, sample.by, cluster_1, cluster_2,
++  n_bootstrap, transform, robust, trend, seed, verbose
++) {
++  dat <- meta_data[, c(group.by, split.by, sample.by), drop = FALSE]
++  colnames(dat) <- c("clusters", "condition", "sample")
++  dat <- dat[dat$condition %in% c(cluster_1, cluster_2), , drop = FALSE]
++  dat[] <- lapply(dat, as.character)
++  if (anyNA(dat$clusters) || any(!nzchar(dat$clusters))) {
++    stop("Propeller cell type labels must be non-missing and non-empty.", call. = FALSE)
++  }
++  sample_info <- proportion_sample_condition_keys(dat, "sample", "condition")
++  pairs <- sample_info$pairs
++  paired <- proportion_pair_is_paired(pairs, cluster_1, cluster_2)
++  if (any(table(factor(pairs$condition, levels = c(cluster_1, cluster_2))) < 2L)) {
++    stop("Propeller requires at least two biological samples per condition.", call. = FALSE)
++  }
++  if (length(unique(dat$clusters)) < 2L) {
++    stop("Propeller requires at least two cell types in the comparison.", call. = FALSE)
++  }
++
++  props <- propeller_get_fun("getTransformedProps")(
++    clusters = factor(dat$clusters), sample = factor(sample_info$cell_keys),
++    transform = transform
++  )
++  pairs <- pairs[match(colnames(props$Proportions), pairs$sample_key), , drop = FALSE]
++  condition <- factor(pairs$condition, levels = c(cluster_1, cluster_2))
++  design <- stats::model.matrix(~ 0 + condition)
++  if (paired) {
++    donor <- stats::model.matrix(~ factor(pairs$sample))[, -1, drop = FALSE]
++    design <- cbind(design, donor)
++  }
++  rownames(design) <- pairs$sample_key
++  contrasts <- c(1, -1, rep(0, ncol(design) - 2L))
++  upstream <- propeller_get_fun("propeller.ttest")(
++    prop.list = props, design = design, contrasts = contrasts,
++    robust = robust, trend = trend, sort = FALSE
++  )
++
++  result <- upstream
++  result$engine <- "speckle"
++  result$clusters <- rownames(upstream)
++  prop_mat <- props$Proportions[result$clusters, , drop = FALSE]
++  group_1 <- which(pairs$condition == cluster_1)
++  group_2 <- which(pairs$condition == cluster_2)
++  # Align donor IDs before both effect calculation and paired bootstrap.
++  if (paired) {
++    group_2 <- group_2[match(pairs$sample[group_1], pairs$sample[group_2])]
++  }
++  pseudocount <- 1e-5
++  result$obs_log2FD <- log2((rowMeans(prop_mat[, group_1, drop = FALSE]) + pseudocount) /
++    (rowMeans(prop_mat[, group_2, drop = FALSE]) + pseudocount))
++  result$boot_mean_log2FD <- result$boot_CI_2.5 <- result$boot_CI_97.5 <- NA_real_
++  if (!is.null(seed)) set.seed(seed)
++  if (n_bootstrap > 0) {
++    for (i in seq_len(nrow(result))) {
++      v1 <- as.numeric(prop_mat[i, group_1])
++      v2 <- as.numeric(prop_mat[i, group_2])
++      boot_result <- if (paired) {
++        boot <- replicate(n_bootstrap, {
++          idx <- sample.int(length(v1), length(v1), replace = TRUE)
++          log2((mean(v1[idx]) + pseudocount) / (mean(v2[idx]) + pseudocount))
++        })
++        list(boot_mean_log2FD = mean(boot),
++          boot_CI_2.5 = as.numeric(stats::quantile(boot, 0.025)),
++          boot_CI_97.5 = as.numeric(stats::quantile(boot, 0.975)))
++      } else {
++        proportion_bootstrap_stats(v1, v2, n_bootstrap, pseudocount, verbose)
++      }
++      boot_columns <- c("boot_mean_log2FD", "boot_CI_2.5", "boot_CI_97.5")
++      result[i, boot_columns] <- boot_result[boot_columns]
++    }
++  }
++  list(result = result, backend = list(
++    results = upstream, design = design, contrasts = contrasts,
++    sample_data = pairs, counts = props$Counts, paired = paired
++  ))
++}
+diff --git a/R/RunProportionTest.R b/R/RunProportionTest.R
+index 53f5256ad..4c3dfe539 100644
+--- a/R/RunProportionTest.R
++++ b/R/RunProportionTest.R
+@@ -4,6 +4,8 @@
+ #' [RunProportionTest] performs differential abundance testing for cell proportions.
+ #' The function acts as a dispatcher and routes to one of the method-specific
+ #' implementations: permutation, milo, sccoda, or propeller.
++#' `"propeller"` uses the optional speckle backend for pairwise empirical
++#' Bayes moderated tests; see [RunPropeller] for transformations and parameters.
+ #'
+ #' @md
+ #' @inheritParams thisutils::log_message
+@@ -189,6 +191,15 @@ RunProportionTest <- function(
+ 
+   if (isTRUE(pseudo_sample_info$enabled)) {
+     method_bundle$results <- lapply(method_bundle$results, mask_pseudo_sample_inference)
++    if (identical(proportion_method, "propeller") &&
++        !is.null(method_bundle$details$backend_results)) {
++      method_bundle$details$backend_results <- lapply(
++        method_bundle$details$backend_results, function(x) {
++          x$results <- mask_pseudo_sample_inference(x$results)
++          x
++        }
++      )
++    }
+     if (!is.null(method_bundle$neighborhood_results)) {
+       method_bundle$neighborhood_results <- lapply(
+         method_bundle$neighborhood_results, mask_pseudo_sample_inference
+@@ -513,7 +524,7 @@ add_proportion_pseudo_samples <- function(
+ 
+ mask_pseudo_sample_inference <- function(df) {
+   statistics <- c(
+-    "pval", "p_val", "p.value", "PValue", "P.Value", "F",
++    "pval", "p_val", "p.value", "PValue", "P.Value", "F", "Tstatistic",
+     "FDR", "SpatialFDR", "BH_FDR", "adj.P.Val", "q_value", "qval",
+     "inclusion_prob", "boot_CI_2.5", "boot_CI_97.5",
+     "hdi_2.5", "hdi_97.5"
+diff --git a/man/RunPropeller.Rd b/man/RunPropeller.Rd
+index c17d1f9c0..2e1a0d716 100644
+--- a/man/RunPropeller.Rd
++++ b/man/RunPropeller.Rd
+@@ -13,7 +13,10 @@ RunPropeller(
+   n_bootstrap = 1000,
+   seed = 11,
+   verbose = TRUE,
+-  srt = NULL
++  srt = NULL,
++  transform = c("logit", "asin"),
++  robust = TRUE,
++  trend = FALSE
+ )
+ }
+ \arguments{
+@@ -29,7 +32,9 @@ samples are explicitly enabled.}
+ 
+ \item{sample.by}{Metadata column identifying biological samples. Required
+ when calling \code{RunPropeller()} directly. Fully paired sample IDs across two
+-conditions use a paired test; partially paired comparisons are rejected.}
++conditions add a sample blocking effect to the speckle design matrix;
++partially paired comparisons are rejected. At least two biological samples
++per condition are required.}
+ 
+ \item{comparison}{Optional pairs of condition labels. Each pair is
+ \code{c(group1, group2)}. \code{obs_log2FD} is \code{log2(group1 / group2)}, matching
+@@ -37,7 +42,9 @@ conditions use a paired test; partially paired comparisons are rejected.}
+ type is more abundant in \code{group1}. If \code{NULL}, all pairwise comparisons are
+ generated in both directions.}
+ 
+-\item{n_bootstrap}{Number of bootstrap iterations for confidence intervals.}
++\item{n_bootstrap}{Number of sample bootstrap iterations for descriptive
++confidence intervals. Paired samples are resampled together. Use zero to
++omit bootstrap intervals.}
+ 
+ \item{seed}{Random seed, including for permutation testing.}
+ 
+@@ -46,6 +53,13 @@ Default is \code{TRUE}.}
+ 
+ \item{srt}{Deprecated alias for \code{object}; supply exactly one of the two. It
+ will be removed in scop 1.0.0.}
++
++\item{transform}{Proportion transformation, \code{"logit"} (default) or \code{"asin"}.
++Logit uses speckle's count pseudocount of 0.5 before computing proportions.}
++
++\item{robust}{Whether speckle uses robust empirical Bayes variance shrinkage.}
++
++\item{trend}{Whether speckle fits a mean-variance trend.}
+ }
+ \value{
+ A method result bundle used internally by \link{RunProportionTest}.
+@@ -53,7 +67,11 @@ A method result bundle used internally by \link{RunProportionTest}.
+ \description{
+ Method-specific implementation used by \link{RunProportionTest} when
+ \code{proportion_method = "propeller"}.
+-This implementation uses an internal logit-transformed sample-proportion
+-t-test (paired when sample IDs occur in both conditions), not the speckle
+-implementation of propeller. It stores standardized outputs for plotting.
++Uses the optional speckle backend: \code{getTransformedProps()} computes the
++transformed proportions and \code{propeller.ttest()} performs limma empirical
++Bayes moderated tests. Each requested comparison is a two-group test;
++multiple conditions produce pairwise results, not an omnibus ANOVA.
++P-values, FDR, and \code{Tstatistic} come from speckle. \code{obs_log2FD} and bootstrap
++intervals describe the ratio of mean untransformed sample proportions,
++with a \code{1e-5} pseudocount; these intervals are not moderated-test intervals.
+ }
+diff --git a/man/RunProportionTest.Rd b/man/RunProportionTest.Rd
+index d62251ac9..69a8669ce 100644
+--- a/man/RunProportionTest.Rd
++++ b/man/RunProportionTest.Rd
+@@ -84,6 +84,8 @@ will be removed in scop 1.0.0.}
+ \link{RunProportionTest} performs differential abundance testing for cell proportions.
+ The function acts as a dispatcher and routes to one of the method-specific
+ implementations: permutation, milo, sccoda, or propeller.
++\code{"propeller"} uses the optional speckle backend for pairwise empirical
++Bayes moderated tests; see \link{RunPropeller} for transformations and parameters.
+ }
+ \examples{
+ data(pancreas_sub)
+diff --git a/tests/testthat/test-propeller-speckle.R b/tests/testthat/test-propeller-speckle.R
+new file mode 100644
+index 000000000..15e012a75
+--- /dev/null
++++ b/tests/testthat/test-propeller-speckle.R
+@@ -0,0 +1,228 @@
++make_propeller_reference_srt <- function(paired = FALSE) {
++  tab <- rbind(
++    c(100, 0, 0, 0), c(45, 30, 20, 5), c(95, 15, 5, 5), c(40, 20, 15, 5),
++    c(15, 55, 20, 10), c(10, 60, 20, 0), c(0, 60, 25, 15), c(20, 40, 35, 5)
++  )
++  dat <- do.call(rbind, lapply(seq_len(nrow(tab)), function(i) {
++    data.frame(CellType = rep(c("T", "B", "Mono", "Rare"), tab[i, ]),
++      Condition = if (i <= 4L) "A" else "B",
++      Sample = if (paired) paste0("donor", (i - 1L) %% 4L + 1L) else paste0("sample", i))
++  }))
++  counts <- Matrix::sparseMatrix(i = rep(1L, nrow(dat)), j = seq_len(nrow(dat)), x = 1,
++    dims = c(2L, nrow(dat)),
++    dimnames = list(c("gene1", "gene2"), paste0("cell", seq_len(nrow(dat)))))
++  srt <- SeuratObject::CreateSeuratObject(counts)
++  rownames(dat) <- colnames(srt)
++  SeuratObject::AddMetaData(srt, dat)
++}
++
++test_that("SCOP propeller matches upstream with zeros, ones, and unequal totals", {
++  skip_if_not_installed("speckle")
++  check <- getFromNamespace("propeller_check_r", "scop")
++  check()
++  upstream <- thisutils::get_namespace_fun("speckle", "propeller")
++  srt <- make_propeller_reference_srt()
++  for (transform in c("logit", "asin")) {
++    for (robust in c(FALSE, TRUE)) {
++      for (trend in c(FALSE, TRUE)) {
++        bundle <- RunPropeller(srt, "CellType", "Condition", "Sample",
++          comparison = list(c("A", "B")), n_bootstrap = 0L,
++          transform = transform, robust = robust, trend = trend, verbose = FALSE)
++        ref <- upstream(clusters = factor(srt$CellType), sample = factor(srt$Sample),
++          group = factor(srt$Condition, levels = c("A", "B")),
++          transform = transform, robust = robust, trend = trend)
++        result <- bundle$results$A_vs_B
++        ref <- ref[match(result$clusters, rownames(ref)), , drop = FALSE]
++        expect_equal(result$pval, ref$P.Value, tolerance = 1e-12)
++        expect_equal(result$FDR, ref$FDR, tolerance = 1e-12)
++        expect_equal(result$Tstatistic, ref$Tstatistic, tolerance = 1e-12)
++        expect_equal(result$PropRatio, ref$PropRatio, tolerance = 1e-12)
++        expect_identical(bundle$details$engine, "speckle")
++        expect_identical(bundle$parameters$transform, transform)
++        expect_true(all(is.na(result$boot_CI_2.5)))
++      }
++    }
++  }
++})
++
++test_that("speckle comparison reversal preserves significance and flips direction", {
++  skip_if_not_installed("speckle")
++  srt <- make_propeller_reference_srt()
++  out <- RunProportionTest(srt, group.by = "CellType", split.by = "Condition",
++    sample.by = "Sample", proportion_method = "propeller", n_bootstrap = 0L,
++    verbose = FALSE)
++  result <- out@tools$ProportionTest$results
++  a <- result$A_vs_B
++  b <- result$B_vs_A[match(a$clusters, result$B_vs_A$clusters), , drop = FALSE]
++  expect_equal(a$pval, b$pval, tolerance = 1e-12)
++  expect_equal(a$FDR, b$FDR, tolerance = 1e-12)
++  expect_equal(a$Tstatistic, -b$Tstatistic, tolerance = 1e-12)
++  expect_equal(a$obs_log2FD, -b$obs_log2FD, tolerance = 1e-12)
++  expect_gt(a$obs_log2FD[a$clusters == "T"], 0)
++  tab <- table(srt$CellType, srt$Sample)
++  props <- sweep(tab, 2, colSums(tab), "/")
++  expected <- log2((rowMeans(props[, paste0("sample", 1:4)]) + 1e-5) /
++    (rowMeans(props[, paste0("sample", 5:8)]) + 1e-5))
++  expect_equal(a$obs_log2FD, unname(expected[a$clusters]))
++  plots <- ProportionTestPlot(out, proportion_method = "propeller", combine = FALSE)
++  expect_match(plots[[1]]$labels$subtitle, "Speckle propeller")
++  # Previously saved results still identify the original internal test.
++  out@tools$ProportionTest$methods$propeller$results <- lapply(result, function(x) {
++    x$engine <- NULL
++    x
++  })
++  plots <- ProportionTestPlot(out, proportion_method = "propeller", combine = FALSE)
++  expect_match(plots[[1]]$labels$subtitle, "Internal logit")
++})
++
++test_that("independent sample bootstrap is reproducible and leaves speckle tests unchanged", {
++  skip_if_not_installed("speckle")
++  srt <- make_propeller_reference_srt()
++  run <- function(n) RunPropeller(srt, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = n,
++    seed = 19L, verbose = FALSE)$results$A_vs_B
++  result <- run(30L)
++  expect_true(all(is.finite(result$boot_CI_2.5)))
++  expect_true(all(is.finite(result$boot_CI_97.5)))
++  expect_identical(result$boot_CI_2.5, run(30L)$boot_CI_2.5)
++  expect_identical(result$pval, run(0L)$pval)
++  expect_identical(result$FDR, run(0L)$FDR)
++})
++
++test_that("paired propeller matches an upstream donor-blocked design", {
++  skip_if_not_installed("speckle")
++  srt <- make_propeller_reference_srt(paired = TRUE)
++  bundle <- RunPropeller(srt, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = 30L, verbose = FALSE)
++  backend <- bundle$details$backend_results$A_vs_B
++  expect_true(backend$paired)
++  expect_equal(nrow(backend$design), 8L)
++  expect_equal(ncol(backend$design), 5L)
++  check <- getFromNamespace("propeller_check_r", "scop")
++  check()
++  props <- thisutils::get_namespace_fun("speckle", "getTransformedProps")(
++    clusters = factor(srt$CellType),
++    sample = factor(paste(srt$Sample, srt$Condition, sep = ":")), transform = "logit")
++  keys <- colnames(props$Proportions)
++  condition <- factor(sub(".*:", "", keys), levels = c("A", "B"))
++  donor <- factor(sub(":.*", "", keys))
++  design <- stats::model.matrix(~ 0 + condition + donor)
++  ref <- thisutils::get_namespace_fun("speckle", "propeller.ttest")(
++    props, design, c(1, -1, 0, 0, 0), robust = TRUE, trend = FALSE, sort = FALSE)
++  result <- bundle$results$A_vs_B
++  ref <- ref[match(result$clusters, rownames(ref)), , drop = FALSE]
++  expect_equal(result$pval, ref$P.Value, tolerance = 1e-12)
++  expect_equal(result$FDR, ref$FDR, tolerance = 1e-12)
++  expect_equal(result$Tstatistic, ref$Tstatistic, tolerance = 1e-12)
++  expect_true(all(is.finite(result$boot_CI_2.5)))
++  again <- RunPropeller(srt, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = 30L, verbose = FALSE)
++  expect_identical(result$boot_CI_2.5, again$results$A_vs_B$boot_CI_2.5)
++  shuffled <- srt[, rev(seq_len(ncol(srt))) ]
++  again <- RunPropeller(shuffled, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = 30L, verbose = FALSE)
++  expect_equal(result, again$results$A_vs_B)
++})
++
++test_that("propeller rejects insufficient replication and partial pairing", {
++  skip_if_not_installed("speckle")
++  srt <- make_propeller_reference_srt(paired = TRUE)
++  partial <- srt[, !(srt$Sample == "donor4" & srt$Condition == "B")]
++  expect_error(RunPropeller(partial, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = 0L), "fully paired")
++  srt <- make_propeller_reference_srt()
++  single <- srt[, srt$Sample %in% c("sample1", "sample5", "sample6")]
++  expect_error(RunPropeller(single, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = 0L), "at least two biological")
++  srt$CellType[1] <- NA_character_
++  expect_error(RunPropeller(srt, "CellType", "Condition", "Sample",
++    comparison = list(c("A", "B")), n_bootstrap = 0L), "cell type labels")
++})
++
++test_that("propeller reports unavailable speckle without substituting another test", {
++  testthat::local_mocked_bindings(
++    check_r = function(...) list(speckle = FALSE), .package = "scop")
++  srt <- make_propeller_reference_srt()
++  expect_error(RunPropeller(srt, "CellType", "Condition", "Sample",
++    n_bootstrap = 0L), "requires the optional Bioconductor package 'speckle'")
++})
++
++test_that("virtual propeller samples mask upstream statistics too", {
++  skip_if_not_installed("speckle")
++  srt <- make_propeller_reference_srt()
++  out <- suppressWarnings(RunProportionTest(srt, group.by = "CellType",
++    split.by = "Condition", proportion_method = "propeller",
++    allow_pseudo_samples = TRUE, n_bootstrap = 0L, verbose = FALSE))
++  bundle <- out@tools$ProportionTest$methods$propeller
++  expect_false(bundle$inference_valid)
++  expect_true(all(is.na(bundle$results$A_vs_B$pval)))
++  expect_true(all(is.na(bundle$results$A_vs_B$Tstatistic)))
++  expect_true(all(is.na(bundle$details$backend_results$A_vs_B$results$P.Value)))
++})
++
++make_propeller_robust_srt <- function() {
++  # Fixed counts avoid RNG/version dependence. Most types vary mildly, while
++  # the last two alternate between rare and abundant within both conditions.
++  tab <- outer(seq_len(12L), seq_len(30L), function(i, j) {
++    40L + 2L * j + ((i * (j + 3L) + i^2) %% 13L)
++  })
++  tab[7:12, 1:6] <- tab[7:12, 1:6] + 25L
++  tab[, 29L] <- rep(c(1L, 400L, 5L, 300L, 2L, 500L), 2L)
++  tab[, 30L] <- rep(c(350L, 2L, 450L, 1L, 250L, 3L), 2L)
++  dat <- do.call(rbind, lapply(seq_len(nrow(tab)), function(i) {
++    data.frame(CellType = rep(sprintf("type%02d", seq_len(ncol(tab))), tab[i, ]),
++      Condition = if (i <= 6L) "A" else "B", Sample = sprintf("sample%02d", i))
++  }))
++  counts <- Matrix::sparseMatrix(i = rep(1L, nrow(dat)), j = seq_len(nrow(dat)), x = 1,
++    dims = c(2L, nrow(dat)),
++    dimnames = list(c("gene1", "gene2"), paste0("cell", seq_len(nrow(dat)))))
++  srt <- SeuratObject::CreateSeuratObject(counts)
++  rownames(dat) <- colnames(srt)
++  SeuratObject::AddMetaData(srt, dat)
++}
++
++test_that("propeller exercises limma robust estimation with variance outliers", {
++  skip_if_not_installed("speckle")
++  getFromNamespace("propeller_check_r", "scop")()
++  srt <- make_propeller_robust_srt()
++  expect_equal(length(unique(srt$CellType)), 30L)
++  real_fit <- getFromNamespace("fitFDistRobustly", "limma")
++  fits <- list()
++  testthat::local_mocked_bindings(
++    fitFDistRobustly = function(...) {
++      # Delegate unchanged to limma and retain its diagnostics. Small-input
++      # non-robust fallback has no tail.p.value, even when robust=TRUE.
++      fit <- real_fit(...)
++      fits[[length(fits) + 1L]] <<- fit
++      fit
++    }, .package = "limma")
++  upstream <- thisutils::get_namespace_fun("speckle", "propeller")
++  for (transform in c("logit", "asin")) {
++    for (trend in c(FALSE, TRUE)) {
++      fits <- list()
++      result <- RunPropeller(srt, "CellType", "Condition", "Sample",
++        comparison = list(c("A", "B")), n_bootstrap = 0L,
++        transform = transform, robust = TRUE, trend = trend,
++        verbose = FALSE)$results$A_vs_B
++      # RunPropeller also evaluates the reverse comparison.
++      expect_length(fits, 2L)
++      fit <- fits[[1L]]
++      expect_length(fit$tail.p.value, 30L)
++      expect_true(all(is.finite(fit$tail.p.value)))
++      expect_true(any(fit$tail.p.value < 0.01))
++      expect_gt(length(unique(fit$df2.shrunk)), 1L)
++      ref <- upstream(clusters = factor(srt$CellType), sample = factor(srt$Sample),
++        group = factor(srt$Condition, levels = c("A", "B")),
++        transform = transform, robust = TRUE, trend = trend)
++      ref <- ref[match(result$clusters, rownames(ref)), , drop = FALSE]
++      expect_equal(result$pval, ref$P.Value, tolerance = 1e-12)
++      expect_equal(result$FDR, ref$FDR, tolerance = 1e-12)
++      expect_equal(result$Tstatistic, ref$Tstatistic, tolerance = 1e-12)
++      nonrobust <- RunPropeller(srt, "CellType", "Condition", "Sample",
++        comparison = list(c("A", "B")), n_bootstrap = 0L,
++        transform = transform, robust = FALSE, trend = trend,
++        verbose = FALSE)$results$A_vs_B
++      expect_gt(max(abs(result$pval - nonrobust$pval)), 1e-6)
++    }
++  }
++})
+diff --git a/tests/testthat/test-proportion-method-contracts.R b/tests/testthat/test-proportion-method-contracts.R
+index 1d50eddb9..1d363a7ff 100644
+--- a/tests/testthat/test-proportion-method-contracts.R
++++ b/tests/testthat/test-proportion-method-contracts.R
+@@ -146,6 +146,7 @@ test_that("virtual samples require opt-in and suppress inferential columns", {
+     group.by = "CellType", split.by = "Condition",
+     proportion_method = "propeller", n_bootstrap = 0L, verbose = FALSE),
+     "sample.by")
++  skip_if_not_installed("speckle")
+   out <- suppressWarnings(RunProportionTest(srt,
+     group.by = "CellType", split.by = "Condition",
+     proportion_method = "propeller", allow_pseudo_samples = TRUE,

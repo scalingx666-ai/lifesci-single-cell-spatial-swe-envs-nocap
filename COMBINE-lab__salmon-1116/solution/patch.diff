@@ -1,0 +1,152 @@
+diff --git a/crates/salmon-quant/src/processor.rs b/crates/salmon-quant/src/processor.rs
+index 969c211e7..5b4de4a61 100644
+--- a/crates/salmon-quant/src/processor.rs
++++ b/crates/salmon-quant/src/processor.rs
+@@ -794,26 +794,40 @@ fn record(
+     // orphan here.
+     //
+     // Reading `compat[0]` is sound because every surviving mapping of a fragment
+-    // carries the SAME status, so the first is as good as any:
++    // agrees on *orphan-ness*, which is the only thing this test distinguishes:
+     //   * selective alignment: `map_read_pair_into` drops all orphans as soon as
+     //     one non-decoy concordant pair survives, and `finalize_mappings_counted_into`
+     //     never emits decoy mappings — so the set is either all-paired or
+     //     all-orphan;
+     //   * sketch: `map_read_pair_sketch_into` derives one `status` from the
+     //     fragment's `map_type` and stamps it on every accepted hit.
++    //
++    // "All-orphan" does NOT mean one shared status: when neither mate pairs
++    // concordantly to a transcript, mate 1 can orphan onto transcript A while
++    // mate 2 orphans onto transcript B, leaving `PairedEndLeft` and
++    // `PairedEndRight` side by side. Measured on a GRCh38 decoy index, 525 of
++    // 300,000 fragments (0.19%) do exactly that, and no fragment ever mixes
++    // `PairedEndPaired` or `SingleEnd` with anything else. Both orphan statuses
++    // answer this test the same way, so which one sorts first cannot change the
++    // count — but asserting a single shared status was wrong, and aborted debug
++    // builds on any decoy-bearing index (#1115).
++    //
+     // Note `compat` is ordered by transcript id (finalize sorts by `tid`), not by
+     // score, so this must not be read as "the best mapping" — it is "the status
+     // this fragment mapped with", which is well defined.
++    let is_orphan = |i: MapIdx| {
++        matches!(
++            i.get(placements).status,
++            MateStatus::PairedEndLeft | MateStatus::PairedEndRight
++        )
++    };
+     debug_assert!(
+         compat
+             .iter()
+-            .all(|&(i, _)| i.get(placements).status == compat[0].0.get(placements).status),
+-        "a fragment's surviving mappings must share one status"
++            .all(|&(i, _)| is_orphan(i) == is_orphan(compat[0].0)),
++        "a fragment's surviving mappings must agree on orphan-ness"
+     );
+-    if matches!(
+-        compat[0].0.get(placements).status,
+-        MateStatus::PairedEndLeft | MateStatus::PairedEndRight
+-    ) {
++    if is_orphan(compat[0].0) {
+         counters.orphan += 1;
+     }
+ 
+diff --git a/crates/salmon-quant/tests/quant_end_to_end.rs b/crates/salmon-quant/tests/quant_end_to_end.rs
+index ccb28de43..7a4437c7a 100644
+--- a/crates/salmon-quant/tests/quant_end_to_end.rs
++++ b/crates/salmon-quant/tests/quant_end_to_end.rs
+@@ -656,3 +656,95 @@ fn pseudoalignment_quantification_tracks_truth() {
+         );
+     }
+ }
++
++/// Regression test for #1115: a fragment whose two mates orphan onto *different*
++/// transcripts.
++///
++/// When neither mate pairs concordantly to a transcript, `map_read_pair_into`
++/// does not run its orphan-suppression `retain`, so mate 1 can survive as a
++/// `PairedEndLeft` mapping on transcript A while mate 2 survives as a
++/// `PairedEndRight` on transcript B. `record` then sees two *different*
++/// `MateStatus` values in one fragment.
++///
++/// A `debug_assert` there used to require every surviving mapping to share one
++/// status, which aborted debug builds on any index where this occurs — measured
++/// at 525 of 300,000 fragments on a GRCh38 decoy index. The invariant that
++/// actually holds, and the only one the code depends on, is that the mappings
++/// agree on *orphan-ness*: both statuses are orphans, so the orphan counter is
++/// well defined either way.
++///
++/// The fixture forces the case directly: each fragment's R1 is drawn from `a`
++/// and its R2 from `b`, so no concordant pair exists anywhere.
++///
++/// In a release build the assertion is compiled out and this only checks the
++/// counting; in a debug build it is the actual regression check.
++#[test]
++fn mates_orphaning_to_different_transcripts_are_one_orphan_fragment() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path();
++
++    // Two unrelated transcripts: no shared k-mers, so nothing pairs across them.
++    let a = gen_seq(900, 101);
++    let b = gen_seq(900, 202);
++    let fasta = dir.join("txome.fa");
++    {
++        let mut fa = std::fs::File::create(&fasta).unwrap();
++        for (name, seq) in [("a", &a), ("b", &b)] {
++            writeln!(fa, ">{name}").unwrap();
++            fa.write_all(seq).unwrap();
++            writeln!(fa).unwrap();
++        }
++    }
++
++    // R1 from `a`, R2 (reverse complement, as an inward pair would be) from `b`.
++    // Each mate places on its own transcript; the fragment has no proper pair.
++    const N: usize = 200;
++    let r1p = dir.join("reads_1.fq");
++    let r2p = dir.join("reads_2.fq");
++    let mut w = FastqWriters {
++        r1: std::io::BufWriter::new(std::fs::File::create(&r1p).unwrap()),
++        r2: std::io::BufWriter::new(std::fs::File::create(&r2p).unwrap()),
++    };
++    for i in 0..N {
++        let pos = (i * 3) % (900 - READ_LEN);
++        let s1 = a[pos..pos + READ_LEN].to_vec();
++        let s2 = revcomp(&b[pos..pos + READ_LEN]);
++        w.write_pair(i, &s1, &s2);
++    }
++    w.r1.flush().unwrap();
++    w.r2.flush().unwrap();
++    drop(w);
++
++    let idx_dir = dir.join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    let out = dir.join("quant");
++    let mut opts = QuantOptions::new(idx_dir, out);
++    opts.mates1 = vec![r1p];
++    opts.mates2 = vec![r2p];
++    opts.lib_type = "IU".to_string();
++    opts.num_threads = 1;
++
++    // The assertion fires during `record`, so reaching a result at all is the
++    // regression check in a debug build.
++    let res = quantify(&opts).expect("quantify must not abort on mixed-orphan fragments");
++
++    // Every fragment placed, and each counts once — as an orphan, not a pair.
++    assert_eq!(
++        res.num_mapped, N as u64,
++        "expected all {N} mixed-orphan fragments to map"
++    );
++    let counts = counts_by_name(&res);
++    let total: f64 = res.counts.iter().sum();
++    assert!(
++        (total - N as f64).abs() < 1.0,
++        "mass must be conserved: Σ NumReads {total} vs {N} fragments ({counts:?})"
++    );
++    // Both transcripts carry orphan evidence, so neither should be empty.
++    assert!(
++        counts["a"] > 0.0 && counts["b"] > 0.0,
++        "both transcripts should receive orphan mass: {counts:?}"
++    );
++}

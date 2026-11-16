@@ -1,0 +1,259 @@
+diff --git a/omicverse/single/_perturb.py b/omicverse/single/_perturb.py
+index b5065b690..c60fcc0b2 100644
+--- a/omicverse/single/_perturb.py
++++ b/omicverse/single/_perturb.py
+@@ -834,6 +834,11 @@ def perturb(
+ 
+     Notes
+     -----
++    For scTenifoldKnk, KD/OE are one-step linear approximations, not native
++    backend simulations: target rows of the full WT network are scaled once
++    and ``delta_X = X @ (W_perturbed - W_WT)``. GRN outputs are thresholded
++    summaries; their edge-based ``delta_expr`` is not predicted expression.
++
+     See ``Tutorials-single/t_perturb_in_silico.ipynb`` for end-to-end
+     KO / OE workflows on a public dataset.
+     """
+@@ -925,7 +930,7 @@ def _run_sctenifoldknk(
+     1. Build (or take) a PCNet from the scRNA counts via scTenifoldKnk
+        / scTenifoldNet under the hood.
+     2. For each target gene g:
+-         - ``mode='ko'``: zero out g's row/column in the network.
++         - ``mode='ko'``: use the backend's knockout network.
+          - ``mode='kd'``: scale by ``1/fold_change``.
+          - ``mode='oe'``: scale by ``fold_change``.
+     3. Compare control vs perturbed network. The Δ-edge table is the
+@@ -973,7 +978,7 @@ def _run_sctenifoldknk(
+ 
+     grn_base = _tensor_to_graph(wt_tensor, gene_names=gene_names)
+     # For KO the KO tensor produced by scTenifoldKnk is the perturbed graph.
+-    # For KD / OE we scale the WT edges in/out of each target.
++    # For KD / OE we scale the outgoing WT edges of each target.
+     if mode == "ko" and ko_tensor is not None:
+         grn_pert = _tensor_to_graph(ko_tensor, gene_names=gene_names)
+     else:
+@@ -1006,7 +1011,7 @@ def _run_sctenifoldknk(
+             )
+ 
+     # Per-cell ΔX via one-step propagation through the perturbed PCNet:
+-    #   ΔX[cell, gene_j] = sum_i X[cell, gene_i] * (KO[i,j] - WT[i,j])
++    #   ΔX[cell, gene_j] = sum_i X[cell, gene_i] * (perturbed[i,j] - WT[i,j])
+     # The PCNets are gene × gene weight matrices indexed by
+     # ``shared_gene_names`` (the genes that survived scTenifold's QC).
+     delta_X = None
+@@ -1020,9 +1025,16 @@ def _run_sctenifoldknk(
+             shared_in_adata = [g for g in shared if g in adata.var_names]
+             if len(shared_in_adata) == len(shared):
+                 X_sub = _expression_matrix(adata[:, shared], layer=layer)
+-                ko_arr = np.asarray(ko_tensor, dtype=np.float64)
+-                wt_arr = np.asarray(wt_tensor, dtype=np.float64)
+-                delta_X = X_sub @ (ko_arr - wt_arr)
++                if mode == "ko":
++                    pert_arr = np.asarray(ko_tensor, dtype=np.float64)
++                    wt_arr = np.asarray(wt_tensor, dtype=np.float64)
++                else:
++                    wt_arr = np.asarray(wt_tensor, dtype=np.float64)
++                    pert_arr = wt_arr.copy()
++                    target_rows = [i for i, gene in enumerate(shared) if gene in targets]
++                    factor = 1.0 / fold_change if mode == "kd" else fold_change
++                    pert_arr[target_rows, :] *= factor
++                delta_X = X_sub @ (pert_arr - wt_arr)
+                 cell_names = list(adata.obs_names)
+                 # Compute transition_prob if an embedding is available
+                 for emb_key in ("X_umap", "X_draw_graph_fa", "X_pca"):
+@@ -1152,22 +1164,18 @@ def _run_cell_oracle(
+             oracle.perform_PCA()
+             n_cells = oracle.adata.shape[0]
+             k = backend_kwargs.pop("knn_k", max(4, min(8, n_cells - 1)))
+-            try:
+-                oracle.knn_imputation(
+-                    n_pca_dims=backend_kwargs.pop("n_pca_dims", 20),
+-                    k=k,
+-                    balanced=False,
+-                    b_sight=backend_kwargs.pop("b_sight", min(max(n_cells // 4, k * 2), 200)),
+-                    b_maxl=backend_kwargs.pop("b_maxl", min(max(n_cells // 10, k), 50)),
+-                    n_jobs=backend_kwargs.pop("knn_n_jobs", 4),
+-                )
+-            except Exception:  # pragma: no cover - falls back to a no-op imputation
+-                # If kNN imputation fails (typically due to tiny demos), fall
+-                # back to using the raw counts as the imputed layer so
+-                # downstream simulate_shift can proceed.
+-                oracle.adata.layers["imputed_count"] = oracle.adata.X
++            oracle.knn_imputation(
++                n_pca_dims=backend_kwargs.pop("n_pca_dims", 20),
++                k=k,
++                balanced=False,
++                b_sight=backend_kwargs.pop("b_sight", min(max(n_cells // 4, k * 2), 200)),
++                b_maxl=backend_kwargs.pop("b_maxl", min(max(n_cells // 10, k), 50)),
++                n_jobs=backend_kwargs.pop("knn_n_jobs", 4),
++            )
++        if grn_base is None:
++            grn_base = adata.uns.get("base_grn")
+         if grn_base is None:
+-            grn_base = adata.uns.get("base_grn") or adata.uns.get("celloracle_base_grn")
++            grn_base = adata.uns.get("celloracle_base_grn")
+         if grn_base is None:
+             raise ValueError(
+                 "CellOracle backend needs a base GRN. Pass `grn_base=` or "
+@@ -1751,10 +1759,13 @@ def _apply_perturbation_to_graph(graph, *, targets, mode, fold_change):
+         return None
+     import networkx as nx
+     pert = graph.copy()
+-    for g in targets:
++    for g in dict.fromkeys(targets):
+         if g not in pert:
+             continue
+-        for u, v, data in list(pert.in_edges(g, data=True)) + list(pert.out_edges(g, data=True)):
++        edges = list(pert.out_edges(g, data=True))
++        if mode == "ko":
++            edges += list(pert.in_edges(g, data=True))
++        for u, v, data in edges:
+             w = float(data.get("weight", 1.0))
+             if mode == "ko":
+                 w_new = 0.0
+diff --git a/tests/single/test_perturb.py b/tests/single/test_perturb.py
+index 432e636df..75c02a6b9 100644
+--- a/tests/single/test_perturb.py
++++ b/tests/single/test_perturb.py
+@@ -93,8 +93,11 @@ def build(self):
+             for g in self.ko_genes:
+                 if g in idx:
+                     ko[idx[g], :] = 0.0
+-                    ko[:, idx[g]] = 0.0
+-            self.tensor_dict = {"WT": wt, "KO": ko}
++            self.tensor_dict = {
++                key: pd.DataFrame(value, index=self.shared_gene_names,
++                                  columns=self.shared_gene_names)
++                for key, value in {"WT": wt, "KO": ko}.items()
++            }
+ 
+     fake.scTenifoldKnk = _FakeKnk
+     monkeypatch.setitem(sys.modules, "scTenifold", fake)
+@@ -229,20 +232,77 @@ def test_sctenifoldknk_backend_ko(monkeypatch, tiny_adata, fake_grn):
+     assert "G1" in result.grn_base.successors("G0")
+ 
+ 
+-def test_sctenifoldknk_backend_oe(monkeypatch, tiny_adata, fake_grn):
++@pytest.mark.parametrize("mode, factor", [("ko", 0.0), ("kd", 1 / 3), ("oe", 3.0)])
++@pytest.mark.parametrize("grn_output", [True, False])
++def test_sctenifoldknk_delta_matches_perturbation(
++    monkeypatch, tiny_adata, fake_grn, mode, factor, grn_output,
++):
+     from omicverse.single import perturb
+ 
++    tiny_adata = tiny_adata[:, ::-1].copy()
++    tiny_adata.layers["counts"] = tiny_adata.X * 2
++    fake_grn.add_edge("G4", "G6", weight=0.001)
+     _install_fake_sctenifoldknk(monkeypatch, fake_grn)
+ 
+-    result = perturb(tiny_adata, target="G0", mode="oe",
+-                     fold_change=3.0, backend="sctenifoldknk")
+-    assert result.mode == "oe"
++    result = perturb(tiny_adata, target="G0", mode=mode, layer="counts",
++                     fold_change=3.0, backend="sctenifoldknk",
++                     grn_output=grn_output)
++    assert result.mode == mode
+     out_edges = result.delta_grn[result.delta_grn["source"] == "G0"]
+-    # weights should be tripled
+     np.testing.assert_allclose(
+         out_edges["weight_pert"].to_numpy(),
+-        out_edges["weight_base"].to_numpy() * 3.0,
++        out_edges["weight_base"].to_numpy() * factor,
+     )
++    expected = np.zeros((tiny_adata.n_obs, len(result.gene_names)))
++    target_counts = tiny_adata[:, "G0"].layers["counts"][:, 0]
++    for gene, weight in [("G1", 1.0), ("G2", 0.7), ("G3", 0.4)]:
++        expected[:, result.gene_names.index(gene)] = target_counts * weight * (factor - 1)
++    np.testing.assert_allclose(result.delta_X, expected)
++    assert result.cell_names == list(tiny_adata.obs_names)
++    assert (result.grn is not None) == grn_output
++
++
++@pytest.mark.parametrize("mode, factor", [("kd", 1 / 3), ("oe", 3.0)])
++@pytest.mark.parametrize("unrelated_weight", [1.0, 3.0])
++def test_sctenifoldknk_numeric_effect_ignores_display_threshold(
++    monkeypatch, tiny_adata, fake_grn, mode, factor, unrelated_weight,
++):
++    from omicverse.single import perturb
++
++    fake_grn.remove_edges_from(list(fake_grn.edges))
++    fake_grn.add_edge("G0", "G1", weight=0.01)
++    fake_grn.add_edge("G4", "G5", weight=unrelated_weight)
++    _install_fake_sctenifoldknk(monkeypatch, fake_grn)
++    result = perturb(tiny_adata, target="G0", mode=mode, fold_change=3.0,
++                     backend="sctenifoldknk")
++    expected = np.zeros_like(tiny_adata.X)
++    expected[:, 1] = tiny_adata.X[:, 0] * 0.01 * (factor - 1)
++    np.testing.assert_allclose(result.delta_X, expected)
++
++
++@pytest.mark.parametrize("mode, factor, fold_change", [
++    ("ko", 0.0, 3.0), ("kd", 1 / 3, 3.0), ("oe", 3.0, 3.0),
++    ("kd", 1.0, 1.0), ("oe", 1.0, 1.0),
++])
++def test_sctenifoldknk_scales_only_target_rows_once(
++    monkeypatch, tiny_adata, fake_grn, mode, factor, fold_change,
++):
++    from omicverse.single import perturb
++    import networkx as nx
++
++    fake_grn.add_edge("G4", "G0", weight=-0.5)
++    fake_grn.add_edge("G1", "G2", weight=-0.2)
++    _install_fake_sctenifoldknk(monkeypatch, fake_grn)
++    result = perturb(tiny_adata, target=["G0", "G1", "G0"], mode=mode,
++                     fold_change=fold_change, backend="sctenifoldknk")
++    wt = nx.to_numpy_array(fake_grn, nodelist=list(tiny_adata.var_names))
++    delta_input = np.zeros_like(tiny_adata.X)
++    delta_input[:, [0, 1]] = tiny_adata.X[:, [0, 1]] * (factor - 1)
++    np.testing.assert_allclose(result.delta_X, delta_input @ wt)
++    assert result.grn["G4"]["G0"]["weight"] == -0.5
++    pert = nx.to_numpy_array(result.grn, nodelist=list(tiny_adata.var_names))
++    assert pert[0, 1] == pytest.approx(factor)
++    assert pert[1, 2] == pytest.approx(-0.2 * factor)
+ 
+ 
+ def test_sctenifoldknk_backend_missing_raises(monkeypatch, tiny_adata):
+@@ -324,6 +384,43 @@ def test_cell_oracle_requires_base_grn(monkeypatch, tiny_adata, fake_grn):
+         perturb(tiny_adata, target="G0", backend="cell_oracle")
+ 
+ 
++@pytest.mark.parametrize("key", ["base_grn", "celloracle_base_grn"])
++def test_cell_oracle_dataframe_grn_in_uns(monkeypatch, tiny_adata, fake_grn, key):
++    from omicverse.single import perturb
++
++    backend = _install_fake_celloracle(monkeypatch, fake_grn, adata=tiny_adata)
++    grn = pd.DataFrame({"gene_short_name": ["G1"], "peak_id": ["peak1"], "G0": [1]})
++    tiny_adata.uns[key] = grn
++    if key == "base_grn":
++        tiny_adata.uns["celloracle_base_grn"] = pd.DataFrame()
++    received = []
++    monkeypatch.setattr(backend.Oracle, "import_TF_data",
++                        lambda self, TF_info_matrix: received.append(TF_info_matrix))
++
++    result = perturb(tiny_adata, target="G0", backend="auto")
++    assert result.backend == "cell_oracle"
++    assert len(received) == 1 and received[0] is grn
++    assert result.grn_base.has_edge("G0", "G1")
++
++
++def test_cell_oracle_imputation_failure_stops_simulation(monkeypatch, tiny_adata, fake_grn):
++    from omicverse.single import perturb
++
++    hits = {"calls": []}
++    backend = _install_fake_celloracle(monkeypatch, fake_grn,
++                                       adata=tiny_adata, hit_simulate=hits)
++    monkeypatch.setattr(backend.Oracle, "perform_PCA", lambda self: None, raising=False)
++
++    def fail_imputation(self, **kwargs):
++        raise ValueError("invalid imputation input")
++
++    monkeypatch.setattr(backend.Oracle, "knn_imputation", fail_imputation, raising=False)
++    with pytest.raises(ValueError, match="invalid imputation input"):
++        perturb(tiny_adata, target="G0", backend="cell_oracle", grn_base=fake_grn)
++    assert not hits["calls"]
++    assert "imputed_count" not in tiny_adata.layers
++
++
+ def test_auto_backend_picks_sctenifoldknk_without_base_grn(monkeypatch, tiny_adata, fake_grn):
+     """`backend='auto'` falls back to sctenifoldknk when no base GRN
+     is provided."""

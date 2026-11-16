@@ -1,0 +1,174 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ca0cb817..266e1a95 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,37 @@
+ 
+ ### Unreleased (queued for v2.1.0-beta.6)
+ 
++#### Performance (since v2.1.0-beta.5) — Buckberry-scale audit (#248)
++
++Profiled, prototyped, and benchmarked by @an-altosian against an
++84M-read single-end Bisulfite-Seq fixture (Buckberry et al. 2023,
++SRR24827373, 2.1 GiB gzipped, 38% adapter rate) using `hyperfine`
++with 10 trials per condition. Two of the three confirmed wins from
++that audit landed here; item #4 (Myers' bit-parallel adapter
++alignment, ~13% additional reduction) is queued for a separate PR
++from @an-altosian.
++
++- **Output gzip compression level lowered 6 → 1.** Compression CPU
++  was the dominant wall-time consumer on saturated workers
++  (cores=8) — at level 6, gzip output dwarfed actual trimming work.
++  Lowering to level 1 (fastest) measured −23.3% wall-clock
++  (69.693 ± 0.200 s → 53.471 ± 2.135 s) and −43% user-CPU
++  (593.9 s → 338.7 s) at Buckberry scale. Trade: output `.fq.gz`
++  files are roughly 75% larger (273 KB → 479 KB on the local
++  BS-seq_10K_R1 smoke). Decompressed content is byte-identical to
++  the previous output — the CI validation matrix's `gzip -dc |
++  md5sum` comparisons against Perl v0.6.11 still pass on every
++  flag path. New `pub const OUTPUT_GZIP_LEVEL` in `src/fastq.rs`
++  centralises the level so a future `--high-compression` opt-in
++  flag is a one-line change for storage-conscious users. (#248 #1)
++- **Single buffered write per FASTQ record.** Pre-format the
++  4-line record into a `Vec<u8>`, then issue one `write_all`
++  instead of four separate `writeln!` calls. Byte-identical output
++  (md5 match verified end-to-end on BS-seq_10K_R1). At Buckberry
++  scale this measured 9.8% wall-clock reduction
++  (69.693 ± 0.200 s → 62.862 ± 0.352 s) by amortising the per-call
++  Write-trait overhead. (#248 #2)
++
+ #### Bug fixes (since v2.1.0-beta.5) — Perl-parity regressions (contributor-reported)
+ 
+ - **Lowercase clip-flag spellings (`--clip_r1`, `--clip_r2`,
+diff --git a/README.md b/README.md
+index b6c48397..8b8364e9 100644
+--- a/README.md
++++ b/README.md
+@@ -126,7 +126,7 @@ trim_galore --help
+ | Paired-end | `*_val_1.fq.gz` / `*_val_2.fq.gz` | per-read text + JSON reports |
+ | Unpaired (with `--retain_unpaired`) | `*_unpaired_1.fq.gz` / `*_unpaired_2.fq.gz` | |
+ 
+-Output compression mirrors the input: gzipped input (`*.fastq.gz`) produces gzipped output (`*.fq.gz`); plain input (`*.fastq`) produces plain output (`*.fq`). Pass `--dont_gzip` to force plain output regardless.
++Output compression mirrors the input: gzipped input (`*.fastq.gz`) produces gzipped output (`*.fq.gz`); plain input (`*.fastq`) produces plain output (`*.fq`). Pass `--dont_gzip` to force plain output regardless. Gzip output is written at compression level 1 (fastest) — decompressed content is byte-identical to higher-level output, but the resulting `.fq.gz` files are roughly 75% larger in exchange for substantially faster trimming on multi-core runs.
+ 
+ The JSON report contains the same statistics as the text report in a structured format (schema v1), designed for native parsing by MultiQC.
+ 
+diff --git a/docs/src/content/docs/reference/credits.md b/docs/src/content/docs/reference/credits.md
+index 1808cb94..0e686bd9 100644
+--- a/docs/src/content/docs/reference/credits.md
++++ b/docs/src/content/docs/reference/credits.md
+@@ -11,6 +11,15 @@ In 2026, Trim Galore was rewritten in Rust as a single static binary, the **Oxid
+ 
+ Current development is at [github.com/FelixKrueger/TrimGalore](https://github.com/FelixKrueger/TrimGalore).
+ 
++## Contributors
++
++Trim Galore is maintained by [Felix Krueger](https://github.com/FelixKrueger). The Oxidized Edition has benefitted from contributions and design input from a number of people; the [GitHub contributors page](https://github.com/FelixKrueger/TrimGalore/graphs/contributors) tracks the full list. Notable recent contributions:
++
++- **[Phil Ewels](https://github.com/ewels)** — bundled FastQC integration via [`fastqc-rust`](https://crates.io/crates/fastqc-rust), docs site infrastructure (Astro/Starlight), GitHub Actions hardening, hero animation polish.
++- **[Dongze He](https://github.com/an-altosian) (`@an-altosian`)** — Phase-1B Perl-parity hunt and Buckberry-scale performance audit. Reported and prototyped the lowercase clip-flag fix (#242), \--max\_n fraction-mode UX, the gzip-extension and \--retain\_unpaired Perl-parity fixes (#245), the \--clock/\--implicon convenience widening (#245-D), the test-coverage gap inventory (#246), CI hardening recommendations (#247), and the Buckberry-scale performance audit (#248) including the gzip-level and single-buffered-write wins landed in v2.1.0-beta.6.
++
++If you've contributed and would like a line here, please open a PR — the list is intentionally curated rather than auto-generated.
++
+ ## Citing Trim Galore
+ 
+ If you use Trim Galore in published work, cite the project repository:
+diff --git a/src/fastq.rs b/src/fastq.rs
+index b5864b9c..75f62840 100644
+--- a/src/fastq.rs
++++ b/src/fastq.rs
+@@ -16,6 +16,16 @@ use std::path::Path;
+ /// Buffer size for gzip I/O — 64KB for throughput (flate2 default of 8KB is too small).
+ const BUF_SIZE: usize = 64 * 1024;
+ 
++/// Output gzip compression level. Set to 1 (fastest) — at Buckberry-
++/// scale (84M reads, 38% adapter rate, cores=8) the compression CPU
++/// dominated wall time on saturated workers; lowering from level 6 to
++/// 1 measured ~−23% wall and ~−43% user-CPU at byte-identity of the
++/// decompressed output (gzip framing differs but `gzip -dc` yields
++/// the same bytes). Trade: output `.fq.gz` files are ~75% larger.
++/// See #248 (item #1 in @an-altosian's perf audit). Centralised here
++/// so a future `--high-compression` opt-in flag is a one-line change.
++pub const OUTPUT_GZIP_LEVEL: u32 = 1;
++
+ /// A single FASTQ record with owned data.
+ #[derive(Debug, Clone)]
+ pub struct FastqRecord {
+@@ -40,10 +50,23 @@ impl FastqRecord {
+ 
+     /// Write this record to a FASTQ writer.
+     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+-        writeln!(writer, "{}", self.id)?;
+-        writeln!(writer, "{}", self.seq)?;
+-        writeln!(writer, "+")?;
+-        writeln!(writer, "{}", self.qual)?;
++        // Single buffered write per record. Pre-format the entire 4-line
++        // FASTQ block into a Vec<u8>, then issue one `write_all` instead
++        // of four `writeln!` calls. Byte-identical output to the previous
++        // form (same bytes, same order, same trailing `\n`s); the win is
++        // amortising the per-call overhead — at Buckberry scale (84M
++        // reads, 38% adapter rate) this is ~10% wall-clock at cores=8.
++        // See #248 (item #2 in @an-altosian's perf audit).
++        let mut buf =
++            Vec::with_capacity(self.id.len() + self.seq.len() + self.qual.len() + 5);
++        buf.extend_from_slice(self.id.as_bytes());
++        buf.push(b'\n');
++        buf.extend_from_slice(self.seq.as_bytes());
++        buf.push(b'\n');
++        buf.extend_from_slice(b"+\n");
++        buf.extend_from_slice(self.qual.as_bytes());
++        buf.push(b'\n');
++        writer.write_all(&buf)?;
+         Ok(())
+     }
+ 
+@@ -450,14 +473,14 @@ impl FastqWriter {
+                                 cores
+                             )
+                         })?
+-                        .compression_level(Compression::new(6))
++                        .compression_level(Compression::new(OUTPUT_GZIP_LEVEL))
+                         .from_writer(file),
+                 )
+             } else {
+                 // Single-threaded gzip with zlib-rs SIMD backend
+                 Box::new(BufWriter::with_capacity(
+                     BUF_SIZE,
+-                    GzEncoder::new(file, Compression::new(6)),
++                    GzEncoder::new(file, Compression::new(OUTPUT_GZIP_LEVEL)),
+                 ))
+             }
+         } else {
+diff --git a/src/parallel.rs b/src/parallel.rs
+index 53956e5b..ad9f2743 100644
+--- a/src/parallel.rs
++++ b/src/parallel.rs
+@@ -246,15 +246,15 @@ fn process_paired_batch(
+         // Scoped block: GzEncoders borrow the buffers; finish() before block
+         // ends releases the borrows so we can return the buffers.
+         {
+-            let mut gz_r1 = GzEncoder::new(&mut buf_r1, Compression::new(6));
+-            let mut gz_r2 = GzEncoder::new(&mut buf_r2, Compression::new(6));
++            let mut gz_r1 = GzEncoder::new(&mut buf_r1, Compression::new(crate::fastq::OUTPUT_GZIP_LEVEL));
++            let mut gz_r2 = GzEncoder::new(&mut buf_r2, Compression::new(crate::fastq::OUTPUT_GZIP_LEVEL));
+             let mut gz_up_r1 = if retain_unpaired {
+-                Some(GzEncoder::new(&mut buf_up_r1, Compression::new(6)))
++                Some(GzEncoder::new(&mut buf_up_r1, Compression::new(crate::fastq::OUTPUT_GZIP_LEVEL)))
+             } else {
+                 None
+             };
+             let mut gz_up_r2 = if retain_unpaired {
+-                Some(GzEncoder::new(&mut buf_up_r2, Compression::new(6)))
++                Some(GzEncoder::new(&mut buf_up_r2, Compression::new(crate::fastq::OUTPUT_GZIP_LEVEL)))
+             } else {
+                 None
+             };
+@@ -560,7 +560,7 @@ fn process_single_batch(
+ 
+     if gzip {
+         {
+-            let mut gz = GzEncoder::new(&mut buf, Compression::new(6));
++            let mut gz = GzEncoder::new(&mut buf, Compression::new(crate::fastq::OUTPUT_GZIP_LEVEL));
+             process_reads(reads, config, &mut stats, &mut gz)?;
+             gz.finish()?;
+         }

@@ -1,0 +1,798 @@
+diff --git a/openai4s/doubao_search.py b/openai4s/doubao_search.py
+index 9f01f1b6e..3e6ab584d 100644
+--- a/openai4s/doubao_search.py
++++ b/openai4s/doubao_search.py
+@@ -10,7 +10,6 @@
+ import json
+ import math
+ import socket
+-import time
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+@@ -18,11 +17,7 @@
+ from typing import Any, Protocol
+ 
+ from openai4s import datapro, egress, webtools
+-from openai4s.http_deadline import (
+-    HTTPExchangeDeadline,
+-    response_body_exhausted,
+-    socket_timeout_setter,
+-)
++from openai4s.http_deadline import HTTPExchangeDeadline, read_body_capped
+ from openai4s.mcp_protocol import redact_reflected_secret
+ 
+ ENDPOINT = "https://open.feedcoopapi.com/search_api/web_search"
+@@ -126,49 +121,44 @@ def _read_capped(
+     *,
+     limit: int,
+     deadline: float,
+-    timeout_setter: Callable[[float], Any] | None = None,
++    require_bound: bool = True,
+ ) -> bytes:
+-    raw_length = response.headers.get("Content-Length")
+-    if raw_length:
+-        try:
+-            if int(raw_length) > limit:
+-                raise DoubaoSearchResponseError(
+-                    f"Doubao search response exceeded the {limit}-byte limit"
++    """This service's failure vocabulary over the shared bounded reader.
++
++    Every property of the loop -- ``read1`` over buffered ``read``, the
++    absolute deadline, the byte cap, stopping at end-of-body, refusing a
++    truncated body -- is stated once in ``http_deadline`` and shared with the
++    MCP transport, which had to be given each of them separately while the two
++    loops were maintained side by side.
++    """
++
++    def _oversize() -> BaseException:
++        return DoubaoSearchResponseError(
++            f"Doubao search response exceeded the {limit}-byte limit"
++        )
++
++    return read_body_capped(
++        response,
++        limit=limit,
++        deadline=deadline,
++        on_timeout=lambda: DoubaoSearchError("Doubao search request timed out"),
++        on_oversize=_oversize,
++        on_truncated=lambda: DoubaoSearchError(
++            "Doubao search response ended before its declared length"
++        ),
++        # An injected opener is a test transport with no socket beneath it.  The
++        # daemon's own opener always has one, and a body read with no bound
++        # there is the slow-drip exposure this module exists to close.
++        on_unbounded=(
++            (
++                lambda: DoubaoSearchError(
++                    "Doubao search response has no bounded read transport"
+                 )
+-        except ValueError:
+-            pass
+-
+-    chunks: list[bytes] = []
+-    total = 0
+-    read_once = getattr(response, "read1", None)
+-    if not callable(read_once):
+-        read_once = response.read
+-    while True:
+-        remaining = deadline - time.monotonic()
+-        if remaining <= 0:
+-            raise DoubaoSearchError("Doubao search request timed out")
+-        if timeout_setter is not None:
+-            timeout_setter(remaining)
+-        # ``BufferedReader.read(n)`` may issue multiple recv calls while trying
+-        # to fill ``n``; a slow-drip peer can therefore refresh the same
+-        # relative socket timeout indefinitely. ``read1`` performs at most one
+-        # raw read, returning here so the absolute deadline and remaining
+-        # socket timeout are recomputed for every chunk.
+-        chunk = read_once(min(65_536, limit + 1 - total))
+-        if not chunk:
+-            return b"".join(chunks)
+-        total += len(chunk)
+-        if total > limit:
+-            raise DoubaoSearchResponseError(
+-                f"Doubao search response exceeded the {limit}-byte limit"
+             )
+-        chunks.append(chunk)
+-        if response_body_exhausted(response):
+-            # The last content byte and the transport's retirement arrive on the
+-            # same read.  Looping to prove it with one more read asked a closed
+-            # socket to re-bound a read that cannot happen, which reported a
+-            # complete HTTP 200 as a failed request.
+-            return b"".join(chunks)
++            if require_bound
++            else None
++        ),
++    )
+ 
+ 
+ def _safe_error_code(value: Any) -> str:
+@@ -450,16 +440,11 @@ def _search_with_key(
+                     raise DoubaoSearchError(
+                         f"Doubao search request failed with HTTP {int(status)}"
+                     )
+-                timeout_setter = socket_timeout_setter(response)
+-                if self._opener is None and timeout_setter is None:
+-                    raise DoubaoSearchError(
+-                        "Doubao search response has no bounded read transport"
+-                    )
+                 raw = _read_capped(
+                     response,
+                     limit=MAX_RESPONSE_BYTES,
+                     deadline=exchange.deadline,
+-                    timeout_setter=timeout_setter,
++                    require_bound=self._opener is None,
+                 )
+         except urllib.error.HTTPError as error:
+             status = int(error.code)
+diff --git a/openai4s/http_deadline.py b/openai4s/http_deadline.py
+index 4775f3744..be838ae3d 100644
+--- a/openai4s/http_deadline.py
++++ b/openai4s/http_deadline.py
+@@ -23,7 +23,7 @@
+ import threading
+ import time
+ import urllib.request
+-from collections.abc import Iterable
++from collections.abc import Iterable, Iterator
+ from typing import Any, Callable
+ 
+ 
+@@ -38,6 +38,11 @@ def _socket_retired(sock: Any) -> bool:
+     one raises ``OSError`` (EBADF).  ``socket.close()`` alone is not this state:
+     urllib closes the connection socket while ``makefile`` still holds an I/O
+     reference, and the descriptor stays readable for the whole response body.
++
++    Only consulted *after* an arming attempt already failed, so "cannot say"
++    must mean "not provably retired": a transport that exposes no descriptor,
++    or whose ``fileno()`` fails for any reason other than a dead descriptor,
++    keeps its failure rather than silently losing its read bound.
+     """
+ 
+     fileno = getattr(sock, "fileno", None)
+@@ -51,15 +56,44 @@ def _socket_retired(sock: Any) -> bool:
+         return False
+ 
+ 
+-def socket_timeout_setter(response: Any) -> Callable[[float], Any] | None:
+-    """Bound-read-timeout callable for the socket backing a urllib response.
+-
+-    The callable becomes a no-op once that socket is retired.  ``http.client``
+-    retires it on the *same* ``read1`` that returns the final content byte once
+-    a known ``Content-Length`` reaches zero (CPython 3.11+; only the 3.10 floor
+-    waits for one further empty read), so a loop that re-bounds the next read
+-    before checking for more data touched a closed descriptor and turned a
+-    complete, successful response into ``OSError``.
++def _arm_read_timeout(sock: Any, value: float) -> None:
++    """Bound one read on ``sock``, tolerating a transport already retired.
++
++    One caller: :meth:`HTTPExchangeDeadline.register_response`, where the
++    watchdog can close this socket in the gap after ``remaining()`` proved the
++    budget intact.  The body readers do not need this and do not use it --
++    ``read_body_capped`` stops at end-of-body *before* it would re-arm, which
++    is the whole of that fix; a second guard on the same path would only be a
++    place for the two to disagree.
++
++    The retirement test runs after ``settimeout`` has refused, never before:
++    asked first it answers about a moment already past by the time the call
++    runs, and it disarms every transport that bounds reads perfectly well but
++    cannot report a descriptor.  A still-live socket refusing a timeout stays a
++    hard failure -- that is the only case that can leave a read unbounded.
++    """
++
++    try:
++        sock.settimeout(value)
++    except OSError:
++        # Lost the race with a close (the watchdog's, or the stdlib's
++        # end-of-body one).  A finished exchange is not a network failure.
++        if _socket_retired(sock):
++            return
++        raise
++
++
++def _walk_response_transports(response: Any) -> Iterator[Any]:
++    """Yield ``response`` and every object urllib nests a transport under.
++
++    One traversal, two consumers: the read bound wants whatever carries
++    ``settimeout``, the watchdog wants the real ``socket.socket``.  Written out
++    twice they could answer with *different* objects from one response, and the
++    bound would then be armed on a transport the watchdog is not tracking.
++
++    Lazy on purpose.  A caller that stops at its first match never descends past
++    it, which is the search order both consumers had while they each open-coded
++    this walk.
+     """
+ 
+     pending = [response]
+@@ -70,33 +104,70 @@ def socket_timeout_setter(response: Any) -> Callable[[float], Any] | None:
+         if identity in seen:
+             continue
+         seen.add(identity)
+-        setter = getattr(candidate, "settimeout", None)
+-        if callable(setter):
+-            sock = candidate
+-
+-            def set_read_timeout(value: float, _sock: Any = sock) -> None:
+-                if _socket_retired(_sock):
+-                    return
+-                try:
+-                    _sock.settimeout(value)
+-                except OSError:
+-                    # Lost the race with a close (the watchdog's, or the
+-                    # stdlib's end-of-body one).  Only a still-live transport
+-                    # can leave a read unbounded, so re-raise for that case
+-                    # alone rather than reporting a finished exchange as a
+-                    # network failure.
+-                    if _socket_retired(_sock):
+-                        return
+-                    raise
+-
+-            return set_read_timeout
++        yield candidate
+         for attribute in ("fp", "raw", "_sock"):
+             child = getattr(candidate, attribute, None)
+             if child is not None:
+                 pending.append(child)
++
++
++def socket_timeout_setter(response: Any) -> Callable[[float], Any] | None:
++    """Find a live response socket's timeout setter through urllib wrappers.
++
++    Returns the bound ``settimeout`` itself.  It stays unwrapped deliberately:
++    the reader that uses it stops at end-of-body before it would re-bind a
++    retired socket, so a tolerant wrapper here would be a second answer to a
++    question already answered -- and the one place it *would* still be needed
++    calls :func:`_arm_read_timeout` directly.
++    """
++
++    for candidate in _walk_response_transports(response):
++        setter = getattr(candidate, "settimeout", None)
++        if callable(setter):
++            return setter
+     return None
+ 
+ 
++def _remaining_body_bytes(response: Any) -> int | None:
++    """Bytes a declared ``Content-Length`` still owes, when the reader says.
++
++    Matched exactly rather than compared: ``length == 0`` is equally true of
++    ``False``, and a header value that survived as the string ``"0"`` is not a
++    count.  ``None`` means the reader is not tracking one -- a chunked or
++    close-delimited body -- which is a different answer from "none left".
++    """
++
++    remaining = getattr(response, "length", None)
++    if isinstance(remaining, bool) or not isinstance(remaining, int):
++        return None
++    return remaining
++
++
++def _body_exhausted_probe(response: Any) -> Callable[[], bool]:
++    """Resolve the end-of-body accessors once, for a caller inside a read loop.
++
++    Which accessors exist cannot change between chunks, so re-deriving them per
++    chunk is pure overhead in the one place that runs per chunk.  The rule
++    itself lives here alone; :func:`response_body_exhausted` is the same probe
++    for a caller that only asks once.
++    """
++
++    is_closed = getattr(response, "isclosed", None)
++    if not callable(is_closed):
++        is_closed = None
++
++    def exhausted() -> bool:
++        if is_closed is not None:
++            try:
++                if is_closed() is True:
++                    return True
++            except Exception:  # noqa: BLE001 - fall through to the other signal
++                pass
++        return _remaining_body_bytes(response) == 0
++
++    return exhausted
++
++
+ def response_body_exhausted(response: Any) -> bool:
+     """Whether this response can no longer yield body bytes.
+ 
+@@ -105,36 +176,105 @@ def response_body_exhausted(response: Any) -> bool:
+     and a remaining ``length`` of zero is the same fact on the 3.10 floor, which
+     retires one read later.  A reader that stops on either never asks a retired
+     transport for more.
++
++    Both answer only when they answer exactly.  ``bool(is_closed())`` would call
++    any truthy object -- a ``Mock``'s auto-attribute among them -- end-of-body
++    and truncate the read after one chunk.
+     """
+ 
+-    is_closed = getattr(response, "isclosed", None)
+-    if callable(is_closed):
++    return _body_exhausted_probe(response)()
++
++
++def read_body_capped(
++    response: Any,
++    *,
++    limit: int,
++    deadline: float,
++    on_timeout: Callable[[], BaseException],
++    on_oversize: Callable[[], BaseException],
++    on_truncated: Callable[[], BaseException],
++    on_unbounded: Callable[[], BaseException] | None = None,
++) -> bytes:
++    """Read one response body under a byte cap and an absolute deadline.
++
++    The single bounded reader for this package.  Its consumers differ only in
++    the vocabulary they report failures in, which is what the ``on_*`` factories
++    carry; keeping the loop itself in one place is the point, because every
++    property below had to be discovered once and then written into each copy by
++    hand:
++
++    * ``read1`` over ``read``.  ``BufferedReader.read(n)`` may issue many recv
++      calls while trying to fill ``n``, so a peer dripping one byte before each
++      idle timeout keeps a *single* call alive forever.  ``read1`` performs at
++      most one raw read, so the absolute budget and the socket bound are
++      recomputed for every chunk.
++    * Stop at end-of-body, tested at the top of the loop.  ``http.client``
++      retires the transport on the same read that returns the final content
++      byte of a known ``Content-Length`` (CPython 3.11+; the 3.10 floor waits
++      one read longer), so proving it with one more read asked a closed socket
++      to bound a read that cannot happen and reported a complete response as
++      ``OSError``.  Testing before the arming is what makes that unreachable,
++      rather than something a tolerant ``settimeout`` has to absorb.  Chunked
++      and close-delimited bodies retire on a read that returns ``b""`` and need
++      no branch of their own.
++    * An empty read is not proof of a complete body.  If the reader is still
++      owed bytes, the peer cut the connection, and that is a transport failure
++      -- not the invalid-JSON the caller would otherwise diagnose.
++    * ``on_unbounded`` makes a missing read bound fatal.  Pass ``None`` only
++      where the transport is known not to be a socket at all.
++    """
++
++    declared = response.headers.get("Content-Length")
++    if declared:
++        # The raise stays outside the ``except``: an ``on_oversize`` that ever
++        # returned a ``ValueError`` subclass would otherwise be swallowed by
++        # the guard meant for the unparsable header.
+         try:
+-            if bool(is_closed()):
+-                return True
+-        except Exception:  # noqa: BLE001 - an unknown reader is treated as open
+-            return False
+-    return getattr(response, "length", None) == 0
++            announced: int | None = int(declared)
++        except ValueError:
++            announced = None
++        if announced is not None and announced > limit:
++            raise on_oversize()
++
++    arm = socket_timeout_setter(response)
++    if arm is None and on_unbounded is not None:
++        raise on_unbounded()
++    exhausted = _body_exhausted_probe(response)
++    read_once = getattr(response, "read1", None)
++    if not callable(read_once):
++        read_once = response.read
++
++    chunks: list[bytes] = []
++    total = 0
++    while not exhausted():
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise on_timeout()
++        if arm is not None:
++            arm(remaining)
++        chunk = read_once(min(65_536, limit + 1 - total))
++        if not chunk:
++            if (_remaining_body_bytes(response) or 0) > 0:
++                raise on_truncated()
++            break
++        total += len(chunk)
++        if total > limit:
++            raise on_oversize()
++        chunks.append(chunk)
++    return b"".join(chunks)
+ 
+ 
+ def _response_socket(response: Any) -> socket.socket | None:
+     """Return the actual socket retained by an urllib response, if visible."""
+ 
+-    pending = [response]
+-    seen: set[int] = set()
+-    while pending:
+-        candidate = pending.pop()
+-        identity = id(candidate)
+-        if identity in seen:
+-            continue
+-        seen.add(identity)
+-        if isinstance(candidate, socket.socket):
+-            return candidate
+-        for attribute in ("fp", "raw", "_sock"):
+-            child = getattr(candidate, attribute, None)
+-            if child is not None:
+-                pending.append(child)
+-    return None
++    return next(
++        (
++            candidate
++            for candidate in _walk_response_transports(response)
++            if isinstance(candidate, socket.socket)
++        ),
++        None,
++    )
+ 
+ 
+ def _close_socket(sock: Any) -> None:
+@@ -347,12 +487,21 @@ def wrap_tls(
+             raise
+ 
+     def register_response(self, response: Any) -> None:
+-        """Retarget the watchdog to urllib's body socket after headers arrive."""
++        """Retarget the watchdog to urllib's body socket after headers arrive.
++
++        The arming goes through the shared helper for the same reason the body
++        readers do: ``remaining()`` proving the budget is intact does not keep
++        it intact, so the watchdog can close this socket in the gap before
++        ``settimeout`` runs.  Raising the bare ``OSError`` there reported an
++        aborted exchange as ``... failed (OSError)`` -- the wrong projection
++        this module exists to remove -- instead of the deadline the caller can
++        recognise.
++        """
+ 
+         sock = _response_socket(response)
+         if sock is not None:
+             self._register_socket(sock)
+-            sock.settimeout(self.remaining())
++            _arm_read_timeout(sock, self.remaining())
+ 
+     def http_handler(
+         self,
+@@ -472,6 +621,7 @@ def https_open(self, request: urllib.request.Request) -> Any:
+ __all__ = [
+     "HTTPExchangeDeadline",
+     "HTTPExchangeTimeout",
++    "read_body_capped",
+     "response_body_exhausted",
+     "socket_timeout_setter",
+ ]
+diff --git a/openai4s/mcp_http.py b/openai4s/mcp_http.py
+index e3f8c186e..b71c40056 100644
+--- a/openai4s/mcp_http.py
++++ b/openai4s/mcp_http.py
+@@ -17,7 +17,6 @@
+ import re
+ import socket
+ import threading
+-import time
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+@@ -25,11 +24,7 @@
+ from typing import Any, Callable
+ 
+ from openai4s import egress, webtools
+-from openai4s.http_deadline import (
+-    HTTPExchangeDeadline,
+-    response_body_exhausted,
+-    socket_timeout_setter,
+-)
++from openai4s.http_deadline import HTTPExchangeDeadline, read_body_capped
+ from openai4s.mcp_protocol import (
+     MAX_FRAME_BYTES,
+     MCPError,
+@@ -338,45 +333,33 @@ def _check_network_policy(self) -> None:
+             ) from None
+ 
+     def _read_body(self, response: Any, deadline: float) -> bytes:
+-        raw_length = response.headers.get("Content-Length")
+-        if raw_length:
+-            try:
+-                if int(raw_length) > _MAX_FRAME_BYTES:
+-                    raise MCPOversizedResponse(
+-                        "MCP HTTP response exceeded the 4 MiB limit"
+-                    )
+-            except ValueError:
+-                pass
+-        chunks: list[bytes] = []
+-        total = 0
+-        timeout_setter = socket_timeout_setter(response)
+-        read_once = getattr(response, "read1", None)
+-        if not callable(read_once):
+-            read_once = response.read
+-        while True:
+-            remaining = deadline - time.monotonic()
+-            if remaining <= 0:
+-                raise MCPTimeout(f"MCP HTTP request exceeded {self._timeout:g}s")
+-            if timeout_setter is not None:
+-                timeout_setter(remaining)
+-            # ``BufferedReader.read(n)`` may perform multiple raw reads while
+-            # trying to fill ``n``.  A peer that drips one byte just before
+-            # each relative socket timeout can therefore keep that one call
+-            # alive indefinitely.  ``read1`` performs at most one raw read,
+-            # returning here so the absolute remaining budget is recomputed.
+-            chunk = read_once(min(65_536, _MAX_FRAME_BYTES + 1 - total))
+-            if not chunk:
+-                return b"".join(chunks)
+-            total += len(chunk)
+-            if total > _MAX_FRAME_BYTES:
+-                raise MCPOversizedResponse("MCP HTTP response exceeded the 4 MiB limit")
+-            chunks.append(chunk)
+-            if response_body_exhausted(response):
+-                # ``http.client`` retires the transport on the same read that
+-                # returns the final content byte, so one more pass would
+-                # re-bound a read on a closed socket and report a complete
+-                # response as a transport failure.
+-                return b"".join(chunks)
++        """This transport's failure vocabulary over the shared bounded reader.
++
++        The loop itself lives in ``http_deadline`` so that the properties it
++        enforces -- one raw read per deadline check, the byte cap, stopping at
++        end-of-body, refusing a body cut short of its declared length, and
++        refusing to read one at all with no bound -- hold for every consumer
++        rather than for whichever copy last received the fix.
++        """
++
++        def _oversize() -> BaseException:
++            return MCPOversizedResponse("MCP HTTP response exceeded the 4 MiB limit")
++
++        return read_body_capped(
++            response,
++            limit=_MAX_FRAME_BYTES,
++            deadline=deadline,
++            on_timeout=lambda: MCPTimeout(
++                f"MCP HTTP request exceeded {self._timeout:g}s"
++            ),
++            on_oversize=_oversize,
++            on_truncated=lambda: MCPError(
++                "MCP HTTP response ended before its declared length"
++            ),
++            on_unbounded=lambda: MCPError(
++                "MCP HTTP response has no bounded read transport"
++            ),
++        )
+ 
+     def _post(
+         self,
+diff --git a/tests/test_doubao_search.py b/tests/test_doubao_search.py
+index 904120755..1e1999d23 100644
+--- a/tests/test_doubao_search.py
++++ b/tests/test_doubao_search.py
+@@ -31,6 +31,12 @@
+     DoubaoSearchService,
+ )
+ from openai4s.host_dispatch import HostDispatcher
++from openai4s.http_deadline import (
++    HTTPExchangeDeadline,
++    HTTPExchangeTimeout,
++    _arm_read_timeout,
++    _socket_retired,
++)
+ from openai4s.store import Store
+ 
+ # A fake upstream must never teach the response-schema recorder that its shape
+@@ -178,7 +184,18 @@ def open(self, request, timeout=None):  # noqa: ANN001
+             raise reply
+         if isinstance(reply, (bytes, dict, list)):
+             return _Response(reply)
+-        return reply
++        if isinstance(reply, _Response) or hasattr(reply, "read1"):
++            return reply
++        # Stay total.  Passing an unrecognised reply straight through hands the
++        # service something with no ``getcode``/``read1``, and the boundary
++        # reports the fixture mistake as ``... failed (AttributeError)`` -- a
++        # test that then fails, or passes, for a reason that is not the one it
++        # is written to check.
++        raise TypeError(
++            f"_RecordingOpener cannot serve a {type(reply).__name__} reply: "
++            "pass bytes/dict/list to have it encoded, an exception to raise, "
++            "or a response-shaped object"
++        )
+ 
+ 
+ def _store(tmp_path: Path) -> Store:
+@@ -646,21 +663,90 @@ def test_a_completely_read_body_is_not_reported_as_a_failed_request(tmp_path):
+     assert response.socket.timeouts == sorted(response.socket.timeouts, reverse=True)
+ 
+ 
++def test_a_socket_urllib_already_closed_still_takes_its_read_bound():
++    """``_closed`` is not retirement, and reading it as one would be silent.
++
++    ``http.client`` reads the body through a ``makefile`` reader, and urllib
++    closes the connection socket as soon as the headers are in on a
++    ``Connection: close`` exchange -- so ``_closed`` is true for the *whole*
++    body while the descriptor stays open underneath it.  A retirement test that
++    consulted ``_closed`` would therefore drop the read bound off every such
++    response, and nothing would report it: the bound only shows up against a
++    peer that stops sending, which no fixture here has.  Only a gone descriptor
++    counts.
++    """
++
++    client, server = socket.socketpair()
++    body = client.makefile("rb")
++    try:
++        client.close()
++        assert client._closed is True
++        assert client.fileno() >= 0
++        assert _socket_retired(client) is False
++
++        _arm_read_timeout(client, 5.0)
++
++        assert client.gettimeout() == 5.0
++    finally:
++        body.close()
++        server.close()
++
++
++def test_a_watchdog_close_is_reported_as_the_deadline_not_as_a_bare_oserror():
++    """Arming the body socket must not outrank the reason it went away.
++
++    ``register_response`` arms the socket the watchdog is entitled to take:
++    ``remaining()`` proving the budget intact does not keep it intact.  The
++    bare ``OSError`` that escaped there left ``__exit__`` with ``exc_type``
++    set, so the exchange never became the ``HTTPExchangeTimeout`` a caller can
++    recognise and every consumer projected an abort as ``... failed
++    (OSError)``.  This is the one arming site the reader's end-of-body stop
++    cannot cover, which is why the tolerant helper still exists.
++    """
++
++    client, server = socket.socketpair()
++    response = types.SimpleNamespace(
++        fp=types.SimpleNamespace(raw=types.SimpleNamespace(_sock=client))
++    )
++    exchange = HTTPExchangeDeadline(5.0)
++    budget = exchange.remaining
++
++    def _watchdog_wins_the_gap():
++        value = budget()  # still positive: no timeout is raised here ...
++        exchange._expire()  # ... and the socket is gone before it is used
++        return value
++
++    exchange.remaining = _watchdog_wins_the_gap
++    try:
++        with pytest.raises(HTTPExchangeTimeout):
++            with exchange:
++                exchange.register_response(response)
++    finally:
++        client.close()
++        server.close()
++
++
+ def test_a_real_socket_exchange_survives_the_stdlib_end_of_body_close(
+     tmp_path, monkeypatch
+ ):
+-    """The same contract through the production opener over a real socket.
++    """The same contract through the real stdlib client over a real socket.
+ 
+     Nothing below ``socket`` is faked here, so ``http.client`` performs its own
+     end-of-body ``_close_conn()`` and the descriptor is genuinely gone.  This is
+     the shape that failed against the live provider while every fake-transport
+     test passed.
++
++    Two limits, so this is not read as covering more than it does.  Only the
++    3.11+ retirement is exercised: the 3.10 floor keeps the descriptor alive at
++    ``length == 0``, so on that interpreter this test passes against the unfixed
++    reader too, and the two modelled responses above are what carry the floor's
++    regression signal.  And ``connect`` and ``build_opener`` are both
++    substituted below, so the production connect path -- ``create_connection``,
++    ``wrap_tls``, urllib's own proxy discovery -- is out of scope here.
+     """
+ 
+     from openai4s import egress, webtools
+-    from openai4s.http_deadline import HTTPExchangeDeadline, _DeadlineHTTPSConnection
+-
+-    client, server = socket.socketpair()
++    from openai4s.http_deadline import _DeadlineHTTPSConnection
+ 
+     def _build_opener(exchange, *handlers):
+         class _SocketpairConnection(_DeadlineHTTPSConnection):
+@@ -679,19 +765,24 @@ def connect(self) -> None:
+     monkeypatch.setattr(webtools, "guard_url", lambda _url: None)
+     monkeypatch.setattr(egress, "check_url", lambda _url: None)
+     monkeypatch.setattr(HTTPExchangeDeadline, "build_opener", _build_opener)
+-    store = _store(tmp_path)
+-    datapro.save_agent_plan_key(store, _OLD_SECRET)
+-    # No injected opener: this exercises the deadline-aware transport the
+-    # daemon actually uses, including its bounded-read requirement.
+-    service = DoubaoSearchService(store)
++    # Both descriptors are opened inside the block that closes them: a failure
++    # in the setup below used to leak the pair for the rest of the session.
++    client, server = socket.socketpair()
++    store = None
+     try:
++        store = _store(tmp_path)
++        datapro.save_agent_plan_key(store, _OLD_SECRET)
++        # No injected opener: the service takes the deadline-aware read path,
++        # including its bounded-read requirement.
++        service = DoubaoSearchService(store)
+         server.sendall(_http_wire(_successful_payload("real socket result")))
+         server.shutdown(socket.SHUT_WR)
+         result = service.search("real socket exchange", num_results=1, timeout=15)
+     finally:
+         client.close()
+         server.close()
+-        store.close()
++        if store is not None:
++            store.close()
+ 
+     assert result["source"] == "doubao"
+     assert result["results"][0]["title"] == "real socket result"
+diff --git a/tests/test_mcp_client.py b/tests/test_mcp_client.py
+index 1ffc9f11f..43f1f404a 100644
+--- a/tests/test_mcp_client.py
++++ b/tests/test_mcp_client.py
+@@ -10,6 +10,7 @@
+ import sys
+ import threading
+ import time
++import types
+ import urllib.error
+ import urllib.request
+ from pathlib import Path
+@@ -43,12 +44,29 @@ def get(self, key, default=None):
+         )
+ 
+ 
++class _BoundedTransport:
++    """The read-bound carrier every socket-backed response has beneath it.
++
++    The reader refuses to read a body it cannot bound, so a double that omits
++    this is not a cheaper fake of an HTTP response -- it is a fake of a state
++    the transport does not produce.
++    """
++
++    def __init__(self):
++        self.timeouts = []
++
++    def settimeout(self, value):
++        self.timeouts.append(value)
++
++
+ class _HTTPResponse:
+     def __init__(self, status, body=b"", headers=None):
+         self.status = status
+         self._body = body
+         self._offset = 0
+         self.headers = _HTTPHeaders(headers or {})
++        self.socket = _BoundedTransport()
++        self.fp = types.SimpleNamespace(raw=types.SimpleNamespace(_sock=self.socket))
+ 
+     def __enter__(self):
+         return self
+@@ -323,10 +341,15 @@ def __init__(self, body):
+         def isclosed(self):
+             return self.fp is None
+ 
+-        def read1(self, size):
++        def read1(self, size=-1):
++            # The stdlib signature, so a reader that drops the size argument
++            # or passes the default -1 is modelled instead of silently
++            # returning b"" from a backwards slice.
+             self.read1_calls += 1
+             if self.fp is None:
+                 return b""
++            if size is None or size < 0:
++                size = self.length
+             chunk = self._body[self._offset : self._offset + min(size, 8)]
+             self._offset += len(chunk)
+             self.length -= len(chunk)
+@@ -356,7 +379,9 @@ def read(self, _size=-1):
+ def test_streamable_http_slow_drip_cannot_refresh_the_absolute_timeout(monkeypatch):
+     """Each byte may arrive in time, but the whole body still has one budget."""
+ 
+-    from openai4s import mcp_http
++    # The clock the bounded reader consults now that the loop is shared: the
++    # budget is a property of the reader, not of either transport's module.
++    from openai4s import http_deadline
+ 
+     class _Clock:
+         now = 100.0
+@@ -395,7 +420,7 @@ def read1(self, _size):
+         def read(self, _size=-1):
+             raise AssertionError("slow-drip protection requires read1")
+ 
+-    monkeypatch.setattr(mcp_http.time, "monotonic", _Clock.monotonic)
++    monkeypatch.setattr(http_deadline.time, "monotonic", _Clock.monotonic)
+     connection = object.__new__(MCPHTTPConnection)
+     connection._timeout = 1.0
+     response = _SlowDripResponse()

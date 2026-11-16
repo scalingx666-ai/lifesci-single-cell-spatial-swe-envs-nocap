@@ -1,0 +1,244 @@
+diff --git a/README.md b/README.md
+index 8a10357a..46380c5c 100755
+--- a/README.md
++++ b/README.md
+@@ -75,6 +75,7 @@ Release Notes
+ 
+  ### Version 1.4.6 (future)
+ * Fix: drop the deprecated `copy` keyword of the `astype` call in `from_fcs` (`io.py`), avoiding `Pandas4Warning` on pandas >=3.0. `copy=False` was inert here — it can only skip an allocation when the frame is already `float64` — so the cast behaves identically on pandas 2 and 3.
++* Faster, leaner pseudotime on large data, with unchanged results: shortest paths from the waypoints run in `n_jobs` processes, the connectivity check uses `scipy.sparse.csgraph` instead of networkx, and the refinement works in chunks of cells.
+ 
+  ### Version 1.4.5
+  * Fix: pandas 3 compatibility. Under pandas 3 (mandatory Copy-on-Write) `DataFrame.values` returns a read-only view, so several in-place mutations raised `ValueError: assignment destination is read-only`. `run_palantir` failed in `_differentiation_entropy` (terminal-state identity block, now built with `np.eye(...)`), and `select_branch_cells` failed on its NaN fill of the fate-probability array (now copied before mutation). Compatible with both pandas 2 and 3 ([#180](https://github.com/dpeerlab/Palantir/issues/180)).
+diff --git a/src/palantir/core.py b/src/palantir/core.py
+index e4baaaa9..105c817b 100644
+--- a/src/palantir/core.py
++++ b/src/palantir/core.py
+@@ -6,14 +6,13 @@
+ 
+ import numpy as np
+ import pandas as pd
+-import networkx as nx
+ import time
+ import copy
+ 
+ from sklearn.metrics import pairwise_distances
+ from sklearn import preprocessing
+ from sklearn.neighbors import NearestNeighbors
+-from joblib import Parallel, delayed
++from joblib import Parallel, delayed, effective_n_jobs
+ from scipy.sparse.linalg import eigs, splu
+ 
+ from scipy.sparse import csr_matrix, find, csgraph, eye
+@@ -30,6 +29,9 @@
+ warnings.filterwarnings(action="ignore", message="scipy.cluster")
+ warnings.filterwarnings(action="ignore", module="scipy", message="Changing the sparsity")
+ 
++# Cells per chunk in the pseudotime refinement; bounds its temporary arrays
++_CELL_CHUNK = 10_000
++
+ def _get_joblib_backend():
+     """
+     Determine the appropriate joblib backend based on configuration and environment.
+@@ -362,15 +364,32 @@ def _compute_pseudotime(
+ 
+     wp_indices = data.index.get_indexer(waypoints)
+ 
+-    dists = csgraph.dijkstra(adj, directed=False, indices=wp_indices)
++    # Dijkstra holds the GIL, so the waypoints are split over processes
++    n_chunks = min(effective_n_jobs(n_jobs), len(wp_indices))
++    if n_chunks > 1:
++        dists = np.vstack(
++            Parallel(n_jobs=n_chunks, backend=_get_joblib_backend())(
++                delayed(csgraph.dijkstra)(adj, directed=False, indices=chunk)
++                for chunk in np.array_split(wp_indices, n_chunks)
++            )
++        )
++    else:
++        dists = csgraph.dijkstra(adj, directed=False, indices=wp_indices)
+     D_vals = np.asarray(dists, dtype=float)
+     end = time.time()
+     print("Time for shortest paths: {} minutes".format((end - start) / 60))
+ 
+     print("Iteratively refining the pseudotime...")
+     sdv = np.std(D_vals.ravel()) * 1.06 * len(D_vals.ravel()) ** (-1 / 5)
+-    W_vals = np.exp(-0.5 * np.power((D_vals / sdv), 2))
+-    W_vals = W_vals / W_vals.sum(axis=0, keepdims=True)
++    # Each cell's weights and pseudotime depend only on its own column, so work in chunks of cells.
++    # Equal sizes: a one-cell chunk would change numpy's summation order.
++    n_chunks = -(-D_vals.shape[1] // _CELL_CHUNK)
++    bounds = np.linspace(0, D_vals.shape[1], n_chunks + 1).astype(int)
++    chunks = [slice(a, b) for a, b in zip(bounds[:-1], bounds[1:])]
++    W_vals = np.empty_like(D_vals)
++    for c in chunks:
++        W_c = np.exp(-0.5 * np.power((D_vals[:, c] / sdv), 2))
++        W_vals[:, c] = W_c / W_c.sum(axis=0, keepdims=True)
+ 
+     start_row = waypoints.get_loc(start_cell)
+     pseudotime = D_vals[start_row, :].copy()
+@@ -380,13 +399,13 @@ def _compute_pseudotime(
+     wp_cell_indices = data.index.get_indexer(waypoints)
+     while not converged and iteration < max_iterations:
+         t_wp = pseudotime[wp_cell_indices][:, None]
+-        t_cells = pseudotime[None, :]
+-        mask = t_cells < t_wp
+-        signs = np.where(mask, -1.0, 1.0)
+         t_wp[start_row] = 0.0
+-        signs[start_row, :] = 1.0
+-        P_vals = D_vals * signs + t_wp
+-        new_traj_vals = np.sum(P_vals * W_vals, axis=0)
++        new_traj_vals = np.empty_like(pseudotime)
++        for c in chunks:
++            signs = np.where(pseudotime[None, c] < t_wp, -1.0, 1.0)
++            signs[start_row, :] = 1.0
++            P_vals = D_vals[:, c] * signs + t_wp
++            new_traj_vals[c] = np.sum(P_vals * W_vals[:, c], axis=0)
+ 
+         corr = pearsonr(pseudotime, new_traj_vals)[0]
+         print("Correlation at iteration %d: %.4f" % (iteration, corr))
+@@ -400,7 +419,7 @@ def _compute_pseudotime(
+     pseudotime /= np.max(pseudotime)
+ 
+     pseudotime_series = pd.Series(pseudotime, index=data.index)
+-    W = pd.DataFrame(W_vals, index=waypoints, columns=data.index)
++    W = pd.DataFrame(W_vals, index=waypoints, columns=data.index, copy=False)
+     return pseudotime_series, W
+ 
+ 
+@@ -812,10 +831,9 @@ def _connect_graph(adj: csr_matrix, data: pd.DataFrame, start_cell: int) -> csr_
+     csr_matrix
+         Updated adjacency matrix with all cells connected.
+     """
+-    # Create graph and compute distances
+-    graph = nx.Graph(adj)
+-    dists = pd.Series(nx.single_source_dijkstra_path_length(graph, start_cell))
+-    dists = pd.Series(dists.values, index=data.index[dists.index])
++    # Compute distances, keeping the reachable nodes
++    dists = pd.Series(csgraph.dijkstra(adj, directed=False, indices=start_cell), index=data.index)
++    dists = dists[np.isfinite(dists)]
+ 
+     # Idenfity unreachable nodes
+     unreachable_nodes = data.index.difference(dists.index)
+@@ -841,9 +859,8 @@ def _connect_graph(adj: csr_matrix, data: pd.DataFrame, start_cell: int) -> csr_
+         adj[farthest_reachable, add_edge] = unreachable_dists.min()
+ 
+         # Recompute distances to early cell
+-        graph = nx.Graph(adj)
+-        dists = pd.Series(nx.single_source_dijkstra_path_length(graph, start_cell))
+-        dists = pd.Series(dists.values, index=data.index[dists.index])
++        dists = pd.Series(csgraph.dijkstra(adj, directed=False, indices=start_cell), index=data.index)
++        dists = dists[np.isfinite(dists)]
+ 
+         # Idenfity unreachable nodes
+         unreachable_nodes = data.index.difference(dists.index)
+diff --git a/tests/test_core_equivalence.py b/tests/test_core_equivalence.py
+index f9fa0e24..2df6f5a8 100644
+--- a/tests/test_core_equivalence.py
++++ b/tests/test_core_equivalence.py
+@@ -1,8 +1,13 @@
+ from __future__ import annotations
+ 
++import warnings
++
++import networkx as nx
+ import numpy as np
+ import pandas as pd
++import pytest
+ from scipy.sparse import csr_matrix, csgraph, find
++from sklearn.metrics import pairwise_distances
+ from sklearn.neighbors import NearestNeighbors
+ from numpy.random import BitGenerator, SeedSequence, RandomState
+ from numpy.typing import ArrayLike
+@@ -37,6 +42,27 @@ def _max_min_sampling_reference(
+     return data.index[waypoint_set].unique()
+ 
+ 
++def _connect_graph_reference(adj: csr_matrix, data: pd.DataFrame, start_cell: int) -> csr_matrix:
++    graph = nx.Graph(adj)
++    dists = pd.Series(nx.single_source_dijkstra_path_length(graph, start_cell))
++    dists = pd.Series(dists.values, index=data.index[dists.index])
++    unreachable_nodes = data.index.difference(dists.index)
++    while len(unreachable_nodes) > 0:
++        farthest_reachable = np.where(data.index == dists.idxmax())[0][0]
++        unreachable_dists = pairwise_distances(
++            data.iloc[farthest_reachable, :].values.reshape(1, -1),
++            data.loc[unreachable_nodes, :],
++        )
++        unreachable_dists = pd.Series(np.ravel(unreachable_dists), index=unreachable_nodes)
++        add_edge = np.where(data.index == unreachable_dists.idxmin())[0][0]
++        adj[farthest_reachable, add_edge] = unreachable_dists.min()
++        graph = nx.Graph(adj)
++        dists = pd.Series(nx.single_source_dijkstra_path_length(graph, start_cell))
++        dists = pd.Series(dists.values, index=data.index[dists.index])
++        unreachable_nodes = data.index.difference(dists.index)
++    return adj
++
++
+ def _compute_pseudotime_reference(
+     data: pd.DataFrame,
+     start_cell: str,
+@@ -46,7 +72,7 @@ def _compute_pseudotime_reference(
+ ):
+     nbrs = NearestNeighbors(n_neighbors=knn, metric="euclidean", n_jobs=1).fit(data)
+     adj = nbrs.kneighbors_graph(data, mode="distance")
+-    adj = _connect_graph(adj, data, np.where(data.index == start_cell)[0][0])
++    adj = _connect_graph_reference(adj, data, np.where(data.index == start_cell)[0][0])
+ 
+     dists = []
+     for cell in waypoints:
+@@ -117,7 +143,9 @@ def test_max_min_sampling_equivalence():
+     assert list(waypoints_new) == list(waypoints_ref)
+ 
+ 
+-def test_compute_pseudotime_equivalence():
++@pytest.mark.parametrize("n_jobs, cell_chunk", [(1, 10_000), (2, 7)])
++def test_compute_pseudotime_equivalence(monkeypatch, n_jobs, cell_chunk):
++    monkeypatch.setattr("palantir.core._CELL_CHUNK", cell_chunk)
+     rng = np.random.default_rng(1)
+     data = pd.DataFrame(rng.normal(size=(25, 4)))
+     data.index = pd.Index([f"cell_{i}" for i in range(data.shape[0])])
+@@ -125,7 +153,7 @@ def test_compute_pseudotime_equivalence():
+     waypoints = pd.Index([start_cell, data.index[5], data.index[10], data.index[15]])
+ 
+     pt_new, W_new = _compute_pseudotime(
+-        data, start_cell, knn=5, waypoints=waypoints, n_jobs=1, max_iterations=10
++        data, start_cell, knn=5, waypoints=waypoints, n_jobs=n_jobs, max_iterations=10
+     )
+     pt_ref, W_ref = _compute_pseudotime_reference(
+         data, start_cell, knn=5, waypoints=waypoints, max_iterations=10
+@@ -135,6 +163,35 @@ def test_compute_pseudotime_equivalence():
+     assert np.allclose(W_new.values, W_ref.values, atol=1e-10, rtol=1e-10)
+ 
+ 
++def test_compute_pseudotime_chunks_and_jobs_exact(monkeypatch):
++    # chunks of cells and parallel shortest paths give results identical to one chunk, serially;
++    # 81 cells in chunks of at most 8 would leave a one-cell chunk
++    rng = np.random.default_rng(0)
++    data = pd.DataFrame(rng.random((81, 1)))
++    waypoints = data.index[:32]
++    start_cell = waypoints[0]
++    pt_ref, W_ref = _compute_pseudotime(data, start_cell, 30, waypoints, n_jobs=1)
++    monkeypatch.setattr("palantir.core._CELL_CHUNK", 8)
++    pt_new, W_new = _compute_pseudotime(data, start_cell, 30, waypoints, n_jobs=2)
++    assert np.array_equal(pt_new.values, pt_ref.values)
++    assert np.array_equal(W_new.values, W_ref.values)
++
++
++def test_connect_graph_equivalence():
++    # three separate clusters, so the 5-NN graph is disconnected
++    rng = np.random.default_rng(3)
++    data = pd.DataFrame(np.vstack([rng.normal(loc=10 * i, size=(15, 3)) for i in range(3)]))
++    adj = NearestNeighbors(n_neighbors=5).fit(data).kneighbors_graph(data, mode="distance")
++    assert csgraph.connected_components(adj, directed=False)[0] == 3
++
++    with warnings.catch_warnings():
++        warnings.simplefilter("ignore")
++        adj_new = _connect_graph(adj.copy(), data, 0)
++        adj_ref = _connect_graph_reference(adj.copy(), data, 0)
++    assert csgraph.connected_components(adj_new, directed=False)[0] == 1
++    assert (adj_new != adj_ref).nnz == 0
++
++
+ def test_compute_kernel_scanpy_equivalence():
+     rng = np.random.default_rng(2)
+     data = pd.DataFrame(rng.normal(size=(20, 5)))

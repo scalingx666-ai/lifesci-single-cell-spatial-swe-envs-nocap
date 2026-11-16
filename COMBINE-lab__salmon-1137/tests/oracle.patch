@@ -1,0 +1,151 @@
+diff --git a/crates/salmon-map/src/sketch.rs b/crates/salmon-map/src/sketch.rs
+index 19047e0db..7f97cf4df 100644
+--- a/crates/salmon-map/src/sketch.rs
++++ b/crates/salmon-map/src/sketch.rs
+@@ -31,7 +31,10 @@ use piscem_rs::mapping::hits::MappingType;
+ use piscem_rs::mapping::merge_pairs::merge_se_mappings;
+ use piscem_rs::mapping::sketch_hit_simple::SketchHitInfoSimple;
+ use piscem_rs::mapping::streaming_query::PiscemStreamingQuery;
+-use salmon_core::{MateStatus, RefProvider};
++use salmon_core::{
++    observed_paired_format, LibraryFormat, MateStatus, ReadOrientation, ReadStrandedness, ReadType,
++    RefProvider,
++};
+ use sshash_lib::dispatch_on_k;
+ 
+ use crate::score::ScoredMapping;
+@@ -133,7 +136,19 @@ pub fn map_single_read_sketch_into<'idx>(
+                 ref_pos: if h.is_fw { h.pos.max(0) } else { h.pos.max(0) + rl },
+                 fw_pos: if h.is_fw { h.pos.max(0) } else { -1 },
+                 rc_pos: if h.is_fw { -1 } else { h.pos.max(0) },
+-                format: None,
++                // Single-end observed strandedness (sense if forward), exactly
++                // as selective alignment's SE case fills it. Filtering is
++                // status-based for single-end reads either way, but `-l A`
++                // detection samples only formatted placements (#1136).
++                format: Some(LibraryFormat::new(
++                    ReadType::SingleEnd,
++                    ReadOrientation::None,
++                    if h.is_fw {
++                        ReadStrandedness::S
++                    } else {
++                        ReadStrandedness::A
++                    },
++                )),
+                 r1_pos: h.pos.max(0),
+                 r2_pos: -1,
+                 r2_fw: false,
+@@ -337,7 +352,21 @@ pub fn map_read_pair_sketch_into<'idx, R: RefProvider>(
+                         ref_pos,
+                         fw_pos,
+                         rc_pos,
+-                        format: None,
++                        // Observed format from the mate strands, exactly as the
++                        // RAD writer and `DiscreteFld` derive it from these same
++                        // fields. Leaving this `None` exempted every sketch
++                        // proper pair from the strand-compatibility filter
++                        // (`is_compatible` accepts an unrecorded orientation
++                        // rather than guessing) and starved `-l A` detection,
++                        // which samples only formatted placements (#1136).
++                        // Orphans stay `None`, as in selective alignment: they
++                        // are judged by status + strand, not sampled for
++                        // detection.
++                        format: if status == MateStatus::PairedEndPaired {
++                            Some(observed_paired_format(h.is_fw, h.mate_is_fw))
++                        } else {
++                            None
++                        },
+                         r1_pos,
+                         r2_pos,
+                         r2_fw,
+diff --git a/crates/salmon-quant/tests/quant_end_to_end.rs b/crates/salmon-quant/tests/quant_end_to_end.rs
+index b83172c4c..d60d7d8ea 100644
+--- a/crates/salmon-quant/tests/quant_end_to_end.rs
++++ b/crates/salmon-quant/tests/quant_end_to_end.rs
+@@ -829,3 +829,86 @@ fn write_unmapped_names_lists_exactly_the_unmapped_fragments() {
+         "unmapped_names.txt must list exactly the foreign fragments"
+     );
+ }
++
++/// Regression test for #1136: sketch mode must apply the same strand-
++/// compatibility filter selective alignment does.
++///
++/// Sketch proper pairs carried `format: None`, which `is_compatible` accepts
++/// rather than guessing — so on a stranded library, sketch mode silently kept
++/// every wrong-strand fragment at full weight (and, because the `-l A` detector
++/// samples only formatted placements, auto-detection never resolved in sketch
++/// mode either). The orientation was available the whole time (`is_fw` /
++/// `mate_is_fw`; the RAD writer already derives the observed format from it).
++///
++/// The simulated reads are inward FR (observed `ISF`): under `ISF` everything
++/// must map; under the opposite `ISR` (essentially) nothing may; and `-l A`
++/// must now resolve to a concrete detected type.
++#[test]
++fn pseudoalignment_strand_filter_respects_library_type() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (fasta, r1, r2, truth) = simulate(tmp.path());
++    let total_truth: u64 = truth.values().sum();
++
++    let idx_dir = tmp.path().join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    let quant = |lib_type: &str, out: PathBuf| {
++        let mut opts = QuantOptions::new(idx_dir.clone(), out);
++        opts.mates1 = vec![r1.clone()];
++        opts.mates2 = vec![r2.clone()];
++        opts.lib_type = lib_type.to_string();
++        opts.sketch = true;
++        opts.num_threads = 1;
++        quantify(&opts).unwrap_or_else(|e| panic!("quantify {lib_type}: {e}"))
++    };
++
++    // Matching stranded type: everything maps, mass conserved.
++    let isf = quant("ISF", tmp.path().join("sk_isf"));
++    assert!(
++        isf.num_mapped as f64 >= 0.9 * total_truth as f64,
++        "ISF: only {} / {total_truth} mapped",
++        isf.num_mapped
++    );
++    let sum: f64 = isf.counts.iter().sum();
++    assert!(
++        (isf.num_mapped as f64 - sum).abs() <= 1e-6,
++        "ISF: num_mapped={} but Σ counts={sum:.6}",
++        isf.num_mapped
++    );
++
++    // Opposite stranded type: every proper pair is wrong-strand and must be
++    // dropped (default `--incompatPrior 0`). Before the fix this was ~100%
++    // mapped — the filter never saw a sketch pair.
++    let isr = quant("ISR", tmp.path().join("sk_isr"));
++    assert!(
++        (isr.num_mapped as f64) <= 0.05 * total_truth as f64,
++        "ISR: {} of {total_truth} fragments passed a filter that should drop \
++         all of them (#1136 regressed)",
++        isr.num_mapped
++    );
++    let sum: f64 = isr.counts.iter().sum();
++    assert!(
++        (isr.num_mapped as f64 - sum).abs() <= 1e-6,
++        "ISR: num_mapped={} but Σ counts={sum:.6}",
++        isr.num_mapped
++    );
++
++    // Auto-detection now receives samples in sketch mode. The fixture is far
++    // below the 50k-sample lock-in budget (`detected_library_type` stays
++    // `None` for a run this small in every mode), but the end-of-run resolved
++    // type is a best guess from the partial samples — which, before the fix,
++    // were *zero* in sketch mode, so `-l A` always fell back to `IU`.
++    let auto = quant("A", tmp.path().join("sk_auto"));
++    assert_eq!(
++        auto.library_type, "ISF",
++        "sketch `-l A` should resolve the simulated inward-FR orientation \
++         from the detector's samples, not fall back to IU"
++    );
++    assert!(
++        auto.num_mapped as f64 >= 0.9 * total_truth as f64,
++        "A: only {} / {total_truth} mapped",
++        auto.num_mapped
++    );
++}

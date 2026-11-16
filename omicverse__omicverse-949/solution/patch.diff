@@ -1,0 +1,254 @@
+diff --git a/omicverse/pp/ambient/__init__.py b/omicverse/pp/ambient/__init__.py
+index f307852ec..6088b57f0 100644
+--- a/omicverse/pp/ambient/__init__.py
++++ b/omicverse/pp/ambient/__init__.py
+@@ -42,6 +42,9 @@
+ >>> ov.pp.ambient.remove_ambient(adata, method='soupx', raw=raw_adata)
+ >>> # DecontX / scCDC — need a clustered filtered matrix
+ >>> ov.pp.ambient.remove_ambient(adata, method='decontx', cluster_key='leiden')
++>>> # multi-sample DecontX — run per batch / lane / donor
++>>> ov.pp.ambient.remove_ambient(
++...     adata, method='decontx', cluster_key='leiden', batch_key='sample')
+ >>> # diagnostics
+ >>> ov.pp.ambient.count_integrity_check(adata.layers['ambient_raw'], adata.X)
+ >>> ov.pp.ambient.contamination_report(adata)
+diff --git a/omicverse/pp/ambient/_ambient.py b/omicverse/pp/ambient/_ambient.py
+index ef89a651e..1517acc2d 100644
+--- a/omicverse/pp/ambient/_ambient.py
++++ b/omicverse/pp/ambient/_ambient.py
+@@ -150,12 +150,21 @@ def _run_soupx(adata, *, raw=None, layer=None, cluster_key=None,
+ 
+ 
+ def _run_decontx(adata, *, raw=None, layer=None, cluster_key=None,
+-                 max_iter=500, seed=12345, verbose=False, **kwargs):
++                 batch_key=None, max_iter=500, seed=12345, verbose=False,
++                 **kwargs):
+     """DecontX — needs a filtered, clustered matrix."""
+     decontx_mod = _require("pydecontx", "DecontX ambient removal")
+     cluster_key = _resolve_clusters(adata, cluster_key, "decontx")
+     z = adata.obs[cluster_key].astype(str).to_numpy()
+ 
++    batch = None
++    if batch_key is not None:
++        if batch_key not in adata.obs:
++            raise ValueError(
++                f"method='decontx' batch_key='{batch_key}' not found in "
++                "adata.obs.")
++        batch = adata.obs[batch_key].astype(str).to_numpy()
++
+     background = None
+     if raw is not None:
+         # genes x cells empty-droplet matrix anchors eta
+@@ -164,14 +173,15 @@ def _run_decontx(adata, *, raw=None, layer=None, cluster_key=None,
+         background = sp.csc_matrix(rw.X).T
+ 
+     res = decontx_mod.decontx(
+-        adata, z=z, background=background, max_iter=max_iter, seed=seed,
+-        layer=layer, verbose=verbose)
++        adata, z=z, batch=batch, background=background, max_iter=max_iter,
++        seed=seed, layer=layer, verbose=verbose)
+     # res.decontx_counts is genes x cells
+     corrected_cg = sp.csr_matrix(res.decontx_counts.T)
+     rho = np.asarray(res.contamination, dtype=float)
+     n_genes_corrected = int(adata.n_vars)
+     meta = {
+         "cluster_key": cluster_key,
++        "batch_key": batch_key,
+         "max_iter": max_iter,
+         "contamination_fraction": float(np.mean(rho)),
+         "background_used": background is not None,
+@@ -320,6 +330,7 @@ def remove_ambient(
+     raw=None,
+     layer: Optional[str] = None,
+     cluster_key: Optional[str] = None,
++    batch_key: Optional[str] = None,
+     copy: bool = False,
+     keep_raw_layer: bool = True,
+     raw_layer_name: str = "ambient_raw",
+@@ -354,6 +365,9 @@ def remove_ambient(
+     cluster_key
+         ``obs`` column with cluster / cell-type labels — required for
+         DecontX and scCDC, optional for SoupX (enables auto rho).
++    batch_key
++        ``obs`` column with per-cell batch / sample labels — optional.
++        When set, DecontX decontaminates each batch separately.
+     copy
+         Return a new AnnData instead of modifying ``adata`` in place.
+     keep_raw_layer
+@@ -394,7 +408,7 @@ def remove_ambient(
+     runner = _DISPATCH[method]
+     corrected_cg, rho, n_genes_corrected, meta = runner(
+         out, raw=raw, layer=layer, cluster_key=cluster_key,
+-        verbose=verbose, **kwargs)
++        batch_key=batch_key, verbose=verbose, **kwargs)
+ 
+     _set_X(out, corrected_cg, layer)
+ 
+@@ -453,6 +467,7 @@ def estimate_contamination(
+     raw=None,
+     layer: Optional[str] = None,
+     cluster_key: Optional[str] = None,
++    batch_key: Optional[str] = None,
+     obs_key: str = "ambient_contamination_est",
+     verbose: bool = False,
+     **kwargs,
+@@ -476,6 +491,9 @@ def estimate_contamination(
+         Count layer to read. ``None`` uses ``.X``.
+     cluster_key
+         ``obs`` column with cluster labels — required for DecontX / scCDC.
++    batch_key
++        ``obs`` column with per-cell batch / sample labels — optional.
++        When set, DecontX decontaminates each batch separately.
+     obs_key
+         ``obs`` column the estimate is written to. Default
+         ``'ambient_contamination_est'``.
+@@ -501,7 +519,7 @@ def estimate_contamination(
+     runner = _DISPATCH[method]
+     _, rho, _, meta = runner(
+         work, raw=raw, layer=layer, cluster_key=cluster_key,
+-        verbose=verbose, **kwargs)
++        batch_key=batch_key, verbose=verbose, **kwargs)
+ 
+     rho = np.asarray(rho, dtype=float)
+     series = pd.Series(rho, index=adata.obs_names, name=obs_key)
+diff --git a/tests/pp/ambient/test_decontx_batch.py b/tests/pp/ambient/test_decontx_batch.py
+new file mode 100644
+index 000000000..f1a5fdd36
+--- /dev/null
++++ b/tests/pp/ambient/test_decontx_batch.py
+@@ -0,0 +1,135 @@
++"""DecontX must receive per-cell batch labels when ``batch_key`` is set."""
++from __future__ import annotations
++
++import types
++
++import anndata
++import numpy as np
++import pandas as pd
++import pytest
++import scipy.sparse as sp
++
++from omicverse.pp.ambient import _ambient
++
++
++def _make_adata():
++    X = np.array([
++        [12, 0, 0],
++        [9, 0, 0],
++        [0, 11, 0],
++        [0, 7, 0],
++    ], dtype=float)
++    return anndata.AnnData(
++        X=X,
++        obs=pd.DataFrame({
++            "cluster": ["A", "A", "B", "B"],
++            "batch": ["s1", "s1", "s2", "s2"],
++        }),
++    )
++
++
++def _fake_backend(monkeypatch, fake_decontx):
++    fake_mod = types.SimpleNamespace(decontx=fake_decontx)
++    monkeypatch.setattr(
++        _ambient, "_require",
++        lambda modname, role, extra="ambient": fake_mod)
++    return fake_mod
++
++
++def _fake_result(adata):
++    return types.SimpleNamespace(
++        decontx_counts=sp.csr_matrix(
++            np.ones((adata.n_vars, adata.n_obs))),
++        contamination=np.zeros(adata.n_obs),
++    )
++
++
++def test_decontx_backend_passes_batch_labels(monkeypatch):
++    adata = _make_adata()
++    captured = {}
++
++    def fake_decontx(x, z=None, batch=None, background=None, **kwargs):
++        captured["z"] = z
++        captured["batch"] = batch
++        return _fake_result(adata)
++
++    _fake_backend(monkeypatch, fake_decontx)
++
++    corrected, rho, n_genes, meta = _ambient._run_decontx(
++        adata, cluster_key="cluster", batch_key="batch")
++
++    np.testing.assert_array_equal(captured["z"], ["A", "A", "B", "B"])
++    np.testing.assert_array_equal(
++        captured["batch"], ["s1", "s1", "s2", "s2"])
++    assert meta["batch_key"] == "batch"
++    assert corrected.shape == adata.shape
++    assert rho.shape == (adata.n_obs,)
++    assert n_genes == adata.n_vars
++
++
++def test_decontx_backend_defaults_to_all_cells(monkeypatch):
++    adata = _make_adata()
++    captured = {}
++
++    def fake_decontx(x, z=None, batch=None, background=None, **kwargs):
++        captured["batch"] = batch
++        return _fake_result(adata)
++
++    _fake_backend(monkeypatch, fake_decontx)
++    _ambient._run_decontx(adata, cluster_key="cluster")
++
++    assert captured["batch"] is None
++
++
++def test_decontx_backend_rejects_missing_batch_key(monkeypatch):
++    adata = _make_adata()
++    _fake_backend(monkeypatch, lambda *args, **kwargs: None)
++
++    with pytest.raises(ValueError, match="batch_key='missing'"):
++        _ambient._run_decontx(
++            adata, cluster_key="cluster", batch_key="missing")
++
++
++def test_remove_ambient_forwards_batch_key(monkeypatch):
++    adata = _make_adata()
++    captured = {}
++
++    def fake_runner(adata, *, raw=None, layer=None, cluster_key=None,
++                    batch_key=None, verbose=False, **kwargs):
++        captured["batch_key"] = batch_key
++        return (
++            adata.X.copy(),
++            np.zeros(adata.n_obs),
++            adata.n_vars,
++            {"cluster_key": cluster_key, "batch_key": batch_key},
++        )
++
++    monkeypatch.setattr(_ambient, "_DISPATCH", {"decontx": fake_runner})
++    out = _ambient.remove_ambient(
++        adata, method="decontx", cluster_key="cluster",
++        batch_key="batch", check_integrity=False)
++
++    assert captured["batch_key"] == "batch"
++    assert out.uns["ambient"]["batch_key"] == "batch"
++
++
++def test_estimate_contamination_forwards_batch_key(monkeypatch):
++    adata = _make_adata()
++    captured = {}
++
++    def fake_runner(adata, *, raw=None, layer=None, cluster_key=None,
++                    batch_key=None, verbose=False, **kwargs):
++        captured["batch_key"] = batch_key
++        return (
++            None,
++            np.zeros(adata.n_obs),
++            0,
++            {"cluster_key": cluster_key, "batch_key": batch_key},
++        )
++
++    monkeypatch.setattr(_ambient, "_DISPATCH", {"decontx": fake_runner})
++    series = _ambient.estimate_contamination(
++        adata, method="decontx", cluster_key="cluster", batch_key="batch")
++
++    assert captured["batch_key"] == "batch"
++    assert series.attrs["batch_key"] == "batch"

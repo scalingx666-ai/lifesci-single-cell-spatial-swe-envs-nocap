@@ -1,0 +1,4162 @@
+diff --git a/spateo/external/MERFISHVI/__init__.py b/spateo/external/MERFISHVI/__init__.py
+new file mode 100644
+index 00000000..82d7cf53
+--- /dev/null
++++ b/spateo/external/MERFISHVI/__init__.py
+@@ -0,0 +1,6 @@
++from ._model import MERFISHVI, SpatialSCVI
++
++__all__ = [
++    "SpatialSCVI",
++    "MERFISHVI",
++]
+diff --git a/spateo/external/MERFISHVI/_model.py b/spateo/external/MERFISHVI/_model.py
+new file mode 100644
+index 00000000..4ae7c0fc
+--- /dev/null
++++ b/spateo/external/MERFISHVI/_model.py
+@@ -0,0 +1,805 @@
++from __future__ import annotations
++
++import logging
++import warnings
++from typing import TYPE_CHECKING, Dict, Optional
++
++import numpy as np
++import torch
++from scipy.sparse import coo_matrix
++
++# Import libraries needed for spatial graph processing
++from scipy.spatial import Delaunay
++from scvi import REGISTRY_KEYS, settings
++from scvi.data import AnnDataManager
++from scvi.data._constants import ADATA_MINIFY_TYPE
++from scvi.data._utils import _get_adata_minify_type
++from scvi.data.fields import (
++    CategoricalJointObsField,
++    CategoricalObsField,
++    LayerField,
++    NumericalJointObsField,
++    NumericalObsField,
++)
++from scvi.model._utils import _init_library_size
++from scvi.model.base import (
++    ArchesMixin,
++    BaseMinifiedModeModelClass,
++    EmbeddingMixin,
++    RNASeqMixin,
++    UnsupervisedTrainingMixin,
++    VAEMixin,
++)
++from scvi.module import VAE
++from scvi.utils import setup_anndata_dsp
++from sklearn.neighbors import kneighbors_graph
++from torch_geometric.utils import from_scipy_sparse_matrix
++
++if TYPE_CHECKING:
++    from typing import Literal
++
++    from anndata import AnnData
++
++logger = logging.getLogger(__name__)
++
++
++class SpatialSCVI(
++    EmbeddingMixin,
++    RNASeqMixin,
++    VAEMixin,
++    ArchesMixin,
++    UnsupervisedTrainingMixin,
++    BaseMinifiedModeModelClass,
++):
++    """Single-cell Variational Inference model.
++
++    This model uses a variational autoencoder (VAE) to learn low-dimensional representations of single-cell data.
++    It can be used for batch effect correction, differential expression analysis, data imputation, and various other downstream tasks.
++
++    Parameters
++    ----------
++    adata
++        AnnData object containing single-cell data, which must be registered through the setup_anndata method.
++    n_hidden
++        Number of nodes in hidden layers.
++    n_latent
++        Dimension of the latent space (dimension of low-dimensional representation).
++    n_spatial
++        Dimension of spatial features. Effective when use_spatial=True.
++    n_layers
++        Number of hidden layers in encoder and decoder networks.
++    dropout_rate
++        Ratio of neurons randomly dropped during training.
++    dispersion
++        How to model variance parameters:
++        * 'gene' - one parameter per gene
++        * 'gene-batch' - different parameters for each gene in each batch
++        * 'gene-label' - different parameters for each gene in each label group
++        * 'gene-cell' - different parameters for each gene in each cell
++    gene_likelihood
++        Distribution used to model gene expression:
++        * 'nb' - negative binomial distribution (for count data with overdispersion)
++        * 'zinb' - zero-inflated negative binomial distribution (for sparse count data)
++        * 'poisson' - Poisson distribution (for count data)
++        * 'normal' - normal distribution (experimental)
++    use_observed_lib_size
++        Whether to use observed library size as scaling factor.
++    latent_distribution
++        Type of latent distribution:
++        * 'normal' - standard normal distribution
++        * 'ln' - logistic normal distribution
++    use_spatial
++        Whether to use spatial information. If True, spatial coordinates will be read from adata.obsm['spatial'].
++    spatial_graph_type
++        Method for spatial graph construction:
++        * 'knn' - K-nearest neighbors graph
++        * 'delaunay' - Delaunay triangulation
++    n_neighbors
++        Number of neighbors for KNN graph when spatial_graph_type='knn'.
++    attention_heads
++        Number of attention heads in graph attention network.
++    spatial_kl_weight
++        Weight for KL divergence of spatial latent variables.
++    **kwargs
++        Additional parameters passed to the VAE module.
++
++    Examples
++    --------
++    >>> import anndata
++    >>> import scvi
++    >>> adata = anndata.read_h5ad("my_data.h5ad")
++    >>> scvi.model.SCVI.setup_anndata(adata, batch_key="batch")
++    >>> model = scvi.model.SCVI(adata, use_spatial=True)
++    >>> model.train()
++    >>> adata.obsm["X_scVI"] = model.get_latent_representation()
++    """
++
++    _module_cls = VAE
++    # Key names for latent variable mean and variance
++    latent_mean_key = "scvi_latent_qzm"
++    latent_var_key = "scvi_latent_qzv"
++
++    def __init__(
++        self,
++        adata: AnnData | None = None,
++        n_hidden: int = 128,
++        n_latent: int = 10,
++        n_spatial: int = 10,
++        n_layers: int = 1,
++        dropout_rate: float = 0.1,
++        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
++        gene_likelihood: Literal["zinb", "nb", "poisson", "normal"] = "zinb",
++        use_observed_lib_size: bool = True,
++        latent_distribution: Literal["normal", "ln"] = "normal",
++        use_spatial: bool = False,
++        spatial_graph_type: Literal["knn", "delaunay"] = "knn",
++        n_neighbors: int = 10,
++        attention_heads: int = 1,
++        spatial_kl_weight: float = 0.01,
++        **kwargs,
++    ):
++        # Initialize parent class
++        super().__init__(adata)
++
++        # Store model configuration parameters
++        self._module_kwargs = {
++            "n_hidden": n_hidden,
++            "n_latent": n_latent,
++            "n_spatial": n_spatial,
++            "n_layers": n_layers,
++            "dropout_rate": dropout_rate,
++            "dispersion": dispersion,
++            "gene_likelihood": gene_likelihood,
++            "latent_distribution": latent_distribution,
++            **kwargs,
++        }
++
++        # Create model summary string
++        self._model_summary_string = (
++            "SpatialSCVI model parameter summary: \n"
++            f"Hidden layer nodes: {n_hidden}, Latent dimensions: {n_latent}, Spatial dimensions: {n_spatial}, "
++            f"Layers: {n_layers}, Dropout rate: {dropout_rate}, "
++            f"Dispersion type: {dispersion}, Gene likelihood: {gene_likelihood}, "
++            f"Use spatial info: {use_spatial}, Spatial KL weight: {spatial_kl_weight}"
++        )
++
++        # Spatial related parameters
++        self.use_spatial = use_spatial
++        self.spatial_graph_type = spatial_graph_type
++        self.n_neighbors = n_neighbors
++        self.attention_heads = attention_heads
++        self.spatial_kl_weight = spatial_kl_weight
++        self.edge_index = None  # Edge indices for spatial graph
++
++        # If using spatial information, set up spatial graph
++        if use_spatial and adata is not None:
++            if "spatial" not in adata.obsm:
++                warnings.warn(
++                    "Using spatial information but no spatial coordinates found in adata.obsm['spatial']. "
++                    "Please provide coordinates in adata.obsm['spatial'].",
++                    UserWarning,
++                    stacklevel=settings.warnings_stacklevel,
++                )
++            else:
++                self.setup_spatial_graph(adata)
++
++        # Handle case where adata is not provided during initialization
++        if self._module_init_on_train:
++            self.module = None
++            warnings.warn(
++                "No adata provided during model initialization. Module will be initialized when train() is called. "
++                "This is an experimental feature and may change in the future.",
++                UserWarning,
++                stacklevel=settings.warnings_stacklevel,
++            )
++        else:
++            # Get categorical covariate information (if available)
++            cat_covs_per_group = (
++                self.adata_manager.get_state_registry("categorical_covariates").n_cats_per_key
++                if "categorical_covariates" in self.adata_manager.data_registry
++                else None
++            )
++
++            # Get number of batches from data
++            num_batches = self.summary_stats.n_batch
++
++            # Check if size factor is provided in data
++            use_size_factor = "size_factor" in self.adata_manager.data_registry
++
++            # Initialize library size parameters if needed
++            lib_mean, lib_var = None, None
++            if (
++                not use_size_factor
++                and self.minified_data_type != ADATA_MINIFY_TYPE.LATENT_POSTERIOR
++                and not use_observed_lib_size
++            ):
++                lib_mean, lib_var = _init_library_size(self.adata_manager, num_batches)
++
++            # CreateVAE module - add spatial related parameters
++            from .scvi_spatial_module import SpatialVAE  # Import new spatial VAE module
++
++            if use_spatial:
++                # Use VAE module with spatial information
++                self.module = SpatialVAE(
++                    n_input=self.summary_stats.n_vars,
++                    n_batch=num_batches,
++                    n_labels=self.summary_stats.n_labels,
++                    n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
++                    n_cats_per_cov=cat_covs_per_group,
++                    n_hidden=n_hidden,
++                    n_latent=n_latent,
++                    n_spatial=n_spatial,
++                    n_layers=n_layers,
++                    dropout_rate=dropout_rate,
++                    dispersion=dispersion,
++                    gene_likelihood=gene_likelihood,
++                    use_observed_lib_size=use_observed_lib_size,
++                    latent_distribution=latent_distribution,
++                    use_size_factor_key=use_size_factor,
++                    library_log_means=lib_mean,
++                    library_log_vars=lib_var,
++                    edge_index=self.edge_index,
++                    attention_heads=attention_heads,
++                    spatial_kl_weight=spatial_kl_weight,
++                    **kwargs,
++                )
++            else:
++                # Use standard VAE module
++                self.module = self._module_cls(
++                    n_input=self.summary_stats.n_vars,
++                    n_batch=num_batches,
++                    n_labels=self.summary_stats.n_labels,
++                    n_continuous_cov=self.summary_stats.get("n_extra_continuous_covs", 0),
++                    n_cats_per_cov=cat_covs_per_group,
++                    n_hidden=n_hidden,
++                    n_latent=n_latent,
++                    n_layers=n_layers,
++                    dropout_rate=dropout_rate,
++                    dispersion=dispersion,
++                    gene_likelihood=gene_likelihood,
++                    use_observed_lib_size=use_observed_lib_size,
++                    latent_distribution=latent_distribution,
++                    use_size_factor_key=use_size_factor,
++                    library_log_means=lib_mean,
++                    library_log_vars=lib_var,
++                    **kwargs,
++                )
++
++            self.module.minified_data_type = self.minified_data_type
++
++        # Store initialization parameters
++        self.init_params_ = self._get_init_params(locals())
++
++    @classmethod
++    @setup_anndata_dsp.dedent
++    def setup_anndata(
++        cls,
++        adata: AnnData,
++        layer: str | None = None,
++        batch_key: str | None = None,
++        labels_key: str | None = None,
++        size_factor_key: str | None = None,
++        categorical_covariate_keys: list[str] | None = None,
++        continuous_covariate_keys: list[str] | None = None,
++        **kwargs,
++    ):
++        """Set up AnnData object for SpatialSCVI model training.
++
++        This method prepares for training by registering necessary data fields.
++
++        Parameters
++        ----------
++        adata
++            AnnData object containing single-cell data
++        layer
++            If provided, use this layer's expression values instead of adata.X
++        batch_key
++            Key in adata.obs representing batch information. If None, assumes all cells are from same batch.
++        labels_key
++            Key in adata.obs representing cell type or other label information
++        size_factor_key
++            Key in adata.obs representing size factor information. Used for normalization.
++        categorical_covariate_keys
++            List of keys in adata.obs representing categorical covariates (like experimental conditions)
++        continuous_covariate_keys
++            List of keys in adata.obs representing continuous covariates (like quality control metrics)
++        """
++        # Store setup parameters
++        setup_args = cls._get_setup_method_args(**locals())
++
++        # Define all data fields needed by the model
++        data_fields = [
++            # Main expression data (X)
++            LayerField("X", layer, is_count_data=True),
++            # Batch information, used for handling batch effects
++            CategoricalObsField("batch", batch_key),
++            # Cell type or other label information
++            CategoricalObsField("labels", labels_key),
++            # Size factor for normalization (optional)
++            NumericalObsField("size_factor", size_factor_key, required=False),
++            # Additional categorical and continuous covariates
++            CategoricalJointObsField("categorical_covariates", categorical_covariate_keys),
++            NumericalJointObsField("continuous_covariates", continuous_covariate_keys),
++        ]
++
++        # Check if data is in minified format and add appropriate fields
++        data_type = _get_adata_minify_type(adata)
++        if data_type is not None:
++            # Add required fields for minified data format
++            data_fields += cls._get_fields_for_adata_minification(data_type)
++
++        # Create manager for data fields
++        adata_manager = AnnDataManager(fields=data_fields, setup_method_args=setup_args)
++
++        # Register all fields to AnnData object
++        adata_manager.register_fields(adata, **kwargs)
++
++        # Register manager to model class
++        cls.register_manager(adata_manager)
++
++    def setup_spatial_graph(self, adata: AnnData):
++        """Set up spatial graph for spatial information processing.
++
++        Build spatial graph based on spatial coordinates in adata.obsm['spatial'],
++        choosing between K-nearest neighbors graph or Delaunay triangulation.
++
++        Parameters
++        ----------
++        adata
++            AnnData object containing spatial coordinates in adata.obsm['spatial']
++        """
++        try:
++            # Get spatial coordinates
++            if "spatial" not in adata.obsm:
++                raise ValueError("Spatial coordinates not found in adata.obsm['spatial']")
++
++            coordinates = adata.obsm["spatial"]
++            logger.info(
++                f"Retrieved spatial coordinates for {len(coordinates)} cells, dimension: {coordinates.shape[1]}"
++            )
++
++            # Check validity of coordinate data
++            if np.isnan(coordinates).any():
++                # Handle NaN values
++                logger.warning("Spatial coordinates contain NaN values, will use mean filling")
++                coordinates = np.nan_to_num(coordinates, nan=np.nanmean(coordinates, axis=0))
++
++            # Build spatial graph based on chosen method
++            if self.spatial_graph_type == "knn":
++                # Build K-nearest neighbors graph
++                logger.info(f"Building spatial graph using KNN method, neighbors: {self.n_neighbors}")
++                adj_matrix = kneighbors_graph(
++                    coordinates,
++                    n_neighbors=min(self.n_neighbors, len(coordinates) - 1),
++                    mode="connectivity",
++                    include_self=False,
++                    n_jobs=-1,  # Use all available CPU cores to speed up computation
++                )
++                # Ensure graph is symmetric
++                adj_matrix = adj_matrix + adj_matrix.T
++                adj_matrix.data = np.ones(adj_matrix.data.shape)
++                # Remove duplicate edges
++                adj_matrix = adj_matrix.tocsr()
++                adj_matrix.data = np.ones_like(adj_matrix.data)
++
++            elif self.spatial_graph_type == "delaunay":
++                # Build Delaunay triangulation
++                logger.info("Building spatial graph using Delaunay triangulation")
++
++                # Ensure coordinates are 2D or 3D, Delaunay needs at least 2D
++                if coordinates.shape[1] == 1:
++                    # If only 1D coordinates, add a fake second dimension
++                    logger.warning(
++                        "Coordinates are only 1D, adding random small noise as second dimension for Delaunay triangulation"
++                    )
++                    coordinates_2d = np.column_stack(
++                        [coordinates, np.random.normal(0, 0.01, size=(len(coordinates), 1))]
++                    )
++                else:
++                    coordinates_2d = coordinates
++
++                # Perform triangulation
++                tri = Delaunay(coordinates_2d)
++                # Get adjacency from triangulation
++                edges = set()
++                for simplex in tri.simplices:
++                    for i in range(len(simplex)):
++                        for j in range(i + 1, len(simplex)):
++                            # Add undirected edge (both directions)
++                            edges.add((simplex[i], simplex[j]))
++                            edges.add((simplex[j], simplex[i]))
++
++                # Create sparse adjacency matrix
++                if edges:
++                    rows, cols = zip(*edges)
++                    data = np.ones(len(rows))
++                    adj_matrix = coo_matrix((data, (rows, cols)), shape=(adata.n_obs, adata.n_obs)).tocsr()
++                else:
++                    logger.warning("Delaunay triangulation did not generate any edges, will use fully connected graph")
++                    # Create a sparse graph with a few random connections
++                    adj_matrix = kneighbors_graph(
++                        coordinates, n_neighbors=min(10, len(coordinates) - 1), mode="connectivity"
++                    )
++            else:
++                raise ValueError(f"Unknown spatial graph type: {self.spatial_graph_type}")
++
++            # Check graph connectivity
++            n_components = 1  # Assume connected
++            if adj_matrix.nnz == 0:
++                logger.warning("Generated graph has no edges, will use fully connected graph")
++                # Create fully connected graph
++                rows, cols = np.where(np.ones((adata.n_obs, adata.n_obs)) - np.eye(adata.n_obs))
++                data = np.ones(len(rows))
++                adj_matrix = coo_matrix((data, (rows, cols)), shape=(adata.n_obs, adata.n_obs))
++
++            # Convert to PyTorch Geometric edge index format
++            edge_index, _ = from_scipy_sparse_matrix(adj_matrix)
++
++            # Move to appropriate device
++            if hasattr(self, "device"):
++                device = self.device
++            elif hasattr(self, "module") and hasattr(self.module, "device"):
++                device = self.module.device
++            else:
++                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++
++            self.edge_index = edge_index.to(device)
++
++            logger.info(
++                f"Successfully built spatial graph, type: {self.spatial_graph_type}, "
++                f"nodes: {adata.n_obs}, edges: {edge_index.shape[1] // 2}, "
++                f"device: {device}"
++            )
++
++        except Exception as e:
++            # Catch any errors, provide detailed error information
++            import traceback
++
++            logger.error(f"Error building spatial graph: {str(e)}\n{traceback.format_exc()}")
++            warnings.warn(
++                f"Error building spatial graph: {str(e)}. Will not use spatial information.",
++                UserWarning,
++                stacklevel=settings.warnings_stacklevel,
++            )
++            self.edge_index = None
++            self.use_spatial = False
++
++
++class MERFISHVI(SpatialSCVI):
++    """MERFISH spatial multimodal variational inference model.
++
++    This model extends SCVI to simultaneously process MERFISH data with spatial information and
++    other modality data (such as scRNA-seq) without spatial information. It uses a shared
++    latent space to jointly model both modalities.
++
++    Parameters
++    ----------
++    adata_spatial
++        AnnData object containing spatial modality data
++    adata_nonspatial
++        AnnData object containing non-spatial modality data, optional
++    n_hidden
++        Number of nodes in hidden layers
++    n_latent
++        Dimension of latent space
++    n_spatial
++        Dimension of spatial features
++    n_layers
++        Number of hidden layers in encoder and decoder networks
++    dropout_rate
++        Dropout rate during training
++    dispersion
++        How to model variance parameters
++    gene_likelihood
++        Distribution used to model gene expression
++    latent_distribution
++        Type of latent distribution
++    spatial_graph_type
++        Spatial graph construction method, 'knn' or 'delaunay'
++    n_neighbors
++        Number of neighbors when spatial_graph_type='knn'
++    attention_heads
++        Number of attention heads in graph attention network
++    spatial_kl_weight
++        Weight for spatial feature KL divergence
++    modality_weights
++        Modality weights to balance contribution of each modality in the loss function
++    **kwargs
++        Additional parameters passed to VAE module
++    """
++
++    def __init__(
++        self,
++        adata_spatial: AnnData,
++        adata_nonspatial: Optional[AnnData] = None,
++        n_hidden: int = 128,
++        n_latent: int = 10,
++        n_spatial: int = 10,
++        n_layers: int = 1,
++        dropout_rate: float = 0.1,
++        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
++        gene_likelihood: Literal["zinb", "nb", "poisson", "normal"] = "zinb",
++        use_observed_lib_size: bool = True,
++        latent_distribution: Literal["normal", "ln"] = "normal",
++        spatial_graph_type: Literal["knn", "delaunay"] = "knn",
++        n_neighbors: int = 10,
++        attention_heads: int = 1,
++        spatial_kl_weight: float = 0.01,
++        modality_weights: Dict[str, float] = {"spatial": 1.0, "nonspatial": 1.0},
++        **kwargs,
++    ):
++        # Store non-spatial modality data
++        self.adata_nonspatial = adata_nonspatial
++        self.modality_weights = modality_weights
++
++        # Initialize parent class using spatial modality data
++        super().__init__(adata_spatial)
++
++        # Store model configuration parameters
++        self._module_kwargs = {
++            "n_hidden": n_hidden,
++            "n_latent": n_latent,
++            "n_spatial": n_spatial,
++            "n_layers": n_layers,
++            "dropout_rate": dropout_rate,
++            "dispersion": dispersion,
++            "gene_likelihood": gene_likelihood,
++            "latent_distribution": latent_distribution,
++            **kwargs,
++        }
++
++        # Create model summary string
++        self._model_summary_string = (
++            "MERFISHVI model parameter summary: \n"
++            f"Hidden layer nodes: {n_hidden}, Latent dimensions: {n_latent}, Spatial dimensions: {n_spatial}, "
++            f"Layers: {n_layers}, Dropout rate: {dropout_rate}, "
++            f"Dispersion type: {dispersion}, Gene likelihood: {gene_likelihood}, "
++            f"Spatial graph type: {spatial_graph_type}, Spatial KL weight: {spatial_kl_weight}, "
++            f"Modality weights: {modality_weights}"
++        )
++
++        # Spatial related parameters
++        self.spatial_graph_type = spatial_graph_type
++        self.n_neighbors = n_neighbors
++        self.attention_heads = attention_heads
++        self.spatial_kl_weight = spatial_kl_weight
++        self.edge_index = None
++
++        # Set up spatial graph for spatial modality
++        self.setup_spatial_graph(adata_spatial)
++
++        # Set up non-spatial modality data manager
++        if adata_nonspatial is not None:
++            self.setup_nonspatial_anndata(adata_nonspatial)
++
++        # Initialize model
++        if self._module_init_on_train:
++            self.module = None
++            warnings.warn(
++                "No adata provided during model initialization. Module will be initialized when train() is called. "
++                "This is an experimental feature and may change in the future.",
++                UserWarning,
++                stacklevel=settings.warnings_stacklevel,
++            )
++        else:
++            # Create model
++            self._create_module()
++            self.module.minified_data_type = self.minified_data_type
++
++        # Store initialization parameters
++        self.init_params_ = self._get_init_params(locals())
++
++    @classmethod
++    @setup_anndata_dsp.dedent
++    def setup_nonspatial_anndata(cls, adata: AnnData, **kwargs):
++        """Set up non-spatial modality AnnData object.
++
++        Parameters
++        ----------
++        adata
++            Non-spatial modality AnnData object
++        """
++        # Create separate data manager for non-spatial modality
++
++        # Store setup parameters
++        setup_args = cls._get_setup_method_args(**locals())
++
++        # Define all data fields needed by the model
++        data_fields = [
++            LayerField("X", None, is_count_data=True),
++            CategoricalObsField("batch", None),
++            CategoricalObsField("labels", None),
++            NumericalObsField("size_factor", None, required=False),
++            CategoricalJointObsField("categorical_covariates", None),
++            NumericalJointObsField("continuous_covariates", None),
++        ]
++
++        # Check if data is in minified format and add appropriate fields
++        data_type = _get_adata_minify_type(adata)
++        if data_type is not None:
++            # Add required fields for minified data format
++            data_fields += cls._get_fields_for_adata_minification(data_type)
++
++        # Create manager for data fields
++        adata_manager = AnnDataManager(fields=data_fields, setup_method_args=setup_args)
++
++        # Register all fields to AnnData object
++        adata_manager.register_fields(adata, **kwargs)
++
++        # Register manager to model class
++        cls.register_manager(adata_manager)
++
++        logger.info(f"Successfully set up non-spatial modality data, shape: {adata.shape}")
++
++    def _create_module(self):
++        """Create model module"""
++        # Get spatial modality data information
++        n_vars_spatial = self.summary_stats.n_vars
++        n_batch_spatial = self.summary_stats.n_batch
++        n_labels_spatial = self.summary_stats.n_labels
++
++        # Get spatial modality categorical covariate information
++        cat_covs_per_group_spatial = (
++            self.adata_manager.get_state_registry("categorical_covariates").n_cats_per_key
++            if "categorical_covariates" in self.adata_manager.data_registry
++            else None
++        )
++
++        # Use size factor
++        use_size_factor_spatial = "size_factor" in self.adata_manager.data_registry
++
++        # Initialize library size parameters
++        lib_mean_spatial, lib_var_spatial = None, None
++        if (
++            not use_size_factor_spatial
++            and self.minified_data_type != ADATA_MINIFY_TYPE.LATENT_POSTERIOR
++            and not self._module_kwargs.get("use_observed_lib_size", True)
++        ):
++            lib_mean_spatial, lib_var_spatial = _init_library_size(self.adata_manager, n_batch_spatial)
++
++        # Check if non-spatial modality is available
++        has_nonspatial = hasattr(self, "adata_manager_nonspatial")
++
++        if has_nonspatial:
++            # Get non-spatial modality data information
++            n_vars_nonspatial = self.adata_manager_nonspatial.summary_stats.n_vars
++            n_batch_nonspatial = self.adata_manager_nonspatial.summary_stats.n_batch
++            n_labels_nonspatial = self.adata_manager_nonspatial.summary_stats.n_labels
++
++            # Get non-spatial modality categorical covariate information
++            cat_covs_per_group_nonspatial = (
++                self.adata_manager_nonspatial.get_state_registry("categorical_covariates").n_cats_per_key
++                if "categorical_covariates" in self.adata_manager_nonspatial.data_registry
++                else None
++            )
++
++            # Use size factor
++            use_size_factor_nonspatial = "size_factor" in self.adata_manager_nonspatial.data_registry
++
++            # Initialize library size parameters
++            lib_mean_nonspatial, lib_var_nonspatial = None, None
++            if (
++                not use_size_factor_nonspatial
++                and self.minified_data_type != ADATA_MINIFY_TYPE.LATENT_POSTERIOR
++                and not self._module_kwargs.get("use_observed_lib_size", True)
++            ):
++                lib_mean_nonspatial, lib_var_nonspatial = _init_library_size(
++                    self.adata_manager_nonspatial, n_batch_nonspatial
++                )
++
++        # Import multimodal spatial VAE module
++        from .multimodal_spatial_vae import MultiModalSpatialVAE
++
++        # Create model module
++        if has_nonspatial:
++            self.module = MultiModalSpatialVAE(
++                n_input_spatial=n_vars_spatial,
++                n_input_nonspatial=n_vars_nonspatial,
++                n_batch_spatial=n_batch_spatial,
++                n_batch_nonspatial=n_batch_nonspatial,
++                n_labels_spatial=n_labels_spatial,
++                n_labels_nonspatial=n_labels_nonspatial,
++                n_hidden=self._module_kwargs["n_hidden"],
++                n_latent=self._module_kwargs["n_latent"],
++                n_spatial=self._module_kwargs["n_spatial"],
++                n_layers=self._module_kwargs["n_layers"],
++                dropout_rate=self._module_kwargs["dropout_rate"],
++                dispersion=self._module_kwargs["dispersion"],
++                gene_likelihood=self._module_kwargs["gene_likelihood"],
++                latent_distribution=self._module_kwargs["latent_distribution"],
++                use_observed_lib_size=self._module_kwargs.get("use_observed_lib_size", True),
++                edge_index=self.edge_index,
++                attention_heads=self.attention_heads,
++                spatial_kl_weight=self.spatial_kl_weight,
++                modality_weights=self.modality_weights,
++                cats_per_cov_spatial=cat_covs_per_group_spatial,
++                cats_per_cov_nonspatial=cat_covs_per_group_nonspatial,
++                use_size_factor_spatial=use_size_factor_spatial,
++                use_size_factor_nonspatial=use_size_factor_nonspatial,
++                library_log_means_spatial=lib_mean_spatial,
++                library_log_vars_spatial=lib_var_spatial,
++                library_log_means_nonspatial=lib_mean_nonspatial,
++                library_log_vars_nonspatial=lib_var_nonspatial,
++                **{
++                    k: v
++                    for k, v in self._module_kwargs.items()
++                    if k
++                    not in [
++                        "n_hidden",
++                        "n_latent",
++                        "n_spatial",
++                        "n_layers",
++                        "dropout_rate",
++                        "dispersion",
++                        "gene_likelihood",
++                        "latent_distribution",
++                        "use_observed_lib_size",
++                    ]
++                },
++            )
++        else:
++            # Only use spatial modality
++            from .scvi_spatial_module import SpatialVAE
++
++            self.module = SpatialVAE(
++                n_input=n_vars_spatial,
++                n_batch=n_batch_spatial,
++                n_labels=n_labels_spatial,
++                n_hidden=self._module_kwargs["n_hidden"],
++                n_latent=self._module_kwargs["n_latent"],
++                n_spatial=self._module_kwargs["n_spatial"],
++                n_layers=self._module_kwargs["n_layers"],
++                dropout_rate=self._module_kwargs["dropout_rate"],
++                dispersion=self._module_kwargs["dispersion"],
++                gene_likelihood=self._module_kwargs["gene_likelihood"],
++                latent_distribution=self._module_kwargs["latent_distribution"],
++                use_observed_lib_size=self._module_kwargs.get("use_observed_lib_size", True),
++                edge_index=self.edge_index,
++                attention_heads=self.attention_heads,
++                spatial_kl_weight=self.spatial_kl_weight,
++                n_cats_per_cov=cat_covs_per_group_spatial,
++                use_size_factor_key=use_size_factor_spatial,
++                library_log_means=lib_mean_spatial,
++                library_log_vars=lib_var_spatial,
++                **{
++                    k: v
++                    for k, v in self._module_kwargs.items()
++                    if k
++                    not in [
++                        "n_hidden",
++                        "n_latent",
++                        "n_spatial",
++                        "n_layers",
++                        "dropout_rate",
++                        "dispersion",
++                        "gene_likelihood",
++                        "latent_distribution",
++                        "use_observed_lib_size",
++                    ]
++                },
++            )
++
++    # Add methods for getting multimodal representations
++    @torch.inference_mode()
++    def get_spatial_representation(self, adata=None, indices=None, batch_size=None):
++        """Get spatial feature representation"""
++        if hasattr(self.module, "get_spatial_representation"):
++            return self.module.get_spatial_representation(adata, indices, batch_size)
++        else:
++            raise AttributeError("Current model does not support getting spatial representation")
++
++    @torch.inference_mode()
++    def get_latent_representation(self, adata=None, indices=None, batch_size=None, modality="spatial"):
++        """Get latent representation, can choose from spatial modality, non-spatial modality, or fused representation"""
++        if hasattr(self.module, "get_latent_representation_by_modality"):
++            return self.module.get_latent_representation_by_modality(adata, indices, batch_size, modality)
++        else:
++            return super().get_latent_representation(adata, indices, batch_size)
++
++    @torch.inference_mode()
++    def get_fused_representation(self, adata=None, indices=None, batch_size=None):
++        """Get fused latent representation"""
++        if hasattr(self.module, "get_fused_representation"):
++            return self.module.get_fused_representation(adata, indices, batch_size)
++        else:
++            return self.get_latent_representation(adata, indices, batch_size)
+diff --git a/spateo/external/MERFISHVI/_module.py b/spateo/external/MERFISHVI/_module.py
+new file mode 100644
+index 00000000..d54ce2ab
+--- /dev/null
++++ b/spateo/external/MERFISHVI/_module.py
+@@ -0,0 +1,1065 @@
++from __future__ import annotations
++
++import logging
++import warnings
++from typing import TYPE_CHECKING
++
++import numpy as np
++import torch
++from scvi import REGISTRY_KEYS, settings
++from scvi.data._constants import ADATA_MINIFY_TYPE
++from scvi.module._constants import MODULE_KEYS
++from scvi.module.base import (
++    BaseMinifiedModeModuleClass,
++    EmbeddingModuleMixin,
++    LossOutput,
++    auto_move_data,
++)
++from scvi.utils import unsupported_if_adata_minified
++from torch.nn.functional import one_hot
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
++    from typing import Literal
++
++    from torch.distributions import Distribution
++
++logger = logging.getLogger(__name__)
++
++
++class VAE(EmbeddingModuleMixin, BaseMinifiedModeModuleClass):
++    """Variational auto-encoder :cite:p:`Lopez18`.
++
++    Parameters
++    ----------
++    n_input
++        Number of input features.
++    n_batch
++        Number of batches. If ``0``, no batch correction is performed.
++    n_labels
++        Number of labels.
++    n_hidden
++        Number of nodes per hidden layer. Passed into :class:`~scvi.nn.Encoder` and
++        :class:`~scvi.nn.DecoderSCVI`.
++    n_latent
++        Dimensionality of the latent space.
++    n_layers
++        Number of hidden layers. Passed into :class:`~scvi.nn.Encoder` and
++        :class:`~scvi.nn.DecoderSCVI`.
++    n_continuous_cov
++        Number of continuous covariates.
++    n_cats_per_cov
++        A list of integers containing the number of categories for each categorical covariate.
++    dropout_rate
++        Dropout rate. Passed into :class:`~scvi.nn.Encoder` but not :class:`~scvi.nn.DecoderSCVI`.
++    dispersion
++        Flexibility of the dispersion parameter when ``gene_likelihood`` is either ``"nb"`` or
++        ``"zinb"``. One of the following:
++
++        * ``"gene"``: parameter is constant per gene across cells.
++        * ``"gene-batch"``: parameter is constant per gene per batch.
++        * ``"gene-label"``: parameter is constant per gene per label.
++        * ``"gene-cell"``: parameter is constant per gene per cell.
++    log_variational
++        If ``True``, use :func:`~torch.log1p` on input data before encoding for numerical stability
++        (not normalization).
++    gene_likelihood
++        Distribution to use for reconstruction in the generative process. One of the following:
++
++        * ``"nb"``: :class:`~scvi.distributions.NegativeBinomial`.
++        * ``"zinb"``: :class:`~scvi.distributions.ZeroInflatedNegativeBinomial`.
++        * ``"poisson"``: :class:`~scvi.distributions.Poisson`.
++        * ``"normal"``: :class:`~torch.distributions.Normal`.
++    latent_distribution
++        Distribution to use for the latent space. One of the following:
++
++        * ``"normal"``: isotropic normal.
++        * ``"ln"``: logistic normal with normal params N(0, 1).
++    encode_covariates
++        If ``True``, covariates are concatenated to gene expression prior to passing through
++        the encoder(s). Else, only gene expression is used.
++    deeply_inject_covariates
++        If ``True`` and ``n_layers > 1``, covariates are concatenated to the outputs of hidden
++        layers in the encoder(s) (if ``encoder_covariates`` is ``True``) and the decoder prior to
++        passing through the next layer.
++    batch_representation
++        ``EXPERIMENTAL`` Method for encoding batch information. One of the following:
++
++        * ``"one-hot"``: represent batches with one-hot encodings.
++        * ``"embedding"``: represent batches with continuously-valued embeddings using
++          :class:`~scvi.nn.Embedding`.
++
++        Note that batch representations are only passed into the encoder(s) if
++        ``encode_covariates`` is ``True``.
++    use_batch_norm
++        Specifies where to use :class:`~torch.nn.BatchNorm1d` in the model. One of the following:
++
++        * ``"none"``: don't use batch norm in either encoder(s) or decoder.
++        * ``"encoder"``: use batch norm only in the encoder(s).
++        * ``"decoder"``: use batch norm only in the decoder.
++        * ``"both"``: use batch norm in both encoder(s) and decoder.
++
++        Note: if ``use_layer_norm`` is also specified, both will be applied (first
++        :class:`~torch.nn.BatchNorm1d`, then :class:`~torch.nn.LayerNorm`).
++    use_layer_norm
++        Specifies where to use :class:`~torch.nn.LayerNorm` in the model. One of the following:
++
++        * ``"none"``: don't use layer norm in either encoder(s) or decoder.
++        * ``"encoder"``: use layer norm only in the encoder(s).
++        * ``"decoder"``: use layer norm only in the decoder.
++        * ``"both"``: use layer norm in both encoder(s) and decoder.
++
++        Note: if ``use_batch_norm`` is also specified, both will be applied (first
++        :class:`~torch.nn.BatchNorm1d`, then :class:`~torch.nn.LayerNorm`).
++    use_size_factor_key
++        If ``True``, use the :attr:`~anndata.AnnData.obs` column as defined by the
++        ``size_factor_key`` parameter in the model's ``setup_anndata`` method as the scaling
++        factor in the mean of the conditional distribution. Takes priority over
++        ``use_observed_lib_size``.
++    use_observed_lib_size
++        If ``True``, use the observed library size for RNA as the scaling factor in the mean of the
++        conditional distribution.
++    extra_payload_autotune
++        If ``True``, will return extra matrices in the loss output to be used during autotune
++    library_log_means
++        :class:`~numpy.ndarray` of shape ``(1, n_batch)`` of means of the log library sizes that
++        parameterize the prior on library size if ``use_size_factor_key`` is ``False`` and
++        ``use_observed_lib_size`` is ``False``.
++    library_log_vars
++        :class:`~numpy.ndarray` of shape ``(1, n_batch)`` of variances of the log library sizes
++        that parameterize the prior on library size if ``use_size_factor_key`` is ``False`` and
++        ``use_observed_lib_size`` is ``False``.
++    var_activation
++        Callable used to ensure positivity of the variance of the variational distribution. Passed
++        into :class:`~scvi.nn.Encoder`. Defaults to :func:`~torch.exp`.
++    extra_encoder_kwargs
++        Additional keyword arguments passed into :class:`~scvi.nn.Encoder`.
++    extra_decoder_kwargs
++        Additional keyword arguments passed into :class:`~scvi.nn.DecoderSCVI`.
++    batch_embedding_kwargs
++        Keyword arguments passed into :class:`~scvi.nn.Embedding` if ``batch_representation`` is
++        set to ``"embedding"``.
++
++    Notes
++    -----
++    Lifecycle: argument ``batch_representation`` is experimental in v1.2.
++    """
++
++    def __init__(
++        self,
++        n_input: int,
++        n_batch: int = 0,
++        n_labels: int = 0,
++        n_hidden: int = 128,
++        n_latent: int = 10,
++        n_layers: int = 1,
++        n_continuous_cov: int = 0,
++        n_cats_per_cov: list[int] | None = None,
++        dropout_rate: float = 0.1,
++        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
++        log_variational: bool = True,
++        gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
++        latent_distribution: Literal["normal", "ln"] = "normal",
++        encode_covariates: bool = False,
++        deeply_inject_covariates: bool = True,
++        batch_representation: Literal["one-hot", "embedding"] = "one-hot",
++        use_batch_norm: Literal["encoder", "decoder", "none", "both"] = "both",
++        use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
++        use_size_factor_key: bool = False,
++        use_observed_lib_size: bool = True,
++        extra_payload_autotune: bool = False,
++        library_log_means: np.ndarray | None = None,
++        library_log_vars: np.ndarray | None = None,
++        var_activation: Callable[[torch.Tensor], torch.Tensor] = None,
++        extra_encoder_kwargs: dict | None = None,
++        extra_decoder_kwargs: dict | None = None,
++        batch_embedding_kwargs: dict | None = None,
++    ):
++        from scvi.nn import DecoderSCVI, Encoder
++
++        super().__init__()
++
++        self.dispersion = dispersion
++        self.n_latent = n_latent
++        self.log_variational = log_variational
++        self.gene_likelihood = gene_likelihood
++        self.n_batch = n_batch
++        self.n_labels = n_labels
++        self.latent_distribution = latent_distribution
++        self.encode_covariates = encode_covariates
++        self.use_size_factor_key = use_size_factor_key
++        self.use_observed_lib_size = use_size_factor_key or use_observed_lib_size
++        self.extra_payload_autotune = extra_payload_autotune
++
++        if not self.use_observed_lib_size:
++            if library_log_means is None or library_log_vars is None:
++                raise ValueError(
++                    "If not using observed_lib_size, " "must provide library_log_means and library_log_vars."
++                )
++
++            self.register_buffer("library_log_means", torch.from_numpy(library_log_means).float())
++            self.register_buffer("library_log_vars", torch.from_numpy(library_log_vars).float())
++
++        if self.dispersion == "gene":
++            self.px_r = torch.nn.Parameter(torch.randn(n_input))
++        elif self.dispersion == "gene-batch":
++            self.px_r = torch.nn.Parameter(torch.randn(n_input, n_batch))
++        elif self.dispersion == "gene-label":
++            self.px_r = torch.nn.Parameter(torch.randn(n_input, n_labels))
++        elif self.dispersion == "gene-cell":
++            pass
++        else:
++            raise ValueError("`dispersion` must be one of 'gene', 'gene-batch', 'gene-label', 'gene-cell'.")
++
++        self.batch_representation = batch_representation
++        if self.batch_representation == "embedding":
++            self.init_embedding("batch", n_batch, **(batch_embedding_kwargs or {}))
++            batch_dim = self.get_embedding("batch").embedding_dim
++        elif self.batch_representation != "one-hot":
++            raise ValueError("`batch_representation` must be one of 'one-hot', 'embedding'.")
++
++        use_batch_norm_encoder = use_batch_norm == "encoder" or use_batch_norm == "both"
++        use_batch_norm_decoder = use_batch_norm == "decoder" or use_batch_norm == "both"
++        use_layer_norm_encoder = use_layer_norm == "encoder" or use_layer_norm == "both"
++        use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
++
++        n_input_encoder = n_input + n_continuous_cov * encode_covariates
++        if self.batch_representation == "embedding":
++            n_input_encoder += batch_dim * encode_covariates
++            cat_list = list([] if n_cats_per_cov is None else n_cats_per_cov)
++        else:
++            cat_list = [n_batch] + list([] if n_cats_per_cov is None else n_cats_per_cov)
++
++        encoder_cat_list = cat_list if encode_covariates else None
++        _extra_encoder_kwargs = extra_encoder_kwargs or {}
++        self.z_encoder = Encoder(
++            n_input_encoder,
++            n_latent,
++            n_cat_list=encoder_cat_list,
++            n_layers=n_layers,
++            n_hidden=n_hidden,
++            dropout_rate=dropout_rate,
++            distribution=latent_distribution,
++            inject_covariates=deeply_inject_covariates,
++            use_batch_norm=use_batch_norm_encoder,
++            use_layer_norm=use_layer_norm_encoder,
++            var_activation=var_activation,
++            return_dist=True,
++            **_extra_encoder_kwargs,
++        )
++        # l encoder goes from n_input-dimensional data to 1-d library size
++        self.l_encoder = Encoder(
++            n_input_encoder,
++            1,
++            n_layers=1,
++            n_cat_list=encoder_cat_list,
++            n_hidden=n_hidden,
++            dropout_rate=dropout_rate,
++            inject_covariates=deeply_inject_covariates,
++            use_batch_norm=use_batch_norm_encoder,
++            use_layer_norm=use_layer_norm_encoder,
++            var_activation=var_activation,
++            return_dist=True,
++            **_extra_encoder_kwargs,
++        )
++        n_input_decoder = n_latent + n_continuous_cov
++        if self.batch_representation == "embedding":
++            n_input_decoder += batch_dim
++
++        _extra_decoder_kwargs = extra_decoder_kwargs or {}
++        self.decoder = DecoderSCVI(
++            n_input_decoder,
++            n_input,
++            n_cat_list=cat_list,
++            n_layers=n_layers,
++            n_hidden=n_hidden,
++            inject_covariates=deeply_inject_covariates,
++            use_batch_norm=use_batch_norm_decoder,
++            use_layer_norm=use_layer_norm_decoder,
++            scale_activation="softplus" if use_size_factor_key else "softmax",
++            **_extra_decoder_kwargs,
++        )
++
++    def _get_inference_input(
++        self,
++        tensors: dict[str, torch.Tensor | None],
++        full_forward_pass: bool = False,
++    ) -> dict[str, torch.Tensor | None]:
++        """获取推断过程所需的输入张量。
++
++        Args:
++            tensors: 输入数据张量
++            full_forward_pass: 是否执行完整的前向传播
++
++        Returns:
++            用于推断过程的输入字典
++        """
++        # 根据数据类型选择加载方式
++        if full_forward_pass or self.minified_data_type is None:
++            loader = "full_data"
++        elif self.minified_data_type in [
++            ADATA_MINIFY_TYPE.LATENT_POSTERIOR,
++            ADATA_MINIFY_TYPE.LATENT_POSTERIOR_WITH_COUNTS,
++        ]:
++            loader = "minified_data"
++        else:
++            raise NotImplementedError(f"未知的简化数据类型: {self.minified_data_type}")
++
++        # 完整数据情况：提供表达数据和批次信息
++        if loader == "full_data":
++            return {
++                "x": tensors["X"],  # 基因表达数据
++                "batch_index": tensors["batch"],  # 批次索引
++                "cont_covariates": tensors.get("continuous_covariates", None),  # 连续型协变量
++                "cat_covariates": tensors.get("categorical_covariates", None),  # 分类型协变量
++            }
++        # 简化数据情况：提供已计算的潜在变量分布参数
++        else:
++            return {
++                "qzm": tensors["scvi_latent_qzm"],  # 潜变量均值
++                "qzv": tensors["scvi_latent_qzv"],  # 潜变量方差
++                "observed_lib_size": tensors["observed_lib_size"],  # 观测到的文库大小
++            }
++
++    def _get_generative_input(
++        self,
++        tensors: dict[str, torch.Tensor],
++        inference_outputs: dict[str, torch.Tensor | Distribution | None],
++    ) -> dict[str, torch.Tensor | None]:
++        """获取生成过程的输入张量。
++
++        将推断步骤的输出与原始数据结合，准备生成网络的输入。
++
++        Args:
++            tensors: 原始数据张量
++            inference_outputs: 推断过程的输出
++
++        Returns:
++            生成过程所需的输入字典
++        """
++        # 获取size_factor（如果提供）
++        size_factor = tensors.get("size_factor", None)
++        if size_factor is not None:
++            size_factor = torch.log(size_factor)
++
++        return {
++            "z": inference_outputs["z"],  # 潜在空间表示
++            "library": inference_outputs["library"],  # 文库大小
++            "batch_index": tensors["batch"],  # 批次索引
++            "y": tensors["labels"],  # 细胞类型标签
++            "cont_covariates": tensors.get("continuous_covariates", None),  # 连续型协变量
++            "cat_covariates": tensors.get("categorical_covariates", None),  # 分类型协变量
++            "size_factor": size_factor,  # 大小因子
++        }
++
++    def _compute_local_library_params(
++        self,
++        batch_index: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """计算局部文库参数。
++
++        为每个细胞计算文库大小的均值和方差参数，这些参数取决于细胞所属的批次。
++
++        Args:
++            batch_index: 形状为 (batch_size, 1) 的批次索引张量
++
++        Returns:
++            tuple: 包含两个张量，分别是文库大小对数的均值和方差
++        """
++        from torch.nn.functional import linear
++
++        # 批次数量
++        num_batches = self.library_log_means.shape[1]
++
++        # 将批次索引转换为独热编码
++        batch_one_hot = one_hot(batch_index.squeeze(-1), num_batches).float()
++
++        # 计算每个细胞的文库大小对数均值
++        # 相当于从全局文库均值表中查找对应批次的值
++        library_log_means = linear(batch_one_hot, self.library_log_means)
++
++        # 计算每个细胞的文库大小对数方差
++        # 相当于从全局文库方差表中查找对应批次的值
++        library_log_vars = linear(batch_one_hot, self.library_log_vars)
++
++        return library_log_means, library_log_vars
++
++    @auto_move_data
++    def _regular_inference(
++        self,
++        x: torch.Tensor,
++        batch_index: torch.Tensor,
++        cont_covs: torch.Tensor | None = None,
++        cat_covs: torch.Tensor | None = None,
++        n_samples: int = 1,
++    ) -> dict[str, torch.Tensor | Distribution | None]:
++        """运行常规推断过程，获取数据的潜在表示。
++
++        Args:
++            x: 基因表达数据
++            batch_index: 批次索引
++            cont_covs: 连续型协变量
++            cat_covs: 分类型协变量
++            n_samples: 采样数量
++
++        Returns:
++            包含潜在变量和分布的字典
++        """
++        x_ = x
++        if self.use_observed_lib_size:
++            # 计算观测到的文库大小（基因表达总和）
++            library = torch.log(x.sum(1)).unsqueeze(1)
++        if self.log_variational:
++            # 对数据取对数，增加数值稳定性
++            x_ = torch.log1p(x_)
++
++        if cont_covs is not None and self.encode_covariates:
++            # 将基因表达和连续协变量拼接起来
++            encoder_input = torch.cat((x_, cont_covs), dim=-1)
++        else:
++            encoder_input = x_
++        if cat_covs is not None and self.encode_covariates:
++            # 处理分类协变量
++            categorical_input = torch.split(cat_covs, 1, dim=1)
++        else:
++            categorical_input = ()
++
++        if self.batch_representation == "embedding" and self.encode_covariates:
++            # 使用嵌入表示批次
++            batch_embedding = self.compute_embedding("batch", batch_index)
++            encoder_input = torch.cat([encoder_input, batch_embedding], dim=-1)
++            # 获取潜在变量分布和样本
++            qz, z = self.z_encoder(encoder_input, *categorical_input)
++        else:
++            # 使用独热编码表示批次
++            qz, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
++
++        ql = None
++        if not self.use_observed_lib_size:
++            if self.batch_representation == "embedding":
++                # 使用嵌入表示批次来编码文库大小
++                ql, library_encoded = self.l_encoder(encoder_input, *categorical_input)
++            else:
++                # 使用独热编码表示批次来编码文库大小
++                ql, library_encoded = self.l_encoder(encoder_input, batch_index, *categorical_input)
++            library = library_encoded
++
++        if n_samples > 1:
++            # 多个样本情况下的处理
++            untran_z = qz.sample((n_samples,))
++            z = self.z_encoder.z_transformation(untran_z)
++            if self.use_observed_lib_size:
++                library = library.unsqueeze(0).expand((n_samples, library.size(0), library.size(1)))
++            else:
++                library = ql.sample((n_samples,))
++
++        return {
++            "z": z,  # 潜在空间表示
++            "qz": qz,  # 潜在空间分布
++            "ql": ql,  # 文库大小分布
++            "library": library,  # 文库大小
++        }
++
++    @auto_move_data
++    def _cached_inference(
++        self,
++        qzm: torch.Tensor,
++        qzv: torch.Tensor,
++        observed_lib_size: torch.Tensor,
++        n_samples: int = 1,
++    ) -> dict[str, torch.Tensor | None]:
++        """使用缓存的潜在变量分布参数进行推断。
++
++        这种方法主要用于已经计算并存储了潜在变量分布的情况，
++        可以加快推断速度，无需重新运行编码器网络。
++
++        Args:
++            qzm: 潜在变量均值
++            qzv: 潜在变量方差
++            observed_lib_size: 观测到的文库大小
++            n_samples: 采样数量
++
++        Returns:
++            包含潜在变量和分布的字典
++        """
++        from torch.distributions import Normal
++
++        # 创建潜在变量的正态分布
++        latent_dist = Normal(qzm, qzv.sqrt())
++
++        # 从分布中采样
++        # 使用sample()而不是rsample()，因为我们不需要对z进行优化
++        if n_samples == 1:
++            untransformed_z = latent_dist.sample()
++        else:
++            untransformed_z = latent_dist.sample((n_samples,))
++
++        # 变换潜在变量（如果使用的是logistic normal分布）
++        z = self.z_encoder.z_transformation(untransformed_z)
++
++        # 计算文库大小（取对数）
++        library = torch.log(observed_lib_size)
++
++        # 多样本情况下扩展文库大小
++        if n_samples > 1:
++            library = library.unsqueeze(0).expand((n_samples, library.size(0), library.size(1)))
++
++        return {
++            "z": z,  # 潜在空间表示
++            "qz": latent_dist,  # 潜在空间分布
++            "ql": None,  # 没有文库大小分布（使用观测值）
++            "library": library,  # 文库大小
++        }
++
++    @auto_move_data
++    def generative(
++        self,
++        z: torch.Tensor,
++        library: torch.Tensor,
++        batch_index: torch.Tensor,
++        cont_covs: torch.Tensor | None = None,
++        cat_covs: torch.Tensor | None = None,
++        size_factor: torch.Tensor | None = None,
++        y: torch.Tensor | None = None,
++        transform_batch: torch.Tensor | None = None,
++    ) -> dict[str, Distribution | None]:
++        """Run the generative process to get distribution parameters.
++
++        This method takes latent representations and covariates to generate
++        the parameters of the data distribution.
++
++        Parameters
++        ----------
++        z : torch.Tensor
++            Latent space representation
++        library : torch.Tensor
++            Library size factors
++        batch_index : torch.Tensor
++            Batch indices for each cell
++        cont_covs : torch.Tensor, optional
++            Continuous covariates
++        cat_covs : torch.Tensor, optional
++            Categorical covariates
++        size_factor : torch.Tensor, optional
++            Size factors (if not using library)
++        y : torch.Tensor, optional
++            Labels for each cell
++        transform_batch : torch.Tensor, optional
++            Batch to transform to (for batch correction)
++
++        Returns
++        -------
++        dict
++            Dictionary with distribution objects for data, library size, and latent space
++        """
++        from scvi.distributions import (
++            NegativeBinomial,
++            Normal,
++            Poisson,
++            ZeroInflatedNegativeBinomial,
++        )
++        from torch.nn.functional import linear
++
++        # Prepare the decoder input by concatenating latent variables with covariates
++        if cont_covs is None:
++            decoder_input = z
++        elif z.dim() != cont_covs.dim():
++            # Handle case where dimensions don't match (e.g., when using multiple samples)
++            decoder_input = torch.cat([z, cont_covs.unsqueeze(0).expand(z.size(0), -1, -1)], dim=-1)
++        else:
++            decoder_input = torch.cat([z, cont_covs], dim=-1)
++
++        # Process categorical covariates if provided
++        if cat_covs is not None:
++            categorical_input = torch.split(cat_covs, 1, dim=1)
++        else:
++            categorical_input = ()
++
++        # For batch correction: transform to a specific batch if requested
++        if transform_batch is not None:
++            batch_index = torch.ones_like(batch_index) * transform_batch
++
++        # Use library size as size factor if not explicitly provided
++        if not self.use_size_factor_key:
++            size_factor = library
++
++        # Process batch information using either embedding or one-hot encoding
++        if self.batch_representation == "embedding":
++            # Get batch embedding and concatenate to decoder input
++            batch_embedding = self.compute_embedding("batch", batch_index)
++            decoder_input = torch.cat([decoder_input, batch_embedding], dim=-1)
++
++            # Get parameters from decoder
++            scale, dispersion_param, rate, dropout_prob = self.decoder(
++                self.dispersion,
++                decoder_input,
++                size_factor,
++                *categorical_input,
++                y,
++            )
++        else:
++            # Standard approach using batch index directly
++            scale, dispersion_param, rate, dropout_prob = self.decoder(
++                self.dispersion,
++                decoder_input,
++                size_factor,
++                batch_index,
++                *categorical_input,
++                y,
++            )
++
++        # Process dispersion parameter based on specified mode
++        if self.dispersion == "gene-label":
++            # Dispersion depends on cell label (cell type)
++            dispersion_param = linear(one_hot(y.squeeze(-1), self.n_labels).float(), self.px_r)
++        elif self.dispersion == "gene-batch":
++            # Dispersion depends on batch
++            dispersion_param = linear(one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
++        elif self.dispersion == "gene":
++            # One dispersion per gene
++            dispersion_param = self.px_r
++
++        # Ensure dispersion is positive by exponentiating
++        dispersion_param = torch.exp(dispersion_param)
++
++        # Create the appropriate distribution based on gene_likelihood
++        if self.gene_likelihood == "zinb":
++            # Zero-inflated negative binomial for sparse count data
++            data_dist = ZeroInflatedNegativeBinomial(
++                mu=rate,
++                theta=dispersion_param,
++                zi_logits=dropout_prob,
++                scale=scale,
++            )
++        elif self.gene_likelihood == "nb":
++            # Negative binomial for count data with overdispersion
++            data_dist = NegativeBinomial(mu=rate, theta=dispersion_param, scale=scale)
++        elif self.gene_likelihood == "poisson":
++            # Poisson for count data
++            data_dist = Poisson(rate=rate, scale=scale)
++        elif self.gene_likelihood == "normal":
++            # Normal distribution (experimental)
++            data_dist = Normal(rate, dispersion_param, normal_mu=scale)
++
++        # Set up prior distributions
++        if self.use_observed_lib_size:
++            # No library size prior if using observed library size
++            lib_dist = None
++        else:
++            # Calculate parameters for library size prior based on batch
++            lib_mean, lib_var = self._compute_local_library_params(batch_index)
++            lib_dist = Normal(lib_mean, lib_var.sqrt())
++
++        # Standard normal prior for latent space
++        latent_dist = Normal(torch.zeros_like(z), torch.ones_like(z))
++
++        # Return all distributions with clear names
++        return {
++            "gene_expression": data_dist,  # Distribution for gene expression
++            "library_size": lib_dist,  # Distribution for library size
++            "latent_space": latent_dist,  # Distribution for latent space
++        }
++
++    @unsupported_if_adata_minified
++    def loss(
++        self,
++        tensors: dict[str, torch.Tensor],
++        inference_outputs: dict[str, torch.Tensor | Distribution | None],
++        generative_outputs: dict[str, Distribution | None],
++        kl_weight: torch.tensor | float = 1.0,
++    ) -> LossOutput:
++        """计算变分自编码器的损失函数。
++
++        损失函数由重构损失和KL散度两部分组成：
++        1. 重构损失：衡量生成的数据与原始数据的匹配程度
++        2. KL散度：衡量后验分布与先验分布的差异，起到正则化作用
++
++        Args:
++            tensors: 原始数据张量
++            inference_outputs: 推断过程的输出
++            generative_outputs: 生成过程的输出
++            kl_weight: KL散度项的权重系数（用于KL退火）
++
++        Returns:
++            包含总损失和各部分损失的对象
++        """
++        from torch.distributions import kl_divergence
++
++        # 获取原始基因表达数据
++        x = tensors["X"]  # 使用直观的X代替REGISTRY_KEYS.X_KEY
++
++        # 计算潜在变量的KL散度：后验分布q(z|x)与先验分布p(z)之间的差异
++        kl_divergence_z = kl_divergence(inference_outputs["qz"], generative_outputs["latent_space"]).sum(dim=-1)
++
++        # 计算文库大小的KL散度（如果使用学习的文库大小）
++        if not self.use_observed_lib_size:
++            kl_divergence_l = kl_divergence(inference_outputs["ql"], generative_outputs["library_size"]).sum(dim=1)
++        else:
++            # 如果使用观测的文库大小，则KL散度为0
++            kl_divergence_l = torch.zeros_like(kl_divergence_z)
++
++        # 计算重构损失：负对数似然
++        reconstruction_loss = -generative_outputs["gene_expression"].log_prob(x).sum(-1)
++
++        # 区分需要进行权重调整的KL散度（用于KL退火）
++        kl_for_warmup = kl_divergence_z  # 潜在变量z的KL散度会参与退火
++        kl_no_warmup = kl_divergence_l  # 文库大小l的KL散度不参与退火
++
++        # 应用权重后的KL散度
++        weighted_kl = kl_weight * kl_for_warmup + kl_no_warmup
++
++        # 总损失 = 重构损失 + 加权KL散度
++        total_loss = torch.mean(reconstruction_loss + weighted_kl)
++
++        # 为自动调优准备额外的指标（如果需要）
++        if self.extra_payload_autotune:
++            extra_metrics = {
++                "z": inference_outputs["z"],
++                "batch": tensors["batch"],  # 使用直观的batch代替REGISTRY_KEYS.BATCH_KEY
++                "labels": tensors["labels"],  # 使用直观的labels代替REGISTRY_KEYS.LABELS_KEY
++            }
++        else:
++            extra_metrics = {}
++
++        # 返回损失对象
++        return LossOutput(
++            loss=total_loss,
++            reconstruction_loss=reconstruction_loss,
++            kl_local={
++                "kl_divergence_l": kl_divergence_l,  # 文库大小的KL散度
++                "kl_divergence_z": kl_divergence_z,  # 潜在变量的KL散度
++            },
++            extra_metrics=extra_metrics,
++        )
++
++    @torch.inference_mode()
++    def sample(
++        self,
++        tensors: dict[str, torch.Tensor],
++        n_samples: int = 1,
++        max_poisson_rate: float = 1e8,
++    ) -> torch.Tensor:
++        r"""Generate predictive samples from the posterior predictive distribution.
++
++        The posterior predictive distribution is denoted as :math:`p(\hat{x} \mid x)`, where
++        :math:`x` is the input data and :math:`\hat{x}` is the sampled data.
++
++        We sample from this distribution by first sampling ``n_samples`` times from the posterior
++        distribution :math:`q(z \mid x)` for a given observation, and then sampling from the
++        likelihood :math:`p(\hat{x} \mid z)` for each of these.
++
++        Parameters
++        ----------
++        tensors
++            Dictionary of tensors passed into :meth:`~scvi.module.VAE.forward`.
++        n_samples
++            Number of Monte Carlo samples to draw from the distribution for each observation.
++        max_poisson_rate
++            The maximum value to which to clip the ``rate`` parameter of
++            :class:`~scvi.distributions.Poisson`. Avoids numerical sampling issues when the
++            parameter is very large due to the variance of the distribution.
++
++        Returns
++        -------
++        Tensor on CPU with shape ``(n_obs, n_vars)`` if ``n_samples == 1``, else
++        ``(n_obs, n_vars,)``.
++        """
++        from scvi.distributions import Poisson
++
++        inference_kwargs = {"n_samples": n_samples}
++        _, generative_outputs = self.forward(tensors, inference_kwargs=inference_kwargs, compute_loss=False)
++
++        dist = generative_outputs[MODULE_KEYS.PX_KEY]
++        if self.gene_likelihood == "poisson":
++            # TODO: NEED TORCH MPS FIX for 'aten::poisson'
++            dist = (
++                Poisson(torch.clamp(dist.rate.to("cpu"), max=max_poisson_rate))
++                if self.device.type == "mps"
++                else Poisson(torch.clamp(dist.rate, max=max_poisson_rate))
++            )
++
++        # (n_obs, n_vars) if n_samples == 1, else (n_samples, n_obs, n_vars)
++        samples = dist.sample()
++        # (n_samples, n_obs, n_vars) -> (n_obs, n_vars, n_samples)
++        samples = torch.permute(samples, (1, 2, 0)) if n_samples > 1 else samples
++
++        return samples.cpu()
++
++    @torch.inference_mode()
++    @auto_move_data
++    def marginal_ll(
++        self,
++        tensors: dict[str, torch.Tensor],
++        n_mc_samples: int,
++        return_mean: bool = False,
++        n_mc_samples_per_pass: int = 1,
++    ):
++        """Compute the marginal log-likelihood of the data under the model.
++
++        Parameters
++        ----------
++        tensors
++            Dictionary of tensors passed into :meth:`~scvi.module.VAE.forward`.
++        n_mc_samples
++            Number of Monte Carlo samples to use for the estimation of the marginal log-likelihood.
++        return_mean
++            Whether to return the mean of marginal likelihoods over cells.
++        n_mc_samples_per_pass
++            Number of Monte Carlo samples to use per pass. This is useful to avoid memory issues.
++        """
++        from torch import logsumexp
++        from torch.distributions import Normal
++
++        batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
++
++        to_sum = []
++        if n_mc_samples_per_pass > n_mc_samples:
++            warnings.warn(
++                "Number of chunks is larger than the total number of samples, setting it to the " "number of samples",
++                RuntimeWarning,
++                stacklevel=settings.warnings_stacklevel,
++            )
++            n_mc_samples_per_pass = n_mc_samples
++        n_passes = int(np.ceil(n_mc_samples / n_mc_samples_per_pass))
++        for _ in range(n_passes):
++            # Distribution parameters and sampled variables
++            inference_outputs, _, losses = self.forward(
++                tensors,
++                inference_kwargs={"n_samples": n_mc_samples_per_pass},
++                get_inference_input_kwargs={"full_forward_pass": True},
++            )
++            qz = inference_outputs[MODULE_KEYS.QZ_KEY]
++            ql = inference_outputs[MODULE_KEYS.QL_KEY]
++            z = inference_outputs[MODULE_KEYS.Z_KEY]
++            library = inference_outputs[MODULE_KEYS.LIBRARY_KEY]
++
++            # Reconstruction Loss
++            reconst_loss = losses.dict_sum(losses.reconstruction_loss)
++
++            # Log-probabilities
++            p_z = Normal(torch.zeros_like(qz.loc), torch.ones_like(qz.scale)).log_prob(z).sum(dim=-1)
++            p_x_zl = -reconst_loss
++            q_z_x = qz.log_prob(z).sum(dim=-1)
++            log_prob_sum = p_z + p_x_zl - q_z_x
++
++            if not self.use_observed_lib_size:
++                (
++                    local_library_log_means,
++                    local_library_log_vars,
++                ) = self._compute_local_library_params(batch_index)
++
++                p_l = Normal(local_library_log_means, local_library_log_vars.sqrt()).log_prob(library).sum(dim=-1)
++                q_l_x = ql.log_prob(library).sum(dim=-1)
++
++                log_prob_sum += p_l - q_l_x
++            if n_mc_samples_per_pass == 1:
++                log_prob_sum = log_prob_sum.unsqueeze(0)
++
++            to_sum.append(log_prob_sum)
++        to_sum = torch.cat(to_sum, dim=0)
++        batch_log_lkl = logsumexp(to_sum, dim=0) - np.log(n_mc_samples)
++        if return_mean:
++            batch_log_lkl = torch.mean(batch_log_lkl).item()
++        else:
++            batch_log_lkl = batch_log_lkl.cpu()
++        return batch_log_lkl
++
++    @torch.inference_mode()
++    def get_loadings(self) -> np.ndarray:
++        """Extract per-gene weights in the linear decoder.
++
++        Returns:
++            numpy.ndarray: A matrix of weights showing how each latent dimension
++                          contributes to each gene's expression level.
++        """
++        # Get the weights from the linear decoder
++        # If batch normalization is used, we need to account for its effect
++        if self.use_batch_norm is True:
++            # Get the weight matrix from the first layer
++            weights = self.decoder.factor_regressor.fc_layers[0][0].weight
++            # Get the batch normalization layer
++            batch_norm = self.decoder.factor_regressor.fc_layers[0][1]
++            # Calculate the scaling factors from batch norm parameters
++            variance = torch.sqrt(batch_norm.running_var + batch_norm.eps)
++            gamma = batch_norm.weight
++            scaling = gamma / variance
++            # Create a diagonal matrix from the scaling factors
++            scaling_matrix = torch.diag(scaling)
++            # Apply the scaling to the weights
++            loadings = torch.matmul(scaling_matrix, weights)
++        else:
++            # If no batch norm, just use the weights directly
++            loadings = self.decoder.factor_regressor.fc_layers[0][0].weight
++
++        # Convert to numpy array for easier downstream analysis
++        loadings = loadings.detach().cpu().numpy()
++
++        # If we have multiple batches, remove the batch effect columns
++        if self.n_batch > 1:
++            loadings = loadings[:, : -self.n_batch]
++
++        # The loadings matrix shows how each latent dimension influences each gene's expression
++        return loadings
++
++
++class LDVAE(VAE):
++    """Linear-decoded Variational auto-encoder model.
++
++    Implementation of :cite:p:`Svensson20`.
++
++    This model uses a linear decoder, directly mapping the latent representation
++    to gene expression levels. It still uses a deep neural network to encode
++    the latent representation.
++
++    Compared to standard VAE, this model is less powerful, but can be used to
++    inspect which genes contribute to variation in the dataset. It may also be used
++    for all scVI tasks, like differential expression, batch correction, imputation, etc.
++    However, batch correction may be less powerful as it assumes a linear model.
++
++    Parameters
++    ----------
++    n_input
++        Number of input genes
++    n_batch
++        Number of batches
++    n_labels
++        Number of labels
++    n_hidden
++        Number of nodes per hidden layer (for encoder)
++    n_latent
++        Dimensionality of the latent space
++    n_layers_encoder
++        Number of hidden layers used for encoder NNs
++    dropout_rate
++        Dropout rate for neural networks
++    dispersion
++        One of the following
++
++        * ``'gene'`` - dispersion parameter of NB is constant per gene across cells
++        * ``'gene-batch'`` - dispersion can differ between different batches
++        * ``'gene-label'`` - dispersion can differ between different labels
++        * ``'gene-cell'`` - dispersion can differ for every gene in every cell
++    log_variational
++        Log(data+1) prior to encoding for numerical stability. Not normalization.
++    gene_likelihood
++        One of
++
++        * ``'nb'`` - Negative binomial distribution
++        * ``'zinb'`` - Zero-inflated negative binomial distribution
++        * ``'poisson'`` - Poisson distribution
++    use_batch_norm
++        Bool whether to use batch norm in decoder
++    bias
++        Bool whether to have bias term in linear decoder
++    latent_distribution
++        One of
++
++        * ``'normal'`` - Isotropic normal
++        * ``'ln'`` - Logistic normal with normal params N(0, 1)
++    use_observed_lib_size
++        Use observed library size for RNA as scaling factor in mean of conditional distribution.
++    **kwargs
++    """
++
++    def __init__(
++        self,
++        n_input: int,
++        n_batch: int = 0,
++        n_labels: int = 0,
++        n_hidden: int = 128,
++        n_latent: int = 10,
++        n_layers_encoder: int = 1,
++        dropout_rate: float = 0.1,
++        dispersion: str = "gene",
++        log_variational: bool = True,
++        gene_likelihood: str = "nb",
++        use_batch_norm: bool = True,
++        bias: bool = False,
++        latent_distribution: str = "normal",
++        use_observed_lib_size: bool = False,
++        **kwargs,
++    ):
++        from scvi.nn import Encoder, LinearDecoderSCVI
++
++        super().__init__(
++            n_input=n_input,
++            n_batch=n_batch,
++            n_labels=n_labels,
++            n_hidden=n_hidden,
++            n_latent=n_latent,
++            n_layers=n_layers_encoder,
++            dropout_rate=dropout_rate,
++            dispersion=dispersion,
++            log_variational=log_variational,
++            gene_likelihood=gene_likelihood,
++            latent_distribution=latent_distribution,
++            use_observed_lib_size=use_observed_lib_size,
++            **kwargs,
++        )
++        self.use_batch_norm = use_batch_norm
++        self.z_encoder = Encoder(
++            n_input,
++            n_latent,
++            n_layers=n_layers_encoder,
++            n_hidden=n_hidden,
++            dropout_rate=dropout_rate,
++            distribution=latent_distribution,
++            use_batch_norm=True,
++            use_layer_norm=False,
++            return_dist=True,
++        )
++        self.l_encoder = Encoder(
++            n_input,
++            1,
++            n_layers=1,
++            n_hidden=n_hidden,
++            dropout_rate=dropout_rate,
++            use_batch_norm=True,
++            use_layer_norm=False,
++            return_dist=True,
++        )
++        self.decoder = LinearDecoderSCVI(
++            n_latent,
++            n_input,
++            n_cat_list=[n_batch],
++            use_batch_norm=use_batch_norm,
++            use_layer_norm=False,
++            bias=bias,
++        )
++
++    @torch.inference_mode()
++    def get_loadings(self) -> np.ndarray:
++        """Extract per-gene weights in the linear decoder.
++
++        Returns:
++            numpy.ndarray: A matrix of weights showing how each latent dimension
++                          contributes to each gene's expression level.
++        """
++        # Get the weights from the linear decoder
++        # If batch normalization is used, we need to account for its effect
++        if self.use_batch_norm is True:
++            # Get the weight matrix from the first layer
++            weights = self.decoder.factor_regressor.fc_layers[0][0].weight
++            # Get the batch normalization layer
++            batch_norm = self.decoder.factor_regressor.fc_layers[0][1]
++            # Calculate the scaling factors from batch norm parameters
++            variance = torch.sqrt(batch_norm.running_var + batch_norm.eps)
++            gamma = batch_norm.weight
++            scaling = gamma / variance
++            # Create a diagonal matrix from the scaling factors
++            scaling_matrix = torch.diag(scaling)
++            # Apply the scaling to the weights
++            loadings = torch.matmul(scaling_matrix, weights)
++        else:
++            # If no batch norm, just use the weights directly
++            loadings = self.decoder.factor_regressor.fc_layers[0][0].weight
++
++        # Convert to numpy array for easier downstream analysis
++        loadings = loadings.detach().cpu().numpy()
++
++        # If we have multiple batches, remove the batch effect columns
++        if self.n_batch > 1:
++            loadings = loadings[:, : -self.n_batch]
++
++        # The loadings matrix shows how each latent dimension influences each gene's expression
++        return loadings
+diff --git a/spateo/external/MERFISHVI/multimodal_spatial_vae.py b/spateo/external/MERFISHVI/multimodal_spatial_vae.py
+new file mode 100644
+index 00000000..3b22c77b
+--- /dev/null
++++ b/spateo/external/MERFISHVI/multimodal_spatial_vae.py
+@@ -0,0 +1,941 @@
++from __future__ import annotations
++
++import logging
++import warnings
++from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
++
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch.distributions import Distribution, Normal, kl_divergence
++
++try:
++    from torch_geometric.nn import GATv2Conv
++except ImportError:
++    try:
++        from torch_geometric.nn.conv import GATv2Conv
++    except ImportError:
++        raise ImportError("Failed to import GATv2Conv, please install PyTorch Geometric")
++
++from scvi import REGISTRY_KEYS
++
++try:
++    from scvi.module.base import LossOutput, auto_move_data
++except ImportError:
++    try:
++        from scvi.module.base import LossOutput
++        from scvi.nn.base import auto_move_data
++    except ImportError:
++        try:
++            from scvi.model.base import LossOutput
++            from scvi.nn import auto_move_data
++        except ImportError:
++            raise ImportError("Failed to import auto_move_data and LossOutput, please check scvi-tools version")
++
++try:
++    from scvi.utils import unsupported_if_adata_minified
++except ImportError:
++    try:
++        from scvi.model.base import unsupported_if_adata_minified
++    except ImportError:
++        # Create a dummy decorator if not available
++        def unsupported_if_adata_minified(fn):
++            return fn
++
++
++from anndata import AnnData
++from scvi.module import VAE
++from scvi.nn import Decoder, Encoder, FCLayers
++
++# Import SpatialEncoder and SpatialVAE
++from .scvi_spatial_module import SpatialEncoder, SpatialVAE
++
++logger = logging.getLogger(__name__)
++
++
++class MultiModalSpatialVAE(SpatialVAE):
++    """Multi-modal spatial variational autoencoder.
++
++    Processes both modalities with spatial information and those without spatial information.
++    Uses a shared latent space for joint modeling.
++
++    Parameters
++    ----------
++    n_input_spatial
++        Number of input features for spatial modality
++    n_input_nonspatial
++        Number of input features for non-spatial modality
++    n_batch_spatial
++        Number of batches for spatial modality
++    n_batch_nonspatial
++        Number of batches for non-spatial modality
++    n_labels_spatial
++        Number of labels for spatial modality
++    n_labels_nonspatial
++        Number of labels for non-spatial modality
++    n_hidden
++        Number of nodes in hidden layers
++    n_latent
++        Dimension of latent space
++    n_spatial
++        Dimension of spatial features
++    n_layers
++        Number of hidden layers
++    dropout_rate
++        Dropout rate
++    dispersion
++        Dispersion parameter type
++    gene_likelihood
++        Gene likelihood distribution type
++    latent_distribution
++        Latent distribution type
++    **kwargs
++        Additional parameters
++    """
++
++    def __init__(
++        self,
++        n_input_spatial: int,
++        n_input_nonspatial: int,
++        n_batch_spatial: int = 0,
++        n_batch_nonspatial: int = 0,
++        n_labels_spatial: int = 0,
++        n_labels_nonspatial: int = 0,
++        n_hidden: int = 128,
++        n_latent: int = 10,
++        n_spatial: int = 10,
++        n_layers: int = 1,
++        dropout_rate: float = 0.1,
++        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
++        gene_likelihood: Literal["zinb", "nb", "poisson", "normal"] = "zinb",
++        latent_distribution: Literal["normal", "ln"] = "normal",
++        use_observed_lib_size: bool = True,
++        edge_index: Optional[torch.Tensor] = None,
++        attention_heads: int = 1,
++        spatial_kl_weight: float = 0.01,
++        modality_weights: Dict[str, float] = {"spatial": 1.0, "nonspatial": 1.0},
++        cats_per_cov_spatial: Optional[List[int]] = None,
++        cats_per_cov_nonspatial: Optional[List[int]] = None,
++        use_size_factor_spatial: bool = False,
++        use_size_factor_nonspatial: bool = False,
++        library_log_means_spatial: Optional[torch.Tensor] = None,
++        library_log_vars_spatial: Optional[torch.Tensor] = None,
++        library_log_means_nonspatial: Optional[torch.Tensor] = None,
++        library_log_vars_nonspatial: Optional[torch.Tensor] = None,
++        var_eps: float = 1e-4,
++        **kwargs,
++    ):
++        # Initialize base VAE (note here we do not call SpatialVAE's initialization, but directly call VAE's initialization)
++        VAE.__init__(
++            self,
++            n_input=n_input_spatial,
++            n_batch=n_batch_spatial,
++            n_labels=n_labels_spatial,
++            n_hidden=n_hidden,
++            n_latent=n_latent,
++            n_layers=n_layers,
++            dropout_rate=dropout_rate,
++            dispersion=dispersion,
++            gene_likelihood=gene_likelihood,
++            latent_distribution=latent_distribution,
++            use_observed_lib_size=use_observed_lib_size,
++            n_cats_per_cov=cats_per_cov_spatial,
++            use_size_factor_key=use_size_factor_spatial,
++            library_log_means=library_log_means_spatial,
++            library_log_vars=library_log_vars_spatial,
++            **kwargs,
++        )
++
++        # Store configuration parameters
++        self.n_spatial = n_spatial
++        self.spatial_kl_weight = spatial_kl_weight
++        self.modality_weights = modality_weights
++        self.var_eps = var_eps
++
++        # Initialize spatial encoder
++        self.spatial_encoder = SpatialEncoder(
++            n_latent=n_latent,
++            n_spatial=n_spatial,
++            attention_heads=attention_heads,
++            dropout_rate=dropout_rate,
++            var_eps=var_eps,
++        )
++
++        # Create encoder for non-spatial modality
++        self.nonspatial_encoder = Encoder(
++            n_input=n_input_nonspatial,
++            n_output=n_latent,
++            n_cat_list=[n_batch_nonspatial] if n_batch_nonspatial > 0 else None,
++            n_layers=n_layers,
++            n_hidden=n_hidden,
++            dropout_rate=dropout_rate,
++            distribution=latent_distribution,
++        )
++
++        # Create decoder for non-spatial modality
++        if gene_likelihood in ["zinb", "nb"]:
++            from scvi.nn import DecoderSCVI
++
++            self.nonspatial_decoder = DecoderSCVI(
++                n_input=n_latent,
++                n_output=n_input_nonspatial,
++                n_cat_list=[n_batch_nonspatial] if n_batch_nonspatial > 0 else None,
++                n_layers=n_layers,
++                n_hidden=n_hidden,
++            )
++        else:
++            self.nonspatial_decoder = Decoder(
++                n_input=n_latent,
++                n_output=n_input_nonspatial,
++                n_cat_list=[n_batch_nonspatial] if n_batch_nonspatial > 0 else None,
++                n_layers=n_layers,
++                n_hidden=n_hidden,
++            )
++
++        # Create library size parameter for non-spatial modality (if needed)
++        if not use_observed_lib_size:
++            self.nonspatial_l_mean = torch.nn.Parameter(
++                library_log_means_nonspatial
++                if library_log_means_nonspatial is not None
++                else torch.zeros(n_batch_nonspatial if n_batch_nonspatial > 0 else 1)
++            )
++            self.nonspatial_l_var = torch.nn.Parameter(
++                library_log_vars_nonspatial
++                if library_log_vars_nonspatial is not None
++                else torch.zeros(n_batch_nonspatial if n_batch_nonspatial > 0 else 1)
++            )
++
++        # Process edge_index (spatial graph)
++        if edge_index is not None:
++            if not isinstance(edge_index, torch.Tensor):
++                try:
++                    edge_index = torch.tensor(edge_index, dtype=torch.long)
++                except Exception as e:
++                    warnings.warn(f"Failed to convert edge_index to tensor: {str(e)}, will set to None", UserWarning)
++                    edge_index = None
++            elif edge_index.dtype != torch.long:
++                try:
++                    edge_index = edge_index.long()
++                except Exception as e:
++                    warnings.warn(f"Failed to convert edge_index to long type: {str(e)}, will set to None", UserWarning)
++                    edge_index = None
++
++            # Check edge_index shape
++            if edge_index is not None and (len(edge_index.shape) != 2 or edge_index.shape[0] != 2):
++                warnings.warn(
++                    f"edge_index shape error: {edge_index.shape}, should be [2, num_edges], will set to None",
++                    UserWarning,
++                )
++                edge_index = None
++
++        self.edge_index = edge_index
++        self.register_buffer("_edge_index", edge_index)
++
++    @auto_move_data
++    def inference_spatial(
++        self, x: torch.Tensor, batch_index: Optional[torch.Tensor] = None, **kwargs
++    ) -> Dict[str, torch.Tensor]:
++        """Spatial modality inference process.
++
++        Parameters
++        ----------
++        x
++            Input data of spatial modality
++        batch_index
++            Batch index
++
++        Returns
++        -------
++        dict
++            Dictionary containing inference results
++        """
++        # Call base VAE inference
++        outputs = VAE.inference(self, x, batch_index, **kwargs)
++
++        # Get latent representation
++        z = outputs["z"]
++
++        # Ensure edge_index is on the correct device
++        if self.edge_index is not None and z.device != self.edge_index.device:
++            self.edge_index = self.edge_index.to(z.device)
++
++        # Calculate spatial feature
++        try:
++            spatial_mean, spatial_var, spatial_sample = self.spatial_encoder(z, self.edge_index)
++
++            # Add spatial feature to outputs
++            outputs.update(
++                {
++                    "spatial_mean": spatial_mean,
++                    "spatial_var": spatial_var,
++                    "spatial_sample": spatial_sample,
++                }
++            )
++        except Exception as e:
++            # If spatial encoder fails, add warning log and return zero tensor
++            warnings.warn(
++                f"Spatial encoder processing failed: {str(e)}. Will return zero tensor as spatial feature.", UserWarning
++            )
++            batch_size = z.size(0)
++            device = z.device
++
++            # Create zero tensor as spatial feature
++            spatial_mean = torch.zeros(batch_size, self.n_spatial, device=device)
++            spatial_var = torch.ones(batch_size, self.n_spatial, device=device) * self.var_eps
++            spatial_sample = torch.zeros(batch_size, self.n_spatial, device=device)
++
++            # Add spatial feature to outputs
++            outputs.update(
++                {
++                    "spatial_mean": spatial_mean,
++                    "spatial_var": spatial_var,
++                    "spatial_sample": spatial_sample,
++                }
++            )
++
++        return outputs
++
++    @auto_move_data
++    def inference_nonspatial(
++        self, x: torch.Tensor, batch_index: Optional[torch.Tensor] = None, **kwargs
++    ) -> Dict[str, torch.Tensor]:
++        """Non-spatial modality inference process.
++
++        Parameters
++        ----------
++        x
++            Input data of non-spatial modality
++        batch_index
++            Batch index
++
++        Returns
++        -------
++        dict
++            Dictionary containing inference results
++        """
++        # Use non-spatial modality encoder
++        return self.nonspatial_encoder(x, batch_index)
++
++    @auto_move_data
++    def inference(
++        self,
++        x_spatial: torch.Tensor,
++        x_nonspatial: Optional[torch.Tensor] = None,
++        batch_index_spatial: Optional[torch.Tensor] = None,
++        batch_index_nonspatial: Optional[torch.Tensor] = None,
++        **kwargs,
++    ) -> Dict[str, torch.Tensor]:
++        """Joint inference process, handles both spatial and non-spatial modalities.
++
++        Parameters
++        ----------
++        x_spatial
++            Input data of spatial modality
++        x_nonspatial
++            Input data of non-spatial modality, optional
++        batch_index_spatial
++            Batch index of spatial modality
++        batch_index_nonspatial
++            Batch index of non-spatial modality
++
++        Returns
++        -------
++        dict
++            Dictionary containing joint inference results
++        """
++        # First perform spatial modality inference
++        outputs = self.inference_spatial(x_spatial, batch_index_spatial, **kwargs)
++
++        # If no non-spatial modality input, return spatial modality results directly
++        if x_nonspatial is None:
++            return outputs
++
++        # Perform non-spatial modality inference
++        nonspatial_outputs = self.inference_nonspatial(x_nonspatial, batch_index_nonspatial)
++
++        # Fuse latent representations of two modalities
++        w1 = self.modality_weights.get("spatial", 1.0)
++        w2 = self.modality_weights.get("nonspatial", 1.0)
++        total_weight = w1 + w2
++
++        # Weighted fusion latent representations
++        fused_z = (w1 * outputs["z"] + w2 * nonspatial_outputs["z"]) / total_weight
++
++        # Update output dictionary
++        outputs.update(
++            {
++                # Add non-spatial modality outputs
++                "nonspatial_qz_m": nonspatial_outputs["qz_m"],
++                "nonspatial_qz_v": nonspatial_outputs["qz_v"],
++                "nonspatial_z": nonspatial_outputs["z"],
++                # Use fused z
++                "fused_z": fused_z,
++                # Default use fused z as main latent representation
++                "z": fused_z,
++            }
++        )
++
++        return outputs
++
++    @auto_move_data
++    def generative_spatial(
++        self, z: torch.Tensor, batch_index: Optional[torch.Tensor] = None, **kwargs
++    ) -> Dict[str, torch.Tensor]:
++        """Spatial modality generative process.
++
++        Parameters
++        ----------
++        z
++            Latent representation
++        batch_index
++            Batch index
++
++        Returns
++        -------
++        dict
++            Generative output
++        """
++        return VAE.generative(self, z, batch_index, **kwargs)
++
++    @auto_move_data
++    def generative_nonspatial(
++        self,
++        z: torch.Tensor,
++        batch_index: Optional[torch.Tensor] = None,
++        library_size: Optional[torch.Tensor] = None,
++        **kwargs,
++    ) -> Dict[str, torch.Tensor]:
++        """Non-spatial modality generative process.
++
++        Parameters
++        ----------
++        z
++            Latent representation
++        batch_index
++            Batch index
++        library_size
++            Library size
++
++        Returns
++        -------
++        dict
++            Generative output
++        """
++        # Generate reconstruction of non-spatial modality
++        px_rate = self.nonspatial_decoder(z, batch_index)
++
++        # If library size is not provided and needs estimation
++        if library_size is None and not self.use_observed_lib_size:
++            batch_index = batch_index.view(-1, 1) if batch_index is not None else None
++            if batch_index is None and self.nonspatial_l_mean.shape[0] > 1:
++                raise ValueError("No batch_index provided, but model has multiple batches")
++
++            # Get library size parameter of current batch
++            if batch_index is not None and self.nonspatial_l_mean.shape[0] > 1:
++                library_loc = F.linear(torch.ones_like(batch_index, dtype=torch.float), self.nonspatial_l_mean)
++                library_scale = F.linear(
++                    torch.ones_like(batch_index, dtype=torch.float), torch.exp(self.nonspatial_l_var) + 1e-4
++                )
++            else:
++                library_loc = self.nonspatial_l_mean
++                library_scale = torch.exp(self.nonspatial_l_var) + 1e-4
++
++            # Sample library size
++            library = torch.distributions.LogNormal(library_loc, library_scale.sqrt()).rsample()
++        elif library_size is not None:
++            library = library_size
++        else:
++            # Use observed library size (normalized)
++            library = torch.log(torch.sum(torch.exp(x_nonspatial), dim=1, keepdim=True))
++
++        # Build output dictionary
++        outputs = {"px_rate": px_rate}
++
++        if self.gene_likelihood == "zinb":
++            px_r = self.px_r
++            px_dropout = self.px_dropout
++            outputs.update({"px_r": px_r, "px_dropout": px_dropout})
++
++        return outputs
++
++    @auto_move_data
++    def generative(
++        self,
++        z: torch.Tensor,
++        batch_index_spatial: Optional[torch.Tensor] = None,
++        batch_index_nonspatial: Optional[torch.Tensor] = None,
++        library_size_spatial: Optional[torch.Tensor] = None,
++        library_size_nonspatial: Optional[torch.Tensor] = None,
++        **kwargs,
++    ) -> Dict[str, Dict[str, torch.Tensor]]:
++        """Joint generative process.
++
++        Parameters
++        ----------
++        z
++            Latent representation
++        batch_index_spatial
++            Batch index of spatial modality
++        batch_index_nonspatial
++            Batch index of non-spatial modality
++        library_size_spatial
++            Library size of spatial modality
++        library_size_nonspatial
++            Library size of non-spatial modality
++
++        Returns
++        -------
++        dict
++            Dictionary containing outputs of two modalities generative process
++        """
++        # Generate reconstruction of spatial modality
++        spatial_outputs = self.generative_spatial(z, batch_index_spatial, library_size=library_size_spatial, **kwargs)
++
++        # If batch_index_nonspatial is not None, generate reconstruction of non-spatial modality
++        if batch_index_nonspatial is not None:
++            nonspatial_outputs = self.generative_nonspatial(
++                z, batch_index_nonspatial, library_size=library_size_nonspatial, **kwargs
++            )
++
++            # Return dictionary containing outputs of two modalities
++            return {"spatial": spatial_outputs, "nonspatial": nonspatial_outputs}
++        else:
++            # Return output of spatial modality only
++            return {"spatial": spatial_outputs}
++
++    @auto_move_data
++    def forward(
++        self, tensors: Dict[str, torch.Tensor], inference_kwargs: Dict = None, compute_loss: bool = True, **kwargs
++    ) -> Tuple:
++        """Forward propagation process.
++
++        Parameters
++        ----------
++        tensors
++            Input tensor dictionary, containing data of two modalities
++        inference_kwargs
++            Parameters to pass to inference function
++        compute_loss
++            Whether to compute loss
++
++        Returns
++        -------
++        tuple
++            Inference output, generative output and loss
++        """
++        # Ensure no conflicting parameters are passed
++        if inference_kwargs is None:
++            inference_kwargs = {}
++
++        # Fix parameter names
++        if "cont_covariates" in tensors and "cont_covs" not in tensors:
++            tensors["cont_covs"] = tensors.pop("cont_covariates")
++        if "cat_covariates" in tensors and "cat_covs" not in tensors:
++            tensors["cat_covs"] = tensors.pop("cat_covariates")
++
++        # Extract data of two modalities from tensors
++        x_spatial = tensors.get("X", None)
++        x_nonspatial = tensors.get("X_nonspatial", None)
++        batch_index_spatial = tensors.get("batch_indices", None)
++        batch_index_nonspatial = tensors.get("batch_indices_nonspatial", None)
++
++        # If no non-spatial modality data is provided, only process spatial modality
++        has_nonspatial = x_nonspatial is not None
++
++        # Perform joint inference
++        inference_inputs = {
++            "x_spatial": x_spatial,
++            "batch_index_spatial": batch_index_spatial,
++        }
++
++        if has_nonspatial:
++            inference_inputs.update(
++                {
++                    "x_nonspatial": x_nonspatial,
++                    "batch_index_nonspatial": batch_index_nonspatial,
++                }
++            )
++
++        inference_inputs.update(inference_kwargs)
++        inference_outputs = self.inference(**inference_inputs)
++
++        # Perform joint generative
++        generative_inputs = {
++            "z": inference_outputs["z"],  # Use fused latent representation
++            "batch_index_spatial": batch_index_spatial,
++        }
++
++        if has_nonspatial:
++            generative_inputs.update(
++                {
++                    "batch_index_nonspatial": batch_index_nonspatial,
++                }
++            )
++
++        generative_outputs = self.generative(**generative_inputs)
++
++        if compute_loss:
++            # Calculate joint loss
++            loss_inputs = {
++                "tensors": tensors,
++                "inference_outputs": inference_outputs,
++                "generative_outputs": generative_outputs,
++            }
++
++            losses = self.loss(**loss_inputs)
++            return inference_outputs, generative_outputs, losses
++        else:
++            return inference_outputs, generative_outputs
++
++    @unsupported_if_adata_minified
++    def loss(
++        self,
++        tensors: Dict[str, torch.Tensor],
++        inference_outputs: Dict[str, torch.Tensor | Distribution | None],
++        generative_outputs: Dict[str, Dict[str, Distribution | None]],
++        kl_weight: torch.tensor | float = 1.0,
++    ) -> LossOutput:
++        """Calculate joint loss function.
++
++        Parameters
++        ----------
++        tensors
++            Input tensors
++        inference_outputs
++            Inference process outputs
++        generative_outputs
++            Generative process outputs
++        kl_weight
++            KL divergence weight
++
++        Returns
++        -------
++        LossOutput
++            Loss output object
++        """
++        # Extract weights of two modalities
++        w_spatial = self.modality_weights.get("spatial", 1.0)
++        w_nonspatial = self.modality_weights.get("nonspatial", 1.0)
++        total_weight = w_spatial + w_nonspatial
++
++        # Extract input data
++        x_spatial = tensors.get("X", None)
++        x_nonspatial = tensors.get("X_nonspatial", None)
++
++        # Calculate spatial modality loss
++        # Create tensors dictionary containing only spatial modality data
++        spatial_tensors = {"X": x_spatial}
++        for k, v in tensors.items():
++            if k != "X_nonspatial" and not k.endswith("_nonspatial"):
++                spatial_tensors[k] = v
++
++        # If there is spatial feature, calculate spatial modality KL divergence
++        if "spatial_mean" in inference_outputs:
++            spatial_mean = inference_outputs["spatial_mean"]
++            spatial_var = inference_outputs["spatial_var"]
++
++            # Create distribution objects
++            q_s = Normal(spatial_mean, spatial_var.sqrt())
++            p_s = Normal(torch.zeros_like(spatial_mean), torch.ones_like(spatial_var.sqrt()))
++
++            # Calculate KL divergence
++            kl_divergence_s = kl_divergence(q_s, p_s).sum(dim=-1)
++            spatial_kl = kl_divergence_s
++        else:
++            spatial_kl = torch.tensor(0.0, device=self.device)
++
++        # Calculate spatial modality reconstruction loss
++        spatial_reconst_loss, spatial_kl_local = self._get_reconstruction_loss(x_spatial, generative_outputs["spatial"])
++
++        # Calculate total KL divergence of spatial modality
++        spatial_kl_local.update({"kl_divergence_s": spatial_kl})
++        spatial_kl_weighted = torch.mean(
++            torch.sum(spatial_kl_local["kl_divergence_z"], dim=-1)
++        ) + self.spatial_kl_weight * torch.mean(spatial_kl)
++
++        # Calculate total loss of spatial modality
++        spatial_loss = spatial_reconst_loss + kl_weight * spatial_kl_weighted
++
++        # If there is non-spatial modality, calculate non-spatial modality loss
++        if x_nonspatial is not None and "nonspatial" in generative_outputs:
++            # Calculate non-spatial modality KL divergence
++            nonspatial_qz_m = inference_outputs["nonspatial_qz_m"]
++            nonspatial_qz_v = inference_outputs["nonspatial_qz_v"]
++
++            # Create distribution objects
++            qz = Normal(nonspatial_qz_m, nonspatial_qz_v.sqrt())
++            pz = Normal(torch.zeros_like(nonspatial_qz_m), torch.ones_like(nonspatial_qz_v.sqrt()))
++
++            # Calculate KL divergence
++            kl_divergence_z_nonspatial = kl_divergence(qz, pz).sum(dim=-1)
++
++            # Calculate non-spatial modality reconstruction loss
++            nonspatial_reconst_loss = self._get_reconstruction_loss_nonspatial(
++                x_nonspatial, generative_outputs["nonspatial"]
++            )
++
++            # Calculate total loss of non-spatial modality
++            nonspatial_kl_weighted = torch.mean(kl_divergence_z_nonspatial)
++            nonspatial_loss = nonspatial_reconst_loss + kl_weight * nonspatial_kl_weighted
++
++            # Merge two modality losses
++            total_loss = (w_spatial * spatial_loss + w_nonspatial * nonspatial_loss) / total_weight
++
++            # Update KL divergence dictionary
++            spatial_kl_local.update({"kl_divergence_z_nonspatial": kl_divergence_z_nonspatial})
++        else:
++            # Use spatial modality loss only
++            total_loss = spatial_loss
++            nonspatial_reconst_loss = torch.tensor(0.0, device=self.device)
++
++        # Return loss output object
++        extra_metrics = {
++            "spatial_reconstruction_loss": spatial_reconst_loss,
++            "nonspatial_reconstruction_loss": nonspatial_reconst_loss if x_nonspatial is not None else None,
++            "spatial_kl": spatial_kl_weighted,
++            "nonspatial_kl": nonspatial_kl_weighted if x_nonspatial is not None else None,
++        }
++
++        return LossOutput(
++            loss=total_loss,
++            reconstruction_loss=spatial_reconst_loss,  # Use spatial modality reconstruction loss as main reconstruction loss
++            kl_local=spatial_kl_local,
++            extra_metrics=extra_metrics,
++        )
++
++    def _get_reconstruction_loss_nonspatial(
++        self, x: torch.Tensor, generative_outputs: Dict[str, torch.Tensor]
++    ) -> torch.Tensor:
++        """Calculate non-spatial modality reconstruction loss.
++
++        Parameters
++        ----------
++        x
++            Input data
++        generative_outputs
++            Generative process outputs
++
++        Returns
++        -------
++        torch.Tensor
++            Reconstruction loss
++        """
++        # Calculate reconstruction loss based on different likelihood functions
++        px_rate = generative_outputs["px_rate"]
++
++        if self.gene_likelihood == "zinb":
++            px_r = generative_outputs["px_r"]
++            px_dropout = generative_outputs["px_dropout"]
++
++            # Use zero-inflated negative binomial distribution
++            reconst_loss = -log_zinb_positive(x, px_rate, px_r, px_dropout)
++        elif self.gene_likelihood == "nb":
++            px_r = generative_outputs["px_r"]
++
++            # Use negative binomial distribution
++            reconst_loss = -log_nb_positive(x, px_rate, px_r)
++        elif self.gene_likelihood == "poisson":
++            # Use Poisson distribution
++            reconst_loss = -log_poisson(x, px_rate)
++        else:  # normal
++            # Use normal distribution
++            reconst_loss = -log_normal(x, px_rate, torch.ones_like(px_rate))
++
++        return torch.mean(reconst_loss.sum(dim=-1))
++
++    @torch.inference_mode()
++    def get_latent_representation_by_modality(
++        self, adata=None, indices=None, batch_size=None, modality="spatial"
++    ) -> np.ndarray:
++        """Get latent representation of specific modality.
++
++        Parameters
++        ----------
++        adata
++            AnnData object, optional
++        indices
++            Index to get representation, optional
++        batch_size
++            Batch processing size, optional
++        modality
++            Modality to get, can be "spatial", "nonspatial" or "fused"
++
++        Returns
++        -------
++        np.ndarray
++            Latent representation
++        """
++        if modality == "spatial":
++            # Get standard latent representation
++            return self.get_latent_representation(adata, indices, batch_size)
++        elif modality == "nonspatial":
++            # If not joint training, return latent representation of spatial modality
++            if not hasattr(self, "nonspatial_encoder"):
++                logger.warning(
++                    "Model does not have non-spatial encoder, will return latent representation of spatial modality"
++                )
++                return self.get_latent_representation(adata, indices, batch_size)
++
++            # Get latent representation of non-spatial modality
++            # This requires running inference process first
++            # Implement similar to get_latent_representation but using nonspatial_encoder
++            # ...
++            raise NotImplementedError("Non-spatial latent representation retrieval not implemented yet")
++        elif modality == "fused":
++            return self.get_fused_representation(adata, indices, batch_size)
++        else:
++            raise ValueError(f"Unsupported modality: {modality}, valid values are 'spatial', 'nonspatial' or 'fused'")
++
++    @torch.inference_mode()
++    def get_fused_representation(self, adata=None, indices=None, batch_size=None) -> np.ndarray:
++        """Get fused latent representation.
++
++        Parameters
++        ----------
++        adata
++            AnnData object, optional
++        indices
++            Index to get representation, optional
++        batch_size
++            Batch processing size, optional
++
++        Returns
++        -------
++        np.ndarray
++            Fused latent representation
++        """
++        # If not joint training, return latent representation of spatial modality
++        if not hasattr(self, "nonspatial_encoder"):
++            logger.warning(
++                "Model does not have non-spatial encoder, will return latent representation of spatial modality"
++            )
++            return self.get_latent_representation(adata, indices, batch_size)
++
++        # Need to get latent representations of both modalities and fuse them
++        # In actual application, this may require more complex implementation
++        return self.get_latent_representation(adata, indices, batch_size)
++
++    @torch.inference_mode()
++    def get_nonspatial_specific_features(self, adata=None, indices=None, batch_size=None) -> np.ndarray:
++        """Get non-spatial modality specific features.
++
++        Parameters
++        ----------
++        adata
++            AnnData object, optional
++        indices
++            Index to get representation, optional
++        batch_size
++            Batch processing size, optional
++
++        Returns
++        -------
++        np.ndarray
++            Non-spatial modality specific features
++        """
++        # If not joint training, return None
++        if not hasattr(self, "nonspatial_encoder"):
++            logger.warning("Model does not have non-spatial encoder, cannot get non-spatial features")
++            return None
++
++        # Implement logic to get non-spatial modality specific features
++        # This may require additional network layers
++        return None
++
++    def _get_inference_input(
++        self,
++        tensors: Dict[str, torch.Tensor | None],
++        full_forward_pass: bool = False,
++    ) -> Dict[str, torch.Tensor | None]:
++        """Get input tensors required for inference process, override parent method to handle multi-modal data.
++
++        Parameters
++        ----------
++        tensors
++            Input data tensors
++        full_forward_pass
++            Whether to execute full forward propagation
++
++        Returns
++        -------
++        Dict
++            Input dictionary for inference process
++        """
++        # Call parent method to get basic inputs
++        inputs = super()._get_inference_input(tensors, full_forward_pass)
++
++        # Fix parameter name mismatch issue: rename cont_covariates to cont_covs
++        if "cont_covariates" in inputs:
++            inputs["cont_covs"] = inputs.pop("cont_covariates")
++        if "cat_covariates" in inputs:
++            inputs["cat_covs"] = inputs.pop("cat_covariates")
++
++        return inputs
++
++    def _get_generative_input(
++        self,
++        tensors: Dict[str, torch.Tensor],
++        inference_outputs: Dict[str, torch.Tensor | Distribution | None],
++    ) -> Dict[str, torch.Tensor | None]:
++        """Get input tensors required for generative process, override parent method to handle multi-modal data.
++
++        Parameters
++        ----------
++        tensors
++            Input data tensors
++        inference_outputs
++            Outputs from inference process
++
++        Returns
++        -------
++        Dict
++            Input dictionary for generative process
++        """
++        # Call parent method to get basic inputs
++        inputs = super()._get_generative_input(tensors, inference_outputs)
++
++        # Handle multi-modal specific parameters
++        if "X_nonspatial" in tensors:
++            inputs["batch_index_spatial"] = inputs.pop("batch_index", None)
++            inputs["batch_index_nonspatial"] = tensors.get("batch_indices_nonspatial", None)
++
++        return inputs
++
++
++# 引入一些可能需要的辅助函数
++def log_zinb_positive(x, mu, theta, pi, eps=1e-8):
++    """Log likelihood of zero-inflated negative binomial distribution."""
++    case_zero = torch.log(pi + ((1 - pi) * torch.pow(theta / (theta + mu), theta)))
++    case_non_zero = (
++        torch.log(1 - pi)
++        + torch.lgamma(theta + x)
++        - torch.lgamma(theta)
++        - torch.lgamma(x + 1)
++        + theta * torch.log(theta)
++        + x * torch.log(mu)
++        - (x + theta) * torch.log(theta + mu)
++    )
++    return torch.where(x < eps, case_zero, case_non_zero)
++
++
++def log_nb_positive(x, mu, theta, eps=1e-8):
++    """Log likelihood of negative binomial distribution."""
++    return (
++        torch.lgamma(theta + x)
++        - torch.lgamma(theta)
++        - torch.lgamma(x + 1)
++        + theta * torch.log(theta)
++        + x * torch.log(mu)
++        - (x + theta) * torch.log(theta + mu)
++    )
++
++
++def log_poisson(x, mu, eps=1e-8):
++    """Log likelihood of Poisson distribution."""
++    return x * torch.log(mu) - mu - torch.lgamma(x + 1)
++
++
++def log_normal(x, mu, var, eps=1e-8):
++    """Log likelihood of normal distribution."""
++    return -0.5 * torch.log(2 * np.pi * var) - 0.5 * torch.pow(x - mu, 2) / var
+diff --git a/spateo/external/MERFISHVI/scvi_spatial_module.py b/spateo/external/MERFISHVI/scvi_spatial_module.py
+new file mode 100644
+index 00000000..8949d3f5
+--- /dev/null
++++ b/spateo/external/MERFISHVI/scvi_spatial_module.py
+@@ -0,0 +1,1076 @@
++from __future__ import annotations
++
++import logging
++import warnings
++from typing import Dict, List, Literal, Optional, Sequence, Union
++
++import numpy as np
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from torch.distributions import Distribution, Normal, kl_divergence
++
++# Import GATv2Conv with fallback
++try:
++    from torch_geometric.nn import GATv2Conv
++except ImportError:
++    try:
++        from torch_geometric.nn.conv import GATv2Conv
++    except ImportError:
++        raise ImportError("Failed to import GATv2Conv, please install PyTorch Geometric")
++
++from scvi import REGISTRY_KEYS
++
++# Import auto_move_data with fallback options
++try:
++    from scvi.module.base import LossOutput, auto_move_data
++except ImportError:
++    try:
++        from scvi.module.base import LossOutput
++        from scvi.nn.base import auto_move_data
++    except ImportError:
++        try:
++            from scvi.model.base import LossOutput
++            from scvi.nn import auto_move_data
++        except ImportError:
++            raise ImportError("Failed to import auto_move_data and LossOutput, please check scvi-tools version")
++
++# Import unsupported_if_adata_minified
++try:
++    from scvi.utils import unsupported_if_adata_minified
++except ImportError:
++    try:
++        from scvi.model.base import unsupported_if_adata_minified
++    except ImportError:
++        # If not available, create a dummy decorator
++        def unsupported_if_adata_minified(fn):
++            return fn
++
++
++from scvi.nn import Encoder
++
++# Import VAE with fallbacks
++try:
++    from scvi.module import VAE
++except ImportError:
++    try:
++        from scvi.module.base import VAE
++    except ImportError:
++        try:
++            from scvi.nn import VAE
++        except ImportError:
++            raise ImportError("Failed to import VAE class, please check scvi-tools version")
++
++from anndata import AnnData
++
++# Import AnnTorchDataset with fallbacks
++try:
++    from scvi.data import AnnTorchDataset
++except ImportError:
++    try:
++        from scvi.data._anntorchdataset import AnnTorchDataset
++    except ImportError:
++        try:
++            from scvi.dataloaders import AnnTorchDataset
++        except ImportError:
++            # Define a placeholder that will raise a more helpful error when used
++            class AnnTorchDataset:
++                def __init__(self, *args, **kwargs):
++                    raise ImportError("Failed to import AnnTorchDataset class, please check scvi-tools version")
++
++
++logger = logging.getLogger(__name__)
++
++
++class SpatialEncoder(nn.Module):
++    """Spatial encoder that uses graph attention networks to process spatial information.
++
++    Applies graph attention network to latent representations to obtain spatial features.
++
++    Parameters
++    ----------
++    n_latent
++        Dimension of the latent space
++    n_spatial
++        Dimension of the spatial features
++    attention_heads
++        Number of attention heads
++    dropout_rate
++        Dropout ratio
++    var_eps
++        Minimum value for variance to ensure numerical stability
++    """
++
++    def __init__(
++        self,
++        n_latent: int,
++        n_spatial: int,
++        attention_heads: int = 1,
++        dropout_rate: float = 0.1,
++        var_eps: float = 1e-4,
++    ):
++        super().__init__()
++
++        # Graph attention network to transform latent representations into spatial features
++        self.gat = GATv2Conv(
++            in_channels=n_latent, out_channels=n_spatial, heads=attention_heads, dropout=dropout_rate, concat=False
++        )
++
++        # Fully connected layers for computing spatial feature distribution parameters
++        self.mean_encoder = nn.Linear(n_spatial, n_spatial)
++        self.var_encoder = nn.Linear(n_spatial, n_spatial)
++        self.n_spatial = n_spatial
++
++        self.var_eps = var_eps
++
++    def forward(
++        self,
++        z: torch.Tensor,
++        edge_index: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Forward pass, calculate spatial feature distribution.
++
++        Parameters
++        ----------
++        z
++            Latent representation, shape [batch_size, n_latent]
++        edge_index
++            Graph edge indices, shape [2, num_edges]
++
++        Returns
++        -------
++        tuple
++            Mean, variance and sampled value of the spatial feature distribution
++        """
++        batch_size = z.size(0)
++        device = z.device
++
++        # Check if edge index is valid
++        if edge_index is None or edge_index.shape[1] == 0:
++            # If no edges, return zero tensors
++            spatial_mean = torch.zeros(batch_size, self.n_spatial, device=device)
++            spatial_var = torch.ones(batch_size, self.n_spatial, device=device) * self.var_eps
++            spatial_sample = torch.zeros(batch_size, self.n_spatial, device=device)
++
++            warnings.warn("Edge index is empty or has no edges, returning zero tensor as spatial features", UserWarning)
++            return spatial_mean, spatial_var, spatial_sample
++
++        # Ensure edge_index is on the correct device
++        if edge_index.device != device:
++            edge_index = edge_index.to(device)
++
++        # Check if edge_index is valid (indices not exceeding node count)
++        max_index = torch.max(edge_index)
++        if max_index >= batch_size:
++            warnings.warn(
++                f"Edge index contains out-of-range indices, max index is {max_index.item()}, node count is {batch_size}. Will trim edge indices.",
++                UserWarning,
++            )
++            # Select only edges with valid nodes
++            valid_edges = (edge_index[0] < batch_size) & (edge_index[1] < batch_size)
++            if valid_edges.sum() == 0:
++                # If no valid edges, return zero tensors
++                spatial_mean = torch.zeros(batch_size, self.n_spatial, device=device)
++                spatial_var = torch.ones(batch_size, self.n_spatial, device=device) * self.var_eps
++                spatial_sample = torch.zeros(batch_size, self.n_spatial, device=device)
++                return spatial_mean, spatial_var, spatial_sample
++
++            edge_index = edge_index[:, valid_edges]
++
++        try:
++            # Process latent representation with GATv2Conv
++            # print('Processing latent representation with GATv2Conv')
++            spatial_features = self.gat(z, edge_index)
++
++            # Use mean and variance encoders
++            spatial_mean = self.mean_encoder(spatial_features)
++            log_var = self.var_encoder(spatial_features)
++
++            # Calculate variance, ensure non-negative
++            spatial_var = torch.exp(log_var) + self.var_eps
++
++            # Create normal distribution
++            dist = Normal(spatial_mean, spatial_var.sqrt())
++
++            # Sample from the distribution
++            spatial_sample = dist.rsample()
++
++            return spatial_mean, spatial_var, spatial_sample
++        except Exception as e:
++            warnings.warn(
++                f"GATv2Conv processing failed: {str(e)}. Will return zero tensor as spatial features.", RuntimeWarning
++            )
++            # Return zero tensors as fallback
++            spatial_mean = torch.zeros(batch_size, self.n_spatial, device=device)
++            spatial_var = torch.ones(batch_size, self.n_spatial, device=device) * self.var_eps
++            spatial_sample = torch.zeros(batch_size, self.n_spatial, device=device)
++
++            return spatial_mean, spatial_var, spatial_sample
++
++
++class SpatialVAE(VAE):
++    """Variational autoencoder with spatial information support.
++
++    Extends standard VAE to include spatial information processing. Uses graph attention networks
++    to capture spatial relationships between cells.
++
++    Parameters
++    ----------
++    n_input
++        Number of input features
++    n_batch
++        Number of batches
++    n_labels
++        Number of labels
++    n_hidden
++        Number of nodes in hidden layers
++    n_latent
++        Dimension of latent space
++    n_spatial
++        Dimension of spatial features
++    n_layers
++        Number of hidden layers
++    dropout_rate
++        Dropout rate
++    dispersion
++        Dispersion parameter type
++    gene_likelihood
++        Gene likelihood distribution type
++    latent_distribution
++        Latent distribution type
++    **kwargs
++        Additional parameters
++    """
++
++    def __init__(
++        self,
++        n_input: int,
++        n_batch: int = 0,
++        n_labels: int = 0,
++        n_hidden: int = 128,
++        n_latent: int = 10,
++        n_spatial: int = 10,
++        n_layers: int = 1,
++        dropout_rate: float = 0.1,
++        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
++        gene_likelihood: Literal["zinb", "nb", "poisson", "normal"] = "zinb",
++        latent_distribution: Literal["normal", "ln"] = "normal",
++        edge_index: Optional[torch.Tensor] = None,
++        attention_heads: int = 1,
++        spatial_kl_weight: float = 0.01,
++        var_eps: float = 1e-4,
++        **kwargs,
++    ):
++        """Initialize SpatialVAE model.
++
++        Parameters
++        ----------
++        n_input
++            Input feature dimension
++        n_batch
++            Number of batches
++        n_labels
++            Number of labels
++        n_hidden
++            Hidden layer dimension
++        n_latent
++            Latent space dimension
++        n_spatial
++            Spatial feature dimension
++        n_layers
++            Number of layers
++        dropout_rate
++            Dropout rate
++        dispersion
++            Dispersion type
++        gene_likelihood
++            Gene likelihood function
++        latent_distribution
++            Latent distribution type
++        edge_index
++            Edge indices for establishing spatial relationships
++        attention_heads
++            Number of attention heads
++        spatial_kl_weight
++            Weight for spatial feature KL divergence
++        var_eps
++            Small constant for variance
++        """
++        # Initialize base VAE
++        super().__init__(
++            n_input=n_input,
++            n_batch=n_batch,
++            n_labels=n_labels,
++            n_hidden=n_hidden,
++            n_latent=n_latent,
++            n_layers=n_layers,
++            dropout_rate=dropout_rate,
++            dispersion=dispersion,
++            gene_likelihood=gene_likelihood,
++            latent_distribution=latent_distribution,
++            **kwargs,
++        )
++
++        self.n_spatial = n_spatial
++        self.spatial_kl_weight = spatial_kl_weight
++        self.spatial_encoder = SpatialEncoder(
++            n_latent=n_latent,
++            n_spatial=n_spatial,
++            attention_heads=attention_heads,
++            dropout_rate=dropout_rate,
++            var_eps=var_eps,
++        )
++
++        # Validate and process edge_index
++        if edge_index is not None:
++            if not isinstance(edge_index, torch.Tensor):
++                try:
++                    edge_index = torch.tensor(edge_index, dtype=torch.long)
++                except Exception as e:
++                    warnings.warn(f"Failed to convert edge_index to tensor: {str(e)}, will set to None", UserWarning)
++                    edge_index = None
++            elif edge_index.dtype != torch.long:
++                try:
++                    edge_index = edge_index.long()
++                except Exception as e:
++                    warnings.warn(f"Failed to convert edge_index to long type: {str(e)}, will set to None", UserWarning)
++                    edge_index = None
++
++            # Check edge_index shape
++            if edge_index is not None and (len(edge_index.shape) != 2 or edge_index.shape[0] != 2):
++                warnings.warn(
++                    f"Incorrect edge_index shape: {edge_index.shape}, should be [2, num_edges], will set to None",
++                    UserWarning,
++                )
++                edge_index = None
++
++        self.edge_index = edge_index
++        self.register_buffer("_edge_index", edge_index)
++
++    @auto_move_data
++    def inference(
++        self,
++        x: torch.Tensor,
++        batch_index: torch.Tensor,
++        cont_covs: torch.Tensor | None = None,
++        cat_covs: torch.Tensor | None = None,
++        cont_covariates: torch.Tensor | None = None,
++        cat_covariates: torch.Tensor | None = None,
++        **kwargs,
++    ) -> dict[str, torch.Tensor]:
++        """Inference process, computes latent representation and spatial features.
++
++        Parameters
++        ----------
++        x
++            Input data
++        batch_index
++            Batch indices
++        cont_covs
++            Continuous covariates (VAE parameter naming)
++        cat_covs
++            Categorical covariates (VAE parameter naming)
++        cont_covariates
++            Continuous covariates (compatible format)
++        cat_covariates
++            Categorical covariates (compatible format)
++
++        Returns
++        -------
++        dict
++            Dictionary containing latent representation and spatial features
++        """
++        # Parameter name unification
++        if cont_covs is None and cont_covariates is not None:
++            cont_covs = cont_covariates
++        if cat_covs is None and cat_covariates is not None:
++            cat_covs = cat_covariates
++
++        # Remove redundant parameters to avoid conflicting parameter names
++        if "cont_covariates" in kwargs:
++            del kwargs["cont_covariates"]
++        if "cat_covariates" in kwargs:
++            del kwargs["cat_covariates"]
++
++        # Call base VAE inference with correct parameter names
++        inference_outputs = super().inference(x, batch_index, cont_covs=cont_covs, cat_covs=cat_covs, **kwargs)
++
++        # Get latent representation
++        z = inference_outputs["z"]
++
++        # Ensure edge_index is on the correct device
++        if self.edge_index is not None and z.device != self.edge_index.device:
++            self.edge_index = self.edge_index.to(z.device)
++
++        # Calculate spatial features
++        try:
++            spatial_mean, spatial_var, spatial_sample = self.spatial_encoder(z, self.edge_index)
++
++            # Add spatial features to output
++            inference_outputs.update(
++                {
++                    "spatial_mean": spatial_mean,
++                    "spatial_var": spatial_var,
++                    "spatial_sample": spatial_sample,
++                }
++            )
++        except Exception as e:
++            # If spatial encoder fails, add warning log and return zero tensors
++            warnings.warn(
++                f"Spatial encoder processing failed: {str(e)}. Will return zero tensors as spatial features.",
++                UserWarning,
++            )
++            batch_size = z.size(0)
++            device = z.device
++
++            # Create zero tensors as spatial features
++            spatial_mean = torch.zeros(batch_size, self.n_spatial, device=device)
++            spatial_var = torch.ones(batch_size, self.n_spatial, device=device) * self.spatial_encoder.var_eps
++            spatial_sample = torch.zeros(batch_size, self.n_spatial, device=device)
++
++            # Add spatial features to output
++            inference_outputs.update(
++                {
++                    "spatial_mean": spatial_mean,
++                    "spatial_var": spatial_var,
++                    "spatial_sample": spatial_sample,
++                }
++            )
++
++        return inference_outputs
++
++    @auto_move_data
++    def forward(self, tensors, inference_kwargs=None, compute_loss=True, **kwargs):
++        """Forward pass process.
++
++        Parameters
++        ----------
++        tensors
++            Input tensor dictionary
++        inference_kwargs
++            Parameters passed to inference function
++        compute_loss
++            Whether to compute loss
++
++        Returns
++        -------
++        tuple
++            Inference outputs, generative outputs and loss
++        """
++        # Ensure no duplicate parameters will be passed
++        # Remove items from kwargs that might conflict with parameters in parent's forward
++        if "get_inference_input_kwargs" in kwargs:
++            del kwargs["get_inference_input_kwargs"]
++
++        # Call base VAE's forward pass
++        if inference_kwargs is None:
++            inference_kwargs = {}
++
++        # Fix parameter name mismatch issues
++        if "cont_covariates" in tensors and "cont_covs" not in tensors:
++            tensors["cont_covs"] = tensors.pop("cont_covariates")
++
++        # Fix categorical covariate parameter name mismatch issues
++        if "cat_covariates" in tensors and "cat_covs" not in tensors:
++            tensors["cat_covs"] = tensors.pop("cat_covariates")
++
++        # return inference_outputs, generative_outputs, losses
++
++        if compute_loss:
++            inference_outputs, generative_outputs, losses = super().forward(
++                tensors, inference_kwargs=inference_kwargs, compute_loss=compute_loss, **kwargs
++            )
++            # losses = module.loss(tensors, inference_outputs, generative_outputs, **loss_kwargs)
++            return inference_outputs, generative_outputs, losses
++        else:
++            inference_outputs, generative_outputs = super().forward(
++                tensors, inference_kwargs=inference_kwargs, compute_loss=compute_loss, **kwargs
++            )
++            return inference_outputs, generative_outputs
++
++    @unsupported_if_adata_minified
++    def loss(
++        self,
++        tensors: dict[str, torch.Tensor],
++        inference_outputs: dict[str, torch.Tensor | Distribution | None],
++        generative_outputs: dict[str, Distribution | None],
++        kl_weight: torch.tensor | float = 1.0,
++    ) -> LossOutput:
++        """Calculate loss function, including KL divergence of spatial features.
++
++        Parameters
++        ----------
++        tensors
++            Input tensors
++        inference_outputs
++            Inference process outputs
++        generative_outputs
++            Generative process outputs
++        kl_weight
++            KL divergence weight
++
++        Returns
++        -------
++        LossOutput
++            Loss output object
++        """
++        # Get base VAE loss
++        base_loss = super().loss(tensors, inference_outputs, generative_outputs, kl_weight)
++
++        # If no spatial features, return base loss directly
++        if "spatial_mean" not in inference_outputs:
++            return base_loss
++
++        # Calculate KL divergence for spatial features
++        spatial_mean = inference_outputs["spatial_mean"]
++        spatial_var = inference_outputs["spatial_var"]
++
++        # Create distribution objects
++        q_s = Normal(spatial_mean, spatial_var.sqrt())
++        p_s = Normal(torch.zeros_like(spatial_mean), torch.ones_like(spatial_var.sqrt()))
++
++        # Calculate KL divergence
++        kl_divergence_s = kl_divergence(q_s, p_s).sum(dim=-1)
++
++        # Apply weight
++        weighted_kl_s = self.spatial_kl_weight * kl_divergence_s
++
++        # Update total loss
++        loss = base_loss.loss + torch.mean(weighted_kl_s)
++
++        # Update KL divergence dictionary
++        kl_local = base_loss.kl_local
++        kl_local.update({"kl_divergence_s": kl_divergence_s})
++
++        return LossOutput(
++            loss=loss,
++            reconstruction_loss=base_loss.reconstruction_loss,
++            kl_local=kl_local,
++            extra_metrics=base_loss.extra_metrics,
++        )
++
++    def get_latent_representation(self, adata, indices, batch_size):
++        return super().get_latent_representation(adata, indices, batch_size)
++
++    @torch.inference_mode()
++    def get_spatial_representation(
++        self,
++        adata=None,
++        indices=None,
++        batch_size=None,
++    ) -> np.ndarray:
++        """Get spatial feature representation.
++
++        Parameters
++        ----------
++        adata
++            AnnData object, optional
++        indices
++            Indices to get representation for, optional
++        batch_size
++            Batch size, optional
++
++        Returns
++        -------
++        np.ndarray
++            Spatial feature representation
++        """
++        # Ensure model has spatial encoder
++        if not hasattr(self, "spatial_encoder"):
++            raise ValueError("Model does not have a spatial encoder")
++
++        try:
++            # Get latent representation
++            latent = self.get_latent_representation(adata, indices, batch_size)
++
++            # If no edge_index, return zero matrix
++            if self.edge_index is None:
++                logger.warning("No edge index found, will return zero matrix as spatial representation")
++                return np.zeros((latent.shape[0], self.n_spatial))
++
++            # Convert to PyTorch tensor and ensure on correct device
++            device = next(self.parameters()).device
++            latent_tensor = torch.tensor(latent, dtype=torch.float32, device=device)
++
++            # Ensure edge_index is on correct device
++            if self.edge_index.device != device:
++                self.edge_index = self.edge_index.to(device)
++
++            # Process in batches to avoid memory overflow
++            result_chunks = []
++            chunk_size = 2048 if batch_size is None else batch_size
++
++            for i in range(0, latent_tensor.shape[0], chunk_size):
++                # Get current batch
++                chunk = latent_tensor[i : i + chunk_size]
++                # Calculate spatial features
++                _, _, spatial_chunk = self.spatial_encoder(chunk, self.edge_index)
++                # Add to result list
++                result_chunks.append(spatial_chunk.cpu().numpy())
++
++            # Merge all batch results
++            spatial_representation = np.concatenate(result_chunks, axis=0)
++
++            return spatial_representation
++
++        except Exception as e:
++            # Catch any exceptions to ensure function doesn't crash
++            import traceback
++
++            logger.error(f"Error getting spatial representation: {str(e)}\n{traceback.format_exc()}")
++
++            # Return zero matrix as fallback
++            n_cells = len(adata) if adata is not None else (len(indices) if indices is not None else 0)
++            if n_cells == 0 and hasattr(self, "adata") and self.adata is not None:
++                n_cells = self.adata.n_obs
++
++            return np.zeros((n_cells, self.n_spatial))
++
++    def _get_inference_input(
++        self,
++        tensors: dict[str, torch.Tensor | None],
++        full_forward_pass: bool = False,
++    ) -> dict[str, torch.Tensor | None]:
++        """Get tensors needed for inference process, overrides parent method to fix parameter name mismatch issues.
++
++        Args:
++            tensors: Input data tensors
++            full_forward_pass: Whether to perform full forward pass
++
++        Returns:
++            Dictionary of inputs for inference process
++        """
++        # Call parent method to get basic inputs
++        inputs = super()._get_inference_input(tensors, full_forward_pass)
++
++        # Fix parameter name mismatch issue: rename cont_covariates to cont_covs
++        if "cont_covariates" in inputs and "cont_covs" not in inputs:
++            inputs["cont_covs"] = inputs.pop("cont_covariates")
++
++        # Fix parameter name mismatch issue: rename cat_covariates to cat_covs
++        if "cat_covariates" in inputs and "cat_covs" not in inputs:
++            inputs["cat_covs"] = inputs.pop("cat_covariates")
++
++        return inputs
++
++    def _get_generative_input(
++        self,
++        tensors: dict[str, torch.Tensor],
++        inference_outputs: dict[str, torch.Tensor | Distribution | None],
++    ) -> dict[str, torch.Tensor | None]:
++        """Get tensors for generative process, overrides parent method to fix parameter name mismatch issues.
++
++        Args:
++            tensors: Original data tensors
++            inference_outputs: Outputs from inference process
++
++        Returns:
++            Dictionary of inputs needed for generative process
++        """
++        # Call parent method to get basic generative inputs
++        generative_inputs = super()._get_generative_input(tensors, inference_outputs)
++
++        # Fix continuous covariate parameter name mismatch issue
++        if "cont_covariates" in generative_inputs and "cont_covs" not in generative_inputs:
++            generative_inputs["cont_covs"] = generative_inputs.pop("cont_covariates")
++
++        # Fix categorical covariate parameter name mismatch issue
++        if "cat_covariates" in generative_inputs and "cat_covs" not in generative_inputs:
++            generative_inputs["cat_covs"] = generative_inputs.pop("cat_covariates")
++
++        return generative_inputs
++
++    def setup_spatial_graph(
++        self,
++        adata: AnnData,
++        spatial_key: str = "spatial",
++        batch_key: Optional[str] = None,
++        method: str = "knn",
++        n_neighbors: int = 10,
++    ):
++        """Set up spatial graph for spatial information processing.
++
++        Constructs a spatial graph based on spatial coordinates in adata.obsm[spatial_key],
++        using either K-nearest neighbors or Delaunay triangulation.
++
++        Parameters
++        ----------
++        adata
++            AnnData object containing spatial coordinates in adata.obsm[spatial_key]
++        spatial_key
++            obsm key storing spatial coordinates, default is 'spatial'
++        batch_key
++            obs key for batch information, if provided, graph will be constructed per batch
++        method
++            Method for constructing the graph, can be 'knn' or 'delaunay'
++        n_neighbors
++            Number of neighbors for KNN method
++        """
++        try:
++            # Get spatial coordinates
++            if spatial_key not in adata.obsm:
++                raise ValueError(f"Spatial coordinates not found in adata.obsm['{spatial_key}']")
++
++            coordinates = adata.obsm[spatial_key]
++            logger.info(
++                f"Retrieved spatial coordinates for {len(coordinates)} cells, dimension: {coordinates.shape[1]}"
++            )
++
++            # Check validity of coordinate data
++            if np.isnan(coordinates).any():
++                # Handle NaN values
++                nan_count = np.isnan(coordinates).any(axis=1).sum()
++                logger.warning(
++                    f"Detected {nan_count} cells with NaN coordinates, these cells will be excluded from spatial analysis"
++                )
++
++                # Create mask without NaNs
++                valid_mask = ~np.isnan(coordinates).any(axis=1)
++                coordinates = coordinates[valid_mask]
++
++                if len(coordinates) == 0:
++                    raise ValueError("No valid coordinate data after processing NaN values")
++
++            # Process by batch
++            if batch_key is not None and batch_key in adata.obs:
++                j = 0  # Initialize counter
++
++                # Process each batch separately
++                for batch in adata.obs[batch_key].unique():
++                    # Get data for current batch
++                    batch_mask = adata.obs[batch_key] == batch
++                    batch_coords = coordinates[batch_mask]
++
++                    if len(batch_coords) < 3:
++                        logger.warning(f"Batch {batch} has only {len(batch_coords)} cells, skipping this batch")
++                        continue
++
++                    if method.lower() == "knn":
++                        # Use K-nearest neighbors to build graph
++                        from scipy.sparse import csr_matrix
++                        from sklearn.neighbors import kneighbors_graph
++                        from torch_geometric.utils import from_scipy_sparse_matrix
++
++                        # Build KNN graph
++                        A = kneighbors_graph(batch_coords, n_neighbors=min(n_neighbors, len(batch_coords) - 1))
++
++                        # Convert to PyTorch edge index format
++                        edge_index_batch, _ = from_scipy_sparse_matrix(A)
++
++                        # Get indices in original dataset
++                        batch_indices = np.where(batch_mask)[0]
++                        batch_indices_tensor = torch.tensor(batch_indices, dtype=torch.long)
++
++                        # Map edge indices back to original dataset indices
++                        edge_index_batch = batch_indices_tensor[edge_index_batch]
++
++                    else:  # Use Delaunay triangulation
++                        from scipy.spatial import Delaunay
++
++                        # Create Delaunay triangles
++                        try:
++                            tri = Delaunay(batch_coords)
++                            triangles = tri.simplices
++                        except Exception as e:
++                            logger.warning(
++                                f"Delaunay triangulation failed for batch {batch}: {str(e)}, skipping this batch"
++                            )
++                            continue
++
++                        # Extract edges
++                        edges = set()
++                        for triangle in triangles:
++                            for i in range(3):
++                                # Create ordered edge pairs
++                                edge = tuple(sorted((triangle[i], triangle[(i + 1) % 3])))
++                                edges.add(edge)
++
++                        # Check if edges were extracted
++                        if len(edges) == 0:
++                            logger.warning(f"No valid edges extracted for batch {batch}, skipping this batch")
++                            continue
++
++                        # Convert to PyTorch edge index format
++                        edge_list = torch.tensor(list(edges), dtype=torch.long).t()
++
++                        # Get indices in original dataset
++                        batch_indices = np.where(batch_mask)[0]
++                        batch_indices_tensor = torch.tensor(batch_indices, dtype=torch.long)
++
++                        # Map edge indices back to original dataset indices
++                        edge_index_batch = batch_indices_tensor[edge_list]
++
++                    # Merge edge indices
++                    if j == 0:
++                        edge_index = edge_index_batch
++                        j = 1
++                    else:
++                        edge_index = torch.cat((edge_index, edge_index_batch), dim=1)
++
++                # Check if edges were successfully built
++                if j == 0:
++                    raise ValueError("Failed to build valid edges for any batch")
++
++            else:  # Process without batches
++                if method.lower() == "knn":
++                    # Use K-nearest neighbors to build graph
++                    from sklearn.neighbors import kneighbors_graph
++                    from torch_geometric.utils import from_scipy_sparse_matrix
++
++                    # Build KNN graph
++                    A = kneighbors_graph(coordinates, n_neighbors=min(n_neighbors, len(coordinates) - 1))
++
++                    # Convert to PyTorch edge index format
++                    edge_index, _ = from_scipy_sparse_matrix(A)
++
++                else:  # Use Delaunay triangulation
++                    from scipy.spatial import Delaunay
++
++                    # Create Delaunay triangles
++                    tri = Delaunay(coordinates)
++                    triangles = tri.simplices
++
++                    # Extract edges
++                    edges = set()
++                    for triangle in triangles:
++                        for i in range(3):
++                            # Create ordered edge pairs
++                            edge = tuple(sorted((triangle[i], triangle[(i + 1) % 3])))
++                            edges.add(edge)
++
++                    # Convert to PyTorch edge index format
++                    edge_index = torch.tensor(list(edges), dtype=torch.long).t()
++
++            # Store edge index
++            self.edge_index = edge_index
++
++            # Register as buffer
++            if hasattr(self, "_edge_index"):
++                self._edge_index = edge_index
++            else:
++                self.register_buffer("_edge_index", edge_index)
++
++            logger.info(
++                f"Successfully built spatial graph with {edge_index.shape[1]} edges connecting {adata.n_obs} cells"
++            )
++
++            return edge_index
++
++        except Exception as e:
++            logger.error(f"Failed to build spatial graph: {str(e)}")
++            # Set to None
++            self.edge_index = None
++            if hasattr(self, "_edge_index"):
++                self._edge_index = None
++            else:
++                self.register_buffer("_edge_index", None)
++
++            raise ValueError(f"Failed to build spatial graph: {str(e)}")
++
++    def process_in_batches(
++        self,
++        edge_index: torch.Tensor,
++        max_edges_per_batch: int = 100000,
++        combine_results: bool = True,
++        adata: Optional[AnnData] = None,
++    ):
++        """Process edge indices in batches, suitable for processing large graph structures.
++
++        Divides edge_index into smaller batches for processing to avoid memory overflow errors.
++
++        Parameters
++        ----------
++        edge_index
++            Edge index tensor, shape [2, num_edges]
++        max_edges_per_batch
++            Maximum number of edges per batch
++        combine_results
++            Whether to combine results from all batches
++        adata
++            AnnData object, if None uses the AnnData object from training
++
++        Returns
++        -------
++        dict or list
++            If combine_results is True, returns combined result dictionary;
++            otherwise returns a list of results for each batch
++        """
++        if edge_index is None or edge_index.shape[1] == 0:
++            warnings.warn("Edge index is empty, cannot process in batches", UserWarning)
++            return None
++
++        # Get number of edges
++        num_edges = edge_index.shape[1]
++
++        # If edge count is less than or equal to max_edges_per_batch, process directly
++        if num_edges <= max_edges_per_batch:
++            return self.process_edges(edge_index, adata=adata)
++
++        # Calculate batch count
++        num_batches = (num_edges + max_edges_per_batch - 1) // max_edges_per_batch
++
++        logger.info(f"Dividing {num_edges} edges into {num_batches} batches, max {max_edges_per_batch} edges per batch")
++
++        # Process in batches
++        batch_results = []
++        for i in range(num_batches):
++            # Calculate start and end indices for current batch
++            start_idx = i * max_edges_per_batch
++            end_idx = min((i + 1) * max_edges_per_batch, num_edges)
++
++            # Get edge indices for current batch
++            batch_edge_index = edge_index[:, start_idx:end_idx]
++
++            try:
++                # Process current batch
++                batch_result = self.process_edges(batch_edge_index, adata=adata)
++                batch_results.append(batch_result)
++
++                logger.debug(f"Completed batch {i+1}/{num_batches}, processed {end_idx-start_idx} edges")
++
++            except Exception as e:
++                logger.error(f"Error processing batch {i+1}/{num_batches}: {str(e)}")
++                continue
++
++        # If no batches were processed successfully, return None
++        if not batch_results:
++            warnings.warn("All batch processing failed", UserWarning)
++            return None
++
++        # If results don't need to be combined, return list of batch results
++        if not combine_results:
++            return batch_results
++
++        # Combine results from all batches
++        combined_result = {}
++
++        # Get all result keys
++        all_keys = set()
++        for result in batch_results:
++            all_keys.update(result.keys())
++
++        # Combine results for each key
++        for key in all_keys:
++            # Find all results containing this key
++            valid_results = [result[key] for result in batch_results if key in result]
++
++            if not valid_results:
++                continue
++
++            # Check data type to decide how to combine
++            sample_data = valid_results[0]
++
++            if isinstance(sample_data, torch.Tensor):
++                # If tensor, check if it can be concatenated along some dimension
++                if len(sample_data.shape) > 0 and sample_data.shape[0] > 0:
++                    try:
++                        combined_result[key] = torch.cat(valid_results, dim=0)
++                    except:
++                        # If cannot concatenate, take mean
++                        combined_result[key] = torch.stack(valid_results).mean(dim=0)
++                else:
++                    # If scalar tensor, take mean
++                    combined_result[key] = torch.stack(valid_results).mean()
++            elif isinstance(sample_data, (int, float)):
++                # If numeric, take mean
++                combined_result[key] = sum(valid_results) / len(valid_results)
++            elif isinstance(sample_data, dict):
++                # If dictionary, recursively combine
++                combined_result[key] = {}
++                all_subkeys = set()
++                for result in valid_results:
++                    all_subkeys.update(result.keys())
++
++                for subkey in all_subkeys:
++                    sub_valid_results = [result[subkey] for result in valid_results if subkey in result]
++                    if sub_valid_results:
++                        if isinstance(sub_valid_results[0], torch.Tensor):
++                            try:
++                                combined_result[key][subkey] = torch.cat(sub_valid_results, dim=0)
++                            except:
++                                combined_result[key][subkey] = torch.stack(sub_valid_results).mean(dim=0)
++                        else:
++                            combined_result[key][subkey] = sub_valid_results[0]  # Simply take first one
++            else:
++                # Other types, simply take first one
++                combined_result[key] = valid_results[0]
++
++        return combined_result
++
++    def process_edges(self, edge_index: torch.Tensor, adata: Optional[AnnData] = None):
++        """Process a single batch of edge indices.
++
++        This is a utility method for processing a single batch of edge indices in batch processing.
++
++        Parameters
++        ----------
++        edge_index
++            Edge index tensor, shape [2, num_edges]
++        adata
++            AnnData object, if None uses the AnnData object from training
++
++        Returns
++        -------
++        dict
++            Processing results
++        """
++        # Try different locations for AnnTorchDataset
++        try:
++            from scvi.data import AnnTorchDataset
++        except ImportError:
++            try:
++                from scvi.data._anntorchdataset import AnnTorchDataset
++            except ImportError:
++                try:
++                    from scvi.dataloaders import AnnTorchDataset
++                except ImportError:
++                    raise ImportError("Failed to import AnnTorchDataset class, please check scvi-tools version")
++
++        from scvi.data import AnnDataManager
++
++        # Get AnnData object
++        if adata is None:
++            try:
++                # Try different ways to get associated AnnData
++                if hasattr(self, "_model") and hasattr(self._model, "_adata_manager"):
++                    adata_manager = self._model._adata_manager
++                elif hasattr(self, "adata_manager"):
++                    adata_manager = self.adata_manager
++                elif hasattr(self, "module") and hasattr(self.module, "adata_manager"):
++                    adata_manager = self.module.adata_manager
++                else:
++                    raise ValueError("Cannot find AnnData manager")
++            except Exception as e:
++                raise ValueError(f"Need to provide adata parameter when processing edge indices: {str(e)}")
++        else:
++            # Create temporary manager for provided AnnData
++            adata_manager = AnnDataManager(fields=[], setup_method_args={})
++            adata_manager.register_fields(adata)
++
++        # Create data tensors
++        try:
++            data = AnnTorchDataset(adata_manager)
++            data = data[np.arange(data.data["X"].shape[0])]
++        except Exception as e:
++            raise ValueError(f"Cannot create AnnTorchDataset: {str(e)}")
++
++        # Move data to model's device
++        device = next(self.parameters()).device
++        for key, value in data.items():
++            if value is not None:
++                if key == REGISTRY_KEYS.BATCH_KEY and value is not None:
++                    data[key] = torch.LongTensor(value).to(device)
++                else:
++                    data[key] = torch.Tensor(value).to(device)
++
++        # Ensure edge index is on correct device
++        if edge_index.device != device:
++            edge_index = edge_index.to(device)
++
++        # Run inference
++        with torch.no_grad():
++            inference_outputs = self.inference(
++                x=data[REGISTRY_KEYS.X_KEY], batch_index=data.get(REGISTRY_KEYS.BATCH_KEY, None), edge_index=edge_index
++            )
++
++        return inference_outputs
+diff --git a/spateo/external/__init__.py b/spateo/external/__init__.py
+index debf4fc5..3ccda58a 100644
+--- a/spateo/external/__init__.py
++++ b/spateo/external/__init__.py
+@@ -1 +1,57 @@
+ from . import lack
++
++# Try to import MERFISHVI only if scvi dependencies are available
++try:
++    from . import MERFISHVI
++
++    _MERFISHVI_AVAILABLE = True
++except ImportError as e:
++    # Check if the error is related to scvi or other required dependencies
++    if "scvi" in str(e) or "torch_geometric" in str(e) or "torch" in str(e):
++        import warnings
++
++        warnings.warn(
++            "MERFISHVI could not be imported due to missing dependencies. "
++            "To use MERFISHVI functionality, please install the required packages: "
++            "pip install scvi-tools torch torch-geometric",
++            ImportWarning,
++            stacklevel=2,
++        )
++        _MERFISHVI_AVAILABLE = False
++        # Create a dummy MERFISHVI module that raises an informative error when accessed
++        class _MERFISHVIPlaceholder:
++            def __getattr__(self, name):
++                raise ImportError(
++                    f"Cannot access {name} from MERFISHVI. "
++                    "MERFISHVI requires additional dependencies. "
++                    "Please install them with: pip install scvi-tools torch torch-geometric"
++                )
++
++        MERFISHVI = _MERFISHVIPlaceholder()
++    else:
++        # Re-raise if it's a different import error
++        raise
++
++
++def is_merfishvi_available():
++    """
++    Check if MERFISHVI and its dependencies are available.
++
++    Returns
++    -------
++    bool
++        True if MERFISHVI can be imported successfully, False otherwise.
++    """
++    return _MERFISHVI_AVAILABLE
++
++
++def get_merfishvi_requirements():
++    """
++    Get the list of required packages for MERFISHVI functionality.
++
++    Returns
++    -------
++    list
++        List of required package names.
++    """
++    return ["scvi-tools", "torch", "torch-geometric", "scipy", "sklearn"]
+diff --git a/spateo/external/lack.py b/spateo/external/lack.py
+index 5653dfb6..ee78a935 100644
+--- a/spateo/external/lack.py
++++ b/spateo/external/lack.py
+@@ -1,9 +1,31 @@
++# Force import of standard library logging module
++import builtins
+ import functools
+-import logging
+ import sys
+ import time
+ from contextlib import contextmanager
+ 
++_original_import = builtins.__import__
++
++
++def _import_stdlib_logging():
++    """Force import of stdlib logging, not spateo.logging"""
++    # Temporarily remove current directory from sys.path
++    old_path = sys.path[:]
++    try:
++        # Remove paths that might contain spateo
++        filtered_path = [p for p in sys.path if "spateo" not in p and p != "." and p != ""]
++        sys.path[:] = filtered_path
++        import logging as _logging
++
++        return _logging
++    finally:
++        # Restore original path
++        sys.path[:] = old_path
++
++
++_logging = _import_stdlib_logging()
++
+ 
+ def silence_logger(name):
+     """Given a logger name, silence it completely.
+@@ -11,8 +33,8 @@ def silence_logger(name):
+     :param name: name of the logger
+     :type name: str
+     """
+-    package_logger = logging.getLogger(name)
+-    package_logger.setLevel(logging.CRITICAL + 100)
++    package_logger = _logging.getLogger(name)
++    package_logger.setLevel(_logging.CRITICAL + 100)
+     package_logger.propagate = False
+ 
+ 
+@@ -22,7 +44,7 @@ def set_logger_level(name, level):
+     :param name: name of the logger
+     :type name: str
+     """
+-    package_logger = logging.getLogger(name)
++    package_logger = _logging.getLogger(name)
+     package_logger.setLevel(level)
+ 
+ 
+@@ -30,13 +52,13 @@ def format_logging_message(msg, logging_level, indent_level=1, indent_space_num=
+     indent_str = "-" * indent_space_num
+     prefix = indent_str * indent_level
+     prefix = "|" + prefix[1:]
+-    if logging_level == logging.INFO:
++    if logging_level == _logging.INFO:
+         prefix += ">"
+-    elif logging_level == logging.WARNING:
++    elif logging_level == _logging.WARNING:
+         prefix += "?"
+-    elif logging_level == logging.CRITICAL:
++    elif logging_level == _logging.CRITICAL:
+         prefix += "!!"
+-    elif logging_level == logging.DEBUG:
++    elif logging_level == _logging.DEBUG:
+         prefix += ">>>"
+     new_msg = prefix + " " + str(msg)
+     return new_msg
+@@ -49,7 +71,7 @@ class Logger:
+ 
+     def __init__(self, namespace="main", level=None):
+         self.namespace = namespace
+-        self.logger = logging.getLogger(namespace)
++        self.logger = _logging.getLogger(namespace)
+         self.previous_timestamp = time.time()  # in seconds
+         self.time_passed = 0
+         self.report_hook_percent_state = None
+@@ -58,8 +80,8 @@ def __init__(self, namespace="main", level=None):
+ 
+         # ensure only one stream handler exists in one logger instance
+         if len(self.logger.handlers) == 0:
+-            self.logger_stream_handler = logging.StreamHandler(sys.stdout)
+-            self.logger_stream_handler.setFormatter(logging.Formatter(self.FORMAT))
++            self.logger_stream_handler = _logging.StreamHandler(sys.stdout)
++            self.logger_stream_handler.setFormatter(_logging.Formatter(self.FORMAT))
+             self.logger.addHandler(self.logger_stream_handler)
+         else:
+             self.logger_stream_handler = self.logger.handlers[0]
+@@ -77,7 +99,7 @@ def __init__(self, namespace="main", level=None):
+         if not (level is None):
+             self.logger.setLevel(level)
+         else:
+-            self.logger.setLevel(logging.INFO)
++            self.logger.setLevel(_logging.INFO)
+ 
+     def namespaced(self, namespace):
+         """Function decorator to set the logging namespace for the duration of
+@@ -128,32 +150,32 @@ def setLevel(self, *args, **kwargs):
+         return self.logger.setLevel(*args, **kwargs)
+ 
+     def debug(self, message, indent_level=1, *args, **kwargs):
+-        message = format_logging_message(message, logging.DEBUG, indent_level=indent_level)
++        message = format_logging_message(message, _logging.DEBUG, indent_level=indent_level)
+         return self.logger.debug(message, *args, **kwargs)
+ 
+     def info(self, message, indent_level=1, *args, **kwargs):
+-        message = format_logging_message(message, logging.INFO, indent_level=indent_level)
++        message = format_logging_message(message, _logging.INFO, indent_level=indent_level)
+         return self.logger.info(message, *args, **kwargs)
+ 
+     def warning(self, message, indent_level=1, *args, **kwargs):
+-        message = format_logging_message(message, logging.WARNING, indent_level=indent_level)
++        message = format_logging_message(message, _logging.WARNING, indent_level=indent_level)
+         return self.logger.warning(message, *args, **kwargs)
+ 
+     def exception(self, message, indent_level=1, *args, **kwargs):
+-        message = format_logging_message(message, logging.ERROR, indent_level=indent_level)
++        message = format_logging_message(message, _logging.ERROR, indent_level=indent_level)
+         return self.logger.exception(message, *args, **kwargs)
+ 
+     def critical(self, message, indent_level=1, *args, **kwargs):
+-        message = format_logging_message(message, logging.CRITICAL, indent_level=indent_level)
++        message = format_logging_message(message, _logging.CRITICAL, indent_level=indent_level)
+         return self.logger.critical(message, *args, **kwargs)
+ 
+     def error(self, message, indent_level=1, *args, **kwargs):
+-        message = format_logging_message(message, logging.ERROR, indent_level=indent_level)
++        message = format_logging_message(message, _logging.ERROR, indent_level=indent_level)
+         return self.logger.error(message, *args, **kwargs)
+ 
+     def info_insert_adata(self, key, adata_attr="obsm", indent_level=1, *args, **kwargs):
+         message = "<insert> %s to %s in AnnData Object." % (key, adata_attr)
+-        message = format_logging_message(message, logging.INFO, indent_level=indent_level)
++        message = format_logging_message(message, _logging.INFO, indent_level=indent_level)
+         return self.logger.info(message, *args, **kwargs)
+ 
+     def info_insert_adata_var(self, key, indent_level=1, *args, **kwargs):
+@@ -180,7 +202,7 @@ def report_progress(self, percent=None, count=None, total=None, progress_name=""
+         if progress_name != "":
+             progress_name = "[" + str(progress_name) + "] "
+         message = "\r" + format_logging_message(
+-            "%sin progress: %.4f%%" % (progress_name, percent), logging_level=logging.INFO, indent_level=indent_level
++            "%sin progress: %.4f%%" % (progress_name, percent), logging_level=_logging.INFO, indent_level=indent_level
+         )
+         self.logger.info(message)
+         self.logger_stream_handler.flush()
+@@ -231,10 +253,10 @@ def request_report_hook(self, bn: int, rs: int, ts: int) -> None:
+ 
+ 
+ class LoggerManager:
+-    DEBUG = logging.DEBUG
+-    INFO = logging.INFO
+-    CRITICAL = logging.CRITICAL
+-    EXCEPTION = logging.ERROR
++    DEBUG = _logging.DEBUG
++    INFO = _logging.INFO
++    CRITICAL = _logging.CRITICAL
++    EXCEPTION = _logging.ERROR
+ 
+     @staticmethod
+     def gen_logger(namespace: str):
+@@ -316,7 +338,7 @@ def main_log_time(
+     def main_silence(
+         self,
+     ):
+-        self.main_logger.setLevel(logging.CRITICAL + 100)
++        self.main_logger.setLevel(_logging.CRITICAL + 100)
+ 
+     def main_finish_progress(self, progress_name=""):
+         self.main_logger.finish_progress(progress_name=progress_name)

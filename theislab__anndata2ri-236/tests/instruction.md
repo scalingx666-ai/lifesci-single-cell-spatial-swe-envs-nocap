@@ -1,0 +1,16 @@
+# Issue
+
+**Title:** [pre-commit.ci] pre-commit autoupdate
+
+## Description
+
+<!--pre-commit.ci start-->
+updates:
+- [github.com/pre-commit/pre-commit-hooks: v5.0.0 → v6.0.0](https://github.com/pre-commit/pre-commit-hooks/compare/v5.0.0...v6.0.0)
+- [github.com/astral-sh/ruff-pre-commit: v0.12.7 → v0.12.8](https://github.com/astral-sh/ruff-pre-commit/compare/v0.12.7...v0.12.8)
+- [github.com/biomejs/pre-commit: v2.1.3 → v2.1.4](https://github.com/biomejs/pre-commit/compare/v2.1.3...v2.1.4)
+<!--pre-commit.ci end-->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `41d2f59c62f4`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

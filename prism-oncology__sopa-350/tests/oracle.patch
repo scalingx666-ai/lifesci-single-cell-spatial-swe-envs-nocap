@@ -1,0 +1,496 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4a4d389a..2942bb41 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -94,7 +94,7 @@ jobs:
+           python-version: "3.12"
+ 
+       - name: Install sopa with pip
+-        run: pip install -e ".[wsi]" && pip install pytest-cov poethepoet
++        run: pip install -e . && pip install pytest-cov poethepoet
+ 
+       - name: Run short tests
+         run: poe test_short
+diff --git a/sopa/io/reader/_wsi_reader.py b/sopa/io/reader/_wsi_reader.py
+index 1707370e..5fe36d28 100644
+--- a/sopa/io/reader/_wsi_reader.py
++++ b/sopa/io/reader/_wsi_reader.py
+@@ -171,6 +171,7 @@ def __init__(self, path: str):
+ 
+     def read_region(self, location, level, size):
+         import numpy as np
++        from PIL import Image
+ 
+         with self.slide.get_scene(0) as scene:
+             scaling = 1 / scene.get_zoom_level_info(level).scale
+@@ -184,7 +185,7 @@ def read_region(self, location, level, size):
+             _tile = scene.read_block((x, y, x_width, y_height), (tile_x, tile_y))
+             tile = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+             tile[: _tile.shape[0], : _tile.shape[1], :] = _tile[:, :, :3]  # Ensure RGB format
+-        return np.array(tile)
++        return Image.fromarray(tile)
+ 
+     def get_zarr_store(self, tilesize: int = 512):
+         from zarr.storage import KVStore
+diff --git a/sopa/patches/__init__.py b/sopa/patches/__init__.py
+index 167da568..86d855ab 100644
+--- a/sopa/patches/__init__.py
++++ b/sopa/patches/__init__.py
+@@ -1,3 +1,4 @@
++from ._inference import TileLoader
+ from ._patches import Patches2D
+ from ._factory import make_image_patches, make_transcript_patches
+ from .cluster import cluster_embeddings
+diff --git a/sopa/patches/_inference.py b/sopa/patches/_inference.py
+index 70ce5fb0..ba0b28ba 100644
+--- a/sopa/patches/_inference.py
++++ b/sopa/patches/_inference.py
+@@ -1,75 +1,52 @@
+ import logging
+-from typing import Callable
+ 
+ import dask
+ import numpy as np
+-import torch
++from spatialdata import SpatialData
+ from xarray import DataArray, DataTree
+ 
+ from .. import settings
++from .._constants import SopaAttrs, SopaKeys
+ from ..io.reader._wsi_reader import get_reader
+-from . import models
++from ..utils import get_spatial_element
++from ._patches import Patches2D
+ 
+ log = logging.getLogger(__name__)
+ 
+ 
+-class Inference:
++class TileLoader:
+     def __init__(
+         self,
+-        image: DataTree | DataArray,
+-        model: Callable | str,
++        sdata: SpatialData,
+         patch_width: int,
++        image_key: str | None = None,
+         level: int | None = 0,
+         magnification: int | None = None,
+-        device: str | None = None,
+-        data_parallel: bool | list[int] = False,
++        patch_overlap: int = 0,
++        roi_key: str | None = SopaKeys.ROI,
+     ):
++        multiscale_image = _get_image_for_inference(sdata, image_key)
+         self.image, self.level, self.tile_resize_factor, self.level_downsample = _get_extraction_parameters(
+-            image, level, magnification
++            multiscale_image, level, magnification
+         )
+ 
+-        _backend = image.attrs.get("backend")
+-        _path = image.attrs.get("path")
++        _backend = multiscale_image.attrs.get("backend")
++        _path = multiscale_image.attrs.get("path")
+ 
+         try:
+             if settings.native_read_region and _backend is not None:
+                 self.slide = get_reader(_backend)(_path)
+             else:
+-                self.slide = get_reader("xarray")(image)
++                self.slide = get_reader("xarray")(multiscale_image)
+         except Exception as e:
+             log.warning(
+                 f"Exception raised for '{_backend}' and path '{_path}'. Falling back to xarray reader. Error: {e}"
+             )
+-            self.slide = get_reader("xarray")(image)
++            self.slide = get_reader("xarray")(multiscale_image)
+ 
+         self.patch_width = int(patch_width / self.tile_resize_factor)
+         self.resized_patch_width = patch_width
+-
+-        self.model_str, self.model = self._instantiate_model(model)
+-
+-        self.device = device
+-        if self.device is not None:
+-            self.model.to(device)
+-
+-        if data_parallel:
+-            ids = data_parallel if isinstance(data_parallel, list) else list(range(torch.cuda.device_count()))
+-            self.model = torch.nn.DataParallel(self.model, device_ids=ids)
+-
+-    def _instantiate_model(self, model: Callable | str) -> tuple[str, torch.nn.Module]:
+-        if isinstance(model, str):
+-            assert model in models.available_models, (
+-                f"'{model}' is not a valid model name. Valid names are: {', '.join(list(models.available_models.keys()))}"
+-            )
+-
+-            return model, models.available_models[model]()
+-
+-        return model.__class__.__name__, model
+-
+-    def _torch_resize(self, tensor: torch.Tensor):
+-        from torchvision.transforms import Resize
+-
+-        dim = (self.resized_patch_width, self.resized_patch_width)
+-        return Resize(dim)(tensor)
++        self.patches = Patches2D(sdata, self.image, self.patch_width, patch_overlap=patch_overlap, roi_key=roi_key)
+ 
+     def _numpy_patch(self, box: tuple[int, int, int, int]) -> np.ndarray:
+         """
+@@ -86,26 +63,55 @@ def _numpy_patch(self, box: tuple[int, int, int, int]) -> np.ndarray:
+ 
+         pad_x, pad_y = self.patch_width - image_patch.shape[0], self.patch_width - image_patch.shape[1]
+         padded_patch = np.pad(image_patch, ((0, pad_x), (0, pad_y), (0, 0)))
+-        return np.transpose(padded_patch, (2, 0, 1))
++        return padded_patch
+ 
+-    def _torch_batch(self, bboxes: np.ndarray):
++    def get_batch(self, bboxes: np.ndarray):
+         """Retrives a batch of patches using the bboxes"""
++        import torch
+ 
+         delayed_patches = [dask.delayed(self._numpy_patch)(box) for box in bboxes]
+         batch = np.array(dask.compute(*delayed_patches))
++
+         batch = torch.tensor(batch, dtype=torch.float32) / 255.0
++        batch = batch.movedim(-1, 1)
++
++        if self.tile_resize_factor != 1:
++            from torchvision.transforms import Resize
++
++            dim = (self.resized_patch_width, self.resized_patch_width)
++            batch = Resize(dim)(batch)
++
++        assert len(batch.shape) == 4
++
++        return batch
++
++    def get_PIL_patch(self, idx: int):
++        """Retrives a PIL patch using the index"""
++        from PIL import Image
++
++        return Image.fromarray(np.array(self[idx][0].movedim(0, -1) * 255, dtype="uint8"))
++
++    def __len__(self):
++        return len(self.patches)
++
++    def __getitem__(self, idx: int | slice):
++        bboxes = self.patches.bboxes[idx]
++        batch = self.get_batch(np.atleast_2d(bboxes))
++        return batch
++
+ 
+-        return batch if self.tile_resize_factor == 1 else self._torch_resize(batch)
++def _get_image_for_inference(sdata: SpatialData, image_key: str | None = None) -> DataArray | DataTree:
++    if image_key is not None:
++        return get_spatial_element(sdata.images, key=image_key)
+ 
+-    @torch.no_grad()
+-    def infer_bboxes(self, bboxes: np.ndarray) -> torch.Tensor:
+-        patches = self._torch_batch(bboxes)  # shape (B, C, Y, X)
++    cell_image = sdata.attrs.get(SopaAttrs.CELL_SEGMENTATION)
++    tissue_image = sdata.attrs.get(SopaAttrs.TISSUE_SEGMENTATION)
+ 
+-        assert len(patches.shape) == 4
+-        embedding = self.model(patches.to(self.device))
+-        assert len(embedding.shape) == 2, "The model must have the following signature: (B, C, Y, X) -> (B, C)"
++    assert cell_image is None or tissue_image is None or cell_image == tissue_image, (
++        "When different images are existing for cell and tissue segmentation, you need to provide the `image_key` argument"
++    )
+ 
+-        return embedding.cpu()  # shape (B, output_dim)
++    return get_spatial_element(sdata.images, key=cell_image or tissue_image)
+ 
+ 
+ def _get_extraction_parameters(
+diff --git a/sopa/patches/infer.py b/sopa/patches/infer.py
+index 264cd9ff..6c529cb6 100644
+--- a/sopa/patches/infer.py
++++ b/sopa/patches/infer.py
+@@ -5,11 +5,9 @@
+ from anndata import AnnData
+ from spatialdata import SpatialData
+ from spatialdata.models import TableModel
+-from xarray import DataArray, DataTree
+ 
+-from .._constants import SopaAttrs, SopaKeys
+-from ..utils import add_spatial_element, get_spatial_element
+-from . import Patches2D
++from .._constants import SopaKeys
++from ..utils import add_spatial_element
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -29,10 +27,10 @@ def compute_embeddings(
+     key_added: str | None = None,
+     **kwargs: int,
+ ) -> str:
+-    """It creates patches, runs a computer vision model on each patch, and store the embeddings of each all patches as an image. This is mostly useful for WSI images.
++    """It creates patches, runs a computer vision model on each patch, and store the embeddings of each all patches as an [`AnnData` object](https://anndata.readthedocs.io/en/stable/). This is mostly useful for WSI images.
+ 
+     !!! info
+-        The image will be saved into the `SpatialData` object with the key `"{model_name}_embeddings"` (see the `model_name` argument below), except if `key_added` is provided.
++        The `AnnData` object will be saved into the `SpatialData` object with the key `"{model_name}_embeddings"` (see the `model_name` argument below), except if `key_added` is provided.
+         The shapes of the patches will be saved with the key `"embeddings_patches"`.
+ 
+     !!! warning
+@@ -40,21 +38,21 @@ def compute_embeddings(
+ 
+     Args:
+         sdata: A `SpatialData` object
+-        model: Callable that takes as an input a tensor of size `(batch_size, channels, x, y)` and returns a vector for each tile `(batch_size, emb_dim)`, or a string with the name of one of the available models (`resnet50`, `histo_ssl`, `dinov2`, `hoptimus0`, `conch`).
+-        patch_width: Width (pixels) of the patches.
+-        patch_overlap: Width (pixels) of the overlap between the patches.
++        model: A supported model name (`resnet50`, `histo_ssl`, `dinov2`, `hoptimus0`, or `conch`), or a callable that takes as an input a tensor of size `(batch_size, channels, x, y)` and returns a vector for each tile `(batch_size, emb_dim)`.
++        patch_width: Width of the patches in pixels.
++        patch_overlap: Width of the overlap between the patches in pixels.
+         level: Image level on which the processing is performed. Either `level` or `magnification` should be provided.
+         magnification: The target magnification on which the processing is performed. If `magnification` is provided, the `level` argument will be automatically computed.
+-        image_key: Optional image key of the image, unecessary if there is only one image.
++        image_key: Optional image key of the image. By default, uses the only image (if only one) or the image used for cell or tissue segmentation.
+         batch_size: Mini-batch size used during inference.
+         device: Device used for the computer vision model.
+         data_parallel: If `True`, the model will be run in data parallel mode. If a list of GPUs is provided, the model will be run in data parallel mode on the specified GPUs.
+-        roi_key: Optional name of the shapes that needs to touch the patches. Patches that do not touch any shape will be ignored. If `None`, all patches will be used.
++        roi_key: Optional name of the shapes that needs to touch the patches. Patches that do not touch any shape will be ignored. If `None`, all patches will be used. By default, uses the tissue segmentation if available.
+         key_added: Optional name of the spatial element that will be added (storing the embeddings).
+         **kwargs: Additional keyword arguments passed to the `Patches2D` constructor.
+ 
+     Returns:
+-        The key of the spatial element that was added to the `SpatialData` object.
++        The name of the `AnnData` table that was added to the `SpatialData` object.
+     """
+     try:
+         import torch
+@@ -62,25 +60,42 @@ def compute_embeddings(
+         raise ImportError(
+             "For patch embedding, you need `torch` (and perhaps `torchvision`). Consider installing the sopa WSI extra: `pip install 'sopa[wsi]'`."
+         )
++    from . import models
++    from ._inference import TileLoader
+ 
+-    from ._inference import Inference
++    if isinstance(model, str):
++        assert model in models.available_models, (
++            f"'{model}' is not a valid model name. Valid names are: {', '.join(list(models.available_models.keys()))}"
++        )
++        model_name, model = model, models.available_models[model]()
++    else:
++        model_name = model.__class__.__name__
++
++    if device is not None:
++        model.to(device)
+ 
+-    image = _get_image_for_inference(sdata, image_key)
++    if data_parallel:
++        ids = data_parallel if isinstance(data_parallel, list) else list(range(torch.cuda.device_count()))
++        model = torch.nn.DataParallel(model, device_ids=ids)
+ 
+-    infer = Inference(image, model, patch_width, level, magnification, device, data_parallel)
+-    patches = Patches2D(sdata, infer.image, infer.patch_width, patch_overlap, roi_key=roi_key, **kwargs)
++    tile_loader = TileLoader(sdata, patch_width, image_key, level, magnification, patch_overlap, roi_key)
+ 
+-    log.info(f"Processing {len(patches)} patches extracted from level {infer.level}")
++    log.info(f"Processing {len(tile_loader)} patches extracted from level {tile_loader.level}")
+ 
+     predictions = []
+-    for i in tqdm.tqdm(range(0, len(patches), batch_size)):
+-        prediction = infer.infer_bboxes(patches.bboxes[i : i + batch_size])
+-        predictions.extend(prediction)
+-    predictions = torch.stack(predictions)
++    with torch.no_grad():
++        for i in tqdm.tqdm(range(0, len(tile_loader), batch_size)):
++            batch = tile_loader[i : i + batch_size]
++            embedding: torch.Tensor = model(batch.to(device))
++            assert len(embedding.shape) == 2, "The model must have the signature (B, C, Y, X) -> (B, C)"
++
++            predictions.append(embedding.cpu())
+ 
++    predictions = torch.cat(predictions)
+     if len(predictions.shape) == 1:
+         predictions = torch.unsqueeze(predictions, 1)
+ 
++    patches = tile_loader.patches
+     patches.add_shapes(key_added=SopaKeys.EMBEDDINGS_PATCHES)
+ 
+     gdf = sdata[SopaKeys.EMBEDDINGS_PATCHES]
+@@ -99,27 +114,13 @@ def compute_embeddings(
+         "patch_width": patch_width,
+         "patch_overlap": patch_overlap,
+         "magnification": magnification,
+-        "level": infer.level,
+-        "level_downsample": infer.level_downsample,
+-        "tile_resize_factor": infer.tile_resize_factor,
+-        "model_str": infer.model_str,
++        "level": tile_loader.level,
++        "level_downsample": tile_loader.level_downsample,
++        "tile_resize_factor": tile_loader.tile_resize_factor,
++        "model_name": model_name,
+     }
+ 
+-    key_added = key_added or f"{infer.model_str}_embeddings"
++    key_added = key_added or f"{model_name}_embeddings"
+     add_spatial_element(sdata, key_added, adata)
+ 
+     return key_added
+-
+-
+-def _get_image_for_inference(sdata: SpatialData, image_key: str | None = None) -> DataArray | DataTree:
+-    if image_key is not None:
+-        return get_spatial_element(sdata.images, key=image_key)
+-
+-    cell_image = sdata.attrs.get(SopaAttrs.CELL_SEGMENTATION)
+-    tissue_image = sdata.attrs.get(SopaAttrs.TISSUE_SEGMENTATION)
+-
+-    assert cell_image is None or tissue_image is None or cell_image == tissue_image, (
+-        "When different images are existing for cell and tissue segmentation, you need to provide the `image_key` argument"
+-    )
+-
+-    return get_spatial_element(sdata.images, key=cell_image or tissue_image)
+diff --git a/sopa/patches/models/__init__.py b/sopa/patches/models/__init__.py
+index 01f1702e..22d311a6 100644
+--- a/sopa/patches/models/__init__.py
++++ b/sopa/patches/models/__init__.py
+@@ -1,3 +1,5 @@
++import torch
++
+ from .conch import ConchFeatures
+ from .dinov2 import DINOv2Features
+ from .dummy import DummyFeatures
+@@ -14,7 +16,7 @@
+     "Resnet50Features",
+ ]
+ 
+-available_models = {
++available_models: dict[str, type[torch.nn.Module]] = {
+     "conch": ConchFeatures,
+     "dinov2": DINOv2Features,
+     "dummy": DummyFeatures,
+diff --git a/tests/test_embeddings.py b/tests/test_embeddings.py
+deleted file mode 100644
+index 6b543fa1..00000000
+--- a/tests/test_embeddings.py
++++ /dev/null
+@@ -1,46 +0,0 @@
+-import pytest
+-
+-import sopa
+-
+-
+-def test_patches_embeddings_inference_clustering():
+-    sdata = sopa.io.toy_dataset(length=200)
+-
+-    with pytest.raises(AssertionError):  # two images, and no image_key provided
+-        sopa.patches.compute_embeddings(sdata, "dummy", 50)
+-
+-    sopa.patches.compute_embeddings(sdata, "dummy", 50, image_key="he_image")
+-
+-    assert sdata["dummy_embeddings"].shape == (4, 3)
+-
+-    sopa.patches.compute_embeddings(sdata, "dummy", 25, level=-1, image_key="he_image")
+-
+-    assert sdata["dummy_embeddings"].shape == (1, 3)
+-
+-    sopa.patches.compute_embeddings(sdata, "dummy", 13, patch_overlap=3, level=-1, image_key="he_image")
+-
+-    assert sdata["dummy_embeddings"].shape == (9, 3)
+-
+-    sdata["he_image"].attrs["backend"] = "tiffslide"
+-    sdata["he_image"].attrs["metadata"] = {
+-        "level_downsamples": [1, 2, 4],
+-        "properties": {"tiffslide.objective-power": 50},
+-    }
+-
+-    sopa.patches.compute_embeddings(sdata, "dummy", 10, magnification=10, image_key="he_image")
+-    assert sdata["dummy_embeddings"].shape == (9, 3)
+-
+-    sopa.patches.compute_embeddings(sdata, "dummy", 11, magnification=10, image_key="he_image")
+-    assert sdata["dummy_embeddings"].shape == (4, 3)
+-
+-    sopa.patches.compute_embeddings(sdata, "dummy", 50, magnification=100, image_key="he_image")
+-    assert sdata["dummy_embeddings"].shape == (16, 3)
+-
+-    sopa.patches.cluster_embeddings(sdata, "dummy_embeddings")
+-
+-    assert "cluster" in sdata["dummy_embeddings"].obs
+-
+-    # Testing the xarray slicing for the read region
+-    sopa.settings.native_read_region = False
+-    sopa.patches.compute_embeddings(sdata, "dummy", 10, magnification=10, image_key="he_image")
+-    assert sdata["dummy_embeddings"].shape == (9, 3)
+diff --git a/tests/test_wsi_embeddings.py b/tests/test_wsi_embeddings.py
+index 6aa017c5..7bab2324 100644
+--- a/tests/test_wsi_embeddings.py
++++ b/tests/test_wsi_embeddings.py
+@@ -5,6 +5,50 @@
+ import sopa
+ 
+ 
++@pytest.mark.wsi
++def test_patches_embeddings_inference_clustering():
++    sdata = sopa.io.toy_dataset(length=200)
++
++    with pytest.raises(AssertionError):  # two images, and no image_key provided
++        sopa.patches.compute_embeddings(sdata, "dummy", 50)
++
++    sopa.patches.compute_embeddings(sdata, "dummy", 50, image_key="he_image")
++
++    assert sdata["dummy_embeddings"].shape == (4, 3)
++
++    sopa.patches.compute_embeddings(sdata, "dummy", 25, level=-1, image_key="he_image")
++
++    assert sdata["dummy_embeddings"].shape == (1, 3)
++
++    sopa.patches.compute_embeddings(sdata, "dummy", 13, patch_overlap=3, level=-1, image_key="he_image")
++
++    assert sdata["dummy_embeddings"].shape == (9, 3)
++
++    sdata["he_image"].attrs["backend"] = "tiffslide"
++    sdata["he_image"].attrs["metadata"] = {
++        "level_downsamples": [1, 2, 4],
++        "properties": {"tiffslide.objective-power": 50},
++    }
++
++    sopa.patches.compute_embeddings(sdata, "dummy", 10, magnification=10, image_key="he_image")
++    assert sdata["dummy_embeddings"].shape == (9, 3)
++
++    sopa.patches.compute_embeddings(sdata, "dummy", 11, magnification=10, image_key="he_image")
++    assert sdata["dummy_embeddings"].shape == (4, 3)
++
++    sopa.patches.compute_embeddings(sdata, "dummy", 50, magnification=100, image_key="he_image")
++    assert sdata["dummy_embeddings"].shape == (16, 3)
++
++    sopa.patches.cluster_embeddings(sdata, "dummy_embeddings")
++
++    assert "cluster" in sdata["dummy_embeddings"].obs
++
++    # Testing the xarray slicing for the read region
++    sopa.settings.native_read_region = False
++    sopa.patches.compute_embeddings(sdata, "dummy", 10, magnification=10, image_key="he_image")
++    assert sdata["dummy_embeddings"].shape == (9, 3)
++
++
+ @pytest.mark.wsi
+ @pytest.mark.parametrize("model", ["resnet50", "dinov2"])
+ def test_deterministic_embedding(model: str):
+@@ -25,17 +69,14 @@ def test_deterministic_embedding(model: str):
+ 
+ @pytest.mark.wsi
+ def test_resize_patches():
+-    from sopa.patches._inference import Inference
+-    from sopa.patches.infer import Patches2D, _get_image_for_inference
++    from sopa.patches import TileLoader
+ 
+     sdata = sopa.io.wsi("tests/CMU-1-Small-Region.svs")
+-    image = _get_image_for_inference(sdata)
+ 
+     patch_size = 253
+     n_bboxes = 2
+ 
+-    infer = Inference(image, "dummy", patch_size, 0, 15, "cpu", False)
+-    patches = Patches2D(sdata, infer.image, infer.patch_width, 0)
++    tile_loader = TileLoader(sdata, patch_size, magnification=15)
+ 
+-    batch = infer._torch_batch(patches.bboxes[:n_bboxes])
++    batch = tile_loader[:n_bboxes]
+     assert batch.shape == (n_bboxes, 3, patch_size, patch_size)

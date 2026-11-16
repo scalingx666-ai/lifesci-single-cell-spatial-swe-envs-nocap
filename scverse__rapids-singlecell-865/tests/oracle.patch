@@ -1,0 +1,1892 @@
+diff --git a/docs/release-notes/0.19.0.md b/docs/release-notes/0.19.0.md
+index bf6a8e64..835d21ef 100644
+--- a/docs/release-notes/0.19.0.md
++++ b/docs/release-notes/0.19.0.md
+@@ -10,6 +10,7 @@
+ ```{rubric} Performance
+ ```
+ * Speed up {func}`~rapids_singlecell.pp.harmony_integrate` and lower its peak GPU memory on large datasets, also for float64 or Fortran-ordered NumPy input; results stay bitwise reproducible, but seeded results differ from 0.18.1 {pr}`829` {smaller}`S Dicks`
++* Speed up {func}`~rapids_singlecell.pp.harmony_integrate` with several batch keys {pr}`865` {smaller}`S Dicks`
+ * {func}`~rapids_singlecell.pp.harmony_integrate` with several batch keys that have thousands of levels in total runs slower than in 0.18.1 {pr}`829` {smaller}`S Dicks`
+ * Speed up {class}`~rapids_singlecell.ptg.GuideAssignment` with CUDA kernels that read CSR, CSC and dense counts in place; {meth}`~rapids_singlecell.ptg.GuideAssignment.assign_to_max_guide` no longer densifies sparse input {pr}`852` {smaller}`L Heumos & S Dicks`
+ 
+diff --git a/src/rapids_singlecell/_cuda/harmony/comm.cuh b/src/rapids_singlecell/_cuda/harmony/comm.cuh
+index 90001272..1c3ea082 100644
+--- a/src/rapids_singlecell/_cuda/harmony/comm.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/comm.cuh
+@@ -187,8 +187,10 @@ struct Comm {
+         barrier();
+         return slot;
+     }
+-    // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU,
+-    // in order on `stream` but copied on the rank's own stream: on a legacy
++    // n values at src, in rank `from`'s send slot, to dst on rank `to`'s GPU
++    // (a slot, or memory a kernel on `stream` reads before it is freed: a peer
++    // copy in flight into freed memory faults both GPUs, see exchange), in
++    // order on `stream` but copied on the rank's own stream: on a legacy
+     // default stream, a peer copy would also wait for the other GPU's work.
+     void pull(int to, int from, long long* dst, const long long* src, size_t n,
+               cudaStream_t stream) {
+@@ -230,6 +232,15 @@ __global__ void sum_pieces_kernel(const long long* __restrict__ recv,
+     }
+ }
+ 
++// data[i] = recv[i] outside this rank's own piece [first, first + m).
++__global__ void land_pieces_kernel(const long long* __restrict__ recv,
++                                   long long* data, size_t n, size_t first,
++                                   size_t m) {
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
++         i += (size_t)blockDim.x * gridDim.x)
++        if (i < first || i >= first + m) data[i] = recv[i];
++}
++
+ // One exchange of n <= capacity values (see allreduce).
+ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
+                      cudaStream_t stream) {
+@@ -255,7 +266,10 @@ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
+     }
+     if (pieces) {
+         // The summed piece replaces this rank's own in its send slot (the
+-        // others read only their pieces of it), then the others' are copied.
++        // others read only their pieces of it); the others' land in the
++        // receive slot and a kernel moves them into data, so data may be
++        // freed in stream order (cudaFree waits for kernels, not for a peer
++        // copy in flight).
+         Comm::check(cudaMemcpyAsync(me.send[slot] + first, data + first,
+                                     m * sizeof(long long), cudaMemcpyDefault,
+                                     stream));
+@@ -265,17 +279,21 @@ inline void exchange(Comm* comm, int rank, long long* data, size_t n,
+             if (r == rank) continue;
+             Comm::check(
+                 cudaStreamWaitEvent(stream, comm->ranks[r].reduced[slot]));
+-            comm->pull(rank, r, data + lo(r), comm->ranks[r].send[slot] + lo(r),
+-                       hi(r) - lo(r), stream);
++            comm->pull(rank, r, me.recv[slot] + lo(r),
++                       comm->ranks[r].send[slot] + lo(r), hi(r) - lo(r),
++                       stream);
+         }
++        land_pieces_kernel<<<(int)std::min<size_t>((n + 255) / 256, 1024), 256,
++                             0, stream>>>(me.recv[slot], data, n, first, m);
++        Comm::check(cudaGetLastError());
+     }
+     Comm::check(cudaEventRecord(me.read[slot], stream));
+ }
+ 
+ // data (n values on rank's GPU, stream-ordered) = its sum over the GPUs, in
+ // exchanges of at most `capacity` values. Every rank makes the same sequence
+-// of calls; without comm this is a no-op. Summed pieces land in data by peer
+-// copy: read it with a kernel, or synchronize before freeing it.
++// of calls; without comm this is a no-op. data may be freed in stream order
++// afterwards.
+ inline void allreduce(Comm* comm, int rank, long long* data, size_t n,
+                       cudaStream_t stream) {
+     if (!comm || comm->ranks.size() < 2) return;
+diff --git a/src/rapids_singlecell/_cuda/harmony/correction/apply_rows.cuh b/src/rapids_singlecell/_cuda/harmony/correction/apply_rows.cuh
+index 985d14e9..252d3fbe 100644
+--- a/src/rapids_singlecell/_cuda/harmony/correction/apply_rows.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/correction/apply_rows.cuh
+@@ -1,17 +1,19 @@
+ #pragma once
+ 
+ // Fused Harmony correction apply: for every cell i of a segment of group g,
+-//   z_d = X_id - sum_k R_ik W[g * w_group_stride + k * w_k_stride + d]
+-// (one fma chain over k = 0, 1, ..., K - 1 from 0), then optionally
++//   z_d = X_id - sum_k R_ik W[g][k][d]
++// (W[g]: the segment's row of the table, or the sum of its rows of several
++// tables; one fma chain over k = 0, 1, ..., K - 1 from 0), then optionally
+ // z *= inv_norm_scale(sum_d z_d^2) (lane l: fma chain over z_l^2,
+ // z_{l+32}^2, ...; warp_sum; the same order for D <= 256 in
+ // registers and D > 256 in a second pass). Each element depends only on its row
+ // and W[g]: results do not depend on how rows are split into segments, shards
+ // or CTAs, nor on the launch configuration. CTAs take runs of row tiles of one
+ // segment; R tiles are staged in shared memory by cp.async, W[g] stays there
+-// (in k chunks when it does not fit; partial sums then wait in Z). Callers
+-// chunk clusters the same way: a call without `finish` leaves the sums in Z,
+-// and one with `resume` continues them (the same bits for the same W).
++// (summed as it is staged; in k chunks when it does not fit, partial sums then
++// wait in Z). Callers chunk clusters the same way: a call without `finish`
++// leaves the sums in Z, and one with `resume` continues them (the same bits
++// for the same W).
+ 
+ #include <cuda_bf16.h>
+ #include <cuda_pipeline.h>
+@@ -26,6 +28,20 @@
+ #include "../storage.cuh"
+ 
+ namespace harmony_apply {
++
++constexpr int kMaxTables = 8;
++constexpr size_t kStaticSmem = kMaxTables * sizeof(int);  // apply_rows_kernel
++
++// The coefficients W[g] of a segment s: the sum over its tables t < n of
++// w[t][seg_group[t][s]] (K x D each, common strides), added in that order as
++// they are staged.
++template <typename T>
++struct Tables {
++    const T* w[kMaxTables];
++    const int* seg_group[kMaxTables];
++    int n;
++};
++
+ namespace detail {
+ 
+ constexpr int NT = 256;  // 8 warps; warp w owns rows w * RM .. w * RM + RM - 1
+@@ -67,12 +83,10 @@ __device__ __forceinline__ void stage(int v, unsigned char* dst, int dn,
+ template <typename T, typename RT, int SLOTS>
+ __global__ void __launch_bounds__(NT)
+     apply_rows_kernel(const T* __restrict__ X, const RT* __restrict__ R,
+-                      int ldr, const T* __restrict__ W, long long wks,
+-                      long long wgs, int D, int K,
+-                      const int* __restrict__ seg_start,
+-                      const int* __restrict__ seg_group, bool normalize,
+-                      bool resume, bool finish, T* __restrict__ Z, int kc,
+-                      int v) {
++                      int ldr, Tables<T> tb, long long wks, long long wgs,
++                      int D, int K, const int* __restrict__ seg_start,
++                      bool normalize, bool resume, bool finish,
++                      T* __restrict__ Z, int kc, int v) {
+     constexpr int RM = SLOTS < 8 ? 4 : 2, TM = 8 * RM, DW = 32 * SLOTS;
+     constexpr bool CONV = !std::is_same_v<T, RT>;
+     static_assert(!CONV || std::is_same_v<T, float> &&
+@@ -85,7 +99,16 @@ __global__ void __launch_bounds__(NT)
+     if (t0 == t1) return;
+     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+     const int K4 = (K + 3) & ~3, WS = min(D, DW);
+-    const T* wg = W + seg_group[seg] * wgs;
++    // The segment's group in every table: thread 0 resolves them with constant
++    // indices into the parameter (a runtime index would copy it to local
++    // memory) and the barrier below publishes them; groups rather than
++    // pointers keep the loads in their address spaces.
++    __shared__ int sgrp[kMaxTables];
++    if (threadIdx.x == 0) {
++#pragma unroll
++        for (int t = 0; t < kMaxTables; ++t)
++            if (t < tb.n) sgrp[t] = tb.seg_group[t][seg];
++    }
+     // shared: 2 stages of R tiles (TM x kc as RT) | CONV: the tile as T | W
+     // chunk, element (k, j) at ((k / 4) * WS + j) * 4 + k % 4, + slack read by
+     // lanes past WS (results unused)
+@@ -102,11 +125,19 @@ __global__ void __launch_bounds__(NT)
+             for (int i = threadIdx.x; i < kn * wn; i += NT) {
+                 int k = i / wn, d = i - k * wn;
+                 T* p = ws + ((k >> 2) * WS + d) * 4 + (k & 3);
+-                if (k0 + k < K)
+-                    __pipeline_memcpy_async(p, wg + (k0 + k) * wks + d0 + d,
+-                                            sizeof(T));
+-                else  // R pad +0: fma(+0, -0, acc) == acc, also for acc = -0
++                const long long e = (k0 + k) * wks + d0 + d;
++                if (k0 + k >= K)  // R pad +0: fma(+0, -0, acc) == acc, -0 too
+                     *p = T(-0.0);
++                else if (tb.n == 1)
++                    __pipeline_memcpy_async(
++                        p, tb.w[0] + (size_t)sgrp[0] * wgs + e, sizeof(T));
++                else {
++                    T sum = tb.w[0][(size_t)sgrp[0] * wgs + e];
++#pragma unroll
++                    for (int t = 1; t < kMaxTables; ++t)
++                        if (t < tb.n) sum += tb.w[t][(size_t)sgrp[t] * wgs + e];
++                    *p = sum;
++                }
+             }
+             const int dn = kn * sizeof(RT), n = min(kn, K - k0) * sizeof(RT);
+             auto load = [&](int t) {
+@@ -211,12 +242,14 @@ auto kernel_for(int slots) {
+ // of at most kc clusters (rounded up to 4) and at most `budget` bytes of
+ // shared memory; results depend on none of them.
+ template <typename T, typename RT>
+-cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
+-                   long long wgs, int D, int K, const int* seg_start,
+-                   const int* seg_group, int n_seg, bool normalize, bool resume,
++cudaError_t launch(const T* X, const RT* R, int ldr, const Tables<T>& tb,
++                   long long wks, long long wgs, int D, int K,
++                   const int* seg_start, int n_seg, bool normalize, bool resume,
+                    bool finish, T* Z, int slots, int kc, size_t budget,
+                    cudaStream_t s) {
+-    // shared T per cluster: 2 R stages (or 2 bfloat16 + widened), W column
++    // shared T per cluster: 2 R stages (or 2 bfloat16 + widened), W column;
++    // the kernel's static rows come out of the budget
++    budget -= kStaticSmem;
+     const int k4 = (K + 3) & ~3, dw = 32 * slots, ws = std::min(D, dw);
+     const int per = 16 * (slots < 8 ? 4 : 2) + ws, slack = (dw - ws) * 4;
+     kc = std::min(
+@@ -225,7 +258,7 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
+     if (n_seg <= 0) return cudaSuccess;
+     const size_t smem = ((size_t)per * kc + slack) * sizeof(T);
+     auto kernel = kernel_for<T, RT>(slots);
+-    if (smem > 48 * 1024 &&
++    if (smem + kStaticSmem > 48 * 1024 &&
+         cudaFuncSetAttribute(
+             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem))
+         return cudaGetLastError();
+@@ -234,9 +267,11 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
+         reinterpret_cast<size_t>(R) | 16 | ((size_t)ldr | kc | K) * sizeof(RT);
+     // at most 2^31 - 1 CTAs per launch
+     for (int s0 = 0, step = INT_MAX / CPS; s0 < n_seg; s0 += step) {
++        Tables<T> part = tb;
++        for (int t = 0; t < tb.n; ++t) part.seg_group[t] += s0;
+         kernel<<<std::min(n_seg - s0, step) * CPS, NT, smem, s>>>(
+-            X, R, ldr, W, wks, wgs, D, K, seg_start + s0, seg_group + s0,
+-            normalize, resume, finish, Z, kc, (int)(a & (~a + 1)));
++            X, R, ldr, part, wks, wgs, D, K, seg_start + s0, normalize, resume,
++            finish, Z, kc, (int)(a & (~a + 1)));
+         if (cudaError_t e = cudaGetLastError()) return e;
+     }
+     return cudaSuccess;
+@@ -244,19 +279,21 @@ cudaError_t launch(const T* X, const RT* R, int ldr, const T* W, long long wks,
+ 
+ }  // namespace detail
+ 
+-// Z (rows x D) for segments [seg_start[s], seg_start[s + 1]) (local rows) of
+-// groups seg_group[s]; see the top of this file. R(i, k) = R[i * ldr + k]
+-// (T, or bfloat16 with T = float; ldr >= K); W[g] is K x D with element
+-// strides w_k_stride and w_group_stride. Z must not alias X, R or W. resume:
+-// Z holds the sums of earlier clusters; finish: Z = X - sums (normalized on
+-// request), else Z = sums and X is not read.
++// Z (rows x D) for segments [seg_start[s], seg_start[s + 1]) (local rows) with
++// the coefficients W (Tables): the sum of its tables' rows for the segment, K x
++// D each with element strides w_k_stride and w_group_stride; see the top of
++// this file. R(i, k) = R[i * ldr + k] (T, or bfloat16 with T = float; ldr >=
++// K). Z must not alias X, R or W. resume: Z holds the sums of earlier
++// clusters; finish: Z = X - sums (normalized on request), else Z = sums and X
++// is not read.
+ template <typename T, typename RT>
+-cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
++cudaError_t apply_rows(const T* X, const RT* R, int ldr, const Tables<T>& W,
+                        long long w_k_stride, long long w_group_stride, int D,
+-                       int K, const int* seg_start, const int* seg_group,
+-                       int n_seg, bool normalize, T* Z, cudaStream_t s,
+-                       bool resume = false, bool finish = true) {
+-    if (D <= 0 || K <= 0 || ldr < K) return cudaErrorInvalidValue;
++                       int K, const int* seg_start, int n_seg, bool normalize,
++                       T* Z, cudaStream_t s, bool resume = false,
++                       bool finish = true) {
++    if (D <= 0 || K <= 0 || ldr < K || W.n < 1 || W.n > kMaxTables)
++        return cudaErrorInvalidValue;
+     if (reinterpret_cast<size_t>(R) % sizeof(RT))
+         return cudaErrorMisalignedAddress;
+     int smem_max;
+@@ -267,9 +304,20 @@ cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
+     // W resident if it fits, else in the largest chunks.
+     const int slots = D <= 32 ? 1 : D <= 64 ? 2 : D <= 128 ? 4 : 8;
+     return detail::launch(X, R, ldr, W, w_k_stride, w_group_stride, D, K,
+-                          seg_start, seg_group, n_seg, normalize, resume,
+-                          finish, Z, slots, K,
+-                          std::min<size_t>(96 * 1024, smem_max), s);
++                          seg_start, n_seg, normalize, resume, finish, Z, slots,
++                          K, std::min<size_t>(96 * 1024, smem_max), s);
++}
++
++// One table: W[g] = W + g * w_group_stride, the segments' groups seg_group[s].
++template <typename T, typename RT>
++cudaError_t apply_rows(const T* X, const RT* R, int ldr, const T* W,
++                       long long w_k_stride, long long w_group_stride, int D,
++                       int K, const int* seg_start, const int* seg_group,
++                       int n_seg, bool normalize, T* Z, cudaStream_t s,
++                       bool resume = false, bool finish = true) {
++    return apply_rows(X, R, ldr, Tables<T>{{W}, {seg_group}, 1}, w_k_stride,
++                      w_group_stride, D, K, seg_start, n_seg, normalize, Z, s,
++                      resume, finish);
+ }
+ 
+ }  // namespace harmony_apply
+diff --git a/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu b/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu
+index 883e2018..9bec1753 100644
+--- a/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu
++++ b/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu
+@@ -1,8 +1,10 @@
+ #include <algorithm>
++#include <functional>
+ #include <cuda_runtime.h>
+ #include <cusolverDn.h>
+ #include <nanobind/stl/optional.h>
+ #include <nanobind/stl/pair.h>
++#include <nanobind/stl/vector.h>
+ #include <optional>
+ #include <stdexcept>
+ #include <utility>
+@@ -52,15 +54,14 @@ constexpr int RHS_LIMBS = sizeof(T) == 4 ? 1 : 2;
+ // all GPUs of comm) of R_ik X_id (R row stride ldr), exact over the segments
+ // (segment_gemm.cuh) in acc (n_groups x RHS_LIMBS x n_clusters x n_pcs);
+ // bounds (n_groups x n_pcs): exponents of n_g max|X_gd| (segment_gemm.cuh).
+-// Only GPU `to` (-1: every one) receives the sums; without out, only this
+-// GPU's part of the exchange.
++// Every GPU of comm receives the sums.
+ template <typename T, typename RT, typename OT>
+ static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
+                          int n_clusters, const int* seg_start,
+                          const int* seg_group, int n_seg, int n_groups,
+                          const short* bounds, long long* acc, OT* out,
+                          long long group_stride, int ld_out,
+-                         harmony_comm::Comm* comm, int rank, int to,
++                         harmony_comm::Comm* comm, int rank,
+                          cudaStream_t stream) {
+     const int limbs = RHS_LIMBS<T>;
+     cuda_check(cudaMemsetAsync(acc, 0,
+@@ -72,67 +73,18 @@ static void segment_sums(const T* X, const RT* R, int ldr, int n_pcs,
+                                              seg_start, seg_group, n_seg,
+                                              bounds, acc, limbs, stream),
+                "segment sums");
+-    harmony_comm::allgather_groups(
+-        comm, rank, acc, (size_t)limbs * n_clusters * n_pcs, stream, to);
+-    if (out)
+-        cuda_check(harmony_segments::finalize_rtz(
+-                       acc, n_groups, n_pcs, n_clusters, limbs, bounds, out,
+-                       group_stride, ld_out, stream),
+-                   "segment sums");
+-}
+-
+-// The regression systems (double) of a chunk's n_clusters clusters from their
+-// joint counts joint_O (J x n_clusters) and joint right-hand sides R_j^T X_j
+-// (J x n_clusters x n_pcs; cells sorted by joint category): the marginal and
+-// intercept rows are sums of those, the Gram matrices sums of the counts.
+-template <typename T>
+-static void prepare_multi_impl(const T* joint_O, const double* joint_rhs,
+-                               const int* joint_cats,
+-                               const int* marginal_joint_offsets,
+-                               const int* marginal_joint_indices,
+-                               Penalties<T> lambda, int n_pcs, int n_clusters,
+-                               int n_batches, int n_first, int n_covariates,
+-                               int n_joint_categories, double* gram,
+-                               double* rhs, cudaStream_t stream) {
+-    int nb1 = n_batches + 1;
+-    cuda_check(
+-        cudaMemsetAsync(
+-            gram, 0, (size_t)n_clusters * nb1 * nb1 * sizeof(double), stream),
+-        "gram memset");
+-    initialize_multi_gram_kernel<T><<<n_clusters, MAX_BLOCK_DIM, 0, stream>>>(
+-        lambda, joint_O, marginal_joint_offsets, marginal_joint_indices, gram,
+-        n_batches, n_clusters, n_joint_categories);
+-    CUDA_CHECK_LAST_ERROR(initialize_multi_gram_kernel);
+-    dim3 grid(strided_grid((long long)n_batches * n_clusters, BLOCK_DIM_1D));
+-    if (n_covariates == 2)
+-        add_joint_cross_kernel<T, 2><<<grid, BLOCK_DIM_1D, 0, stream>>>(
+-            joint_O, joint_cats, marginal_joint_offsets, marginal_joint_indices,
+-            lambda, gram, n_covariates, n_batches, n_clusters);
+-    else if (n_covariates == 3)
+-        add_joint_cross_kernel<T, 3><<<grid, BLOCK_DIM_1D, 0, stream>>>(
+-            joint_O, joint_cats, marginal_joint_offsets, marginal_joint_indices,
+-            lambda, gram, n_covariates, n_batches, n_clusters);
+-    else
+-        add_joint_cross_kernel<T, 0><<<grid, BLOCK_DIM_1D, 0, stream>>>(
+-            joint_O, joint_cats, marginal_joint_offsets, marginal_joint_indices,
+-            lambda, gram, n_covariates, n_batches, n_clusters);
+-    CUDA_CHECK_LAST_ERROR(add_joint_cross_kernel);
+-    marginal_from_joint_rhs_kernel<<<
+-        strided_grid((long long)n_clusters * n_batches * n_pcs, BLOCK_DIM_1D),
+-        BLOCK_DIM_1D, 0, stream>>>(joint_rhs, marginal_joint_offsets,
+-                                   marginal_joint_indices, rhs, n_pcs,
+-                                   n_clusters, n_batches);
+-    CUDA_CHECK_LAST_ERROR(marginal_from_joint_rhs_kernel);
+-    intercept_and_mask_kernel<T>
+-        <<<strided_grid((long long)n_clusters * n_pcs, BLOCK_DIM_1D),
+-           BLOCK_DIM_1D, 0, stream>>>(lambda, rhs, n_pcs, n_clusters, n_batches,
+-                                      n_first);
+-    CUDA_CHECK_LAST_ERROR(intercept_and_mask_kernel);
++    harmony_comm::allgather_groups(comm, rank, acc,
++                                   (size_t)limbs * n_clusters * n_pcs, stream);
++    cuda_check(harmony_segments::finalize_rtz(acc, n_groups, n_pcs, n_clusters,
++                                              limbs, bounds, out, group_stride,
++                                              ld_out, stream),
++               "segment sums");
+ }
+ 
+ // A chunk's k systems of n unknowns solve faster batched than one at a time
+ // (blocked factorization) unless they are few and large, n > 1000 k: measured
+-// on an RTX PRO 6000 Blackwell for n = 64 .. 6000, k = 1 .. 100, 20 .. 100 PCs.
++// on an RTX PRO 6000 Blackwell for n = 64 .. 6000, k = 1 .. 100, 20 .. 100 PCs
++// (float64; the float32 factorization below keeps the rule).
+ // The two give different bits, and batched ones also depend on k (cuBLAS
+ // picks its batched trsm by the batch size), so this rule and the chunk
+ // budget (_multi_correction_cluster_chunk_size) set the results: changing
+@@ -172,6 +124,48 @@ __global__ void restore_failed_kernel(double* gram, const double* diag,
+     }
+ }
+ 
++// The systems equilibrated for float32: D_i = 1/sqrt(diag gram_i) (into D)
++// and As_i = D_i gram_i D_i.
++__global__ void equilibrate_kernel(const double* gram, int k, int n, double* D,
++                                   float* As) {
++    long long total = (long long)k * n * n;
++    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++         e < total; e += (long long)gridDim.x * blockDim.x) {
++        long long i = e / ((long long)n * n), rem = e % ((long long)n * n);
++        int r = (int)(rem / n), c = (int)(rem % n);
++        const double* g = gram + i * (size_t)n * n;
++        double dr = rsqrt(g[(size_t)r * n + r]);
++        if (c == r) D[i * n + r] = dr;
++        As[e] =
++            (float)(g[(size_t)r * n + c] * dr * rsqrt(g[(size_t)c * n + c]));
++    }
++}
++
++// out (+)= D in, row by row (k x n x p): right-hand sides and residuals to the
++// equilibrated systems' scale (float32; a value beyond float32 sets *bad),
++// solutions and corrections back to the systems' scale (float64).
++template <typename In, typename Out>
++__global__ void scale_rows_kernel(const In* in, const double* D, int k, int n,
++                                  int p, bool add, Out* out, int* bad) {
++    long long total = (long long)k * n * p;
++    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++         e < total; e += (long long)gridDim.x * blockDim.x) {
++        double v = D[e / p] * (double)in[e];
++        if (add) v += out[e];
++        out[e] = (Out)v;
++        if (sizeof(Out) == 4 && !isfinite((float)v)) *bad = 1;
++    }
++}
++
++__global__ void float_pointers_kernel(float* As, float* ys, int k,
++                                      size_t gram_stride, size_t rhs_stride,
++                                      float** ptrs) {
++    int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= k) return;
++    ptrs[i] = As + i * gram_stride;
++    ptrs[k + i] = ys + i * rhs_stride;
++}
++
+ // x = cupy.linalg.lstsq(G, b)[0], the minimum-norm solution by SVD, for a
+ // G (n x n) whose Cholesky factorization failed; b, x: n x p, C-ordered, on
+ // the current device and CuPy's current stream (the caller's).
+@@ -194,17 +188,18 @@ static void least_squares(const double* G, const double* b, double* x, int n,
+ }
+ 
+ // Solves the k systems gram_i x_i = rhs_i (n x n, n x p; C-ordered) into x by
+-// Cholesky factors of gram_i (a symmetric C-ordered matrix is its own
++// float64 Cholesky factors of gram_i (a symmetric C-ordered matrix is its own
+ // column-major form), by least squares where gram_i is singular. Batched,
+ // gram_i is factored in place (gram is overwritten) and a C-ordered x_i is
+ // the column-major x_i^T: two right-side triangular solves give
+ // rhs_i^T inv(L_i L_i^T) = x_i^T in place. One at a time, a copy of gram_i is
+ // factored and a column-major copy of rhs_i solved (faster than right-side
+ // solves at that size). Returns how many needed least squares.
+-static int solve_systems(double* gram, const double* rhs, double* x, int k,
+-                         int n, int p, bool one_at_a_time, cudaStream_t stream,
+-                         cublasHandle_t blas, cusolverDnHandle_t solver,
+-                         harmony_comm::Comm* comm = nullptr) {
++static int solve_systems_double(double* gram, const double* rhs, double* x,
++                                int k, int n, int p, bool one_at_a_time,
++                                cudaStream_t stream, cublasHandle_t blas,
++                                cusolverDnHandle_t solver,
++                                harmony_comm::Comm* comm) {
+     if (k == 0) return 0;
+     const double one = 1.0, zero = 0.0;
+     const auto lower = CUBLAS_FILL_MODE_LOWER;
+@@ -283,14 +278,167 @@ static int solve_systems(double* gram, const double* rhs, double* x, int k,
+     return n_least_squares;
+ }
+ 
+-// joint_O (J x k) = the clustering's counts of R's columns (row stride ldr)
++// Solves the k systems in float32 after equilibration (D_i gram_i D_i has a
++// unit diagonal and a condition number bounded by the ridge's share of it
++// over the design's blocks, see _refinement_steps) and refines the solution
++// `refine` times with float64 residuals: each step gains a factor of that
++// condition number times 2^-24, so the caller picks the count from its bound,
++// at a fraction of a float64 factorization's cost on GPUs with slow float64.
++// refine < 0, a system whose float32 factorization fails (near-singular) or
++// a value beyond float32 take the float64 path for the chunk
++// (solve_systems_double; least squares for singular systems). Returns how
++// many systems needed least squares; *fell_back: that the chunk took the
++// float64 path.
++static int solve_systems(double* gram, const double* rhs, double* x, int k,
++                         int n, int p, bool one_at_a_time, int refine,
++                         cudaStream_t stream, cublasHandle_t blas,
++                         cusolverDnHandle_t solver,
++                         harmony_comm::Comm* comm = nullptr,
++                         bool* fell_back = nullptr) {
++    if (fell_back) *fell_back = refine < 0;
++    if (k == 0) return 0;
++    if (refine < 0)
++        return solve_systems_double(gram, rhs, x, k, n, p, one_at_a_time,
++                                    stream, blas, solver, comm);
++    const float onef = 1.0f, zerof = 0.0f;
++    const double one = 1.0, minus_one = -1.0;
++    const auto lower = CUBLAS_FILL_MODE_LOWER;
++    const size_t gram_stride = (size_t)n * n, rhs_stride = (size_t)n * p;
++    cublas_check_status(cublasSetStream(blas, stream), "cublasSetStream");
++    cusolver_check(cusolverDnSetStream(solver, stream), "cusolverDnSetStream");
++    // Plain float32 for the float32 solves (CuPy may have set TF32 on the
++    // handle), and the residual GEMM from an aligned copy of x, so one GPU and
++    // several (x at a rank's offset) get the same cuBLAS kernels.
++    struct MathMode {
++        cublasHandle_t h;
++        cublasMath_t m;
++        ~MathMode() {
++            cublasSetMathMode(h, m);
++        }
++    } saved{blas, CUBLAS_DEFAULT_MATH};
++    cublas_check_status(cublasGetMathMode(blas, &saved.m), "cublasGetMathMode");
++    cublas_check_status(cublasSetMathMode(blas, CUBLAS_DEFAULT_MATH),
++                        "cublasSetMathMode");
++    std::vector<int> failed(k + 1);  // info of the k systems, then `bad`
++    {
++        RmmScratchPool pool;
++        float *As, *ys, *work = nullptr, *Bt = nullptr;
++        float** ptrs = nullptr;
++        double *D, *res, *xs;
++        int *info, *solve_info = nullptr, lwork = 0;
++        if (one_at_a_time) {
++            cusolver_check(cusolverDnSpotrf_bufferSize(solver, lower, n,
++                                                       nullptr, n, &lwork),
++                           "cusolverDnSpotrf_bufferSize");
++            pool.alloc_all(As, k * gram_stride, ys, k * rhs_stride, D,
++                           (size_t)k * n, res, k * rhs_stride, xs,
++                           k * rhs_stride, info, (size_t)k + 1, work, lwork, Bt,
++                           rhs_stride, solve_info, 1);
++        } else {
++            pool.alloc_all(As, k * gram_stride, ys, k * rhs_stride, D,
++                           (size_t)k * n, res, k * rhs_stride, xs,
++                           k * rhs_stride, info, (size_t)k + 1, ptrs,
++                           2 * (size_t)k);
++            float_pointers_kernel<<<(k + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D,
++                                    BLOCK_DIM_1D, 0, stream>>>(
++                As, ys, k, gram_stride, rhs_stride, ptrs);
++            CUDA_CHECK_LAST_ERROR(float_pointers_kernel);
++        }
++        int* bad = info + k;
++        cuda_check(cudaMemsetAsync(info, 0, (k + 1) * sizeof(int), stream),
++                   "solve info memset");
++        equilibrate_kernel<<<strided_grid((long long)k * gram_stride,
++                                          BLOCK_DIM_1D),
++                             BLOCK_DIM_1D, 0, stream>>>(gram, k, n, D, As);
++        CUDA_CHECK_LAST_ERROR(equilibrate_kernel);
++        auto scale = [&](auto* in, bool add, auto* out) {
++            scale_rows_kernel<<<strided_grid((long long)k * rhs_stride,
++                                             BLOCK_DIM_1D),
++                                BLOCK_DIM_1D, 0, stream>>>(in, D, k, n, p, add,
++                                                           out, bad);
++            CUDA_CHECK_LAST_ERROR(scale_rows_kernel);
++        };
++        // ys = As^-1 ys in place, by the factors of As (factored on the first
++        // call).
++        auto solve = [&](bool factor) {
++            if (one_at_a_time) {
++                for (int i = 0; i < k; ++i) {
++                    float *A_i = As + i * gram_stride,
++                          *y_i = ys + i * rhs_stride;
++                    if (factor)
++                        cusolver_check(
++                            cusolverDnSpotrf(solver, lower, n, A_i, n, work,
++                                             lwork, info + i),
++                            "cusolverDnSpotrf");
++                    cublas_check_status(
++                        cublasSgeam(blas, CUBLAS_OP_T, CUBLAS_OP_N, n, p, &onef,
++                                    y_i, p, &zerof, Bt, n, Bt, n),
++                        "cublasSgeam");
++                    cusolver_check(cusolverDnSpotrs(solver, lower, n, p, A_i, n,
++                                                    Bt, n, solve_info),
++                                   "cusolverDnSpotrs");
++                    cublas_check_status(
++                        cublasSgeam(blas, CUBLAS_OP_T, CUBLAS_OP_N, p, n, &onef,
++                                    Bt, n, &zerof, y_i, p, y_i, p),
++                        "cublasSgeam");
++                }
++                return;
++            }
++            if (factor)
++                cusolver_check(
++                    cusolverDnSpotrfBatched(solver, lower, n, ptrs, n, info, k),
++                    "cusolverDnSpotrfBatched");
++            for (auto op : {CUBLAS_OP_T, CUBLAS_OP_N})
++                cublas_check_status(
++                    cublasStrsmBatched(blas, CUBLAS_SIDE_RIGHT, lower, op,
++                                       CUBLAS_DIAG_NON_UNIT, p, n, &onef, ptrs,
++                                       n, ptrs + k, p, k),
++                    "cublasStrsmBatched");
++        };
++        scale(rhs, false, ys);
++        solve(true);
++        scale(ys, false, xs);
++        for (int step = 0; step < refine; ++step) {
++            // res_i^T = rhs_i^T - xs_i^T gram_i (p x n column-major; gram_i
++            // is symmetric)
++            cuda_check(
++                cudaMemcpyAsync(res, rhs, k * rhs_stride * sizeof(double),
++                                cudaMemcpyDeviceToDevice, stream),
++                "refine copy");
++            cublas_check_status(
++                cublas_gemm_strided_batched<double>(
++                    blas, CUBLAS_OP_N, CUBLAS_OP_N, p, n, n, &minus_one, xs, p,
++                    (long long)rhs_stride, gram, n, (long long)gram_stride,
++                    &one, res, p, (long long)rhs_stride, k),
++                "cublasDgemmStridedBatched");
++            scale(res, false, ys);
++            solve(false);
++            scale(ys, true, xs);
++        }
++        cuda_check(cudaMemcpyAsync(x, xs, k * rhs_stride * sizeof(double),
++                                   cudaMemcpyDeviceToDevice, stream),
++                   "solve copy");
++        harmony_comm::synchronize(comm, stream, "solve");
++        cuda_check(cudaMemcpyAsync(failed.data(), info, (k + 1) * sizeof(int),
++                                   cudaMemcpyDeviceToHost, stream),
++                   "solve info");
++        cuda_check(cudaStreamSynchronize(stream), "solve");
++    }
++    if (std::all_of(failed.begin(), failed.end(), [](int f) { return !f; }))
++        return 0;
++    if (fell_back) *fell_back = true;
++    return solve_systems_double(gram, rhs, x, k, n, p, one_at_a_time, stream,
++                                blas, solver, comm);
++}
++
++// acc (J x k int64) = the clustering's counts of R's columns (row stride ldr)
+ // per joint category, exact over the n_total cells on all GPUs of comm
+-// (segment_counts_kernel); acc: J x k scratch. Only GPU `to` (-1: every one)
+-// receives the counts; without joint_O, only this GPU's part of the exchange.
++// (segment_counts_kernel), on GPU `to` (-1: every one); the others take part
++// in the exchange.
+ template <typename T>
+ static void joint_counts(const T* R, int ldr, int k, const int* seg_start,
+                          const int* seg_group, int n_seg, int J,
+-                         long long n_total, long long* acc, T* joint_O,
++                         long long n_total, long long* acc,
+                          harmony_comm::Comm* comm, int rank, int to,
+                          cudaStream_t stream) {
+     FixedScales<T> scales(n_total, 0, k);
+@@ -303,49 +451,42 @@ static void joint_counts(const T* R, int ldr, int k, const int* seg_start,
+                      reinterpret_cast<unsigned long long*>(acc));
+     CUDA_CHECK_LAST_ERROR(segment_counts_kernel);
+     harmony_comm::allgather_groups(comm, rank, acc, k, stream, to);
+-    if (!joint_O) return;
+-    update_counts_kernel<T>
+-        <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+-           stream>>>(acc, nullptr, nullptr, nullptr, nullptr, scales.count_inv,
+-                     joint_O, (int)n);
+-    CUDA_CHECK_LAST_ERROR(update_counts_kernel);
+ }
+ 
+ // The multi-key correction of cells sorted by joint category (X, R: n x K),
+-// in chunks of `chunk` clusters: per chunk the joint counts and right-hand
+-// sides, the systems (prepare_multi_impl) and their solutions, then the
+-// corrections into Z. Several GPUs (comm) take rounds of one chunk each: all
+-// take part in the sums of every chunk, gathered to its GPU, which assembles
+-// and solves the chunk as one GPU would, then they exchange the solutions.
+-// Returns the systems solved here and how many of them by least squares.
++// in chunks of `chunk` clusters: per chunk the exact joint counts (int64) and
++// the exact per-level sums of R^T X (one pass per 8 keys, every level with
++// its own bound), the systems (kernels_correction_multi.cuh) and their
++// solutions, then the corrections into Z (one pass per 8 keys, each segment's
++// coefficients summed over the keys). Several GPUs (comm) take rounds of one
++// chunk each: all take part in the sums of every chunk, the counts gathered
++// to its GPU and the level sums (levels span the GPUs) summed on every one;
++// its GPU assembles and solves the chunk as one GPU would, then they exchange
++// the solutions. seg_levels (n_covariates x n_seg): each segment's level
++// within its key; level_offsets (n_covariates + 1): the first level of each
++// key. Returns the systems solved here and how many of them by least squares.
+ template <typename T>
+ static std::pair<int, int> correction_multi_impl(
+     const T* X, const T* R, const T* lambda_kb, const int* joint_cats,
+-    const int* marginal_joint_offsets, const int* marginal_joint_indices,
+-    int n_pcs, int n_clusters, int n_batches, int n_first, int n_covariates,
+-    int J, const int* seg_start, const int* seg_group, int n_seg,
+-    const short* bounds, T* Z, bool normalize, int chunk, T suppress,
+-    long long n_total, cudaStream_t stream, cublasHandle_t blas,
++    const int* seg_levels, const std::vector<int>& level_offsets, int n_pcs,
++    int n_clusters, int J, const int* seg_start, const int* seg_group,
++    int n_seg, const short* bounds, T* Z, bool normalize, int chunk, T suppress,
++    long long n_total, int refine, cudaStream_t stream, cublasHandle_t blas,
+     cusolverDnHandle_t solver, harmony_comm::Comm* comm, int rank) {
+-    const int nb1 = n_batches + 1, P = comm ? (int)comm->ranks.size() : 1;
++    const int C = (int)level_offsets.size() - 1, n_batches = level_offsets[C];
++    const int nb1 = n_batches + 1, n_first = level_offsets[1];
++    const int P = comm ? (int)comm->ranks.size() : 1;
+     const size_t system = (size_t)nb1 * nb1, coefs = (size_t)nb1 * n_pcs;
++    const size_t sums =
++        (size_t)n_batches * RHS_LIMBS<T> * n_pcs;  // per cluster
+     std::pair<int, int> solved{0, 0};
+     for (int first = 0; first < n_clusters; first += P * chunk) {
+         // GPU q's chunk of the round: clusters first + cut(q) .. cut(q + 1)
+         int m = std::min(n_clusters - first, P * chunk);
+         auto cut = [&](int q) { return std::min(m, q * chunk); };
+         int mine = cut(rank + 1) - cut(rank);
+-        // One GPU: the joint coefficients with the solutions (one allocation;
+-        // nb1 <= J, batched solve).
+-        bool joined =
+-            P == 1 && n_batches < J && !solve_one_at_a_time(mine, nb1);
+         RmmScratchPool round;  // the round's solutions, GPU q's at cut(q)
+-        double* W;
+-        T* W_joint = nullptr;
+-        if (joined)
+-            round.alloc_all(W, m * coefs, W_joint, (size_t)J * m * n_pcs);
+-        else
+-            W = round.alloc<double>(m * coefs);
++        double* W = round.alloc<double>(m * coefs);
+         {
+             RmmScratchPool systems;  // this GPU's
+             double *gram = nullptr, *rhs = nullptr;
+@@ -353,33 +494,66 @@ static std::pair<int, int> correction_multi_impl(
+                 int c0 = first + cut(q), k = cut(q + 1) - cut(q);
+                 bool own = q == rank;  // others' chunks: only their sums
+                 RmmScratchPool pool;
+-                size_t n_acc = (size_t)J * RHS_LIMBS<T> * k * n_pcs;
+-                long long* acc;
+-                T* joint_O = nullptr;
+-                double* joint_rhs = nullptr;
+-                if (own)
+-                    pool.alloc_all(acc, n_acc, joint_O, (size_t)J * k,
+-                                   joint_rhs, (size_t)J * k * n_pcs);
+-                else
+-                    acc = pool.alloc<long long>(n_acc);
++                long long *counts, *acc;
++                pool.alloc_all(counts, (size_t)J * k, acc, sums * k);
++                if (own) {
++                    systems.alloc_all(gram, k * system, rhs, k * coefs);
++                    cuda_check(
++                        cudaMemsetAsync(gram, 0, k * system * sizeof(double),
++                                        stream),
++                        "gram memset");
++                }
+                 joint_counts<T>(R + c0, n_clusters, k, seg_start, seg_group,
+-                                n_seg, J, n_total, acc, joint_O, comm, rank, q,
++                                n_seg, J, n_total, counts, comm, rank, q,
+                                 stream);
+-                segment_sums(X, R + c0, n_clusters, n_pcs, k, seg_start,
+-                             seg_group, n_seg, J, bounds, acc, joint_rhs,
+-                             (long long)k * n_pcs, n_pcs, comm, rank, q,
+-                             stream);
++                // the exact sums of every key's levels in one pass, summed
++                // over the GPUs (levels span them): rows 1 .. of the
++                // right-hand sides
++                cuda_check(cudaMemsetAsync(acc, 0, sums * k * sizeof(long long),
++                                           stream),
++                           "level sums memset");
++                for (int c = 0; c < C; c += harmony_segments::kMaxGroupings) {
++                    harmony_segments::Groupings keys{};
++                    keys.n = std::min(C - c, harmony_segments::kMaxGroupings);
++                    for (int j = 0; j < keys.n; ++j) {
++                        keys.seg_group[j] =
++                            seg_levels + (size_t)(c + j) * n_seg;
++                        keys.offset[j] = level_offsets[c + j];
++                    }
++                    cuda_check(
++                        harmony_segments::segment_rtz(
++                            X, R + c0, n_pcs, k, n_clusters, seg_start, keys,
++                            n_seg, bounds, acc, RHS_LIMBS<T>, stream),
++                        "level sums");
++                }
++                harmony_comm::allreduce(comm, rank, acc, sums * k, stream);
+                 if (!own) continue;
+-                systems.alloc_all(gram, k * system, rhs, k * coefs);
+-                prepare_multi_impl<T>(
+-                    joint_O, joint_rhs, joint_cats, marginal_joint_offsets,
+-                    marginal_joint_indices,
+-                    Penalties<T>{lambda_kb + c0, n_clusters, suppress}, n_pcs,
+-                    k, n_batches, n_first, n_covariates, J, gram, rhs, stream);
++                cuda_check(harmony_segments::finalize_rtz(
++                               acc, n_batches, n_pcs, k, RHS_LIMBS<T>, bounds,
++                               rhs + n_pcs, n_pcs, nb1 * n_pcs, stream),
++                           "level sums");
++                count_blocks_kernel<<<strided_grid((long long)J * k,
++                                                   BLOCK_DIM_1D),
++                                      BLOCK_DIM_1D, 0, stream>>>(
++                    reinterpret_cast<const unsigned long long*>(counts),
++                    joint_cats, C, J, k, nb1,
++                    reinterpret_cast<unsigned long long*>(gram));
++                CUDA_CHECK_LAST_ERROR(count_blocks_kernel);
++                FixedScales<T> scales(n_total, 0, k);  // as joint_counts
++                Penalties<T> lambda{lambda_kb + c0, n_clusters, suppress};
++                finish_gram_kernel<T><<<k, MAX_BLOCK_DIM, 0, stream>>>(
++                    lambda, scales.count_inv, n_first, n_batches, k, gram);
++                CUDA_CHECK_LAST_ERROR(finish_gram_kernel);
++                finish_rhs_kernel<T>
++                    <<<strided_grid((long long)k * n_pcs, BLOCK_DIM_1D),
++                       BLOCK_DIM_1D, 0, stream>>>(lambda, n_first, n_batches,
++                                                  n_pcs, k, rhs);
++                CUDA_CHECK_LAST_ERROR(finish_rhs_kernel);
+             }
+-            solved.second += solve_systems(
+-                gram, rhs, W + cut(rank) * coefs, mine, nb1, n_pcs,
+-                solve_one_at_a_time(mine, nb1), stream, blas, solver, comm);
++            solved.second +=
++                solve_systems(gram, rhs, W + cut(rank) * coefs, mine, nb1,
++                              n_pcs, solve_one_at_a_time(mine, nb1), refine,
++                              stream, blas, solver, comm);
+             solved.first += mine;
+         }
+         if (P > 1)
+@@ -389,26 +563,35 @@ static std::pair<int, int> correction_multi_impl(
+                     return std::pair{cut(q) * coefs, cut(q + 1) * coefs};
+                 },
+                 stream);
+-        // Z = X - R_i W_joint[joint of i] (normalized on request), W_joint[j]
+-        // summing the marginal rows of W over the categories of joint j. Each
+-        // chunk continues the sums of the earlier clusters in Z and the last
+-        // one subtracts them from X, so no second buffer is needed.
++        // Z = X - sum_k R_ik sum_c W_k[level_c(i)] (normalized on request):
++        // one pass, each segment's coefficients summed over the keys. Each
++        // chunk continues the sums of the earlier ones in Z and the last one
++        // subtracts them from X, so no second buffer is needed.
+         for (int c0 = first; c0 < first + m; c0 += chunk) {
+             int k = std::min(chunk, n_clusters - c0);
+             bool last = c0 + k == n_clusters;
+-            long long joint_size = (long long)k * n_pcs;
+             RmmScratchPool pool;
+-            if (!joined) W_joint = pool.alloc<T>(J * joint_size);
+-            joint_coefficients_kernel<T>
+-                <<<strided_grid(J * joint_size, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+-                   stream>>>(W + (c0 - first) * coefs, joint_cats, W_joint,
+-                             n_pcs, k, n_batches, n_covariates, J);
+-            CUDA_CHECK_LAST_ERROR(joint_coefficients_kernel);
+-            cuda_check(harmony_apply::apply_rows(
+-                           X, R + c0, n_clusters, W_joint, n_pcs, joint_size,
+-                           n_pcs, k, seg_start, seg_group, n_seg,
+-                           normalize && last, Z, stream, c0 > 0, last),
+-                       "multi-key apply");
++            T* table = pool.alloc<T>((size_t)n_batches * k * n_pcs);
++            level_tables_kernel<T>
++                <<<strided_grid((long long)n_batches * k * n_pcs, BLOCK_DIM_1D),
++                   BLOCK_DIM_1D, 0, stream>>>(W + (c0 - first) * coefs, k, nb1,
++                                              n_pcs, table);
++            CUDA_CHECK_LAST_ERROR(level_tables_kernel);
++            for (int c = 0; c < C; c += harmony_apply::kMaxTables) {
++                harmony_apply::Tables<T> keys{};
++                keys.n = std::min(C - c, harmony_apply::kMaxTables);
++                for (int j = 0; j < keys.n; ++j) {
++                    keys.w[j] =
++                        table + (size_t)level_offsets[c + j] * k * n_pcs;
++                    keys.seg_group[j] = seg_levels + (size_t)(c + j) * n_seg;
++                }
++                cuda_check(harmony_apply::apply_rows(
++                               X, R + c0, n_clusters, keys, n_pcs,
++                               (long long)k * n_pcs, n_pcs, k, seg_start, n_seg,
++                               normalize && last, Z, stream, c0 > 0 || c > 0,
++                               last && c + keys.n == C),
++                           "multi-key apply");
++            }
+         }
+     }
+     return solved;
+@@ -486,7 +669,7 @@ static void register_correction_batched(nb::module_& m) {
+                     segment_sums(X.data(), r + k0, n_clusters, n_pcs, n_k,
+                                  seg_start.data(), seg_group.data(), n_seg,
+                                  n_batches, bounds.data(), rhs_acc, S, n_pcs,
+-                                 (int)s_cluster, c, rank, -1, s);
++                                 (int)s_cluster, c, rank, s);
+                     // rhs_acc (summed into S) holds the intercepts
+                     ridge_coefficients(O.data(), lambda_kb.data(), S, W,
+                                        reinterpret_cast<double*>(rhs_acc),
+@@ -518,42 +701,47 @@ static void register_correction_batched(nb::module_& m) {
+         [](gpu_array_c<const T, Device> X, gpu_array_c<const T, Device> R,
+            gpu_array_c<const T, Device> lambda_kb,
+            gpu_array_c<const int, Device> joint_cats,
+-           gpu_array_c<const int, Device> marginal_joint_offsets,
+-           gpu_array_c<const int, Device> marginal_joint_indices, int n_first,
++           gpu_array_c<const int, Device> seg_levels,
++           std::vector<int> level_offsets,
+            gpu_array_c<const int, Device> seg_start,
+            gpu_array_c<const int, Device> seg_group,
+            gpu_array_c<const short, Device> bounds, gpu_array_c<T, Device> Z,
+            bool normalize, int chunk, double suppress, long long n_total,
+-           std::uintptr_t stream, std::uintptr_t blas, std::uintptr_t solver,
+-           std::uintptr_t comm, int rank) {
++           int refine, std::uintptr_t stream, std::uintptr_t blas,
++           std::uintptr_t solver, std::uintptr_t comm, int rank) {
++            int C = (int)level_offsets.size() - 1;
+             if (R.ndim() != 2 || R.shape(0) != X.shape(0) ||
+                 Z.size() != X.size() || lambda_kb.ndim() != 2 ||
+-                lambda_kb.shape(1) != R.shape(1) || joint_cats.ndim() != 2 ||
+-                seg_group.size() + 1 != seg_start.size() || chunk < 1)
++                lambda_kb.shape(1) != R.shape(1) || C < 2 ||
++                level_offsets[0] != 0 ||
++                std::adjacent_find(level_offsets.begin(), level_offsets.end(),
++                                   std::greater_equal<int>{}) !=
++                    level_offsets.end() ||
++                joint_cats.ndim() != 2 || joint_cats.shape(1) != (size_t)C ||
++                seg_levels.ndim() != 2 || seg_levels.shape(0) != (size_t)C ||
++                seg_group.size() + 1 != seg_start.size() ||
++                seg_levels.shape(1) != seg_group.size() ||
++                level_offsets[C] != (int)lambda_kb.shape(0) ||
++                bound_groups(bounds, X.shape(1)) != level_offsets[C] ||
++                chunk < 1)
+                 throw std::invalid_argument("correction_multi: bad shapes");
+-            int n_batches = (int)lambda_kb.shape(0);
+-            if (n_first < 1 || n_first > n_batches)
+-                throw std::invalid_argument(
+-                    "n_first must be in [1, n_batches]");
+             return correction_multi_impl<T>(
+                 X.data(), R.data(), lambda_kb.data(), joint_cats.data(),
+-                marginal_joint_offsets.data(), marginal_joint_indices.data(),
+-                (int)X.shape(1), (int)R.shape(1), n_batches, n_first,
+-                (int)joint_cats.shape(1), bound_groups(bounds, X.shape(1)),
+-                seg_start.data(), seg_group.data(), (int)seg_group.size(),
+-                bounds.data(), Z.data(), normalize, chunk, (T)suppress,
+-                n_total > 0 ? n_total : (long long)X.shape(0),
++                seg_levels.data(), level_offsets, (int)X.shape(1),
++                (int)R.shape(1), (int)joint_cats.shape(0), seg_start.data(),
++                seg_group.data(), (int)seg_group.size(), bounds.data(),
++                Z.data(), normalize, chunk, (T)suppress,
++                n_total > 0 ? n_total : (long long)X.shape(0), refine,
+                 (cudaStream_t)stream, (cublasHandle_t)blas,
+                 (cusolverDnHandle_t)solver, (harmony_comm::Comm*)comm, rank);
+         },
+         nb::call_guard<nb::gil_scoped_release>(), "X"_a.noconvert(),
+         nb::kw_only(), "R"_a.noconvert(), "lambda_kb"_a.noconvert(),
+-        "joint_cats"_a.noconvert(), "marginal_joint_offsets"_a.noconvert(),
+-        "marginal_joint_indices"_a.noconvert(), "n_first"_a,
+-        "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
++        "joint_cats"_a.noconvert(), "seg_levels"_a.noconvert(),
++        "level_offsets"_a, "seg_start"_a.noconvert(), "seg_group"_a.noconvert(),
+         "bounds"_a.noconvert(), "Z"_a.noconvert(), "normalize"_a = false,
+-        "chunk"_a, "suppress"_a, "n_total"_a = 0, "stream"_a = 0, "blas"_a,
+-        "solver"_a, "comm"_a = 0, "rank"_a = 0);
++        "chunk"_a, "suppress"_a, "n_total"_a = 0, "refine"_a, "stream"_a = 0,
++        "blas"_a, "solver"_a, "comm"_a = 0, "rank"_a = 0);
+ }
+ 
+ template <typename Device>
+@@ -563,23 +751,26 @@ void register_bindings(nb::module_& m) {
+ 
+     m.def(
+         "solve_spd",
+-        [](gpu_array_c<double, Device> gram,  // batched: overwritten
++        [](gpu_array_c<double, Device> gram,  // float64 path: overwritten
+            gpu_array_c<const double, Device> rhs, gpu_array_c<double, Device> x,
+-           bool one_at_a_time, std::uintptr_t stream, std::uintptr_t blas,
+-           std::uintptr_t solver) {
++           bool one_at_a_time, int refine, std::uintptr_t stream,
++           std::uintptr_t blas, std::uintptr_t solver) {
+             if (gram.ndim() != 3 || gram.shape(1) != gram.shape(2) ||
+                 rhs.ndim() != 3 || rhs.shape(0) != gram.shape(0) ||
+                 rhs.shape(1) != gram.shape(1) || x.size() != rhs.size())
+                 throw std::invalid_argument("solve_spd: bad shapes");
+-            return solve_systems(gram.data(), rhs.data(), x.data(),
+-                                 (int)gram.shape(0), (int)gram.shape(1),
+-                                 (int)rhs.shape(2), one_at_a_time,
+-                                 (cudaStream_t)stream, (cublasHandle_t)blas,
+-                                 (cusolverDnHandle_t)solver);
++            bool fell_back;
++            int n_least_squares = solve_systems(
++                gram.data(), rhs.data(), x.data(), (int)gram.shape(0),
++                (int)gram.shape(1), (int)rhs.shape(2), one_at_a_time, refine,
++                (cudaStream_t)stream, (cublasHandle_t)blas,
++                (cusolverDnHandle_t)solver, nullptr, &fell_back);
++            return std::pair{n_least_squares, fell_back};
+         },
+         nb::call_guard<nb::gil_scoped_release>(), "gram"_a.noconvert(),
+         "rhs"_a.noconvert(), "x"_a.noconvert(), nb::kw_only(),
+-        "one_at_a_time"_a = false, "stream"_a = 0, "blas"_a, "solver"_a);
++        "one_at_a_time"_a = false, "refine"_a = 1, "stream"_a = 0, "blas"_a,
++        "solver"_a);
+ }
+ 
+ NB_MODULE(_harmony_correction_batched_cuda, m) {
+diff --git a/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_multi.cuh b/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_multi.cuh
+index aa9fa06c..6ab0498a 100644
+--- a/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_multi.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_multi.cuh
+@@ -7,10 +7,12 @@
+ 
+ #include "../storage.cuh"
+ 
+-// The regression systems are assembled and solved in double from the joint
+-// counts and the exact joint right-hand sides: every entry is a sum of the
+-// same values, so the intercept and category rows stay consistent and a small
+-// ridge lambda does not lose the solution to rounding.
++// The regression systems (solved by solve_systems, correction_batched.cu) are
++// assembled in double from exact sums:
++// the Gram matrices from the clustering's int64 joint counts (every entry,
++// the intercept and the diagonal included, from the same counts, so the rows
++// stay consistent and a small ridge lambda does not lose the solution to
++// rounding), the right-hand sides from exact per-level sums of R^T X.
+ 
+ // The ridge penalties of a chunk's clusters (rows of stride ld, those of
+ // lambda_kb): a category is active unless its penalty suppresses it (a pruned
+@@ -28,167 +30,101 @@ struct Penalties {
+     }
+ };
+ 
+-// Initialize the intercept, intercept/category, and within-covariate diagonal
+-// entries of every regression Gram matrix.  All other entries are already
+-// zero.  An inactive category is represented by an isolated unit diagonal,
+-// which is algebraically equivalent to omitting that category from the solve
+-// and then restoring a zero coefficient.
+-template <typename T>
+-__global__ void initialize_multi_gram_kernel(
+-    Penalties<T> lambda, const T* __restrict__ joint_O,
+-    const int* __restrict__ marginal_joint_offsets,
+-    const int* __restrict__ marginal_joint_indices, double* __restrict__ gram,
+-    int n_batches, int n_clusters, int n_joint_categories) {
+-    int cluster = blockIdx.x;
+-    if (cluster >= n_clusters) return;
+-
+-    int nb1 = n_batches + 1;
+-    double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
+-    auto count = [&](int joint) {
+-        return (double)joint_O[(size_t)joint * n_clusters + cluster];
+-    };
+-    double total = 0;
+-    for (int joint = threadIdx.x; joint < n_joint_categories;
+-         joint += blockDim.x)
+-        total += count(joint);
+-    total = block_sum(total);
+-    // A cluster without cells has zero right-hand sides: a unit pivot keeps
+-    // its system positive definite (W = 0).
+-    if (threadIdx.x == 0) cluster_gram[0] = total > 0 ? total : 1;
+-
+-    for (int batch = threadIdx.x; batch < n_batches; batch += blockDim.x) {
+-        int row = batch + 1;
+-        if (lambda.active(batch, cluster)) {
+-            double observed = 0;
+-            for (int position = marginal_joint_offsets[batch];
+-                 position < marginal_joint_offsets[batch + 1]; ++position)
+-                observed += count(marginal_joint_indices[position]);
+-            cluster_gram[row] = observed;
+-            cluster_gram[(size_t)row * nb1] = observed;
+-            cluster_gram[(size_t)row * nb1 + row] =
+-                observed + lambda(batch, cluster);
+-        } else {
+-            cluster_gram[(size_t)row * nb1 + row] = 1;
++// Exact joint counts of a chunk's clusters (counts: J x k int64, the
++// clustering's fixed point) summed into the Gram matrices, as int64 in the
++// matrices' own storage: the diagonal of every level and, above it, the
++// cross-key entries of every pair of levels of a joint category. Integer
++// atomics: the same bits in any order. finish_gram_kernel converts them.
++__global__ void count_blocks_kernel(
++    const unsigned long long* __restrict__ counts,
++    const int* __restrict__ joint_cats, int n_covariates, int J, int k, int nb1,
++    unsigned long long* __restrict__ gram) {
++    long long total = (long long)J * k;
++    for (long long e = blockIdx.x * (long long)blockDim.x + threadIdx.x;
++         e < total; e += (long long)gridDim.x * blockDim.x) {
++        unsigned long long v = counts[e];
++        if (!v) continue;
++        const int* levels = joint_cats + (e / k) * n_covariates;
++        unsigned long long* g = gram + (e % k) * (size_t)nb1 * nb1;
++        for (int c = 0; c < n_covariates; ++c) {
++            int b = levels[c] + 1;
++            atomicAdd(g + (size_t)b * nb1 + b, v);
++            for (int d = c + 1; d < n_covariates; ++d)  // levels[d] > levels[c]
++                atomicAdd(g + (size_t)b * nb1 + levels[d] + 1, v);
+         }
+     }
+ }
+ 
+-// Add the cross-covariate blocks A diag(q_k) A^T, where each row of
+-// joint_cats contains the F active marginal levels for one observed joint
+-// category.  Same-covariate blocks are diagonal and were initialized from O.
+-template <typename T, int N_COVARIATES>
+-__global__ void add_joint_cross_kernel(
+-    const T* __restrict__ joint_O, const int* __restrict__ joint_cats,
+-    const int* __restrict__ marginal_joint_offsets,
+-    const int* __restrict__ marginal_joint_indices, Penalties<T> lambda,
+-    double* __restrict__ gram, int n_covariates, int n_batches,
+-    int n_clusters) {
+-    size_t total = (size_t)n_batches * n_clusters;
+-    int nb1 = n_batches + 1;
+-
+-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+-         idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+-        int batch = (int)(idx / n_clusters);
+-        int cluster = (int)(idx % n_clusters);
+-        if (!lambda.active(batch, cluster)) continue;
+-        int row = batch + 1;
+-        double* cluster_gram = gram + (size_t)cluster * nb1 * nb1;
+-        // The lower category owns each symmetric pair and visits its joint
+-        // categories in CSR order. No other thread writes either entry.
+-        for (int position = marginal_joint_offsets[batch];
+-             position < marginal_joint_offsets[batch + 1]; ++position) {
+-            int joint = marginal_joint_indices[position];
+-            T value = joint_O[(size_t)joint * n_clusters + cluster];
+-            if (value == T(0)) continue;
+-            const int* levels =
+-                joint_cats + (size_t)joint * (N_COVARIATES > 0 ? N_COVARIATES
+-                                                               : n_covariates);
+-            int count = N_COVARIATES > 0 ? N_COVARIATES : n_covariates;
+-#pragma unroll
+-            for (int other = 0; other < count; ++other) {
+-                int other_batch = levels[other];
+-                if (other_batch <= batch ||
+-                    !lambda.active(other_batch, cluster))
+-                    continue;
+-                int col = other_batch + 1;
+-                double updated = cluster_gram[(size_t)row * nb1 + col] + value;
+-                cluster_gram[(size_t)row * nb1 + col] = updated;
+-                cluster_gram[(size_t)col * nb1 + row] = updated;
+-            }
++// One block per cluster: the counted Gram matrix as double (count_inv: the
++// fixed point's unit), symmetric, with the ridge on the diagonal, the
++// intercept row and column from the level counts (the first key's levels
++// hold every cell once) and an isolated unit diagonal for an inactive
++// (pruned) level, which omits it from the solve. A cluster without cells
++// gets a unit pivot (W = 0).
++template <typename T>
++__global__ void finish_gram_kernel(Penalties<T> lambda, double count_inv,
++                                   int n_first, int n_batches, int k,
++                                   double* __restrict__ gram) {
++    int nb1 = n_batches + 1, cluster = blockIdx.x;
++    if (cluster >= k) return;
++    double* g = gram + (size_t)cluster * nb1 * nb1;
++    auto u = reinterpret_cast<unsigned long long*>(g);
++    unsigned long long total = 0;
++    for (int b = 1 + threadIdx.x; b <= n_first; b += blockDim.x)
++        total += u[(size_t)b * nb1 + b];
++    total = block_sum(total);
++    __syncthreads();  // every count read before any entry becomes double
++    for (size_t e = threadIdx.x; e < (size_t)nb1 * nb1; e += blockDim.x) {
++        int r = (int)(e / nb1), c = (int)(e % nb1);
++        if (r == 0 && c == 0) {
++            g[0] = total ? (double)total * count_inv : 1.0;
++        } else if (r == 0 || c == 0) {
++            continue;  // written with the diagonal
++        } else if (r == c) {
++            bool active = lambda.active(r - 1, cluster);
++            double count = (double)u[e] * count_inv;
++            g[e] = active ? count + lambda(r - 1, cluster) : 1.0;
++            g[r] = g[(size_t)r * nb1] = active ? count : 0.0;
++        } else if (r < c) {
++            double v =
++                lambda.active(r - 1, cluster) && lambda.active(c - 1, cluster)
++                    ? (double)u[e] * count_inv
++                    : 0.0;
++            g[e] = g[(size_t)c * nb1 + r] = v;
+         }
+     }
+ }
+ 
+-// Expand joint-category cross-products R_j^T X_j into the regression
+-// right-hand sides: row b + 1 sums the joints containing category b (in
+-// ascending CSR order, deterministic). Row 0 and the inactive categories:
+-// intercept_and_mask_kernel.
+-__global__ void marginal_from_joint_rhs_kernel(
+-    const double* __restrict__ joint_rhs,
+-    const int* __restrict__ marginal_joint_offsets,
+-    const int* __restrict__ marginal_joint_indices, double* __restrict__ rhs,
+-    int n_pcs, int n_clusters, int n_batches) {
+-    size_t total = (size_t)n_clusters * n_batches * n_pcs;
+-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+-         idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+-        int pc = (int)(idx % n_pcs);
+-        int b = (int)(idx / n_pcs % n_batches);
+-        int cluster = (int)(idx / ((size_t)n_pcs * n_batches));
+-        double value = 0;
+-        for (int position = marginal_joint_offsets[b];
+-             position < marginal_joint_offsets[b + 1]; ++position)
+-            value += joint_rhs[((size_t)marginal_joint_indices[position] *
+-                                    n_clusters +
+-                                cluster) *
+-                                   n_pcs +
+-                               pc];
+-        rhs[((size_t)cluster * (n_batches + 1) + b + 1) * n_pcs + pc] = value;
+-    }
+-}
+-
+-// Row 0 (intercept) sums every joint: the rows of the first key's n_first
+-// categories, which hold every joint once. Then the rows of inactive
+-// categories are zeroed.
++// The right-hand sides' intercept row (all cells) as the sum of the first
++// key's level rows, in order; then zeros in the rows of inactive levels.
+ template <typename T>
+-__global__ void intercept_and_mask_kernel(Penalties<T> lambda,
+-                                          double* __restrict__ rhs, int n_pcs,
+-                                          int n_clusters, int n_batches,
+-                                          int n_first) {
+-    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+-         idx < (size_t)n_clusters * n_pcs;
+-         idx += (size_t)blockDim.x * gridDim.x) {
+-        int pc = (int)(idx % n_pcs), cluster = (int)(idx / n_pcs);
+-        double* row = rhs + (size_t)cluster * (n_batches + 1) * n_pcs + pc;
+-        double value = 0;
+-        for (int b = 0; b < n_first; ++b) value += row[(size_t)(b + 1) * n_pcs];
+-        row[0] = value;
++__global__ void finish_rhs_kernel(Penalties<T> lambda, int n_first,
++                                  int n_batches, int n_pcs, int k,
++                                  double* __restrict__ rhs) {
++    const int nb1 = n_batches + 1;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++         i < (size_t)k * n_pcs; i += (size_t)gridDim.x * blockDim.x) {
++        const int cluster = (int)(i / n_pcs);
++        double* r = rhs + (size_t)cluster * nb1 * n_pcs + i % n_pcs;
++        double total = 0.0;
++        for (int b = 0; b < n_first; ++b) total += r[(size_t)(b + 1) * n_pcs];
++        r[0] = total;
+         for (int b = 0; b < n_batches; ++b)
+-            if (!lambda.active(b, cluster)) row[(size_t)(b + 1) * n_pcs] = 0;
++            if (!lambda.active(b, cluster)) r[(size_t)(b + 1) * n_pcs] = 0.0;
+     }
+ }
+ 
+-// Coefficients per joint category: W_joint[j][k][:] is the sum of the
+-// marginal rows W_all[k][b + 1][:] over the categories b of joint j. The
+-// intercept is deliberately retained in the embedding, as in Harmony.
++// The coefficients applied per level: table[b][k][:] = W[k][b + 1][:]; the
++// intercept W[k][0][:] stays in the embedding, as in Harmony.
+ template <typename T>
+-__global__ void joint_coefficients_kernel(const double* __restrict__ W_all,
+-                                          const int* __restrict__ joint_cats,
+-                                          T* __restrict__ W_joint, int n_pcs,
+-                                          int n_clusters, int n_batches,
+-                                          int n_covariates,
+-                                          int n_joint_categories) {
+-    int nb1 = n_batches + 1;
+-    size_t total = (size_t)n_joint_categories * n_clusters * n_pcs;
++__global__ void level_tables_kernel(const double* __restrict__ W, int k,
++                                    int nb1, int n_pcs, T* __restrict__ table) {
++    int n_batches = nb1 - 1;
++    size_t total = (size_t)n_batches * k * n_pcs;
+     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+          idx < total; idx += (size_t)blockDim.x * gridDim.x) {
+-        int pc = (int)(idx % n_pcs);
+-        int cluster = (int)(idx / n_pcs % n_clusters);
+-        int joint = (int)(idx / ((size_t)n_pcs * n_clusters));
+-        const int* levels = joint_cats + (size_t)joint * n_covariates;
+-        T value = T(0);
+-        for (int c = 0; c < n_covariates; ++c)
+-            value +=
+-                (T)W_all[((size_t)cluster * nb1 + levels[c] + 1) * n_pcs + pc];
+-        W_joint[idx] = value;
++        int pc = (int)(idx % n_pcs), cluster = (int)(idx / n_pcs % k);
++        int b = (int)(idx / ((size_t)n_pcs * k));
++        table[idx] = (T)W[((size_t)cluster * nb1 + b + 1) * n_pcs + pc];
+     }
+ }
+diff --git a/src/rapids_singlecell/_cuda/harmony/segment_gemm.cuh b/src/rapids_singlecell/_cuda/harmony/segment_gemm.cuh
+index 7807450e..6d572e87 100644
+--- a/src/rapids_singlecell/_cuda/harmony/segment_gemm.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/segment_gemm.cuh
+@@ -45,6 +45,17 @@ struct Plan {
+     int sa, sr, stage_a, stage, smem;  // smem layout, set per launch
+ };
+ 
++constexpr int kMaxGroupings = 8;
++constexpr int kStaticSmem = kMaxGroupings * (int)sizeof(int);  // segment_kernel
++
++// A segment's groups under several groupings j < n at once: seg_group[j][s]
++// (null: 0) + offset[j], rows of the same acc and bound_exp.
++struct Groupings {
++    const int* seg_group[kMaxGroupings];
++    int offset[kMaxGroupings];
++    int n;
++};
++
+ // Pure function of (D, K, sizeof(T), sizeof(RT)). fp32: least issue cost of a
+ // row (FMAs + smem loads of the active warps), one tile if possible ({10, 8}
+ // only if nothing else fits); fp64 (FMA bound): fewest padded FMAs.
+@@ -168,8 +179,7 @@ template <typename T, typename RT, int TD, int TK>
+ __global__ void __launch_bounds__(kThreads, 2)
+     segment_kernel(const T* __restrict__ A, const RT* __restrict__ R, int D,
+                    int K, int ldr, const int* __restrict__ seg_start,
+-                   const int* __restrict__ seg_group, int n_seg,
+-                   const short* __restrict__ bound_exp,
++                   Groupings gs, int n_seg, const short* __restrict__ bound_exp,
+                    unsigned long long* __restrict__ acc, int limbs, Plan p) {
+     extern __shared__ __align__(16) char smem[];
+     const int d0 = blockIdx.y / p.n_ky * p.dgt * TD;
+@@ -238,17 +248,31 @@ __global__ void __launch_bounds__(kThreads, 2)
+             rows(std::false_type{}, a, r, n);
+     }
+     __pipeline_wait_prior(0);
++    // The segment's row under every grouping: thread 0 resolves them with
++    // constant indices into the parameter (a runtime index would copy it to
++    // local memory) and the barrier publishes them; rows rather than pointers
++    // keep the loads below in their address spaces.
++    __shared__ int srow[kMaxGroupings];
++    const int ng = gs.n;
++    if (threadIdx.x == 0) {
++#pragma unroll
++        for (int j = 0; j < kMaxGroupings; ++j)
++            if (j < ng)
++                srow[j] = (gs.seg_group[j] ? gs.seg_group[j][blockIdx.x] : 0) +
++                          gs.offset[j];
++    }
+     __syncthreads();
+ 
+-    const int g = seg_group ? seg_group[blockIdx.x] : 0;
+-    const short* bg = bound_exp + (size_t)g * D + d0;  // this tile's columns
+-    const size_t ls = (size_t)K * D;
+-    unsigned long long* out =
+-        acc + (size_t)g * limbs * ls + (size_t)k0 * D + d0;
++    const size_t ls = (size_t)K * D;  // this tile's columns: + k0 D + d0
+     auto put = [&](T v, int d, int k) {
+         if (d < dv && k < kv)
+-            emit(v, scale_exp(bg[d], limbs), out + (size_t)k * D + d, ls,
+-                 limbs);
++#pragma unroll 1
++            for (int j = 0; j < ng; ++j) {
++                const size_t g = srow[j];
++                emit(v, scale_exp(bound_exp[g * D + d0 + d], limbs),
++                     acc + g * limbs * ls + ((size_t)k0 + k) * D + d0 + d, ls,
++                     limbs);
++            }
+     };
+     if (p.nsplit == 1 && sp == 0)
+ #pragma unroll
+@@ -299,15 +323,18 @@ __global__ void finalize_kernel(const long long* __restrict__ acc, int n_groups,
+ // shards; value = sum_l acc[g][l][k][d] 2^(30 (limbs - 1 - l)) /
+ // 2^scale_exp(bound_exp[g][d]). A, R: rows seg_start[0] .. seg_start[n_seg] of
+ // this shard; R(i, k) = R[i ldr + k] (ldr >= K, the bytes between rows
+-// readable). seg_start (n_seg + 1, local rows), seg_group (n_seg; null: group
+-// 0), bound_exp (n_groups x D): device pointers. Sums in T (R converted to T),
+-// finite inputs, limbs in [1, 3]. Stream-ordered, no allocation, no sync.
++// readable). seg_start (n_seg + 1, local rows), the groupings' seg_group
++// (n_seg; null: group 0), bound_exp (n_groups x D): device pointers. Several
++// groupings add each segment's partials, rounded for each, to every one's
++// rows. Sums in T (R converted to T), finite inputs, limbs in [1, 3].
++// Stream-ordered, no allocation, no sync.
+ template <typename T, typename RT>
+ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
+-                        const int* seg_start, const int* seg_group, int n_seg,
+-                        const short* bound_exp, long long* acc, int limbs,
+-                        cudaStream_t s) {
+-    if (D < 1 || K < 1 || ldr < K || limbs < 1 || limbs > 3)
++                        const int* seg_start, const Groupings& groups,
++                        int n_seg, const short* bound_exp, long long* acc,
++                        int limbs, cudaStream_t s) {
++    if (D < 1 || K < 1 || ldr < K || limbs < 1 || limbs > 3 || groups.n < 1 ||
++        groups.n > kMaxGroupings)
+         return cudaErrorInvalidValue;
+     if (n_seg <= 0) return cudaSuccess;
+     Plan p = make_plan(D, K, sizeof(T), sizeof(RT));
+@@ -324,11 +351,12 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
+     const int red = p.nsplit * p.dgt * p.kgt * p.td * p.tk * sizeof(T);
+     p.smem = std::max(2 * p.stage, p.nsplit > 1 ? red : 0);
+     auto launch = [&](auto kernel) {
+-        if (p.smem > kSmemBudget)  // strided R rows only
++        if (p.smem + kStaticSmem >
++            kSmemBudget)  // strided R rows, or at the budget
+             cudaFuncSetAttribute(
+                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, p.smem);
+         kernel<<<dim3(n_seg, p.n_dy * p.n_ky), kThreads, p.smem, s>>>(
+-            A, R, D, K, ldr, seg_start, seg_group, n_seg, bound_exp,
++            A, R, D, K, ldr, seg_start, groups, n_seg, bound_exp,
+             reinterpret_cast<unsigned long long*>(acc), limbs, p);
+         return cudaGetLastError();
+     };
+@@ -344,6 +372,17 @@ cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
+     return cudaErrorInvalidConfiguration;
+ }
+ 
++// One grouping.
++template <typename T, typename RT>
++cudaError_t segment_rtz(const T* A, const RT* R, int D, int K, int ldr,
++                        const int* seg_start, const int* seg_group, int n_seg,
++                        const short* bound_exp, long long* acc, int limbs,
++                        cudaStream_t s) {
++    return segment_rtz(A, R, D, K, ldr, seg_start,
++                       Groupings{{seg_group}, {0}, 1}, n_seg, bound_exp, acc,
++                       limbs, s);
++}
++
+ // out[g out_group_stride + k ld_out + d] = acc value of (g, k, d) as T. For the
+ // correction right-hand sides S (K, n_batches, D): out = S,
+ // out_group_stride = D, ld_out = n_batches D.
+diff --git a/src/rapids_singlecell/preprocessing/_harmony/__init__.py b/src/rapids_singlecell/preprocessing/_harmony/__init__.py
+index 8e67e23e..6a06dd62 100644
+--- a/src/rapids_singlecell/preprocessing/_harmony/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_harmony/__init__.py
+@@ -17,7 +17,6 @@
+     _harmony_correction_batched_cuda as _correction_batched_cuda,
+ )
+ from rapids_singlecell._cuda import _harmony_correction_cuda as _correction_cuda
+-from rapids_singlecell._utils import _create_category_index_mapping
+ from rapids_singlecell._utils._multi_gpu import _copy_to_device
+ from rapids_singlecell._utils._random import _seed_from_rng
+ 
+@@ -364,10 +363,11 @@ def harmonize(
+             _sorted_groups(offsets, lo, hi, device)
+             for device, lo, hi in zip(devices, bounds[:-1], bounds[1:], strict=True)
+         ]
+-        # Exact int64 sums of block counts, right-hand sides and centroids.
++        # Exact int64 sums of block counts, joint counts, right-hand sides and centroids.
+         capacity = n_clusters * max(
+             (n_blocks if keep else 1) * n_batches,
+-            _limbs(dtype.itemsize) * n_groups * n_pcs,
++            n_groups,
++            _limbs(dtype.itemsize) * n_batches * n_pcs,
+             3 * n_pcs,
+         )
+ 
+@@ -378,7 +378,10 @@ def harmonize(
+         # Read after the upload, whose host staging overlaps the sort.
+         if not bool(cp.isfinite(theta_array).all()):
+             raise ValueError(f"theta must be finite, got {theta}.")
+-        rhs_bounds = _rhs_bounds(shards, offsets, bounds)
++        level_offsets = [0, *np.cumsum(n_levels).tolist()]
++        rhs_bounds = _rhs_bounds(
++            shards, offsets, bounds, joint_cats=joint.get("joint_cats"), level_offsets=level_offsets
++        )
+ 
+         # Initialize algorithm
+         shards = [
+@@ -414,12 +417,12 @@ def run(rank: int, comm: int) -> tuple[cp.ndarray, bool, int]:
+             lo, hi = bounds[rank], bounds[rank + 1]
+             groups, shard_groups[rank] = shard_groups[rank], None
+             mine, local[rank] = local[rank], None
+-            joint_args = {name: mine[name] for name in joint}
+             N_b_local, sums = mine["N_b"], {"comm": comm, "rank": rank}
+             seg_start, seg_group = _segments(offsets, unit, lo, hi)
+             segments = (seg_start, seg_group, mine["rhs_bounds"])
+             if n_covariates > 1:  # centroid sums need no group cuts
+                 seg_start = _segments(offsets[[0, -1]], unit, lo, hi)[0]
++                seg_levels = _segment_levels(mine["joint_cats"], seg_group, level_offsets)
+             Pr_b = (N_b_local / n_cells).astype(dtype)
+             # The update blocks are drawn once per call, before the large arrays
+             # exist; with several keys the assignment tiles take any cells.
+@@ -455,7 +458,7 @@ def run(rank: int, comm: int) -> tuple[cp.ndarray, bool, int]:
+                 Pr_b=Pr_b,
+                 theta=mine["theta"],
+                 seg_start=seg_start,
+-                joint_cats=joint_args.get("joint_cats"),
++                joint_cats=mine.get("joint_cats"),
+                 joints=joints,
+                 **workspace,
+                 force_blocks=_FORCE_CLUSTER_BLOCKS,
+@@ -507,9 +510,11 @@ def run(rank: int, comm: int) -> tuple[cp.ndarray, bool, int]:
+                     Z_hat = _correction_multi(
+                         X,
+                         R,
++                        O=O,
+                         lambda_kb=lambda_kb,
+-                        n_first=int(n_levels[0]),
+-                        **joint_args,
++                        joint_cats=mine["joint_cats"],
++                        seg_levels=seg_levels,
++                        level_offsets=level_offsets,
+                         segments=segments,
+                         output=Z_norm,
+                         normalize=normalize,
+@@ -567,8 +572,9 @@ def _sort_by_batch(
+     """
+     batch_codes, n_levels = _get_batch_codes(batch_mat, batch_key)
+     n_covariates, n_batches = int(n_levels.size), int(n_levels.sum())
+-    # Several keys solve a dense float64 system over all their levels per
+-    # cluster (and factor a copy); fail before the GPU work if it cannot fit.
++    # Several keys assemble a dense float64 system over all their levels per
++    # cluster and factor a copy (float32, or float64 when the solve falls back,
++    # which the bound sizes); fail before the GPU work if it cannot fit.
+     system_bytes = 16 * (n_batches + 1) ** 2
+     if n_covariates > 1 and system_bytes > _CORRECTION_WORKSPACE_LIMIT_BYTES:
+         raise MemoryError(
+@@ -581,18 +587,9 @@ def _sort_by_batch(
+     groups, counts, joint = batch_codes[:, 0], N_b, {}
+     if n_covariates > 1:
+         joint_cats, groups = _factorize_joint_codes(batch_codes, n_levels)
+-        if joint_cats.size > 2**31 - 2**24:  # int32 (category, key) positions
+-            raise ValueError(
+-                f"harmonize supports at most {2**31 - 2**24} joint categories x keys, got {joint_cats.size}."
+-            )
+         counts = cp.zeros(joint_cats.shape[0], dtype=cp.int32)
+         cp.add.at(counts, groups, 1)
+-        marginal = _create_category_index_mapping(joint_cats.ravel(), n_batches)
+-        joint = {
+-            "joint_cats": joint_cats,
+-            "marginal_joint_offsets": marginal[0],
+-            "marginal_joint_indices": (marginal[1] // n_covariates).astype(cp.int32),
+-        }
++        joint = {"joint_cats": joint_cats}
+     # A seeded random order within each group, so the runs of neighbouring
+     # cells shuffled together are random cells of a group. The counts are read
+     # (waiting for the GPU) before the sort is queued.
+@@ -741,36 +738,56 @@ def _assignment_args(R: cp.ndarray, dtype) -> dict:
+     return {"R": R}
+ 
+ 
+-def _rhs_bounds(parts: list[cp.ndarray], offsets: np.ndarray, bounds: list[int]) -> cp.ndarray:
++def _rhs_bounds(
++    parts: list[cp.ndarray],
++    offsets: np.ndarray,
++    bounds: list[int],
++    *,
++    joint_cats: cp.ndarray | None = None,
++    level_offsets: list[int] | None = None,
++) -> cp.ndarray:
+     """Bounds of the exact right-hand side sums (segment_gemm.cuh), on the current GPU.
+ 
+     The exponents e (int16) of n_g max |X_gd| < 2^e for each group g of the cells (sorted by group, ``offsets`` on
+-    the host) and PC d, so no other group or PC coarsens a sum. ``parts`` hold the cells
+-    ``bounds[r] .. bounds[r + 1]``; each GPU takes the maxima of its own groups (a group spanning GPUs from each),
+-    which are exact, so every split gives the same bounds.
++    the host) and PC d, so no other group or PC coarsens a sum: the batches with one key; with several
++    (``joint_cats``: the levels of the joint categories, ``level_offsets``: the first level of each key and the
++    end), every key's levels in key order. ``parts`` hold the cells ``bounds[r] .. bounds[r + 1]``; each GPU takes
++    the maxima of its own cells, which are exact, so every split gives the same bounds.
+     """
+-    maxima = cp.zeros((len(offsets) - 1, parts[0].shape[1]), dtype=parts[0].dtype)
++    n_pcs, counts = parts[0].shape[1], np.diff(offsets).astype(np.int64)
++    if joint_cats is not None:  # cells per level: those of its joint categories
++        cats, n = cp.asnumpy(joint_cats), np.zeros(level_offsets[-1], dtype=np.int64)
++        for c in range(cats.shape[1]):
++            np.add.at(n, cats[:, c], counts)
++    else:
++        n = counts
++    maxima = cp.zeros((len(n), n_pcs), dtype=parts[0].dtype)
+     for part, lo, hi in zip(parts, bounds[:-1], bounds[1:], strict=True):
+-        # the groups of the cells lo .. hi - 1
+-        first, end = np.searchsorted(offsets, [lo, hi - 1], side="right") - [1, 0]
+         with cp.cuda.Device(part.device.id):
+             seg_start, seg_group = _segments(offsets, _SEGMENT, lo, hi)
+-            seg_group -= int(first)  # rows of m
+-            m = cp.empty((end - first, part.shape[1]), dtype=part.dtype)
+-            _correction_batched_cuda.group_absmax(
++            absmax = functools.partial(
++                _correction_batched_cuda.group_absmax,
+                 part,
+                 seg_start=seg_start,
+-                seg_group=seg_group,
+-                out=m,
+                 stream=cp.cuda.get_current_stream().ptr,
+             )
++            if joint_cats is None:  # the groups of the cells lo .. hi - 1
++                first, end = np.searchsorted(offsets, [lo, hi - 1], side="right") - [1, 0]
++                m = cp.empty((end - first, n_pcs), dtype=part.dtype)
++                absmax(seg_group=seg_group - int(first), out=m)
++            else:  # every level of every key, from the segments' joint categories
++                first, end = 0, len(n)
++                m = cp.empty((len(n), n_pcs), dtype=part.dtype)
++                levels = _segment_levels(_copy_to_device(joint_cats, part.device.id), seg_group, level_offsets)
++                for c, (lo_c, hi_c) in enumerate(zip(level_offsets[:-1], level_offsets[1:], strict=True)):
++                    absmax(seg_group=levels[c], out=m[lo_c:hi_c])
+         rows = maxima[first:end]
+         cp.maximum(rows, _copy_to_device(m, maxima.device.id), out=rows)
+     if not bool(cp.isfinite(maxima).all()):
+         raise ValueError(
+             "Input data contains NaN or infinite values. Please handle these before running harmony_integrate."
+         )
+-    n = cp.asarray(np.diff(offsets), dtype=cp.float64)[:, None]
++    n = cp.asarray(n, dtype=cp.float64)[:, None]
+     rhs = n * maxima  # beyond float64 near 1e308: n < 2^a, max < 2^b
+     exp = cp.frexp(cp.where(rhs > 0, rhs, 1.0))[1]
+     exp = cp.where(cp.isinf(rhs), cp.frexp(n)[1] + cp.frexp(maxima)[1], exp)
+@@ -794,6 +811,11 @@ def _segments(
+     return cp.asarray(start - lo, dtype=cp.int32), cp.asarray(group, dtype=cp.int32)
+ 
+ 
++def _segment_levels(joint_cats: cp.ndarray, seg_group: cp.ndarray, level_offsets: list[int]) -> cp.ndarray:
++    """Each segment's level within every key (keys x segments); segments never straddle a joint category."""
++    return cp.ascontiguousarray((joint_cats[seg_group] - cp.asarray(level_offsets[:-1], dtype=cp.int32)).T)
++
++
+ def _sorted_groups(offsets: np.ndarray, lo: int, hi: int, device: int) -> cp.ndarray:
+     """The groups of the sorted cells ``lo .. hi`` (``offsets`` on the host) on ``device``.
+ 
+@@ -1005,11 +1027,11 @@ def _correction_multi(
+     X: cp.ndarray,
+     R: cp.ndarray,
+     *,
++    O: cp.ndarray,
+     lambda_kb: cp.ndarray,
+-    n_first: int,
+     joint_cats: cp.ndarray,
+-    marginal_joint_offsets: cp.ndarray,
+-    marginal_joint_indices: cp.ndarray,
++    seg_levels: cp.ndarray,
++    level_offsets: list[int],
+     segments: tuple,
+     output: cp.ndarray | None = None,
+     normalize: bool = False,
+@@ -1018,8 +1040,11 @@ def _correction_multi(
+ ) -> cp.ndarray:
+     """Apply the exact general-design correction in bounded cluster chunks.
+ 
+-    The cells are sorted by joint category (``segments`` as for _correction_batched), with the joint counts of R over
+-    the ``n_total`` cells of all GPUs.
++    The cells are sorted by joint category (``segments`` as for _correction_batched, the bounds per level),
++    ``seg_levels`` (keys x segments) holds each segment's level within its key and
++    ``level_offsets`` the first level of each key; the counts and sums run over the ``n_total`` cells of all GPUs.
++    The cluster systems are solved in float32 and refined in float64 as the counts ``O`` and the ridge call for
++    (_refinement_steps; correction_batched.cu).
+     """
+     seg_start, seg_group, bounds = segments
+     Z = _correction_output(X, output)
+@@ -1028,9 +1053,8 @@ def _correction_multi(
+         R=R,
+         lambda_kb=lambda_kb,
+         joint_cats=joint_cats,
+-        marginal_joint_offsets=marginal_joint_offsets,
+-        marginal_joint_indices=marginal_joint_indices,
+-        n_first=n_first,
++        seg_levels=seg_levels,
++        level_offsets=level_offsets,
+         seg_start=seg_start,
+         seg_group=seg_group,
+         bounds=bounds,
+@@ -1045,6 +1069,7 @@ def _correction_multi(
+         ),
+         suppress=_SUPPRESS_PENALTY,
+         n_total=n_total,
++        refine=_refinement_steps(O, lambda_kb, len(level_offsets) - 1, X.dtype.itemsize),
+         stream=cp.cuda.get_current_stream().ptr,
+         blas=cp.cuda.device.get_cublas_handle(),
+         solver=cp.cuda.device.get_cusolver_handle(),
+@@ -1053,6 +1078,23 @@ def _correction_multi(
+     return Z
+ 
+ 
++def _refinement_steps(O: cp.ndarray, lambda_kb: cp.ndarray, n_covariates: int, itemsize: int) -> int:
++    """Float64 refinement steps of the float32 cluster solves of the several-keys correction, or -1 for float64.
++
++    Equilibrated, a cluster's system has a unit diagonal and a largest eigenvalue below the number of design blocks
++    (intercept and keys); in the design's null directions only the ridge acts, spread over those blocks, and the
++    intercept has none, so the smallest eigenvalue is at least ``lambda / ((O + lambda) (n_covariates + 1))`` and the
++    condition number at most ``(n_covariates + 1)**2 max (O + lambda) / lambda``. Each step gains that factor times
++    2**-24; the count reaches 2**-20 relative error for float32 data and the rounding level of a float64 solve
++    (1e-15 as the proxy) for float64, else the float64 solve (more steps would cost more than its factorization).
++    """
++    rho = (n_covariates + 1) ** 2 * float(cp.max((O + lambda_kb) / lambda_kb)) * 2.0**-24  # suppressed levels: ~1
++    if not rho < 0.1:
++        return -1
++    steps = math.ceil(math.log(2.0**-20 if itemsize == 4 else 1e-15) / math.log(rho)) - 1
++    return steps if steps <= 4 else -1
++
++
+ def _multi_correction_cluster_chunk_size(
+     *,
+     n_pcs: int,
+@@ -1063,17 +1105,18 @@ def _multi_correction_cluster_chunk_size(
+ ) -> int:
+     """Choose a cluster chunk that keeps multi-key scratch below 1 GiB (one cluster at a time above that)."""
+     nb1 = n_batches + 1
+-    # Double Gram and RHS with the solver's copies, joint right-hand sides
+-    # (double) and coefficients, exact joint sums, and joint counts. The chunk
+-    # sets the results (correction_batched.cu), so the terms of buffers that
+-    # are gone stay: the solver's Gram copies, coefficients in X's dtype and a
+-    # sliced lambda and mask.
++    # Double Gram and right-hand sides, the float32 systems with their scaling
++    # and residuals, the round's coefficients, the exact per-level sums (int64
++    # limbs), the joint counts (int64) and the applied coefficients in X's
++    # dtype. The chunk sets the results (correction_batched.cu), so the terms
++    # of buffers that are gone stay (the solver's Gram copies).
+     per_cluster = (
+         16 * (nb1 * nb1 + nb1 * n_pcs)
++        + 4 * (nb1 * nb1 + nb1 * n_pcs)
++        + 8 * nb1 * (1 + 2 * n_pcs)
++        + 8 * _limbs(itemsize) * nb1 * n_pcs
++        + 8 * n_joint_categories
+         + itemsize * nb1 * n_pcs
+-        + n_joint_categories * ((8 + itemsize) * n_pcs + itemsize)
+-        + 8 * _limbs(itemsize) * n_joint_categories * n_pcs
+-        + (itemsize + 1) * n_batches
+     )
+     return max(1, min(n_clusters, _CORRECTION_WORKSPACE_LIMIT_BYTES // per_cluster))
+ 
+diff --git a/tests/test_harmony.py b/tests/test_harmony.py
+index 3e0dad3b..b5d918e2 100644
+--- a/tests/test_harmony.py
++++ b/tests/test_harmony.py
+@@ -30,6 +30,7 @@
+     _correction,
+     _correction_multi,
+     _rhs_bounds,
++    _segment_levels,
+     _segments,
+ )
+ from rapids_singlecell.preprocessing._harmony._helper import (
+@@ -40,19 +41,22 @@
+ )
+ 
+ 
+-def _solve_spd_batched(gram, rhs, *, one_at_a_time=False):
+-    # The cluster-system solve of the multi-key correction (C++).
++def _solve_spd_batched(gram, rhs, *, one_at_a_time=False, refine=1, with_info=False):
++    # The cluster-system solve of the multi-key correction (C++): float32
++    # factors, `refine` float64 refinement steps, float64 for a chunk whose
++    # float32 factorization failed. with_info: also (least squares, fell back).
+     x = cp.empty_like(rhs)
+-    harmony_module._correction_batched_cuda.solve_spd(
++    info = harmony_module._correction_batched_cuda.solve_spd(
+         gram,
+         rhs,
+         x,
+         one_at_a_time=one_at_a_time,
++        refine=refine,
+         stream=cp.cuda.get_current_stream().ptr,
+         blas=cp.cuda.device.get_cublas_handle(),
+         solver=cp.cuda.device.get_cusolver_handle(),
+     )
+-    return x
++    return (x, info) if with_info else x
+ 
+ 
+ def _get_measure(x, base, norm):
+@@ -246,6 +250,74 @@ def test_harmony_large_multikey_systems_solve_one_at_a_time(one_at_a_time):
+     np.testing.assert_allclose(gram[2] @ result[2], rhs[2], rtol=1e-7, atol=1e-7)
+ 
+ 
++@pytest.mark.parametrize("one_at_a_time", [False, True])
++def test_harmony_multikey_solve_refines_float32_to_float64(one_at_a_time):
++    # The systems of two keys with Zipf-distributed level sizes (plus the
++    # intercept, dynamic ridge, a pruned level): the float32 solve alone is
++    # within 1e-5, one float64 refinement step within 1e-9 of float64.
++    rng = np.random.default_rng(1)
++    L1, L2, n_cells, p = 300, 200, 200_000, 7
++    prob = [1 / np.arange(1, L + 1) for L in (L1, L2)]
++    c1, c2 = (rng.choice(L, n_cells, p=q / q.sum()) for L, q in zip((L1, L2), prob, strict=True))
++    systems = []
++    for seed in range(3):
++        r = np.random.default_rng(seed).random(n_cells)  # soft assignments
++        O = np.concatenate([np.bincount(c1, r, L1), np.bincount(c2, r, L2)])
++        C = np.bincount(c1 * L2 + c2, r, L1 * L2).reshape(L1, L2)
++        lam = 0.2 * r.sum() * np.concatenate([np.bincount(c1, minlength=L1), np.bincount(c2, minlength=L2)]) / n_cells
++        lam[-1] = 1e30  # a pruned level
++        A = np.zeros((1 + L1 + L2,) * 2)
++        A[0, 0], A[0, 1:], A[1:, 0] = r.sum(), O, O
++        A[1:, 1:][np.diag_indices(L1 + L2)] = O + lam
++        A[1 : 1 + L1, 1 + L1 :], A[1 + L1 :, 1 : 1 + L1] = C, C.T
++        systems.append(A)
++    gram = np.stack(systems)
++    rhs = rng.standard_normal((3, gram.shape[1], p)) * 100
++    expected = np.linalg.solve(gram, rhs)
++    for refine, rtol in ((0, 1e-5), (1, 1e-9)):
++        x, (n_least_squares, fell_back) = _solve_spd_batched(
++            cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time, refine=refine, with_info=True
++        )
++        assert (n_least_squares, fell_back) == (0, False)
++        np.testing.assert_allclose(cp.asnumpy(x), expected, rtol=rtol, atol=rtol * np.abs(expected).max())
++
++
++def test_harmony_refinement_steps_follow_the_ridge():
++    # The dynamic ridge keeps the systems well conditioned: one step for float32
++    # data, two for float64; a fixed ridge of 1 against levels of 1e5 cells
++    # needs four for float32 data and, for float64, more than a float64 solve
++    # costs, so float64 it is. Where the count is tight, two balanced keys with
++    # the intercept, the float32 target holds.
++    O = cp.full((4, 3), 1e5)
++    assert harmony_module._refinement_steps(O, 0.2 * O, 2, 4) == 1
++    assert harmony_module._refinement_steps(O, 0.2 * O, 2, 8) == 2
++    assert harmony_module._refinement_steps(O, cp.ones_like(O), 2, 4) == 4
++    assert harmony_module._refinement_steps(O, cp.ones_like(O), 2, 8) == -1
++    assert harmony_module._refinement_steps(O, cp.full_like(O, 1e30), 2, 4) == 0  # all suppressed
++    A = np.array(
++        [[2e5, 1e5, 1e5, 1e5, 1e5], [1e5, 1e5 + 1, 0, 5e4, 5e4], [1e5, 0, 1e5 + 1, 5e4, 5e4]]
++        + [[1e5, 5e4, 5e4, 1e5 + 1, 0], [1e5, 5e4, 5e4, 0, 1e5 + 1]]
++    )
++    rhs = np.random.default_rng(0).standard_normal((1, 5, 3)) * 1e5
++    x = _solve_spd_batched(cp.asarray(A[None]), cp.asarray(rhs), refine=4)
++    expected = np.linalg.solve(A[None], rhs)
++    assert np.abs(cp.asnumpy(x) - expected).max() <= 2**-20 * np.abs(expected).max()
++
++
++@pytest.mark.parametrize("one_at_a_time", [False, True])
++def test_harmony_multikey_solve_falls_back_to_float64(one_at_a_time):
++    # A system that is positive definite in float64 but not in float32 sends
++    # its chunk through the float64 solve.
++    gram = np.array([[[1.0, 1 - 1e-9], [1 - 1e-9, 1.0]], [[2.0, 0.5], [0.5, 2.0]]])
++    rhs = np.array([[[1.0, 2.0], [1.0, 3.0]], [[1.0, 0.0], [0.0, 1.0]]])
++    for refine in (1, -1):  # by failure, and on request
++        x, (n_least_squares, fell_back) = _solve_spd_batched(
++            cp.asarray(gram), cp.asarray(rhs), one_at_a_time=one_at_a_time, refine=refine, with_info=True
++        )
++        assert (n_least_squares, fell_back) == (0, True)
++        np.testing.assert_allclose(cp.asnumpy(x), np.linalg.solve(gram, rhs), rtol=1e-9)
++
++
+ def test_harmony_interrupt_during_the_solve_is_raised_after_it():
+     # Ctrl-C while the main thread waits for the GPU in the C++ solve: its
+     # scratch frees run no Python, so KeyboardInterrupt follows the call (a
+@@ -567,10 +639,15 @@ def run(method):
+ 
+ 
+ @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+-@pytest.mark.parametrize(("n_covariates", "n_cells"), [(2, 31), (3, 31), (4, 31), (2, 1_000_000)])
+-def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n_cells, monkeypatch):
++@pytest.mark.parametrize(
++    ("levels", "n_cells"),
++    [((2, 3), 31), ((2, 3, 4), 31), ((2, 3, 4, 5), 31), ((2,) * 9, 31), ((2, 3), 1_000_000), ((300, 20), 20_000)],
++)
++def test_harmony_multikey_correction_matches_dense_design(dtype, levels, n_cells, monkeypatch):
++    # 9 keys: sums and corrections in passes of 8 keys; (300, 20): Gram matrices
++    # wider than a block and thousands of joint categories.
+     rng = np.random.default_rng(734)
+-    levels = np.arange(2, 2 + n_covariates, dtype=np.int32)
++    levels = np.asarray(levels, dtype=np.int32)
+     offsets = np.concatenate(([0], np.cumsum(levels)[:-1])).astype(np.int32)
+     n_batches = int(levels.sum())
+     n_pcs, n_clusters = 5, 3
+@@ -583,7 +660,7 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
+     R_np /= R_np.sum(axis=1, keepdims=True)
+ 
+     O_np = np.zeros((n_batches, n_clusters), dtype=np_dtype)
+-    for covariate in range(n_covariates):
++    for covariate in range(len(levels)):
+         np.add.at(O_np, cats_np[:, covariate], R_np)
+     lambda_np = rng.uniform(0.2, 1.0, size=O_np.shape).astype(np_dtype)
+     lambda_np[1, 1] = np_dtype.type(_SUPPRESS_PENALTY)
+@@ -594,22 +671,23 @@ def test_harmony_multikey_correction_matches_dense_design(dtype, n_covariates, n
+     cats_np, X_np, R_np = cats_np[order], X_np[order], R_np[order]
+     joint_codes_np = joint_codes_np[order]
+     joint_offsets = np.searchsorted(joint_codes_np, np.arange(len(joint_cats_np) + 1)).astype(np.int32)
+-    marginal = sorted((level, joint) for joint, levels in enumerate(joint_cats_np) for level in levels)
+-    marginal_offsets = np.searchsorted([level for level, _ in marginal], np.arange(n_batches + 1)).astype(np.int32)
++    joint_cats, level_offsets = cp.asarray(joint_cats_np, dtype=cp.int32), [0, *np.cumsum(levels).tolist()]
++    seg_start, seg_group = _segments(joint_offsets)
++    seg_levels = _segment_levels(joint_cats, seg_group, level_offsets)
++    bounds = _rhs_bounds(
++        [cp.asarray(X_np)], joint_offsets, [0, n_cells], joint_cats=joint_cats, level_offsets=level_offsets
++    )
+ 
+     def correct(normalize=False):
+         return _correction_multi(
+             cp.asarray(X_np),
+             cp.asarray(R_np),
++            O=cp.asarray(O_np),
+             lambda_kb=cp.asarray(lambda_np),
+-            n_first=int(levels[0]),
+-            joint_cats=cp.asarray(joint_cats_np, dtype=cp.int32),
+-            segments=(
+-                *_segments(joint_offsets),
+-                cp.asarray(_rhs_bounds([cp.asarray(X_np)], joint_offsets, [0, n_cells])),
+-            ),
+-            marginal_joint_offsets=cp.asarray(marginal_offsets),
+-            marginal_joint_indices=cp.asarray([joint for _, joint in marginal], dtype=cp.int32),
++            joint_cats=joint_cats,
++            seg_levels=seg_levels,
++            level_offsets=level_offsets,
++            segments=(seg_start, seg_group, bounds),
+             normalize=normalize,
+         )
+ 
+@@ -632,6 +710,45 @@ def correct(normalize=False):
+     cp.testing.assert_allclose(correct(normalize=True), cp.asarray(expected), atol=atol, rtol=atol)
+ 
+ 
++@pytest.mark.parametrize(("n_pcs", "n_clusters", "n_keys"), [(64, 64, 1), (30, 23, 1), (32, 126, 1), (30, 10, 2)])
++def test_harmony_shared_memory_boundary(n_pcs, n_clusters, n_keys):
++    # Shapes whose segment-sum or apply plan fills the 48 KB of shared memory a kernel may use without opting in:
++    # the kernels' static rows have to count towards the opt-in.
++    rng = np.random.default_rng(3)
++    n_cells = 2000
++    obs = pd.DataFrame({f"b{i}": rng.integers(0, 4, n_cells).astype(str) for i in range(n_keys)}).astype("category")
++    X = cp.asarray(rng.standard_normal((n_cells, n_pcs), dtype=np.float32))
++    key = list(obs.columns) if n_keys > 1 else "b0"
++    Z = harmony_module.harmonize(X, obs, key, n_clusters=n_clusters, max_iter_harmony=2, rng=0)
++    assert cp.isfinite(Z).all()
++
++
++def test_harmony_rhs_bounds_per_level():
++    # With several keys the bound of a level is the one-key bound of its cells (those of all its joint categories),
++    # also past float64's range, and the same from any split of the cells.
++    rng = np.random.default_rng(5)
++    n_cells, n_pcs, level_offsets = 400, 4, [0, 2, 5]
++    cats = np.column_stack(
++        [rng.integers(lo, hi, n_cells) for lo, hi in zip(level_offsets[:-1], level_offsets[1:], strict=True)]
++    )
++    joint_cats, codes = np.unique(cats, axis=0, return_inverse=True)
++    order = np.argsort(codes, kind="stable")
++    X = rng.normal(size=(n_cells, n_pcs)) * 10.0 ** rng.integers(-3, 3, size=(1, n_pcs))
++    X[0, 0] = 1e307
++    X, cats, codes = X[order], cats[order], codes[order]
++    offsets = np.searchsorted(codes, np.arange(len(joint_cats) + 1)).astype(np.int32)
++    joint_cats = cp.asarray(joint_cats, dtype=cp.int32)
++    got = _rhs_bounds([cp.asarray(X)], offsets, [0, n_cells], joint_cats=joint_cats, level_offsets=level_offsets)
++    assert got.shape == (5, n_pcs)
++    for level in range(5):
++        rows = cp.asarray(X[(cats == level).any(axis=1)])
++        one_key = _rhs_bounds([rows], np.array([0, len(rows)], dtype=np.int32), [0, len(rows)])
++        cp.testing.assert_array_equal(got[level], one_key[0])
++    parts = [cp.asarray(X[:256]), cp.asarray(X[256:])]
++    split = _rhs_bounds(parts, offsets, [0, 256, n_cells], joint_cats=joint_cats, level_offsets=level_offsets)
++    cp.testing.assert_array_equal(split, got)
++
++
+ @pytest.mark.filterwarnings("ignore:Harmony did not converge")
+ @pytest.mark.parametrize(
+     ("case", "theta", "n_clusters", "max_iter_harmony"),
+@@ -1489,6 +1606,9 @@ def on_gpu(device):  # CuPy input on that GPU
+         assert run(devices).tobytes() == one.tobytes()
+         if key[1] == "many":  # each GPU solves its share of the systems
+             assert sum(solved) == on_one
++        with monkeypatch.context() as float64_solve:  # in place at each GPU's offset in the round's solutions
++            float64_solve.setattr(harmony_module, "_refinement_steps", lambda *_: -1)
++            assert run(devices).tobytes() == run([0]).tobytes()
+     # Without peer copies (pinned host slots, relayed CuPy input), in several
+     # upload chunks per shard: scattered rows, and runs of rows from input
+     # sorted by batch.

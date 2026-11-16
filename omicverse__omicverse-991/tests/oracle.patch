@@ -1,0 +1,182 @@
+diff --git a/omicverse/pp/_umap.py b/omicverse/pp/_umap.py
+index 4d9cbc82b..be5d3fcfd 100644
+--- a/omicverse/pp/_umap.py
++++ b/omicverse/pp/_umap.py
+@@ -1,6 +1,9 @@
+ from __future__ import annotations
+ 
++import functools
++import inspect
+ import warnings
++from contextlib import contextmanager
+ from typing import TYPE_CHECKING
+ from datetime import datetime
+ 
+@@ -22,6 +25,51 @@
+     _InitPos = Literal["paga", "spectral", "random"]
+ 
+ 
++# scipy >= 1.17 ships a C port of ARPACK that offsets into the n x ncv
++# Lanczos basis as `v[ldv * j]` with 32-bit ints. umap-learn picks eigsh with
++# ncv = sqrt(n) for graphs below 2M nodes, so from ~1.66M cells the offset
++# overflows and OpenBLAS segfaults during spectral initialisation (#990,
++# scipy/scipy#26395).
++# lobpcg (umap's own choice >= 2M) has no such limit.
++_ARPACK_INT32_MAX = 2**31 - 1
++
++
++def _arpack_overflows(n_nodes, dim):
++    ncv = max(2 * (dim + 1) + 1, int(np.sqrt(n_nodes)))
++    return n_nodes * ncv > _ARPACK_INT32_MAX
++
++
++@contextmanager
++def _lobpcg_for_large_spectral_init():
++    """Route umap-learn's spectral init to lobpcg where eigsh would overflow."""
++    try:
++        import umap.spectral as umap_spectral
++        original = umap_spectral._spectral_layout
++        signature = inspect.signature(original)
++    except (ImportError, AttributeError):
++        yield
++        return
++    if "method" not in signature.parameters:
++        yield
++        return
++
++    @functools.wraps(original)
++    def _spectral_layout(*args, **kwargs):
++        bound = signature.bind(*args, **kwargs)
++        graph, dim = bound.arguments["graph"], bound.arguments["dim"]
++        if not bound.arguments.get("method") and _arpack_overflows(graph.shape[0], dim):
++            bound.arguments["method"] = "lobpcg"
++            print(f"   {Colors.CYAN}💡 {graph.shape[0]:,} cells: spectral init via lobpcg "
++                  f"(ARPACK would overflow int32){Colors.ENDC}")
++        return original(*bound.args, **bound.kwargs)
++
++    umap_spectral._spectral_layout = _spectral_layout
++    try:
++        yield
++    finally:
++        umap_spectral._spectral_layout = original
++
++
+ @old_positionals(
+     "min_dist",
+     "spread",
+@@ -148,25 +196,26 @@ def umap(  # noqa: PLR0913, PLR0915
+         # for the init condition in the UMAP embedding
+         default_epochs = 10 if neighbors["connectivities"].shape[0] <= 10000 else 20
+         n_epochs = default_epochs if maxiter is None else maxiter
+-        X_umap, _ = simplicial_set_embedding(
+-            data=X,
+-            graph=neighbors["connectivities"].tocoo(),
+-            n_components=n_components,
+-            initial_alpha=alpha,
+-            a=a,
+-            b=b,
+-            gamma=gamma,
+-            negative_sample_rate=negative_sample_rate,
+-            n_epochs=n_epochs,
+-            init=init_coords,
+-            random_state=random_state_processed,
+-            metric=neigh_params.get("metric", "euclidean"),
+-            metric_kwds=neigh_params.get("metric_kwds", {}),
+-            densmap=False,
+-            densmap_kwds={},
+-            output_dens=False,
+-            verbose=settings.verbosity > 3,
+-        )
++        with _lobpcg_for_large_spectral_init():
++            X_umap, _ = simplicial_set_embedding(
++                data=X,
++                graph=neighbors["connectivities"].tocoo(),
++                n_components=n_components,
++                initial_alpha=alpha,
++                a=a,
++                b=b,
++                gamma=gamma,
++                negative_sample_rate=negative_sample_rate,
++                n_epochs=n_epochs,
++                init=init_coords,
++                random_state=random_state_processed,
++                metric=neigh_params.get("metric", "euclidean"),
++                metric_kwds=neigh_params.get("metric_kwds", {}),
++                densmap=False,
++                densmap_kwds={},
++                output_dens=False,
++                verbose=settings.verbosity > 3,
++            )
+     elif method == "umap-gpu":
+         # Non-parametric UMAP on the GPU (omicverse.utils.gpuex.umap). Same
+         # fuzzy graph, spectral init (torch.lobpcg), a/b curve and edge-SGD
+diff --git a/tests/pp/test_umap_large_spectral_init.py b/tests/pp/test_umap_large_spectral_init.py
+new file mode 100644
+index 000000000..1607a3c73
+--- /dev/null
++++ b/tests/pp/test_umap_large_spectral_init.py
+@@ -0,0 +1,64 @@
++"""Spectral init must avoid ARPACK's int32 overflow on ~1.66M-2M cells (#990)."""
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++umap_spectral = pytest.importorskip("umap.spectral")
++
++from omicverse.pp import _umap
++
++
++def test_overflow_threshold_matches_arpack_workspace():
++    # umap-learn uses ncv = int(sqrt(n)); n * ncv crosses 2**31 - 1 near 1.66M.
++    assert not _umap._arpack_overflows(1_600_000, 2)
++    assert _umap._arpack_overflows(1_700_000, 2)
++    assert _umap._arpack_overflows(1_829_054, 2)  # dataset in #990
++
++
++class _FakeGraph:
++    def __init__(self, n):
++        self.shape = (n, n)
++
++
++@pytest.mark.parametrize("n, expected", [(1_000, None), (1_829_054, "lobpcg")])
++def test_context_forces_lobpcg_only_when_needed(monkeypatch, n, expected):
++    seen = {}
++
++    def fake(data, graph, dim, random_state, metric="euclidean", metric_kwds={},
++             init="random", method=None, tol=0.0, maxiter=0):
++        seen["method"] = method
++        return np.zeros((graph.shape[0], dim))
++
++    monkeypatch.setattr(umap_spectral, "_spectral_layout", fake)
++    with _umap._lobpcg_for_large_spectral_init():
++        umap_spectral._spectral_layout(data=None, graph=_FakeGraph(n), dim=2,
++                                       random_state=np.random.RandomState(0))
++    assert seen["method"] == expected
++    assert umap_spectral._spectral_layout is fake
++
++
++def test_explicit_method_is_respected(monkeypatch):
++    seen = {}
++
++    def fake(data, graph, dim, random_state, metric="euclidean", metric_kwds={},
++             init="random", method=None, tol=0.0, maxiter=0):
++        seen["method"] = method
++
++    monkeypatch.setattr(umap_spectral, "_spectral_layout", fake)
++    with _umap._lobpcg_for_large_spectral_init():
++        umap_spectral._spectral_layout(None, _FakeGraph(1_829_054), 2, None, method="eigsh")
++    assert seen["method"] == "eigsh"
++
++
++def test_small_graph_embedding_unchanged():
++    # Below the threshold the wrapper must be a no-op on the real solver.
++    rng = np.random.default_rng(0)
++    n = 300
++    rows = np.repeat(np.arange(n), 5)
++    g = sp.csr_matrix((rng.uniform(.1, 1, n * 5), (rows, (rows + rng.integers(1, n, n * 5)) % n)),
++                      shape=(n, n))
++    g = g.maximum(g.T).tocoo()
++    ref = umap_spectral.spectral_layout(None, g, 2, np.random.RandomState(0))
++    with _umap._lobpcg_for_large_spectral_init():
++        got = umap_spectral.spectral_layout(None, g, 2, np.random.RandomState(0))
++    np.testing.assert_allclose(got, ref)

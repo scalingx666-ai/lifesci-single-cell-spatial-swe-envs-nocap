@@ -1,0 +1,152 @@
+diff --git a/docs/response-schemas.json b/docs/response-schemas.json
+index c5b4fbc86..094404a5e 100644
+--- a/docs/response-schemas.json
++++ b/docs/response-schemas.json
+@@ -5799,7 +5799,10 @@
+             ]
+           },
+           "frame_id": {
+-            "type": "null"
++            "type": [
++              "null",
++              "string"
++            ]
+           },
+           "project_id": {
+             "type": "string"
+@@ -17192,7 +17195,10 @@
+             ]
+           },
+           "frame_id": {
+-            "type": "null"
++            "type": [
++              "null",
++              "string"
++            ]
+           },
+           "project_id": {
+             "type": "string"
+diff --git a/openai4s/server/response_capture.py b/openai4s/server/response_capture.py
+index 4b2a334a2..ba022da52 100644
+--- a/openai4s/server/response_capture.py
++++ b/openai4s/server/response_capture.py
+@@ -70,6 +70,26 @@
+ #: quietly drop two unrelated routes' contracts as well.
+ _MACHINE_STATE_KEYS = frozenset({"sandbox", "default_host", "gpu_name", "cuda_version"})
+ 
++#: A different failure that looks like the one above, and must not be fixed the
++#: same way.
++#:
++#: `merge` widens across observations, so a nullable field ends up `["null",
++#: "string"]` *if the suite observes it both ways*. A field the suite only ever
++#: sees in one state freezes as that state alone -- and the resulting entry
++#: describes the run, not the API. `POST /example/session` was the first one
++#: caught: its `error` is `str | None` straight from `last_error()`, but the
++#: suite observed it exactly once, immediately after `start()` cleared the error
++#: and spawned a thread that may or may not have failed yet. Both threads then
++#: contend for one lock, so the field froze as `string` on Linux/CI and `null`
++#: on macOS, and the gate called the other machine a breaking change.
++#:
++#: The fix is a test that exercises the other state, never an entry here. These
++#: fields are not host-dependent -- they are *under-observed*, and eliding them
++#: would delete a real guarantee to silence a coverage gap. A survey at the time
++#: of writing found 94 fields frozen as null-only across 43 route entries
++#: (`frame_id` on both `/example/session` verbs among them); each is a latent
++#: version of this, waiting for the first capture that sees the populated state.
++
+ #: How many incompatibilities to name per route before summarising the rest.
+ #: One structural change can break dozens of nested fields, and a wall of them
+ #: buries the first one, which is usually the cause of all the others.
+diff --git a/tests/test_gateway.py b/tests/test_gateway.py
+index 549cd8ba6..e7f661763 100644
+--- a/tests/test_gateway.py
++++ b/tests/test_gateway.py
+@@ -186,6 +186,88 @@ def _boom(_cfg, _runner):
+         runner.close()
+ 
+ 
++def test_the_example_seed_route_reports_the_already_seeded_state(tmp_path, monkeypatch):
++    """The idempotent path the API docs describe and nothing exercised.
++
++    `POST /example/session` on an install that already has the example must not
++    start anything: `existing is not None` skips `start()` entirely, so the
++    response reports the frame that is there and whatever error the last attempt
++    left behind. Worth a test on its own -- it is the difference between a
++    second click costing nothing and a second click running six cells.
++
++    It also closes a hole that surfaced somewhere unexpected. The frozen
++    `POST /example/session [ok]` shape in `docs/response-schemas.json` was built
++    from the single observation the suite happened to make, and that observation
++    sits immediately after `start()` has cleared `_last_error` and spawned a
++    thread that may or may not have failed yet. Both threads then contend for
++    the same lock, so `error` was captured as `string` on Linux/CI and `null` on
++    macOS -- a scheduler outcome published as a contract, in a file whose whole
++    claim is that it describes the API. The field is `str | None` on both verbs
++    (one dict literal, fed by `last_error()`), and so is `frame_id`
++    (`str` once seeded, `null` before). The two observations below pin both
++    halves of each, deterministically, without depending on which thread wins.
++    """
++    monkeypatch.delenv("OPENAI4S_SEED_DEMO", raising=False)
++    cfg = _cfg(tmp_path)
++    runner = gateway_mod.SessionRunner(cfg, _Hub())
++    seen: list[tuple[dict, int]] = []
++
++    def _handler_for(active_runner):
++        handler = object.__new__(gateway_mod.make_handler(cfg, _Hub(), active_runner))
++        handler.path = "/api/v1/example/session"
++        handler._json = lambda obj, code=200: seen.append((obj, code))
++        handler._body = lambda: {"confirm": True}
++        return handler
++
++    try:
++        # A real error, recorded through the real state object.
++        def _boom(_cfg, _runner):
++            raise RuntimeError("uniprot unreachable")
++
++        monkeypatch.setattr(gateway_mod, "_seed_demo_session", _boom)
++        handler = _handler_for(runner)
++        handler._api("POST", "/example/session")
++        for _ in range(200):
++            if runner.example_seed.last_error():
++                break
++            time.sleep(0.01)
++        assert runner.example_seed.last_error()
++
++        # The example exists now. Written the way the seeder writes it -- a real
++        # store row, not a patched lookup, so the response is still the real
++        # handler's answer and the shape it publishes stays honest.
++        store = get_store(cfg.db_path)
++        fid = store.new_frame(
++            kind="turn", project_id="proj_example", status="done", model=cfg.llm.model
++        )
++        store.update_frame(fid, name=gateway_mod._DEMO_SESSION_NAME)
++
++        handler._api("POST", "/example/session")
++        body, code = seen[-1]
++        assert code == 200
++        assert body["seeded"] is True
++        assert body["started"] is False, "a POST on a seeded install started a run"
++        assert body["frame_id"] == fid
++        assert "uniprot unreachable" in (body["error"] or "")
++
++        # Same seeded install, a runner that has never failed: the null half of
++        # the same contract, and the one CI could not observe.
++        fresh = gateway_mod.SessionRunner(cfg, _Hub())
++        try:
++            for verb in ("GET", "POST"):
++                _handler_for(fresh)._api(verb, "/example/session")
++                body, code = seen[-1]
++                assert code == 200
++                assert body["seeded"] is True
++                assert body["started"] is False
++                assert body["frame_id"] == fid
++                assert body["error"] is None
++        finally:
++            fresh.close()
++    finally:
++        runner.close()
++
++
+ def test_ws_resume_buffer_replaces_notebook_drafts_and_keeps_live_cell_events():
+     hub = gateway_mod.WSHub()
+     root = "root-draft-replay"

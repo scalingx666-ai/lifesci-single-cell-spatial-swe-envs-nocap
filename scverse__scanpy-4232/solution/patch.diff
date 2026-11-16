@@ -1,0 +1,978 @@
+diff --git a/docs/release-notes/4232.feat.md b/docs/release-notes/4232.feat.md
+new file mode 100644
+index 0000000000..12ed0fcb0a
+--- /dev/null
++++ b/docs/release-notes/4232.feat.md
+@@ -0,0 +1 @@
++Fix multi-key {func}`scanpy.pp.harmony_integrate`, remove its legacy correction path, and speed up large integrations {smaller}`S Dicks`
+diff --git a/src/scanpy/preprocessing/_harmony/__init__.py b/src/scanpy/preprocessing/_harmony/__init__.py
+index 98b0c6f5fe..8abc8c7f90 100644
+--- a/src/scanpy/preprocessing/_harmony/__init__.py
++++ b/src/scanpy/preprocessing/_harmony/__init__.py
+@@ -35,14 +35,17 @@ def harmony_integrate(  # noqa: PLR0913
+     ridge_lambda: float = 1.0,
+     alpha: float = 0.2,
+     batch_prune_threshold: float | None = 1e-5,
+-    correction_method: Literal["fast", "original"] = "fast",
++    correction_method: Literal["fast"] = "fast",
+     block_proportion: float = 0.05,
+     rng: SeedLike | RNGLike | None = None,
+ ) -> None:
+     """Integrate different experiments using the Harmony algorithm :cite:p:`Korsunsky2019,Patikas2026`.
+ 
+-    This CPU implementation is based on the harmony-pytorch & rapids_singlecell version,
+-    using NumPy for efficient computation.
++    Integration adjusts a PCA embedding to reduce experiment-specific technical variation,
++    allowing cells from different experiments to be compared.
++    This CPU implementation is based on the rapids-singlecell and harmony-pytorch packages.
++    Multiple batch variables follow the per-covariate formulation described in the Harmony papers:
++    each key is modeled separately instead of combining all keys into one joint category.
+     As Harmony works by adjusting the principal components,
+     this function should be run after performing PCA but before computing the neighbor graph.
+ 
+@@ -62,7 +65,8 @@ def harmony_integrate(  # noqa: PLR0913
+         The annotated data matrix.
+     key
+         The key(s) of the column(s) in ``adata.obs`` that differentiate(s) among experiments/batches.
+-        When multiple keys are provided, a combined batch variable is created from all columns.
++        Multiple keys are modeled as separate batch variables,
++        with one active categorical level per variable and cell.
+     basis
+         The name of the field in ``adata.obsm`` where the PCA table is stored.
+     adjusted_basis
+@@ -102,8 +106,10 @@ def harmony_integrate(  # noqa: PLR0913
+         to contain a balanced representation of all batches.
+         Higher values (e.g. ``4``) produce more aggressive mixing;
+         lower values (e.g. ``0.5``) allow more batch-specific clusters.
+-        Set to ``0`` to disable batch correction entirely.
+-        A list can be provided to set different weights per batch variable.
++        Set to ``0`` to disable the diversity penalty for a batch variable.
++        A scalar is applied to every key. A sequence may contain one value per key,
++        expanded over that key’s categorical levels,
++        or one value per categorical level across all keys.
+     tau
+         Discounting factor on ``theta``.
+         When ``tau > 0``,
+@@ -114,6 +120,7 @@ def harmony_integrate(  # noqa: PLR0913
+         Ridge regression regularization for the correction step.
+         Larger values produce more conservative (smaller) corrections,
+         preventing over-fitting.
++        Must be finite and greater than zero.
+         Only used with ``flavor="harmony1"``.
+     alpha
+         Scaling factor for the dynamic per-cluster-per-batch ridge regularization.
+@@ -123,15 +130,16 @@ def harmony_integrate(  # noqa: PLR0913
+         Only used with ``flavor="harmony2"``.
+     batch_prune_threshold
+         Fraction threshold below which a batch-cluster pair is pruned (correction suppressed).
+-        When the fraction of a batch’s cells assigned to a cluster (``O_kb / N_b``) falls below this threshold,
++        When the fraction of a batch's cells assigned to a cluster (``O_kb / N_b``) falls below this threshold,
+         that batch-cluster pair receives no correction, preventing spurious adjustments.
+         Only used with ``flavor="harmony2"``.
+         Set to ``None`` to disable pruning.
+     correction_method
+         Method for the correction step.
+-        ``"original"`` uses per-cluster ridge regression with explicit matrix inversion.
+         ``"fast"`` uses a precomputed factorization that avoids the full inversion,
+         which can be faster for datasets with many batches.
++        Multiple keys automatically use the exact general-design solve,
++        because this optimization only applies to a single batch variable.
+     block_proportion
+         Proportion of cells updated per clustering sub-iteration.
+         Smaller values produce more stochastic updates.
+@@ -151,6 +159,9 @@ def harmony_integrate(  # noqa: PLR0913
+     if flavor not in {"harmony1", "harmony2"}:
+         msg = f"flavor must be 'harmony1' or 'harmony2', got {flavor!r}."
+         raise ValueError(msg)
++    if correction_method != "fast":
++        msg = f"correction_method must be 'fast', got {correction_method!r}."
++        raise ValueError(msg)
+     stabilized_penalty = flavor == "harmony2"
+     dynamic_lambda = flavor == "harmony2"
+ 
+@@ -211,7 +222,6 @@ def harmony_integrate(  # noqa: PLR0913
+         tol_harmony=tol_harmony,
+         tol_clustering=tol_clustering,
+         ridge_lambda=ridge_lambda,
+-        correction_method=correction_method,
+         block_proportion=block_proportion,
+         tau=tau,
+         rng=rng,
+diff --git a/src/scanpy/preprocessing/_harmony/core.py b/src/scanpy/preprocessing/_harmony/core.py
+index f9bb9e3ad6..02a37bf09c 100644
+--- a/src/scanpy/preprocessing/_harmony/core.py
++++ b/src/scanpy/preprocessing/_harmony/core.py
+@@ -1,7 +1,6 @@
+ from __future__ import annotations
+ 
+ from dataclasses import KW_ONLY, InitVar, dataclass, field
+-from itertools import product
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -15,9 +14,9 @@
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+-    from typing import Literal
+ 
+     import pandas as pd
++    from numpy.typing import NDArray
+ 
+     from ..._utils.random import RNGLike, SeedLike
+ 
+@@ -53,7 +52,6 @@ class Harmony:
+     tol_harmony: float
+     tol_clustering: float
+     ridge_lambda: float
+-    correction_method: Literal["fast", "original"]
+     block_proportion: float
+     tau: int
+     rng: InitVar[SeedLike | RNGLike | None]
+@@ -62,8 +60,10 @@ class Harmony:
+     alpha: float = 0.2
+     batch_prune_threshold: float | None = 1e-5
+ 
+-    batch_codes: np.ndarray = field(init=False)
++    batch_codes: NDArray[np.int32] = field(init=False)
++    n_levels: NDArray[np.int32] = field(init=False)
+     n_batches: int = field(init=False)
++    n_covariates: int = field(init=False)
+     _rng: np.random.Generator = field(init=False)
+ 
+     def __post_init__(
+@@ -87,9 +87,17 @@ def __post_init__(
+             ):
+                 msg = f"batch_prune_threshold must be in [0, 1] or None, got {self.batch_prune_threshold}."
+                 raise ValueError(msg)
++        elif not np.isfinite(self.ridge_lambda) or self.ridge_lambda <= 0:
++            msg = (
++                "ridge_lambda must be a finite positive number when "
++                f"dynamic_lambda=False, got {self.ridge_lambda}."
++            )
++            raise ValueError(msg)
+ 
+         # Process batch keys
+-        self.batch_codes, self.n_batches = _get_batch_codes(batch_df, batch_key)
++        self.batch_codes, self.n_levels = _get_batch_codes(batch_df, batch_key)
++        self.n_batches = int(self.n_levels.sum())
++        self.n_covariates = len(self.n_levels)
+ 
+     def fit(self, x: np.ndarray) -> np.ndarray:
+         """Run Harmony.
+@@ -107,15 +115,12 @@ def fit(self, x: np.ndarray) -> np.ndarray:
+         z_norm = _normalize_rows_l2(x)
+ 
+         # Compute batch proportions
+-        n_b = np.bincount(self.batch_codes, minlength=self.n_batches).astype(x.dtype)
++        n_b = np.bincount(self.batch_codes.ravel(), minlength=self.n_batches).astype(
++            x.dtype
++        )
+         pr_b = (n_b / n_cells).reshape(-1, 1)
+ 
+-        # Set default theta
+-        if isinstance(self.theta, (int, float)):
+-            theta_arr = np.ones(self.n_batches, dtype=x.dtype) * float(self.theta)
+-        else:
+-            theta_arr = np.array(self.theta, dtype=x.dtype)
+-        theta_arr = theta_arr.reshape(1, -1)
++        theta_arr = _get_theta_array(self.theta, self.n_levels, x.dtype)
+ 
+         # Set default n_clusters (needed before tau discounting)
+         if self.n_clusters is None:
+@@ -199,7 +204,6 @@ def _cluster(
+         return _clustering(
+             z_norm,
+             self.batch_codes,
+-            self.n_batches,
+             pr_b,
+             r=r,
+             e=e,
+@@ -222,43 +226,81 @@ def _correct(
+         lambda_kb: np.ndarray,
+     ) -> np.ndarray:
+         """Perform correction step."""
+-        if self.correction_method == "fast":
+-            return _correction_fast(
+-                x,
+-                self.batch_codes,
+-                self.n_batches,
+-                r,
+-                o,
+-                lambda_kb=lambda_kb,
+-            )
+-        else:
+-            return _correction_original(
+-                x,
+-                self.batch_codes,
+-                self.n_batches,
+-                r,
++        if self.n_covariates > 1:
++            return _correction_multi(
++                *(x, self.batch_codes, self.n_batches, r),
+                 lambda_kb=lambda_kb,
+             )
+ 
++        batch_codes = self.batch_codes[:, 0]
++        return _correction_fast(
++            *(x, batch_codes, self.n_batches, r, o),
++            lambda_kb=lambda_kb,
++        )
++
+ 
+ def _get_batch_codes(
+     batch_df: pd.DataFrame,
+     batch_key: str | Sequence[str],
+-) -> tuple[np.ndarray, int]:
+-    """Get batch codes from DataFrame."""
+-    if isinstance(batch_key, str):
+-        batch_vec = batch_df[batch_key]
+-    elif len(batch_key) == 1:
+-        batch_vec = batch_df[batch_key[0]]
+-    else:
+-        df = batch_df[list(batch_key)].astype("str")
+-        batch_vec = df.apply(",".join, axis=1)
++) -> tuple[NDArray[np.int32], NDArray[np.int32]]:
++    """Encode each batch variable into a disjoint range of marginal codes."""
++    keys = [batch_key] if isinstance(batch_key, str) else list(batch_key)
++    if not keys:
++        msg = "batch_key must contain at least one column name"
++        raise ValueError(msg)
++
++    codes = np.empty((len(batch_df), len(keys)), dtype=np.int32)
++    n_levels = np.empty(len(keys), dtype=np.int32)
++    offset = 0
++
++    for covariate, key in enumerate(keys):
++        batch_vec = batch_df[key].astype("category")
++        local_codes = batch_vec.cat.codes.to_numpy(dtype=np.int32, copy=False)
++        if np.any(local_codes < 0):
++            msg = f"Batch variable {key!r} contains missing values"
++            raise ValueError(msg)
+ 
+-    batch_cat = batch_vec.astype("category")
+-    codes = batch_cat.cat.codes.to_numpy(copy=True)
+-    n_batches = len(batch_cat.cat.categories)
++        n_categories = batch_vec.cat.categories.size
++        n_levels[covariate] = n_categories
++        codes[:, covariate] = local_codes + offset
++        offset += n_categories
++
++    return codes, n_levels
++
++
++def _get_theta_array[S: np.generic](
++    theta: float | Sequence[float],
++    n_levels: NDArray[np.integer],
++    dtype: np.dtype[S],
++) -> NDArray[S]:
++    """Normalize scalar, per-variable, or per-category theta values."""
++    levels = n_levels.astype(np.int64, copy=False)
++    n_covariates = levels.size
++    n_categories = int(levels.sum())
++
++    try:
++        theta_array = np.asarray(theta, dtype=dtype)
++    except (TypeError, ValueError) as e:
++        msg = (
++            "theta must be a scalar or an array-like collection of numeric values, "
++            f"got {type(theta).__name__}"
++        )
++        raise ValueError(msg) from e
++
++    if theta_array.ndim == 0:
++        return np.full((1, n_categories), theta_array.item(), dtype=dtype)
++
++    theta_array = theta_array.ravel()
++    if theta_array.size == n_covariates:
++        theta_array = np.repeat(theta_array, levels)
++    elif theta_array.size != n_categories:
++        msg = (
++            f"theta array size ({theta_array.size}) must match the number of batch "
++            f"variables ({n_covariates}) or categorical levels ({n_categories})"
++        )
++        raise ValueError(msg)
+ 
+-    return codes.astype(np.int32), n_batches
++    return theta_array.reshape(1, -1)
+ 
+ 
+ def _normalize_rows_l2(x: np.ndarray) -> np.ndarray:
+@@ -291,7 +333,6 @@ def _initialize_centroids(
+     kmeans = KMeans(
+         n_clusters=n_clusters,
+         random_state=_legacy_random_state(rng, always_state=True),
+-        n_init=10,
+         max_iter=25,
+     )
+     kmeans.fit(z_norm)
+@@ -308,9 +349,10 @@ def _initialize_centroids(
+     # Initialize e (expected) and o (observed)
+     r_sum = r.sum(axis=0)
+     e = pr_b @ r_sum.reshape(1, -1)
+-    # o[b, k] = sum of r[i, k] for cells i in batch b
++    # o[b, k] = sum of r[i, k] for cells in marginal category b
+     o = np.zeros((n_batches, n_clusters), dtype=z_norm.dtype)
+-    np.add.at(o, batch_codes, r)
++    for codes in batch_codes.T:
++        np.add.at(o, codes, r)
+ 
+     # Compute initial objective
+     obj = _compute_objective(
+@@ -338,9 +380,8 @@ def _compute_r(
+ 
+ 
+ def _clustering(  # noqa: PLR0913
+-    z_norm: np.ndarray,
++    z_norm: NDArray[np.floating],
+     batch_codes: np.ndarray,
+-    n_batches: int,
+     pr_b: np.ndarray,
+     *,
+     r: np.ndarray,
+@@ -355,8 +396,8 @@ def _clustering(  # noqa: PLR0913
+     stabilized_penalty: bool = True,
+ ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float | None]:
+     """Run clustering iterations (modifies r, e, o in-place)."""
+-    n_cells = z_norm.shape[0]
+-    k = r.shape[1]
++    n_cells: int = z_norm.shape[0]
++    k: int = r.shape[1]
+     n_blocks = min(n_cells, 1 // block_proportion)
+     term = -2.0 / sigma
+ 
+@@ -376,34 +417,35 @@ def _clustering(  # noqa: PLR0913
+         # Randomly shuffle cell indices
+         idx_list = rng.permutation(n_cells)
+ 
+-        # Process blocks
+-        for block_idx, b in product(
+-            np.array_split(idx_list, n_blocks), range(n_batches)
+-        ):
+-            mask = batch_codes[block_idx] == b
+-            if not np.any(mask):
+-                continue
+-
+-            cell_idx = block_idx[mask]
++        # Process blocks. Every cell contributes once to each batch variable,
++        # while the expected counts depend only on its cluster assignment.
++        for cell_idx in np.array_split(idx_list, n_blocks):
++            cell_codes = batch_codes[cell_idx]
+ 
+-            # Remove old r contribution from o and e
+-            r_old = r[cell_idx, :]
++            # Remove old r contribution from all marginal categories and from e.
++            r_old = r[cell_idx]
+             r_old_sum = r_old.sum(axis=0)
+-            o[b, :] -= r_old_sum
++            for codes in cell_codes.T:
++                np.add.at(o, codes, -r_old)
+             e -= pr_b * r_old_sum
+ 
+             # Compute new r values
+             dots = z_norm[cell_idx, :] @ y_norm.T
+-            r_new = np.exp(term * (1.0 - dots))
++            r_new = np.empty_like(dots)
+ 
+-            # Apply penalty (Harmony1 vs Harmony2)
++            # Apply the product of the marginal penalties in log space.
++            # This both follows the Harmony formulation and avoids overflow
++            # when several variables have large finite penalty factors.
+             if stabilized_penalty:
+                 # Harmony2: denominator is (O + E + 1)
+-                penalty = ((e[b, :] + 1.0) / (o[b, :] + e[b, :] + 1.0)) ** theta[0, b]
++                log_penalty = theta.T * (np.log(e + 1.0) - np.log(o + e + 1.0))
+             else:
+                 # Harmony1: denominator is (O + 1)
+-                penalty = ((e[b, :] + 1.0) / (o[b, :] + 1.0)) ** theta[0, b]
+-            r_new *= penalty
++                log_penalty = theta.T * (np.log(e + 1.0) - np.log(o + 1.0))
++            log_r_new = term * (1.0 - dots)
++            log_r_new += log_penalty[cell_codes].sum(axis=1)
++            log_r_new -= log_r_new.max(axis=1, keepdims=True)
++            np.exp(log_r_new, out=r_new)
+ 
+             # Normalize rows to sum to 1
+             row_sums = r_new.sum(axis=1, keepdims=True)
+@@ -415,7 +457,8 @@ def _clustering(  # noqa: PLR0913
+ 
+             # Add new r contribution to o and e
+             r_new_sum = r_new.sum(axis=0)
+-            o[b, :] += r_new_sum
++            for codes in cell_codes.T:
++                np.add.at(o, codes, r_new)
+             e += pr_b * r_new_sum
+ 
+         # Compute objective
+@@ -468,7 +511,7 @@ def _compute_lambda_kb(
+     return lambda_kb
+ 
+ 
+-def _correction_original(
++def _correction_multi(
+     x: np.ndarray,
+     batch_codes: np.ndarray,
+     n_batches: int,
+@@ -476,43 +519,53 @@ def _correction_original(
+     *,
+     lambda_kb: np.ndarray,
+ ) -> np.ndarray:
+-    """Original correction method - per-cluster ridge regression."""
++    """Apply the exact ridge correction for a multi-covariate design."""
+     _, d = x.shape
+-
+     z = x.copy()
++    sentinel = x.dtype.type(_SUPPRESS_PENALTY)
+ 
+     for k_idx, r_k in enumerate(r.T):
+-        # Build per-cluster lambda diagonal
+-        lambda_diag = np.zeros(n_batches + 1, dtype=x.dtype)
+-        lambda_diag[1:] = lambda_kb[:, k_idx]
+-        lambda_mat = np.diag(lambda_diag)
+-
+-        r_sum_total = r_k.sum()
+-        r_sum_per_batch = np.zeros(n_batches, dtype=x.dtype)
+-        for b in range(n_batches):
+-            r_sum_per_batch[b] = r_k[batch_codes == b].sum()
+-
+-        phi_t_phi = np.zeros((n_batches + 1, n_batches + 1), dtype=x.dtype)
+-        phi_t_phi[0, 0] = r_sum_total
+-        phi_t_phi[0, 1:] = r_sum_per_batch
+-        phi_t_phi[1:, 0] = r_sum_per_batch
+-        phi_t_phi[1:, 1:] = np.diag(r_sum_per_batch)
+-        phi_t_phi += lambda_mat
+-
+-        phi_t_x = np.zeros((n_batches + 1, d), dtype=x.dtype)
+-        phi_t_x[0, :] = r_k @ x
+-        for b in range(n_batches):
+-            mask = batch_codes == b
+-            phi_t_x[b + 1, :] = r_k[mask] @ x[mask]
+-
++        marginal_r = np.zeros(n_batches, dtype=x.dtype)
++        rhs = np.zeros((n_batches + 1, d), dtype=x.dtype)
++        weighted_x = r_k[:, np.newaxis] * x
++        rhs[0] = weighted_x.sum(axis=0)
++        for codes in batch_codes.T:
++            np.add.at(marginal_r, codes, r_k)
++            np.add.at(rhs, codes + 1, weighted_x)
++
++        gram = np.zeros((n_batches + 1, n_batches + 1), dtype=x.dtype)
++        gram[0, 0] = r_k.sum()
++        gram[0, 1:] = marginal_r
++        gram[1:, 0] = marginal_r
++        gram[np.arange(1, n_batches + 1), np.arange(1, n_batches + 1)] = marginal_r
++        for left in range(batch_codes.shape[1] - 1):
++            left_codes = batch_codes[:, left] + 1
++            for right in range(left + 1, batch_codes.shape[1]):
++                right_codes = batch_codes[:, right] + 1
++                np.add.at(gram, (left_codes, right_codes), r_k)
++                np.add.at(gram, (right_codes, left_codes), r_k)
++
++        active = lambda_kb[:, k_idx] < sentinel
++        retained = np.concatenate(([True], active))
++        retained_idx = np.flatnonzero(retained)
++        gram[retained_idx[1:], retained_idx[1:]] += lambda_kb[active, k_idx]
++
++        gram_reduced = gram[np.ix_(retained_idx, retained_idx)]
++        rhs_reduced = rhs[retained]
+         try:
+-            w = np.linalg.solve(phi_t_phi, phi_t_x)
++            if np.linalg.matrix_rank(gram_reduced) < gram_reduced.shape[0]:
++                raise np.linalg.LinAlgError
++            w_reduced = np.linalg.solve(gram_reduced, rhs_reduced)
+         except np.linalg.LinAlgError:
+-            w = np.linalg.lstsq(phi_t_phi, phi_t_x, rcond=None)[0]
++            w_reduced = np.linalg.lstsq(gram_reduced, rhs_reduced, rcond=None)[0]
+ 
+-        w[0, :] = 0
+-        w_batch = w[batch_codes + 1, :]
+-        z -= r_k[:, np.newaxis] * w_batch
++        w = np.zeros((n_batches + 1, d), dtype=x.dtype)
++        w[retained] = w_reduced
++        w[0] = 0
++        correction = np.zeros_like(x)
++        for codes in batch_codes.T:
++            correction += w[codes + 1]
++        z -= r_k[:, np.newaxis] * correction
+ 
+     return z
+ 
+@@ -533,6 +586,15 @@ def _correction_fast(
+     dtype = x.dtype
+     p = np.eye(n_batches + 1, dtype=dtype)
+ 
++    # Compute all cluster/category right-hand sides together.
++    # This avoids rebuilding the same batch masks once per cluster and
++    # lets BLAS process the full responsibility matrix for each category.
++    phi_t_x = np.empty((r.shape[1], n_batches + 1, d), dtype=dtype)
++    phi_t_x[:, 0] = r.T @ x
++    for batch in range(n_batches):
++        mask = batch_codes == batch
++        phi_t_x[:, batch + 1] = r[mask].T @ x[mask]
++
+     for k_idx, (o_k, r_k) in enumerate(zip(o.T, r.T, strict=True)):
+         lam_k = lambda_kb[:, k_idx]
+ 
+@@ -549,13 +611,7 @@ def _correction_fast(
+ 
+         inv_mat = p_t_b_inv @ p
+ 
+-        phi_t_x = np.zeros((n_batches + 1, d), dtype=x.dtype)
+-        phi_t_x[0, :] = r_k @ x
+-        for b in range(n_batches):
+-            mask = batch_codes == b
+-            phi_t_x[b + 1, :] = r_k[mask] @ x[mask]
+-
+-        w = inv_mat @ phi_t_x
++        w = inv_mat @ phi_t_x[k_idx]
+         w[0, :] = 0
+ 
+         w_batch = w[batch_codes + 1, :]
+diff --git a/tests/test_harmony.py b/tests/test_harmony.py
+index 9a6548d3e2..ada0be7e74 100644
+--- a/tests/test_harmony.py
++++ b/tests/test_harmony.py
+@@ -1,16 +1,23 @@
+ from __future__ import annotations
+ 
++from functools import partial
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ import pandas as pd
+ import pooch
+ import pytest
+-from anndata import AnnData
++from anndata import AnnData, read_h5ad
+ from scipy.stats import pearsonr
+ 
+ from scanpy.preprocessing import harmony_integrate
+-from scanpy.preprocessing._harmony.core import _SUPPRESS_PENALTY, _compute_lambda_kb
++from scanpy.preprocessing._harmony.core import (
++    _SUPPRESS_PENALTY,
++    _compute_lambda_kb,
++    _correction_multi,
++    _get_batch_codes,
++    _get_theta_array,
++)
+ from testing.scanpy._helpers.data import pbmc68k_reduced
+ 
+ if TYPE_CHECKING:
+@@ -19,7 +26,17 @@
+     from numpy.typing import DTypeLike
+ 
+ 
+-_HARMONY_DATA_BASE = "https://exampledata.scverse.org/rapids-singlecell/harmony_data"
++_HARMONY_DATA_BASE = (
++    "https://scverse-exampledata.s3.amazonaws.com/rapids-singlecell/harmony_data"
++)
++_IRCOLITIS_HARMONYPY2_H5AD = (
++    "ircolitis_blood_cd8_2048_harmonypy2_2_0_0.h5ad",
++    "sha256:c52c4a916fc6b811134dbfb1dc105d83f53195ea3092f277f30c8dbb987d641a",
++)
++_HARMONYPY2_MULTIKEY_H5AD = (
++    "harmonypy2_two_covariates_2_0_0.h5ad",
++    "sha256:1ac1542ee31b0660175ed307c29077c5621225af062a0e14d251322abcc1ac46",
++)
+ 
+ DATA = dict(
+     pca=("pbmc_3500_pcs.tsv.gz", "md5:27e319b3ddcc0c00d98e70aa8e677b10"),
+@@ -30,6 +47,21 @@
+     meta=("pbmc_3500_meta.tsv.gz", "md5:8c7ca20e926513da7cf0def1211baecb"),
+ )
+ 
++# These settings were used to generate the stored harmonypy 2.0.0 reference outputs.
++# Keep them fixed here so tests only vary the parameters relevant to each fixture.
++_integrate_harmony2_reference = partial(
++    harmony_integrate,
++    flavor="harmony2",
++    sigma=0.1,
++    max_iter_clustering=4,
++    tol_clustering=1e-3,
++    tol_harmony=1e-2,
++    block_proportion=0.05,
++    rng=734,
++    alpha=0.2,
++    batch_prune_threshold=1e-5,
++)
++
+ 
+ def _get_measure(
+     x: np.ndarray, base: np.ndarray, norm: Literal["r", "L2"]
+@@ -80,11 +112,28 @@ def adata_reference(adata_reference_module: AnnData) -> AnnData:
+     return adata_reference_module.copy()
+ 
+ 
+-@pytest.mark.parametrize("correction_method", ["fast", "original"])
++@pytest.fixture(scope="module")
++def adata_harmonypy2_multikey() -> AnnData:
++    filename, known_hash = _HARMONYPY2_MULTIKEY_H5AD
++    reference_file = pooch.retrieve(
++        f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash
++    )
++    return read_h5ad(reference_file)
++
++
++@pytest.fixture(scope="module")
++def adata_ircolitis_harmonypy2() -> AnnData:
++    """Stratified 2,048-cell IRcolitis harmonypy 2.0.0 reference."""
++    filename, known_hash = _IRCOLITIS_HARMONYPY2_H5AD
++    reference_file = pooch.retrieve(
++        f"{_HARMONY_DATA_BASE}/{filename}", known_hash=known_hash
++    )
++    return read_h5ad(reference_file)
++
++
+ @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+ @pytest.mark.parametrize("flavor", ["harmony1", "harmony2"])
+ def test_harmony_integrate(
+-    correction_method: Literal["fast", "original"],
+     dtype: DTypeLike,
+     flavor: Literal["harmony1", "harmony2"],
+ ) -> None:
+@@ -93,57 +142,30 @@ def test_harmony_integrate(
+     harmony_integrate(
+         adata,
+         "bulk_labels",
+-        correction_method=correction_method,
++        correction_method="fast",
+         dtype=dtype,
+         flavor=flavor,
+     )
+     assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
+ 
+ 
+-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+-def test_harmony_integrate_algos(subtests: pytest.Subtests, dtype: DTypeLike) -> None:
+-    """Test that both correction methods produce similar results."""
++def test_harmony_original_correction_rejected() -> None:
+     adata = pbmc68k_reduced()
+-
+-    harmony_integrate(
+-        adata,
+-        "bulk_labels",
+-        correction_method="fast",
+-        dtype=dtype,
+-        flavor="harmony1",
+-        rng=0,
+-    )
+-    fast = adata.obsm["X_pca_harmony"].copy()
+-    harmony_integrate(
+-        adata,
+-        "bulk_labels",
+-        correction_method="original",
+-        dtype=dtype,
+-        flavor="harmony1",
+-        rng=0,
+-    )
+-    slow = adata.obsm["X_pca_harmony"].copy()
+-
+-    with subtests.test("r"):
+-        assert _get_measure(fast, slow, "r").min() > 0.99
+-    with subtests.test("L2"):
+-        assert _get_measure(fast, slow, "L2").max() < 0.1
++    with pytest.raises(ValueError, match="correction_method must be 'fast'"):
++        harmony_integrate(adata, "bulk_labels", correction_method="original")
+ 
+ 
+ @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+-@pytest.mark.parametrize("correction_method", ["fast", "original"])
+ def test_harmony_integrate_reference(
+     *,
+     subtests: pytest.Subtests,
+     adata_reference: AnnData,
+     dtype: DTypeLike,
+-    correction_method: Literal["fast", "original"],
+ ) -> None:
+     """Test that Harmony1 produces results similar to the reference implementation."""
+     harmony_integrate(
+         adata_reference,
+         "donor",
+-        correction_method=correction_method,
+         dtype=dtype,
+         max_iter_harmony=20,
+         flavor="harmony1",
+@@ -156,54 +178,219 @@ def test_harmony_integrate_reference(
+         assert _get_measure(x, base, "L2").max() < 0.1
+ 
+ 
+-@pytest.mark.parametrize("correction_method", ["fast", "original"])
+-@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+-def test_harmony2_correction_methods_agree(
+-    subtests: pytest.Subtests,
+-    adata_reference: AnnData,
+-    correction_method: Literal["fast", "original"],
+-    dtype: DTypeLike,
+-) -> None:
+-    """Harmony2 default path: correction methods produce consistent results."""
++def test_harmony_multiple_keys() -> None:
++    """Test Harmony models multiple batch keys separately."""
++    adata = pbmc68k_reduced()
++    # Create a second batch key
++    rng = np.random.default_rng(0)
++    adata.obs["batch2"] = rng.choice(["A", "B", "C"], size=adata.n_obs)
++
+     harmony_integrate(
+-        adata_reference,
+-        "donor",
+-        correction_method=correction_method,
+-        dtype=dtype,
+-        max_iter_harmony=20,
++        adata,
++        ["bulk_labels", "batch2"],
++        theta=[2.0, 0.1],
++        max_iter_harmony=1,
+         rng=0,
+     )
+-    h2 = adata_reference.obsm["X_pca_harmony"]
+ 
+-    # Run the other method for comparison
+-    other = "original" if correction_method == "fast" else "fast"
+-    adata_ref2 = adata_reference.copy()
+-    harmony_integrate(
+-        adata_ref2,
+-        "donor",
+-        correction_method=other,
+-        dtype=dtype,
+-        max_iter_harmony=20,
+-        rng=0,
++    assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
++
++
++def test_harmony_multikey_marginal_codes_and_theta() -> None:
++    obs = pd.DataFrame({
++        "batch": pd.Categorical(
++            ["b0", "b1", "b2", "b3", "b4", "b0"],
++            categories=["b0", "b1", "b2", "b3", "b4"],
++        ),
++        "sex": pd.Categorical(["f", "m", "f", "m", "f", "m"], categories=["f", "m"]),
++    })
++
++    codes, n_levels = _get_batch_codes(obs, ["batch", "sex"])
++
++    np.testing.assert_array_equal(n_levels, np.array([5, 2], dtype=np.int32))
++    np.testing.assert_array_equal(codes[:, 0], np.array([0, 1, 2, 3, 4, 0]))
++    np.testing.assert_array_equal(codes[:, 1], np.array([5, 6, 5, 6, 5, 6]))
++    np.testing.assert_array_equal(
++        _get_theta_array([2.0, 0.1], n_levels, np.dtype(np.float32)),
++        np.array([[2, 2, 2, 2, 2, 0.1, 0.1]], dtype=np.float32),
++    )
++    np.testing.assert_array_equal(
++        _get_theta_array(2.0, n_levels, np.dtype(np.float32)),
++        np.full((1, 7), 2.0, dtype=np.float32),
+     )
+-    h2_ref = adata_ref2.obsm["X_pca_harmony"]
+ 
+-    with subtests.test("r"):
+-        assert _get_measure(h2, h2_ref, "r").min() > 0.99
+-    with subtests.test("L2"):
+-        assert _get_measure(h2, h2_ref, "L2").max() < 0.05
+ 
++@pytest.mark.parametrize("size", [1, 6])
++def test_harmony_multikey_theta_rejects_invalid_length(size: int) -> None:
++    with pytest.raises(
++        ValueError,
++        match=r"batch variables \(2\) or categorical levels \(7\)",
++    ):
++        _get_theta_array([2.0] * size, np.array([5, 2]), np.dtype(np.float32))
+ 
+-def test_harmony_multiple_keys() -> None:
+-    """Test Harmony with multiple batch keys."""
+-    adata = pbmc68k_reduced()
+-    # Create a second batch key
+-    rng = np.random.default_rng()
+-    adata.obs["batch2"] = rng.choice(["A", "B", "C"], size=adata.n_obs)
+ 
+-    harmony_integrate(adata, ["bulk_labels", "batch2"], correction_method="original")
++def test_harmony_theta_rejects_unsupported_type() -> None:
++    with pytest.raises(ValueError, match="theta must be a scalar or an array-like"):
++        _get_theta_array({"batch": 2.0}, np.array([5, 2]), np.dtype(np.float32))
+ 
+-    assert adata.obsm["X_pca_harmony"].shape == adata.obsm["X_pca"].shape
++
++def test_harmony_batch_keys_are_nonempty_and_complete() -> None:
++    obs = pd.DataFrame({"batch": ["a", None]})
++    with pytest.raises(ValueError, match="contains missing values"):
++        _get_batch_codes(obs, "batch")
++    with pytest.raises(ValueError, match="at least one column"):
++        _get_batch_codes(obs, [])
++
++
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++def test_harmony_multikey_correction_matches_dense_design(
++    dtype: type[np.floating],
++) -> None:
++    """Compare the optimized correction with a direct dense ridge-regression solve.
++
++    Production avoids materializing the one-hot design and exploits its marginal
++    structure. This independent oracle explicitly builds that design and solves
++    the weighted, regularized least-squares problem, catching errors in category
++    indexing, cross-covariate terms, and suppressed penalties.
++    """
++    rng = np.random.default_rng(734)
++    levels = np.array([2, 3], dtype=np.int32)
++    offsets = np.array([0, 2], dtype=np.int32)
++    n_batches = int(levels.sum())
++    n_cells, n_pcs, n_clusters = 31, 5, 3
++
++    local_codes = np.column_stack([
++        rng.integers(0, level, size=n_cells) for level in levels
++    ]).astype(np.int32)
++    codes = local_codes + offsets
++    x = rng.normal(size=(n_cells, n_pcs)).astype(dtype)
++    r = rng.random(size=(n_cells, n_clusters)).astype(dtype)
++    r /= r.sum(axis=1, keepdims=True)
++    lambda_kb = rng.uniform(0.2, 1.0, size=(n_batches, n_clusters)).astype(dtype)
++    lambda_kb[1, 1] = dtype(_SUPPRESS_PENALTY)
++
++    result = _correction_multi(x, codes, n_batches, r, lambda_kb=lambda_kb)
++
++    design = np.zeros((n_cells, n_batches + 1), dtype=dtype)
++    design[:, 0] = 1
++    for covariate in range(codes.shape[1]):
++        design[np.arange(n_cells), codes[:, covariate] + 1] = 1
++
++    expected = x.copy()
++    for cluster, r_k in enumerate(r.T):
++        active = lambda_kb[:, cluster] < dtype(_SUPPRESS_PENALTY)
++        retained = np.concatenate(([True], active))
++        sqrt_r_k = np.sqrt(r_k)
++        weighted_design = sqrt_r_k[:, None] * design[:, retained]
++        weighted_x = sqrt_r_k[:, None] * x
++
++        penalty_design = np.zeros(
++            (active.sum(), retained.sum()),
++            dtype=dtype,
++        )
++        penalty_design[:, 1:] = np.diag(np.sqrt(lambda_kb[active, cluster]))
++        augmented_design = np.vstack((weighted_design, penalty_design))
++        augmented_x = np.vstack((
++            weighted_x,
++            np.zeros((active.sum(), n_pcs), dtype=dtype),
++        ))
++
++        w = np.zeros((n_batches + 1, n_pcs), dtype=dtype)
++        w[retained] = np.linalg.lstsq(
++            augmented_design,
++            augmented_x,
++            rcond=None,
++        )[0]
++        w[0] = 0
++        expected -= r_k[:, None] * (design @ w)
++
++    atol = 2e-5 if dtype == np.float32 else 1e-11
++    np.testing.assert_allclose(result, expected, atol=atol, rtol=atol)
++
++
++def test_harmony_multikey_correction_singular_fallback(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A system diagnosed as singular falls back to least squares."""
++    rng = np.random.default_rng(734)
++    x = rng.normal(size=(12, 3))
++    codes = np.column_stack((
++        np.resize([0, 1], len(x)),
++        np.resize([2, 3, 4], len(x)),
++    )).astype(np.int32)
++    r = rng.random(size=(len(x), 2))
++    r /= r.sum(axis=1, keepdims=True)
++    lambda_kb = np.ones((5, 2))
++
++    expected = _correction_multi(x, codes, 5, r, lambda_kb=lambda_kb)
++    monkeypatch.setattr(np.linalg, "matrix_rank", lambda _: 0)
++    result = _correction_multi(x, codes, 5, r, lambda_kb=lambda_kb)
++
++    np.testing.assert_allclose(result, expected, atol=1e-12, rtol=1e-12)
++
++
++@pytest.mark.parametrize("ridge_lambda", [0.0, -0.1, float("inf"), float("nan")])
++@pytest.mark.parametrize("multikey", [False, True])
++def test_harmony1_rejects_bad_ridge_lambda(
++    ridge_lambda: float, *, multikey: bool
++) -> None:
++    rng = np.random.default_rng(734)
++    batch = np.resize(["a", "b", "c"], 60)
++    adata = AnnData(
++        X=None,
++        obs=pd.DataFrame(
++            {"batch": batch, "duplicate_batch": batch},
++            index=[f"cell_{index}" for index in range(60)],
++        ),
++        obsm={"X_pca": rng.normal(size=(60, 6)).astype(np.float32)},
++    )
++    key = ["batch", "duplicate_batch"] if multikey else "batch"
++
++    with pytest.raises(ValueError, match="ridge_lambda must be a finite positive"):
++        harmony_integrate(
++            adata,
++            key,
++            flavor="harmony1",
++            ridge_lambda=ridge_lambda,
++            n_clusters=3,
++            max_iter_harmony=1,
++            max_iter_clustering=2,
++            block_proportion=1.0,
++            rng=734,
++        )
++
++
++@pytest.mark.parametrize(
++    ("case", "theta", "n_clusters", "max_iter_harmony"),
++    [
++        ("nclust1", [2.0, 0.1], 1, 1),
++        ("nclust4", [2.0, 0.1], 4, 10),
++        ("nclust4_batch_only", [2.0, 0.0], 4, 10),
++        ("nclust4_sex_only", [0.0, 2.0], 4, 10),
++    ],
++)
++def test_harmony2_multikey_reference(
++    adata_harmonypy2_multikey: AnnData,
++    case: str,
++    theta: list[float],
++    n_clusters: int,
++    max_iter_harmony: int,
++) -> None:
++    adata = adata_harmonypy2_multikey.copy()
++    reference = adata.obsm[f"harmony2_ref_{case}"].copy()
++
++    _integrate_harmony2_reference(
++        adata,
++        ["batch", "sex"],
++        theta=theta,
++        dtype=np.float64,
++        n_clusters=n_clusters,
++        max_iter_harmony=max_iter_harmony,
++    )
++
++    result = adata.obsm["X_pca_harmony"]
++    assert _get_measure(reference, result, "r").min() > 0.95
++    assert _get_measure(reference, result, "L2").max() < 0.1
+ 
+ 
+ def test_harmony_custom_parameters() -> None:
+@@ -372,3 +559,25 @@ def test_compute_lambda_kb_zero_denom(dtype: type[np.floating]) -> None:
+     assert result[0, 0] == sentinel
+     # (0,1): normal -> alpha * E = 1.0
+     np.testing.assert_allclose(result[0, 1], dtype(1.0))
++
++
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++def test_harmony2_ircolitis_reference(
++    adata_ircolitis_harmonypy2: AnnData,
++    dtype: type[np.floating],
++) -> None:
++    """Harmony2 on a real 11-batch subset matches harmonypy 2.0.0."""
++    adata = adata_ircolitis_harmonypy2.copy()
++    _integrate_harmony2_reference(
++        adata,
++        "batch",
++        theta=2.0,
++        dtype=dtype,
++        n_clusters=2,
++        max_iter_harmony=10,
++    )
++
++    reference = adata.obsm["harmony2_ref"]
++    result = adata.obsm["X_pca_harmony"]
++    assert _get_measure(reference, result, "r").min() > 0.95
++    assert _get_measure(reference, result, "L2").max() < 0.1

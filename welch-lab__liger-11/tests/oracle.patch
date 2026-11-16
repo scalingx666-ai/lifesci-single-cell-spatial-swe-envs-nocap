@@ -1,0 +1,417 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index cb8ce100..5ad0e7a4 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -22,7 +22,10 @@ Imports: Rcpp (>= 0.12.10),
+ 	 ggplot2,
+ 	 NNLM,
+ 	 Seurat,
+-	 riverplot
++	 riverplot,
++	 Hmisc,
++	 doParallel,
++	 foreach
+ LinkingTo: Rcpp, RcppArmadillo
+ Depends: cowplot, Matrix
+ RoxygenNote: 6.0.1
+diff --git a/NAMESPACE b/NAMESPACE
+index c15117be..5d9c85da 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -3,6 +3,7 @@ importFrom(Rcpp, evalCpp)
+ importFrom(plyr, rbind.fill.matrix)
+ importFrom(Rtsne,Rtsne)
+ importFrom(cowplot,plot_grid)
++importFrom(doParallel,registerDoParallel)
+ importFrom(ggplot2,ggplot)
+ importFrom(ggplot2,geom_point)
+ importFrom(ggplot2,aes)
+@@ -11,11 +12,15 @@ importFrom(ggplot2,scale_color_gradient2)
+ importFrom(ggplot2,ggtitle)
+ importFrom(FNN,get.knn)
+ importFrom(FNN,get.knnx)
++importFrom(foreach,foreach)
++importFrom(foreach, "%dopar%")
+ importFrom(ggrepel,geom_text_repel)
+ importFrom(grid,roundrectGrob)
+ importFrom(grid,gpar)
++importFrom(Hmisc, minor.tick)
+ importFrom(irlba,prcomp_irlba)
+ importFrom(ica, icafast)
++importFrom(NNLM, nnmf)
+ importFrom(Seurat,FindClusters)
+ importFrom(Seurat,CreateSeuratObject)
+ import(Matrix)
+diff --git a/R/Analogizer.R b/R/Analogizer.R
+index e5084b77..e9a7a768 100644
+--- a/R/Analogizer.R
++++ b/R/Analogizer.R
+@@ -491,7 +491,8 @@ rbindlist = function(mat_list)
+ #' analogy = scaleNotCenter(analogy)
+ #' analogy = optimize_als(analogy,k=2,nrep=1)
+ #' }
+-optimizeALS = function(object,k,lambda=5.0,thresh=1e-4,max_iters=25,nrep=1,H_init=NULL,W_init=NULL,V_init=NULL,rand.seed=1)
++optimizeALS = function(object,k,lambda=5.0,thresh=1e-4,max_iters=25,nrep=1,
++                       H_init=NULL,W_init=NULL,V_init=NULL,rand.seed=1)
+ {
+   E = object@scale.data
+   N = length(E)
+@@ -576,6 +577,8 @@ optimizeALS = function(object,k,lambda=5.0,thresh=1e-4,max_iters=25,nrep=1,H_ini
+   object@W = W_m
+   names(V_m)=names(object@raw.data)
+   object@V = V_m
++  # set parameter values
++  object@parameters$lambda = lambda
+   return(object)
+ }
+ 
+@@ -768,6 +771,119 @@ optimizeSubset = function(object,cell.subset=NULL,cluster.subset=NULL,lambda=5.0
+   return(object)
+ }
+ 
++#' Optimize objective function for new lambda value. Uses an efficient strategy for updating 
++#' that takes advantage of the information in the existing factorization.
++#'
++#' @param object analogizer object. Should call optimizeALS before calling.
++#' @param new_lambda Regularization parameter. Larger values penalize dataset-specific effects more strongly.
++#' @param thresh Convergence threshold. Convergence occurs when |obj0-obj|/(mean(obj0,obj)) < thresh
++#' @param max_iters Maximum number of block coordinate descent iterations to perform
++#' @param rand.seed Random seed for reproducibility 
++#' @return Analogizer object with optimized factorization values
++#' @export
++#' @examples
++#' \dontrun{
++#' Y = matrix(c(1,2,3,4,5,6,7,8,9,10,11,12),nrow=4,byrow=T)
++#' Z = matrix(c(1,2,3,4,5,6,7,6,5,4,3,2),nrow=4,byrow=T)
++#' analogy = Analogizer(Y,Z)
++#' analogy@var.genes = c(1,2,3,4)
++#' analogy = scaleNotCenter(analogy)
++#' analogy = optimize_als(analogy,k=2,nrep=1)
++#' }
++optimizeNewLambda = function(object, new_lambda, thresh=1e-4, max_iters=25, rand.seed = 1) {
++  k = ncol(object@H[[1]])
++  H = object@H
++  W = object@W
++  if (new_lambda < object@parameters$lambda) {
++    print('New lambda less than current lambda; new factorization may not be optimal.
++          Re-optimization with optimizeAlS recommended instead.')
++  }
++  object = optimizeALS(object, k, lambda = new_lambda, thresh = thresh, max_iters = max_iters,
++                       H_init=H, W_init=W, rand.seed = rand.seed)
++  return(object)
++}
++
++#' Plot alignment and agreement for various test values of lambda. Can be used to select
++#' appropriate value of lambda for factorization of particular dataset. 
++#'
++#' @param object analogizer object. Should normalize, select genes, and scale before calling.
++#' @param k Number of factors for factorizations
++#' @param lambda_test Vector of lambda values to test. If not given, use default set spanning 
++#'                    0.25 to 60
++#' @param thresh Convergence threshold. Convergence occurs when |obj0-obj|/(mean(obj0,obj)) < thresh
++#' @param max_iters Maximum number of block coordinate descent iterations to perform
++#' @param rand.seed Random seed for reproducibility 
++#' @param num.cores Number of cores to use for optimizing factorizations in parallel
++#' @param k2 Horizon parameter for SNF quantile alignment
++#' @param ref_dataset Reference dataset for SNF quantile alignment
++#' @param resolution Resolution for SNF quantile alignment
++#' @param agree.method Reference dr.method for calculating distortion_metric
++#' @param gen.new Do not use optimizeNewLambda in factorizations. Recommended to use
++#'                when looking at only a small range of lambdas (ie. 1:7)
++#' @param return_results Return matrix of alignment and agreement values 
++#' @return Matrix of results or plot 
++#' @importFrom doParallel registerDoParallel
++#' @importFrom foreach foreach
++#' @importFrom foreach "%dopar%"
++#' @importFrom Hmisc minor.tick
++#' @export
++#' @examples
++#' \dontrun{
++#' Y = matrix(c(1,2,3,4,5,6,7,8,9,10,11,12),nrow=4,byrow=T)
++#' Z = matrix(c(1,2,3,4,5,6,7,6,5,4,3,2),nrow=4,byrow=T)
++#' analogy = Analogizer(Y,Z)
++#' analogy@var.genes = c(1,2,3,4)
++#' analogy = scaleNotCenter(analogy)
++#' analogy = optimize_als(analogy,k=2,nrep=1)
++#' }
++lambdaSuggestion = function(object, k, lambda_test = NULL, rand.seed = 1, num.cores = 1, 
++                            thresh = 1e-4, max_iters = 25, k2 = 500, ref_dataset=NULL, resolution = 1, 
++                            agree.method='PCA', gen.new=F, return_results=F) {
++  if (is.null(lambda_test)){
++    lambda_test = c(seq(0.25, 1, 0.25), seq(2, 10, 1), seq(10, 60, 5))
++  }
++  registerDoParallel(cores = num.cores)
++  print(paste('Optimizing initial factorization with lambda =', lambda_test[1]))
++  object = optimizeALS(object,k=k,thresh = thresh, lambda = lambda_test[1], max_iters=max_iters,
++                       nrep=1, rand.seed = rand.seed)
++  data_matrix <- foreach(i=1:length(lambda_test), .combine = 'rbind') %dopar% {
++    if (i != 1) {
++      if (gen.new) {
++        ob.test = optimizeALS(object, k=k, lambda = lambda_test[i], thresh = thresh, 
++                              max_iters = max_iters, rand.seed = rand.seed)
++      } else {
++        ob.test = optimizeNewLambda(object, new_lambda = lambda_test[i], thresh = thresh, 
++                                    max_iters = max_iters, rand.seed = rand.seed)
++      }
++    } else {
++      ob.test = object
++    }
++    ob.test = quantile_align_SNF(ob.test, k2 = k2, resolution = resolution, ref_dataset = ref_dataset,
++                                 id.number = i) 
++    align = alignment_metric(ob.test)
++    agree_unaligned = distortion_metric(ob.test, ndims = k, k = 15, dr_method = agree.method, 
++                                        use_aligned = F)
++    agree_aligned = distortion_metric(ob.test, ndims = k, k = 15, dr_method = agree.method, 
++                                      use_aligned = T)
++    c(align, agree_unaligned, agree_aligned)
++  }
++  # plot results on same plot 
++  plot(lambda_test, data_matrix[,1], type='p', col='black', ylim=c(0,1), xlab = 'Lambda', 
++       ylab='Value')
++  minor.tick(nx=4, ny=2, tick.ratio=0.5)
++  grid()
++  lines(lambda_test, data_matrix[,1], col='black')
++  lines(lambda_test, data_matrix[,2], col='blue')
++  lines(lambda_test, data_matrix[,3], col='green')
++  legend('bottomright', legend=c('Alignment', paste0('Agreement(',agree.method, ')'), 
++                                 paste0('Agreement(',agree.method, '-aligned)')), 
++         col = c('black', 'blue', 'green'), lty=1, cex=0.8)
++  
++  if (return_results) {
++    return(data_matrix)
++  }
++}
++
+ #' Word cloud plots coloring t-SNE points by their loading on specifed factors as well as the
+ #' most highly loading shared and dataset-specific genes
+ #'
+@@ -1646,6 +1762,16 @@ quantile_align_SNF<-function(object,knn_k=20,k2=500,prune.thresh=0.2,ref_dataset
+   }
+   object@H.norm = Reduce(rbind, Hs)
+   object@clusters = idents
++  # set parameters
++  object@parameters$ref_dataset = ref_dataset
++  object@parameters$knn_k = knn_k
++  object@parameters$k2 = k2
++  object@parameters$prune.thresh = prune.thresh
++  object@parameters$min_cells = min_cells
++  object@parameters$dims.use = dims.use
++  object@parameters$dist.use = dist.use
++  object@parameters$SNF_center = center
++  object@parameters$resolution = resolution
+   return(object)
+ }
+ 
+diff --git a/man/extractSubset.Rd b/man/extractSubset.Rd
+new file mode 100644
+index 00000000..f8d031f9
+--- /dev/null
++++ b/man/extractSubset.Rd
+@@ -0,0 +1,29 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/Analogizer.R
++\name{extractSubset}
++\alias{extractSubset}
++\title{Construct an Analogizer object with a specified subset of cells or clusters.}
++\usage{
++extractSubset(object, cell.subset = NULL, cluster.subset = NULL)
++}
++\arguments{
++\item{object}{analogizer object.}
++
++\item{cell.subset}{List of names of cells to extract. Names of list elements should match names of datasets.}
++
++\item{cluster.subset}{Clusters to extract}
++}
++\value{
++analogizer object
++}
++\description{
++Construct an Analogizer object with a specified subset of cells or clusters.
++}
++\examples{
++\dontrun{
++Y = matrix(c(1,2,3,4,5,6,7,8,9,10,11,12),nrow=4,byrow=T)
++Z = matrix(c(1,2,3,4,5,6,7,6,5,4,3,2),nrow=4,byrow=T)
++analogy = Analogizer(list(Y,Z))
++analogy =
++}
++}
+diff --git a/man/lambdaSuggestion.Rd b/man/lambdaSuggestion.Rd
+new file mode 100644
+index 00000000..3fd1db03
+--- /dev/null
++++ b/man/lambdaSuggestion.Rd
+@@ -0,0 +1,58 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/Analogizer.R
++\name{lambdaSuggestion}
++\alias{lambdaSuggestion}
++\title{Plot alignment and agreement for various test values of lambda. Can be used to select
++appropriate value of lambda for factorization of particular dataset.}
++\usage{
++lambdaSuggestion(object, k, lambda_test = NULL, rand.seed = 1,
++  num.cores = 1, thresh = 1e-04, max_iters = 25, k2 = 500,
++  ref_dataset = NULL, resolution = 1, agree.method = "PCA", gen.new = F,
++  return_results = F)
++}
++\arguments{
++\item{object}{analogizer object. Should normalize, select genes, and scale before calling.}
++
++\item{k}{Number of factors for factorizations}
++
++\item{lambda_test}{Vector of lambda values to test. If not given, use default set spanning 
++0.25 to 60}
++
++\item{rand.seed}{Random seed for reproducibility}
++
++\item{num.cores}{Number of cores to use for optimizing factorizations in parallel}
++
++\item{thresh}{Convergence threshold. Convergence occurs when |obj0-obj|/(mean(obj0,obj)) < thresh}
++
++\item{max_iters}{Maximum number of block coordinate descent iterations to perform}
++
++\item{k2}{Horizon parameter for SNF quantile alignment}
++
++\item{ref_dataset}{Reference dataset for SNF quantile alignment}
++
++\item{resolution}{Resolution for SNF quantile alignment}
++
++\item{agree.method}{Reference dr.method for calculating distortion_metric}
++
++\item{gen.new}{Do not use optimizeNewLambda in factorizations. Recommended to use
++when looking at only a small range of lambdas (ie. 1:7)}
++
++\item{return_results}{Return matrix of alignment and agreement values}
++}
++\value{
++Matrix of results or plot
++}
++\description{
++Plot alignment and agreement for various test values of lambda. Can be used to select
++appropriate value of lambda for factorization of particular dataset.
++}
++\examples{
++\dontrun{
++Y = matrix(c(1,2,3,4,5,6,7,8,9,10,11,12),nrow=4,byrow=T)
++Z = matrix(c(1,2,3,4,5,6,7,6,5,4,3,2),nrow=4,byrow=T)
++analogy = Analogizer(Y,Z)
++analogy@var.genes = c(1,2,3,4)
++analogy = scaleNotCenter(analogy)
++analogy = optimize_als(analogy,k=2,nrep=1)
++}
++}
+diff --git a/man/optimizeNewLambda.Rd b/man/optimizeNewLambda.Rd
+new file mode 100644
+index 00000000..a2e69a0d
+--- /dev/null
++++ b/man/optimizeNewLambda.Rd
+@@ -0,0 +1,38 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/Analogizer.R
++\name{optimizeNewLambda}
++\alias{optimizeNewLambda}
++\title{Optimize objective function for new lambda value. Uses an efficient strategy for updating 
++that takes advantage of the information in the existing factorization.}
++\usage{
++optimizeNewLambda(object, new_lambda, thresh = 1e-04, max_iters = 25,
++  rand.seed = 1)
++}
++\arguments{
++\item{object}{analogizer object. Should call optimizeALS before calling.}
++
++\item{new_lambda}{Regularization parameter. Larger values penalize dataset-specific effects more strongly.}
++
++\item{thresh}{Convergence threshold. Convergence occurs when |obj0-obj|/(mean(obj0,obj)) < thresh}
++
++\item{max_iters}{Maximum number of block coordinate descent iterations to perform}
++
++\item{rand.seed}{Random seed for reproducibility}
++}
++\value{
++Analogizer object with optimized factorization values
++}
++\description{
++Optimize objective function for new lambda value. Uses an efficient strategy for updating 
++that takes advantage of the information in the existing factorization.
++}
++\examples{
++\dontrun{
++Y = matrix(c(1,2,3,4,5,6,7,8,9,10,11,12),nrow=4,byrow=T)
++Z = matrix(c(1,2,3,4,5,6,7,6,5,4,3,2),nrow=4,byrow=T)
++analogy = Analogizer(Y,Z)
++analogy@var.genes = c(1,2,3,4)
++analogy = scaleNotCenter(analogy)
++analogy = optimize_als(analogy,k=2,nrep=1)
++}
++}
+diff --git a/man/quantile_align_SNF.Rd b/man/quantile_align_SNF.Rd
+index 490e5a48..949743af 100644
+--- a/man/quantile_align_SNF.Rd
++++ b/man/quantile_align_SNF.Rd
+@@ -6,7 +6,8 @@
+ \usage{
+ quantile_align_SNF(object, knn_k = 20, k2 = 500, prune.thresh = 0.2,
+   ref_dataset = NULL, min_cells = 2, quantiles = 50, nstart = 10,
+-  resolution = 1, dist.use = "CR", print_align_summary = TRUE)
++  resolution = 1, dims.use = 1:ncol(object@H[[1]]), dist.use = "CR",
++  center = F, id.number = NULL, print_align_summary = TRUE)
+ }
+ \arguments{
+ \item{object}{analogizer object. Should run optimizeALS before calling.}
+@@ -27,6 +28,8 @@ the dataset with the largest number of cells is used.}
+ \item{nstart}{Number of times to perform Louvain community detection with different random starts}
+ 
+ \item{resolution}{Controls the number of communities detected. Higher resolution=more communities.}
++
++\item{dims.use}{Indices of factors to use for shared nearest factor determination}
+ }
+ \value{
+ analogizer object
+diff --git a/man/run_tSNE.Rd b/man/run_tSNE.Rd
+index 5c430c13..1aa58152 100644
+--- a/man/run_tSNE.Rd
++++ b/man/run_tSNE.Rd
+@@ -5,7 +5,7 @@
+ \title{Perform t-SNE on the normalized cell factors to generate a 2D embedding for visualization}
+ \usage{
+ run_tSNE(object, rand.seed = 42, use.raw = F,
+-  factors.use = 1:ncol(object@H.norm))
++  dims.use = 1:ncol(object@H.norm))
+ }
+ \arguments{
+ \item{object}{analogizer object. Should run quantile_norm before calling.}
+@@ -14,7 +14,7 @@ run_tSNE(object, rand.seed = 42, use.raw = F,
+ 
+ \item{use.raw}{Use scaled data or factorization result?}
+ 
+-\item{factors.use}{Which factors to use for computing tSNE embedding}
++\item{dims.use}{Which factors to use for computing tSNE embedding}
+ }
+ \value{
+ analogizer object
+diff --git a/man/run_umap.Rd b/man/run_umap.Rd
+index 241227de..61901f4e 100644
+--- a/man/run_umap.Rd
++++ b/man/run_umap.Rd
+@@ -4,8 +4,9 @@
+ \alias{run_umap}
+ \title{Run UMAP on the normalized cell factors to generate a 2D embedding for visualization}
+ \usage{
+-run_umap(object, rand.seed = 42, use.raw = F, k = 2,
+-  distance = "euclidean", n_neighbors = 10, min_dist = 0.1)
++run_umap(object, rand.seed = 42, use.raw = F,
++  dims.use = 1:ncol(object@H.norm), k = 2, distance = "euclidean",
++  n_neighbors = 10, min_dist = 0.1)
+ }
+ \arguments{
+ \item{object}{analogizer object. Should run quantile_norm before calling.}
+@@ -14,6 +15,8 @@ run_umap(object, rand.seed = 42, use.raw = F, k = 2,
+ 
+ \item{use.raw}{Use scaled data or factorization result?}
+ 
++\item{dims.use}{Indices of factors to use}
++
+ \item{k}{Number of dimensions to reduce to}
+ 
+ \item{distance}{Name of distance metric to use in defining fuzzy simplicial sets}

@@ -1,0 +1,696 @@
+diff --git a/openTSNE/dependencies/annoy/annoylib.h b/openTSNE/dependencies/annoy/annoylib.h
+index 3b5ed0af..3fcf89fa 100644
+--- a/openTSNE/dependencies/annoy/annoylib.h
++++ b/openTSNE/dependencies/annoy/annoylib.h
+@@ -58,6 +58,12 @@ typedef signed __int64    int64_t;
+ #include <queue>
+ #include <limits>
+ 
++#ifdef ANNOYLIB_MULTITHREADED_BUILD
++#include <thread>
++#include <mutex>
++#include <shared_mutex>
++#endif
++
+ #ifdef _MSC_VER
+ // Needed for Visual Studio to disable runtime checks for mempcy
+ #pragma runtime_checks("s", off)
+@@ -104,7 +110,6 @@ inline void set_error_from_string(char **error, const char* msg) {
+ #ifndef _MSC_VER
+ #define popcount __builtin_popcountll
+ #else // See #293, #358
+-#define isnan(x) _isnan(x)
+ #define popcount cole_popcount
+ #endif
+ 
+@@ -123,24 +128,31 @@ inline void set_error_from_string(char **error, const char* msg) {
+ #endif
+ #endif
+ 
++#if !defined(__MINGW32__)
++#define FTRUNCATE_SIZE(x) static_cast<int64_t>(x)
++#else
++#define FTRUNCATE_SIZE(x) (x)
++#endif
+ 
+ using std::vector;
+ using std::pair;
+ using std::numeric_limits;
+ using std::make_pair;
+ 
+-inline void* remap_memory(void* _ptr, int _fd, size_t old_size, size_t new_size) {
++inline bool remap_memory_and_truncate(void** _ptr, int _fd, size_t old_size, size_t new_size) {
+ #ifdef __linux__
+-  _ptr = mremap(_ptr, old_size, new_size, MREMAP_MAYMOVE);
++    *_ptr = mremap(*_ptr, old_size, new_size, MREMAP_MAYMOVE);
++    bool ok = ftruncate(_fd, new_size) != -1;
+ #else
+-  munmap(_ptr, old_size);
++    munmap(*_ptr, old_size);
++    bool ok = ftruncate(_fd, FTRUNCATE_SIZE(new_size)) != -1;
+ #ifdef MAP_POPULATE
+-  _ptr = mmap(_ptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, _fd, 0);
++    *_ptr = mmap(*_ptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, _fd, 0);
+ #else
+-  _ptr = mmap(_ptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, _fd, 0);
++    *_ptr = mmap(*_ptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, _fd, 0);
+ #endif
+ #endif
+-  return _ptr;
++    return ok;
+ }
+ 
+ namespace {
+@@ -587,8 +599,8 @@ struct DotProduct : Angular {
+     // Step one: compute the norm of each vector and store that in its extra dimension (f-1)
+     for (S i = 0; i < node_count; i++) {
+       Node* node = get_node_ptr<S, Node>(nodes, _s, i);
+-      T norm = sqrt(dot(node->v, node->v, f));
+-      if (isnan(norm)) norm = 0;
++      T d = dot(node->v, node->v, f);
++      T norm = d < 0 ? 0 : sqrt(d);
+       node->dot_factor = norm;
+     }
+ 
+@@ -605,9 +617,8 @@ struct DotProduct : Angular {
+     for (S i = 0; i < node_count; i++) {
+       Node* node = get_node_ptr<S, Node>(nodes, _s, i);
+       T node_norm = node->dot_factor;
+-
+-      T dot_factor = sqrt(pow(max_norm, static_cast<T>(2.0)) - pow(node_norm, static_cast<T>(2.0)));
+-      if (isnan(dot_factor)) dot_factor = 0;
++      T squared_norm_diff = pow(max_norm, static_cast<T>(2.0)) - pow(node_norm, static_cast<T>(2.0));
++      T dot_factor = squared_norm_diff < 0 ? 0 : sqrt(squared_norm_diff);
+ 
+       node->dot_factor = dot_factor;
+     }
+@@ -810,7 +821,7 @@ class AnnoyIndexInterface {
+   // Note that the methods with an **error argument will allocate memory and write the pointer to that string if error is non-NULL
+   virtual ~AnnoyIndexInterface() {};
+   virtual bool add_item(S item, const T* w, char** error=NULL) = 0;
+-  virtual bool build(int q, char** error=NULL) = 0;
++  virtual bool build(int q, int n_threads=-1, char** error=NULL) = 0;
+   virtual bool unbuild(char** error=NULL) = 0;
+   virtual bool save(const char* filename, bool prefault=false, char** error=NULL) = 0;
+   virtual void unload() = 0;
+@@ -826,7 +837,7 @@ class AnnoyIndexInterface {
+   virtual bool on_disk_build(const char* filename, char** error=NULL) = 0;
+ };
+ 
+-template<typename S, typename T, typename Distance, typename Random>
++template<typename S, typename T, typename Distance, typename Random, class ThreadedBuildPolicy>
+   class AnnoyIndex : public AnnoyIndexInterface<S, T> {
+   /*
+    * We use random projection to build a forest of binary trees of all items.
+@@ -843,12 +854,13 @@ template<typename S, typename T, typename Distance, typename Random>
+   const int _f;
+   size_t _s;
+   S _n_items;
+-  Random _random;
+   void* _nodes; // Could either be mmapped, or point to a memory buffer that we reallocate
+   S _n_nodes;
+   S _nodes_size;
+   vector<S> _roots;
+   S _K;
++  bool _is_seeded;
++  int _seed;
+   bool _loaded;
+   bool _verbose;
+   int _fd;
+@@ -856,7 +868,7 @@ template<typename S, typename T, typename Distance, typename Random>
+   bool _built;
+ public:
+ 
+-   AnnoyIndex(int f) : _f(f), _random() {
++   AnnoyIndex(int f) : _f(f) {
+     _s = offsetof(Node, v) + _f * sizeof(T); // Size of each node
+     _verbose = false;
+     _built = false;
+@@ -910,7 +922,7 @@ template<typename S, typename T, typename Distance, typename Random>
+       return false;
+     }
+     _nodes_size = 1;
+-    if (ftruncate(_fd, _s * _nodes_size) == -1) {
++    if (ftruncate(_fd, FTRUNCATE_SIZE(_s) * FTRUNCATE_SIZE(_nodes_size)) == -1) {
+       set_error_from_errno(error, "Unable to truncate");
+       return false;
+     }
+@@ -922,7 +934,7 @@ template<typename S, typename T, typename Distance, typename Random>
+     return true;
+   }
+     
+-  bool build(int q, char** error=NULL) {
++  bool build(int q, int n_threads=-1, char** error=NULL) {
+     if (_loaded) {
+       set_error_from_string(error, "You can't build a loaded index");
+       return false;
+@@ -936,21 +948,8 @@ template<typename S, typename T, typename Distance, typename Random>
+     D::template preprocess<T, S, Node>(_nodes, _s, _n_items, _f);
+ 
+     _n_nodes = _n_items;
+-    while (1) {
+-      if (q == -1 && _n_nodes >= _n_items * 2)
+-        break;
+-      if (q != -1 && _roots.size() >= (size_t)q)
+-        break;
+-      if (_verbose) showUpdate("pass %zd...\n", _roots.size());
+ 
+-      vector<S> indices;
+-      for (S i = 0; i < _n_items; i++) {
+-        if (_get(i)->n_descendants >= 1) // Issue #223
+-          indices.push_back(i);
+-      }
+-
+-      _roots.push_back(_make_tree(indices, true));
+-    }
++    ThreadedBuildPolicy::template build<S, T>(this, q, n_threads);
+ 
+     // Also, copy the roots into the last segment of the array
+     // This way we can load them faster without reading the whole file
+@@ -962,8 +961,9 @@ template<typename S, typename T, typename Distance, typename Random>
+     if (_verbose) showUpdate("has %d nodes\n", _n_nodes);
+     
+     if (_on_disk) {
+-      _nodes = remap_memory(_nodes, _fd, _s * _nodes_size, _s * _n_nodes);
+-      if (ftruncate(_fd, _s * _n_nodes)) {
++      if (!remap_memory_and_truncate(&_nodes, _fd,
++          static_cast<size_t>(_s) * static_cast<size_t>(_nodes_size),
++          static_cast<size_t>(_s) * static_cast<size_t>(_n_nodes))) {
+         // TODO: this probably creates an index in a corrupt state... not sure what to do
+         set_error_from_errno(error, "Unable to truncate");
+         return false;
+@@ -1027,6 +1027,7 @@ template<typename S, typename T, typename Distance, typename Random>
+     _n_nodes = 0;
+     _nodes_size = 0;
+     _on_disk = false;
++    _is_seeded = false;
+     _roots.clear();
+   }
+ 
+@@ -1134,35 +1135,97 @@ template<typename S, typename T, typename Distance, typename Random>
+   }
+ 
+   void set_seed(int seed) {
++    _is_seeded = true;
++    _seed = seed;
++  }
++
++  void thread_build(int q, int thread_idx, ThreadedBuildPolicy& threaded_build_policy) {
++    Random _random;
++    // Each thread needs its own seed, otherwise each thread would be building the same tree(s)
++    int seed = _is_seeded ? _seed + thread_idx : thread_idx;
+     _random.set_seed(seed);
++
++    vector<S> thread_roots;
++    while (1) {
++      if (q == -1) {
++        threaded_build_policy.lock_n_nodes();
++        if (_n_nodes >= 2 * _n_items) {
++          threaded_build_policy.unlock_n_nodes();
++          break;
++        }
++        threaded_build_policy.unlock_n_nodes();
++      } else {
++        if (thread_roots.size() >= (size_t)q) {
++          break;
++        }
++      }
++
++      if (_verbose) showUpdate("pass %zd...\n", thread_roots.size());
++
++      vector<S> indices;
++      threaded_build_policy.lock_shared_nodes();
++      for (S i = 0; i < _n_items; i++) {
++        if (_get(i)->n_descendants >= 1) { // Issue #223
++          indices.push_back(i);
++        }
++      }
++      threaded_build_policy.unlock_shared_nodes();
++
++      thread_roots.push_back(_make_tree(indices, true, _random, threaded_build_policy));
++    }
++
++    threaded_build_policy.lock_roots();
++    _roots.insert(_roots.end(), thread_roots.begin(), thread_roots.end());
++    threaded_build_policy.unlock_roots();
+   }
+ 
+ protected:
++  void _reallocate_nodes(S n) {
++    const double reallocation_factor = 1.3;
++    S new_nodes_size = std::max(n, (S) ((_nodes_size + 1) * reallocation_factor));
++    void *old = _nodes;
++    
++    if (_on_disk) {
++      if (!remap_memory_and_truncate(&_nodes, _fd, 
++          static_cast<size_t>(_s) * static_cast<size_t>(_nodes_size), 
++          static_cast<size_t>(_s) * static_cast<size_t>(new_nodes_size)) && 
++          _verbose)
++          showUpdate("File truncation error\n");
++    } else {
++      _nodes = realloc(_nodes, _s * new_nodes_size);
++      memset((char *) _nodes + (_nodes_size * _s) / sizeof(char), 0, (new_nodes_size - _nodes_size) * _s);
++    }
++    
++    _nodes_size = new_nodes_size;
++    if (_verbose) showUpdate("Reallocating to %d nodes: old_address=%p, new_address=%p\n", new_nodes_size, old, _nodes);
++  }
++
++  void _allocate_size(S n, ThreadedBuildPolicy& threaded_build_policy) {
++    if (n > _nodes_size) {
++      threaded_build_policy.lock_nodes();
++      _reallocate_nodes(n);
++      threaded_build_policy.unlock_nodes();
++    }
++  }
++
+   void _allocate_size(S n) {
+     if (n > _nodes_size) {
+-      const double reallocation_factor = 1.3;
+-      S new_nodes_size = std::max(n, (S) ((_nodes_size + 1) * reallocation_factor));
+-      void *old = _nodes;
+-      
+-      if (_on_disk) {
+-        int rc = ftruncate(_fd, _s * new_nodes_size);
+-        if (_verbose && rc) showUpdate("File truncation error\n");
+-        _nodes = remap_memory(_nodes, _fd, _s * _nodes_size, _s * new_nodes_size);
+-      } else {
+-        _nodes = realloc(_nodes, _s * new_nodes_size);
+-        memset((char *) _nodes + (_nodes_size * _s) / sizeof(char), 0, (new_nodes_size - _nodes_size) * _s);
+-      }
+-      
+-      _nodes_size = new_nodes_size;
+-      if (_verbose) showUpdate("Reallocating to %d nodes: old_address=%p, new_address=%p\n", new_nodes_size, old, _nodes);
++      _reallocate_nodes(n);
+     }
+   }
+ 
+-  inline Node* _get(const S i) const {
++  Node* _get(const S i) const {
+     return get_node_ptr<S, Node>(_nodes, _s, i);
+   }
+ 
+-  S _make_tree(const vector<S >& indices, bool is_root) {
++  double _split_imbalance(const vector<S>& left_indices, const vector<S>& right_indices) {
++    double ls = (float)left_indices.size();
++    double rs = (float)right_indices.size();
++    float f = ls / (ls + rs + 1e-9);  // Avoid 0/0
++    return std::max(f, 1-f);
++  }
++
++  S _make_tree(const vector<S>& indices, bool is_root, Random& _random, ThreadedBuildPolicy& threaded_build_policy) {
+     // The basic rule is that if we have <= _K items, then it's a leaf node, otherwise it's a split node.
+     // There's some regrettable complications caused by the problem that root nodes have to be "special":
+     // 1. We identify root nodes by the arguable logic that _n_items == n->n_descendants, regardless of how many descendants they actually have
+@@ -1172,8 +1235,12 @@ template<typename S, typename T, typename Distance, typename Random>
+       return indices[0];
+ 
+     if (indices.size() <= (size_t)_K && (!is_root || (size_t)_n_items <= (size_t)_K || indices.size() == 1)) {
+-      _allocate_size(_n_nodes + 1);
++      threaded_build_policy.lock_n_nodes();
++      _allocate_size(_n_nodes + 1, threaded_build_policy);
+       S item = _n_nodes++;
++      threaded_build_policy.unlock_n_nodes();
++
++      threaded_build_policy.lock_shared_nodes();
+       Node* m = _get(item);
+       m->n_descendants = is_root ? _n_items : (S)indices.size();
+ 
+@@ -1183,9 +1250,12 @@ template<typename S, typename T, typename Distance, typename Random>
+       // Only copy when necessary to avoid crash in MSVC 9. #293
+       if (!indices.empty())
+         memcpy(m->children, &indices[0], indices.size() * sizeof(S));
++
++      threaded_build_policy.unlock_shared_nodes();
+       return item;
+     }
+ 
++    threaded_build_policy.lock_shared_nodes();
+     vector<Node*> children;
+     for (size_t i = 0; i < indices.size(); i++) {
+       S j = indices[i];
+@@ -1196,26 +1266,33 @@ template<typename S, typename T, typename Distance, typename Random>
+ 
+     vector<S> children_indices[2];
+     Node* m = (Node*)alloca(_s);
+-    D::create_split(children, _f, _s, _random, m);
+ 
+-    for (size_t i = 0; i < indices.size(); i++) {
+-      S j = indices[i];
+-      Node* n = _get(j);
+-      if (n) {
+-        bool side = D::side(m, n->v, _f, _random);
+-        children_indices[side].push_back(j);
+-      } else {
+-        showUpdate("No node for index %d?\n", j);
++    for (int attempt = 0; attempt < 3; attempt++) {
++      children_indices[0].clear();
++      children_indices[1].clear();
++      D::create_split(children, _f, _s, _random, m);
++
++      for (size_t i = 0; i < indices.size(); i++) {
++        S j = indices[i];
++        Node* n = _get(j);
++        if (n) {
++          bool side = D::side(m, n->v, _f, _random);
++          children_indices[side].push_back(j);
++        } else {
++          showUpdate("No node for index %d?\n", j);
++        }
+       }
++
++      if (_split_imbalance(children_indices[0], children_indices[1]) < 0.95)
++        break;
+     }
++    threaded_build_policy.unlock_shared_nodes();
+ 
+     // If we didn't find a hyperplane, just randomize sides as a last option
+-    while (children_indices[0].size() == 0 || children_indices[1].size() == 0) {
++    while (_split_imbalance(children_indices[0], children_indices[1]) > 0.99) {
+       if (_verbose)
+         showUpdate("\tNo hyperplane found (left has %ld children, right has %ld children)\n",
+           children_indices[0].size(), children_indices[1].size());
+-      if (_verbose && indices.size() > 100000)
+-        showUpdate("Failed splitting %lu items\n", indices.size());
+ 
+       children_indices[0].clear();
+       children_indices[1].clear();
+@@ -1236,12 +1313,17 @@ template<typename S, typename T, typename Distance, typename Random>
+     m->n_descendants = is_root ? _n_items : (S)indices.size();
+     for (int side = 0; side < 2; side++) {
+       // run _make_tree for the smallest child first (for cache locality)
+-      m->children[side^flip] = _make_tree(children_indices[side^flip], false);
++      m->children[side^flip] = _make_tree(children_indices[side^flip], false, _random, threaded_build_policy);
+     }
+ 
+-    _allocate_size(_n_nodes + 1);
++    threaded_build_policy.lock_n_nodes();
++    _allocate_size(_n_nodes + 1, threaded_build_policy);
+     S item = _n_nodes++;
++    threaded_build_policy.unlock_n_nodes();
++
++    threaded_build_policy.lock_shared_nodes();
+     memcpy(_get(item), m, _s);
++    threaded_build_policy.unlock_shared_nodes();
+ 
+     return item;
+   }
+@@ -1287,7 +1369,7 @@ template<typename S, typename T, typename Distance, typename Random>
+     vector<pair<T, S> > nns_dist;
+     S last = -1;
+     for (size_t i = 0; i < nns.size(); i++) {
+-      S j = nns[i];
++      S j = nns[i]; 
+       if (j == last)
+         continue;
+       last = j;
+@@ -1306,5 +1388,92 @@ template<typename S, typename T, typename Distance, typename Random>
+   }
+ };
+ 
++class AnnoyIndexSingleThreadedBuildPolicy {
++public:
++  template<typename S, typename T, typename D, typename Random>
++  static void build(AnnoyIndex<S, T, D, Random, AnnoyIndexSingleThreadedBuildPolicy>* annoy, int q, int n_threads) {
++    AnnoyIndexSingleThreadedBuildPolicy threaded_build_policy;
++    annoy->thread_build(q, 0, threaded_build_policy);
++  }
++
++  void lock_n_nodes() {}
++  void unlock_n_nodes() {}
++
++  void lock_nodes() {}
++  void unlock_nodes() {}
++
++  void lock_shared_nodes() {}
++  void unlock_shared_nodes() {}
++
++  void lock_roots() {}
++  void unlock_roots() {}
++};
++
++#ifdef ANNOYLIB_MULTITHREADED_BUILD
++class AnnoyIndexMultiThreadedBuildPolicy {
++private:
++  std::shared_timed_mutex nodes_mutex;
++  std::mutex n_nodes_mutex;
++  std::mutex roots_mutex;
++
++public:
++  template<typename S, typename T, typename D, typename Random>
++  static void build(AnnoyIndex<S, T, D, Random, AnnoyIndexMultiThreadedBuildPolicy>* annoy, int q, int n_threads) {
++    AnnoyIndexMultiThreadedBuildPolicy threaded_build_policy;
++    if (n_threads == -1) {
++      // If the hardware_concurrency() value is not well defined or not computable, it returns 0.
++      // We guard against this by using at least 1 thread.
++      n_threads = std::max(1, (int)std::thread::hardware_concurrency());
++    }
++
++    vector<std::thread> threads(n_threads);
++
++    for (int thread_idx = 0; thread_idx < n_threads; thread_idx++) {
++      int trees_per_thread = q == -1 ? -1 : (int)floor((q + thread_idx) / n_threads);
++
++      threads[thread_idx] = std::thread(
++        &AnnoyIndex<S, T, D, Random, AnnoyIndexMultiThreadedBuildPolicy>::thread_build,
++        annoy,
++        trees_per_thread,
++        thread_idx,
++        std::ref(threaded_build_policy)
++      );
++    }
++
++    for (auto& thread : threads) {
++      thread.join();
++    }
++  }
++
++  void lock_n_nodes() {
++    n_nodes_mutex.lock();
++  }
++  void unlock_n_nodes() {
++    n_nodes_mutex.unlock();
++  }
++
++  void lock_nodes() {
++    nodes_mutex.lock();
++  }
++  void unlock_nodes() {
++    nodes_mutex.unlock();
++  }
++
++  void lock_shared_nodes() {
++    nodes_mutex.lock_shared();
++  }
++  void unlock_shared_nodes() {
++    nodes_mutex.unlock_shared();
++  }
++
++  void lock_roots() {
++    roots_mutex.lock();
++  }
++  void unlock_roots() {
++    roots_mutex.unlock();
++  }
++};
++#endif
++
+ #endif
+ // vim: tabstop=2 shiftwidth=2
+diff --git a/openTSNE/dependencies/annoy/annoymodule.cc b/openTSNE/dependencies/annoy/annoymodule.cc
+index f15a0cc6..572b713e 100644
+--- a/openTSNE/dependencies/annoy/annoymodule.cc
++++ b/openTSNE/dependencies/annoy/annoymodule.cc
+@@ -54,6 +54,11 @@ typedef signed __int32    int32_t;
+     #define PyInt_FromLong PyLong_FromLong 
+ #endif
+ 
++#ifdef ANNOYLIB_MULTITHREADED_BUILD
++  typedef AnnoyIndexMultiThreadedBuildPolicy AnnoyIndexThreadedBuildPolicy;
++#else
++  typedef AnnoyIndexSingleThreadedBuildPolicy AnnoyIndexThreadedBuildPolicy;
++#endif
+ 
+ template class AnnoyIndexInterface<int32_t, float>;
+ 
+@@ -63,7 +68,7 @@ class HammingWrapper : public AnnoyIndexInterface<int32_t, float> {
+   // This is questionable from a performance point of view. Should reconsider this solution.
+ private:
+   int32_t _f_external, _f_internal;
+-  AnnoyIndex<int32_t, uint64_t, Hamming, Kiss64Random> _index;
++  AnnoyIndex<int32_t, uint64_t, Hamming, Kiss64Random, AnnoyIndexThreadedBuildPolicy> _index;
+   void _pack(const float* src, uint64_t* dst) const {
+     for (int32_t i = 0; i < _f_internal; i++) {
+       dst[i] = 0;
+@@ -84,7 +89,7 @@ class HammingWrapper : public AnnoyIndexInterface<int32_t, float> {
+     _pack(w, &w_internal[0]);
+     return _index.add_item(item, &w_internal[0], error);
+   };
+-  bool build(int q, char** error) { return _index.build(q, error); };
++  bool build(int q, int n_threads, char** error) { return _index.build(q, n_threads, error); };
+   bool unbuild(char** error) { return _index.unbuild(error); };
+   bool save(const char* filename, bool prefault, char** error) { return _index.save(filename, prefault, error); };
+   void unload() { _index.unload(); };
+@@ -145,17 +150,17 @@ py_an_new(PyTypeObject *type, PyObject *args, PyObject *kwargs) {
+     // This keeps coming up, see #368 etc
+     PyErr_WarnEx(PyExc_FutureWarning, "The default argument for metric will be removed "
+ 		 "in future version of Annoy. Please pass metric='angular' explicitly.", 1);
+-    self->ptr = new AnnoyIndex<int32_t, float, Angular, Kiss64Random>(self->f);
++    self->ptr = new AnnoyIndex<int32_t, float, Angular, Kiss64Random, AnnoyIndexThreadedBuildPolicy>(self->f);
+   } else if (!strcmp(metric, "angular")) {
+-   self->ptr = new AnnoyIndex<int32_t, float, Angular, Kiss64Random>(self->f);
++   self->ptr = new AnnoyIndex<int32_t, float, Angular, Kiss64Random, AnnoyIndexThreadedBuildPolicy>(self->f);
+   } else if (!strcmp(metric, "euclidean")) {
+-    self->ptr = new AnnoyIndex<int32_t, float, Euclidean, Kiss64Random>(self->f);
++    self->ptr = new AnnoyIndex<int32_t, float, Euclidean, Kiss64Random, AnnoyIndexThreadedBuildPolicy>(self->f);
+   } else if (!strcmp(metric, "manhattan")) {
+-    self->ptr = new AnnoyIndex<int32_t, float, Manhattan, Kiss64Random>(self->f);
++    self->ptr = new AnnoyIndex<int32_t, float, Manhattan, Kiss64Random, AnnoyIndexThreadedBuildPolicy>(self->f);
+   } else if (!strcmp(metric, "hamming")) {
+     self->ptr = new HammingWrapper(self->f);
+   } else if (!strcmp(metric, "dot")) {
+-    self->ptr = new AnnoyIndex<int32_t, float, DotProduct, Kiss64Random>(self->f);
++    self->ptr = new AnnoyIndex<int32_t, float, DotProduct, Kiss64Random, AnnoyIndexThreadedBuildPolicy>(self->f);
+   } else {
+     PyErr_SetString(PyExc_ValueError, "No such metric");
+     return NULL;
+@@ -408,16 +413,17 @@ py_an_on_disk_build(py_annoy *self, PyObject *args, PyObject *kwargs) {
+ static PyObject *
+ py_an_build(py_annoy *self, PyObject *args, PyObject *kwargs) {
+   int q;
++  int n_jobs = -1;
+   if (!self->ptr) 
+     return NULL;
+-  static char const * kwlist[] = {"n_trees", NULL};
+-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "i", (char**)kwlist, &q))
++  static char const * kwlist[] = {"n_trees", "n_jobs", NULL};
++  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "i|i", (char**)kwlist, &q, &n_jobs))
+     return NULL;
+ 
+   bool res;
+   char* error;
+   Py_BEGIN_ALLOW_THREADS;
+-  res = self->ptr->build(q, &error);
++  res = self->ptr->build(q, n_jobs, &error);
+   Py_END_ALLOW_THREADS;
+   if (!res) {
+     PyErr_SetString(PyExc_Exception, error);
+@@ -527,7 +533,7 @@ static PyMethodDef AnnoyMethods[] = {
+   {"get_item_vector",(PyCFunction)py_an_get_item_vector, METH_VARARGS, "Returns the vector for item `i` that was previously added."},
+   {"add_item",(PyCFunction)py_an_add_item, METH_VARARGS | METH_KEYWORDS, "Adds item `i` (any nonnegative integer) with vector `v`.\n\nNote that it will allocate memory for `max(i)+1` items."},
+   {"on_disk_build",(PyCFunction)py_an_on_disk_build, METH_VARARGS | METH_KEYWORDS, "Build will be performed with storage on disk instead of RAM."},
+-  {"build",(PyCFunction)py_an_build, METH_VARARGS | METH_KEYWORDS, "Builds a forest of `n_trees` trees.\n\nMore trees give higher precision when querying. After calling `build`,\nno more items can be added."},
++  {"build",(PyCFunction)py_an_build, METH_VARARGS | METH_KEYWORDS, "Builds a forest of `n_trees` trees.\n\nMore trees give higher precision when querying. After calling `build`,\nno more items can be added. `n_jobs` specifies the number of threads used to build the trees. `n_jobs=-1` uses all available CPU cores."},
+   {"unbuild",(PyCFunction)py_an_unbuild, METH_NOARGS, "Unbuilds the tree in order to allows adding new items.\n\nbuild() has to be called again afterwards in order to\nrun queries."},
+   {"unload",(PyCFunction)py_an_unload, METH_NOARGS, "Unloads an index from disk."},
+   {"get_distance",(PyCFunction)py_an_get_distance, METH_VARARGS, "Returns the distance between items `i` and `j`."},
+diff --git a/openTSNE/dependencies/annoy/mman.h b/openTSNE/dependencies/annoy/mman.h
+index 113d46d3..955ab8b6 100644
+--- a/openTSNE/dependencies/annoy/mman.h
++++ b/openTSNE/dependencies/annoy/mman.h
+@@ -210,17 +210,22 @@ inline int munlock(const void *addr, size_t len)
+ }
+ 
+ #if !defined(__MINGW32__)
+-inline int ftruncate(int fd, unsigned int size) {
++inline int ftruncate(const int fd, const int64_t size) {
+     if (fd < 0) {
+         errno = EBADF;
+         return -1;
+     }
+ 
+-    HANDLE h = (HANDLE)_get_osfhandle(fd);
+-    unsigned int cur = SetFilePointer(h, 0, NULL, FILE_CURRENT);
+-    if (cur == ~0 || SetFilePointer(h, size, NULL, FILE_BEGIN) == ~0 || !SetEndOfFile(h)) {
+-        int error = GetLastError();
+-        switch (GetLastError()) {
++    HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
++    LARGE_INTEGER li_start, li_size;
++    li_start.QuadPart = static_cast<int64_t>(0);
++    li_size.QuadPart = size;
++    if (SetFilePointerEx(h, li_start, NULL, FILE_CURRENT) == ~0 ||
++        SetFilePointerEx(h, li_size, NULL, FILE_BEGIN) == ~0 ||
++        !SetEndOfFile(h)) {
++        unsigned long error = GetLastError();
++        fprintf(stderr, "I/O error while truncating: %lu\n", error);
++        switch (error) {
+             case ERROR_INVALID_HANDLE:
+                 errno = EBADF;
+                 break;
+@@ -229,8 +234,7 @@ inline int ftruncate(int fd, unsigned int size) {
+                 break;
+         }
+         return -1;
+-    }
+-
++    }        
+     return 0;
+ }
+ #endif
+diff --git a/openTSNE/nearest_neighbors.py b/openTSNE/nearest_neighbors.py
+index ddf50701..0a924992 100644
+--- a/openTSNE/nearest_neighbors.py
++++ b/openTSNE/nearest_neighbors.py
+@@ -212,7 +212,7 @@ def build(self, data, k):
+             self.index.add_item(i, data[i])
+ 
+         # Number of trees. FIt-SNE uses 50 by default.
+-        self.index.build(50)
++        self.index.build(50, n_jobs=self.n_jobs)
+ 
+         # Return the nearest neighbors in the training set
+         distances = np.zeros((N, k))
+diff --git a/setup.py b/setup.py
+index 539f5c24..2c03caf1 100644
+--- a/setup.py
++++ b/setup.py
+@@ -136,14 +136,33 @@ def build_extensions(self):
+ 
+         # Optimization compiler/linker flags are added appropriately
+         compiler = self.compiler.compiler_type
+-        if compiler == "unix" and platform.platform():
++        if compiler == "unix":
+             extra_compile_args += ["-O3"]
+-            # For some reason fast math causes segfaults on linux but works on mac
+-            if platform.system() == "Darwin":
+-                extra_compile_args += ["-ffast-math", "-fno-associative-math"]
+         elif compiler == "msvc":
+             extra_compile_args += ["/Ox", "/fp:fast"]
+ 
++        if compiler == "unix" and platform.system() == "Darwin":
++            # For some reason fast math causes segfaults on linux but works on mac
++            extra_compile_args += ["-ffast-math", "-fno-associative-math"]
++
++        # Annoy specific flags
++        annoy_ext = None
++        for extension in extensions:
++            if "annoy.annoylib" in extension.name:
++                annoy_ext = extension
++        assert annoy_ext is not None, "Annoy extension not found!"
++
++        if compiler == "unix":
++            annoy_ext.extra_compile_args += ["-std=c++14"]
++            annoy_ext.extra_compile_args += ["-DANNOYLIB_MULTITHREADED_BUILD"]
++        elif compiler == "msvc":
++            annoy_ext.extra_compile_args += ["/std:c++14"]
++
++        # Annoy #349: something with OS X Mojave causes libstd not to be found
++        if compiler == "unix" and platform.system() == "Darwin":
++            annoy_ext.extra_compile_args += ["-mmacosx-version-min=10.12"]
++            annoy_ext.extra_link_args += ["-stdlib=libc++", "-mmacosx-version-min=10.12"]
++
+         # We don't want the compiler to optimize for system architecture if
+         # we're building packages to be distributed by conda-forge, but if the
+         # package is being built locally, this is desired
+@@ -153,11 +172,6 @@ def build_extensions(self):
+             if platform.machine() == "x86_64":
+                 extra_compile_args += ["-march=native"]
+ 
+-        # Annoy #349: something with OS X Mojave causes libstd not to be found
+-        if platform.system() == "Darwin":
+-            extra_compile_args += ["-std=c++11", "-mmacosx-version-min=10.9"]
+-            extra_link_args += ["-stdlib=libc++", "-mmacosx-version-min=10.9"]
+-
+         # We will disable openmp flags if the compiler doesn"t support it. This
+         # is only really an issue with OSX clang
+         if has_c_library("omp"):

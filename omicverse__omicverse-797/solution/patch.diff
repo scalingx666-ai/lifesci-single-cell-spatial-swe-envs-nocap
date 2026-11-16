@@ -1,0 +1,614 @@
+diff --git a/omicverse/single/_batch.py b/omicverse/single/_batch.py
+index f4a5687ff..5490edcc0 100644
+--- a/omicverse/single/_batch.py
++++ b/omicverse/single/_batch.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+-from typing import Optional
++import inspect
++import warnings
++from typing import Any, Callable, Dict, Optional, Tuple
+ 
+ from ..pp import scale,pca
+ import scanpy as sc
+@@ -12,6 +14,115 @@
+ from ..report._provenance import tracked, note
+ 
+ 
++def _split_kwargs_by_signature(
++    kwargs: Dict[str, Any],
++    *destinations: Tuple[str, Callable[..., Any]],
++) -> Tuple[Dict[str, Any], ...]:
++    """Partition ``kwargs`` across multiple callables by inspecting each
++    callable's signature.
++
++    The historical ``ov.single.batch_correction(..., **kwargs)`` API forwarded
++    every keyword to ``scvi.model.SCVI(**kwargs)``, leaving ``.train()``
++    un-parameterisable. Modern scvi-tools splits user-tunable parameters
++    between ``Model.__init__`` (architecture: ``n_hidden`` / ``n_latent`` / …)
++    and ``Model.train`` (optimisation: ``max_epochs`` / ``batch_size`` /
++    ``accelerator`` / …). This helper makes that split automatic.
++
++    Parameters
++    ----------
++    kwargs
++        The full keyword dict supplied by the user.
++    destinations
++        One ``(label, callable)`` pair per target, in priority order. The
++        ``label`` is used in warnings; the ``callable`` is introspected via
++        ``inspect.signature``.
++
++    Returns
++    -------
++    tuple of dict
++        One dict per destination, in the same order as ``destinations``.
++
++    Routing rules
++    -------------
++    1. A kwarg whose name is a named parameter of exactly ONE destination
++       routes there (precise match).
++    2. A kwarg whose name is a named parameter of MULTIPLE destinations
++       routes to the first match in ``destinations`` order, with a warning
++       naming the others.
++    3. A kwarg whose name is in NO destination's named params is sent to the
++       first destination that has ``**kwargs`` (``VAR_KEYWORD``) — this
++       preserves the legacy "send everything to init" behaviour for unknown
++       names without silently mis-routing the ones we now recognise.
++    4. A kwarg that no destination would accept (no named match, no
++       ``VAR_KEYWORD`` anywhere) is dropped with a warning listing the
++       accepted names.
++
++    Notes
++    -----
++    Only ``POSITIONAL_OR_KEYWORD`` and ``KEYWORD_ONLY`` parameters count as
++    "named". ``self`` is filtered out automatically. Signature introspection
++    failures (C-extension callables, decorator obfuscation) collapse to "no
++    named params, no VAR_KEYWORD" — those destinations effectively become
++    inert.
++    """
++    sigs = []
++    for label, fn in destinations:
++        try:
++            params = inspect.signature(fn).parameters
++        except (TypeError, ValueError):
++            params = {}
++        named = {
++            n for n, p in params.items()
++            if n != "self" and p.kind in (
++                inspect.Parameter.POSITIONAL_OR_KEYWORD,
++                inspect.Parameter.KEYWORD_ONLY,
++            )
++        }
++        has_var_kw = any(
++            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
++        )
++        sigs.append((label, named, has_var_kw))
++
++    buckets: list[Dict[str, Any]] = [dict() for _ in destinations]
++    unrecognised: list[str] = []
++
++    for key, val in kwargs.items():
++        matches = [i for i, (_, named, _) in enumerate(sigs) if key in named]
++
++        if len(matches) == 1:
++            buckets[matches[0]][key] = val
++        elif len(matches) > 1:
++            winner = sigs[matches[0]][0]
++            losers = ", ".join(sigs[i][0] for i in matches[1:])
++            warnings.warn(
++                f"kwarg {key!r} is a named parameter of both {winner} and "
++                f"{losers}; routed to {winner}. Rename or pass positionally "
++                f"to disambiguate.",
++                UserWarning, stacklevel=3,
++            )
++            buckets[matches[0]][key] = val
++        else:
++            var_kw_dests = [i for i, (_, _, has) in enumerate(sigs) if has]
++            if var_kw_dests:
++                buckets[var_kw_dests[0]][key] = val
++            else:
++                unrecognised.append(key)
++
++    if unrecognised:
++        accepted = sorted({n for _, named, _ in sigs for n in named})
++        preview = ", ".join(accepted[:20])
++        if len(accepted) > 20:
++            preview += ", …"
++        warnings.warn(
++            f"Dropped unrecognised kwarg(s) {sorted(unrecognised)!r} — none "
++            f"of {[d[0] for d in destinations]} accept them. Accepted "
++            f"names include: {preview}.",
++            UserWarning, stacklevel=3,
++        )
++
++    return tuple(buckets)
++
++
+ # Per-method obsm key the integrated embedding lands in. Used by the
+ # tracked() viz spec so the report's diagnostic plot is colored by
+ # batch_key on the embedding the user just produced.
+@@ -20,6 +131,12 @@
+     "combat":    "X_combat",
+     "scanorama": "X_scanorama",
+     "scVI":      "X_scVI",
++    "scANVI":    "X_scANVI",
++    "SCANVI":    "X_scANVI",
++    "totalVI":   "X_totalVI",
++    "TOTALVI":   "X_totalVI",
++    "scPoli":    "X_scPoli",
++    "SCPOLI":    "X_scPoli",
+     "CellANOVA": "X_cellanova",
+     "Concord":   "X_concord",
+     "cca":       "X_cca",
+@@ -80,10 +197,14 @@ def batch_correction(adata:anndata.AnnData,batch_key:str,
+         Embedding key used by embedding-based methods (for example Harmony).
+     methods : str, default='harmony'
+         Integration backend. Supported values include ``'harmony'``,
+-        ``'combat'``, ``'scanorama'``, ``'scVI'``, ``'CellANOVA'``,
+-        ``'Concord'``, and ``'cca'`` / ``'seurat_cca'`` — the pure-Python
+-        port of ``Seurat::RunCCA`` (via the `pyccasc` package, no R /
+-        rpy2 required).
++        ``'combat'``, ``'scanorama'``, ``'scVI'``, ``'scANVI'``
++        (semi-supervised VAE; requires ``labels_key=``),
++        ``'totalVI'`` (joint RNA+protein; requires
++        ``protein_expression_obsm_key=``), ``'scPoli'`` (scArches
++        conditional VAE; supports ``cell_type_keys=`` for prototype
++        learning), ``'CellANOVA'``, ``'Concord'``, and ``'cca'`` /
++        ``'seurat_cca'`` — the pure-Python port of ``Seurat::RunCCA``
++        (via the `pyccasc` package, no R / rpy2 required).
+     n_pcs : int, default=50
+         Number of principal components / canonical components used by the
+         selected backend. For ``'cca'`` this is the number of canonical
+@@ -232,12 +353,129 @@ def batch_correction(adata:anndata.AnnData,batch_key:str,
+             )
+         import scvi
+         scvi.model.SCVI.setup_anndata(adata, layer="counts", batch_key=batch_key)
+-        model = scvi.model.SCVI(adata, **kwargs)
+-        model.train()
++        # The user's **kwargs may target either SCVI.__init__ (architecture:
++        # n_hidden / n_latent / dropout_rate / dispersion / gene_likelihood /
++        # latent_distribution / …) or SCVI.train (optimisation: max_epochs /
++        # batch_size / accelerator / devices / early_stopping / …). Route by
++        # signature so train-side parameters are no longer silently swallowed
++        # by SCVI.__init__'s **kwargs catch-all.
++        init_kwargs, train_kwargs = _split_kwargs_by_signature(
++            kwargs,
++            ("scvi.model.SCVI.__init__", scvi.model.SCVI.__init__),
++            ("scvi.model.SCVI.train", scvi.model.SCVI.train),
++        )
++        model = scvi.model.SCVI(adata, **init_kwargs)
++        model.train(**train_kwargs)
+         SCVI_LATENT_KEY = "X_scVI"
+         adata.obsm[SCVI_LATENT_KEY] = model.get_latent_representation()
+         add_reference(adata,'scVI','batch correction with scVI')
+         return model
++    elif methods in ('scANVI', 'SCANVI'):
++        try:
++            import scvi
++        except ImportError:
++            raise ImportError(
++                'Please install scvi-tools: `pip install scvi-tools` '
++                'or `conda install scvi-tools -c conda-forge`'
++            )
++        # scANVI is semi-supervised — it needs a cell-type column with an
++        # explicit "unknown" marker for cells without a confident label.
++        labels_key = kwargs.pop('labels_key', None)
++        unlabeled_category = kwargs.pop('unlabeled_category', 'Unknown')
++        if labels_key is None:
++            raise ValueError(
++                "methods='scANVI' requires labels_key= naming a column in "
++                "adata.obs with cell-type labels (use the value passed as "
++                "unlabeled_category= for cells you want the model to predict "
++                "labels for). See scvi-tools docs: "
++                "https://docs.scvi-tools.org/en/stable/user_guide/models/scanvi.html"
++            )
++        scvi.model.SCANVI.setup_anndata(
++            adata, layer="counts", batch_key=batch_key,
++            labels_key=labels_key, unlabeled_category=unlabeled_category,
++        )
++        init_kwargs, train_kwargs = _split_kwargs_by_signature(
++            kwargs,
++            ("scvi.model.SCANVI.__init__", scvi.model.SCANVI.__init__),
++            ("scvi.model.SCANVI.train", scvi.model.SCANVI.train),
++        )
++        model = scvi.model.SCANVI(adata, **init_kwargs)
++        model.train(**train_kwargs)
++        adata.obsm["X_scANVI"] = model.get_latent_representation()
++        # scANVI also predicts labels for unlabeled cells — surface them.
++        try:
++            adata.obs["scANVI_predicted_labels"] = model.predict()
++        except Exception:
++            pass
++        add_reference(adata, 'scANVI', 'batch correction with scANVI (semi-supervised)')
++        return model
++    elif methods in ('totalVI', 'TOTALVI'):
++        try:
++            import scvi
++        except ImportError:
++            raise ImportError(
++                'Please install scvi-tools: `pip install scvi-tools` '
++                'or `conda install scvi-tools -c conda-forge`'
++            )
++        # totalVI is a JOINT RNA + protein (CITE-seq / Total-seq) model. It
++        # needs the protein matrix attached to adata.obsm[<key>] BEFORE call.
++        protein_expression_obsm_key = kwargs.pop('protein_expression_obsm_key', None)
++        if protein_expression_obsm_key is None:
++            raise ValueError(
++                "methods='totalVI' requires protein_expression_obsm_key= naming "
++                "an obsm slot with the (cell × protein) ADT count matrix. "
++                "If you only have RNA, use methods='scVI' (or 'scANVI' with "
++                "labels). See scvi-tools docs: "
++                "https://docs.scvi-tools.org/en/stable/user_guide/models/totalvi.html"
++            )
++        scvi.model.TOTALVI.setup_anndata(
++            adata, batch_key=batch_key, layer="counts",
++            protein_expression_obsm_key=protein_expression_obsm_key,
++        )
++        init_kwargs, train_kwargs = _split_kwargs_by_signature(
++            kwargs,
++            ("scvi.model.TOTALVI.__init__", scvi.model.TOTALVI.__init__),
++            ("scvi.model.TOTALVI.train", scvi.model.TOTALVI.train),
++        )
++        model = scvi.model.TOTALVI(adata, **init_kwargs)
++        model.train(**train_kwargs)
++        adata.obsm["X_totalVI"] = model.get_latent_representation()
++        add_reference(adata, 'totalVI', 'batch correction with totalVI (joint RNA+protein)')
++        return model
++    elif methods in ('scPoli', 'SCPOLI'):
++        try:
++            from scarches.models.scpoli import scPoli
++        except ImportError:
++            raise ImportError(
++                'Please install scArches: `pip install scarches`'
++            )
++        # scPoli is a conditional VAE that learns per-condition prototypes
++        # (optionally per cell type, if cell_type_keys is supplied). It takes
++        # condition_keys instead of batch_key; we forward batch_key there.
++        cell_type_keys = kwargs.pop('cell_type_keys', None)
++        init_kwargs, train_kwargs = _split_kwargs_by_signature(
++            kwargs,
++            ("scarches.models.scpoli.scPoli.__init__", scPoli.__init__),
++            ("scarches.models.scpoli.scPoli.train", scPoli.train),
++        )
++        scpoli_init = {
++            "adata": adata,
++            "condition_keys": batch_key,
++            **init_kwargs,
++        }
++        if cell_type_keys is not None:
++            scpoli_init["cell_type_keys"] = cell_type_keys
++        model = scPoli(**scpoli_init)
++        model.train(**train_kwargs)
++        # scPoli's canonical embedding accessor is get_latent(adata, mean=True);
++        # fall back to get_latent() with no kwargs for older releases.
++        try:
++            latent = model.get_latent(adata, mean=True)
++        except TypeError:
++            latent = model.get_latent(adata)
++        adata.obsm["X_scPoli"] = latent
++        add_reference(adata, 'scPoli', 'batch correction with scPoli (conditional VAE)')
++        return model
+     elif methods=='CellANOVA':
+         from ..external.cellanova.model import calc_ME,calc_BE,calc_TE
+         if ('highly_variable_features' in adata.var.columns) and ('highly_variable' not in adata.var.columns):
+diff --git a/tests/single/test_kwargs_split.py b/tests/single/test_kwargs_split.py
+new file mode 100644
+index 000000000..185b6bdcb
+--- /dev/null
++++ b/tests/single/test_kwargs_split.py
+@@ -0,0 +1,150 @@
++"""Tests for ``omicverse.single._batch._split_kwargs_by_signature``.
++
++The helper underpins the scvi-tools ``batch_correction`` path, where the
++historical ``**kwargs`` API forwarded every keyword to ``SCVI.__init__``,
++leaving ``SCVI.train`` un-parameterisable. The helper partitions the
++kwargs by signature; this file tests that partitioning logic against
++synthetic callables so no real scvi-tools / torch install is required.
++"""
++from __future__ import annotations
++
++import warnings
++
++import pytest
++
++from omicverse.single._batch import _split_kwargs_by_signature
++
++
++# ── Synthetic targets ────────────────────────────────────────────────────────
++
++
++def _init_like(self, adata, n_hidden=128, n_latent=10, dropout_rate=0.1, **kwargs):
++    """Mimics ``scvi.model.SCVI.__init__``: named architecture params + a
++    ``**kwargs`` catch-all that forwards to a submodule."""
++
++
++def _train_like(self, max_epochs=400, batch_size=128, early_stopping=False,
++                accelerator="auto", **trainer_kwargs):
++    """Mimics ``scvi.model.SCVI.train``: named optimisation params + a
++    ``**trainer_kwargs`` catch-all forwarding to Lightning."""
++
++
++def _noop(self):
++    """No named kwargs, no VAR_KEYWORD — accepts nothing by name."""
++
++
++# ── Tests ────────────────────────────────────────────────────────────────────
++
++
++class TestSplitKwargs:
++    def test_named_params_route_to_their_destination(self) -> None:
++        init, train = _split_kwargs_by_signature(
++            {"n_hidden": 256, "max_epochs": 100, "dropout_rate": 0.2,
++             "batch_size": 512, "early_stopping": True},
++            ("init", _init_like),
++            ("train", _train_like),
++        )
++        assert init == {"n_hidden": 256, "dropout_rate": 0.2}
++        assert train == {"max_epochs": 100, "batch_size": 512,
++                         "early_stopping": True}
++
++    def test_empty_kwargs_yields_empty_dicts(self) -> None:
++        init, train = _split_kwargs_by_signature(
++            {},
++            ("init", _init_like),
++            ("train", _train_like),
++        )
++        assert init == {}
++        assert train == {}
++
++    def test_self_param_is_ignored(self) -> None:
++        # 'self' is in both signatures' parameter list but must never be
++        # routed — it's the bound-method receiver, not a real kwarg.
++        init, train = _split_kwargs_by_signature(
++            {"self": "should not be routed"},
++            ("init", _init_like),
++            ("train", _train_like),
++        )
++        # Falls through to first VAR_KEYWORD destination (init).
++        assert init == {"self": "should not be routed"}
++        assert train == {}
++
++    def test_unknown_kwarg_falls_through_to_first_var_keyword(self) -> None:
++        # 'plan_kwargs' is in neither destination's named list; both have
++        # **kwargs, so the FIRST destination wins (deterministic).
++        with warnings.catch_warnings():
++            warnings.simplefilter("error")  # promote warnings to errors
++            init, train = _split_kwargs_by_signature(
++                {"plan_kwargs": {"lr": 1e-3}},
++                ("init", _init_like),
++                ("train", _train_like),
++            )
++        assert init == {"plan_kwargs": {"lr": 1e-3}}
++        assert train == {}
++
++    def test_unknown_kwarg_with_no_var_keyword_is_dropped_with_warning(self) -> None:
++        # Both destinations are no-arg; nothing can accept 'mystery'.
++        with pytest.warns(UserWarning, match="Dropped unrecognised kwarg"):
++            (only,) = _split_kwargs_by_signature(
++                {"mystery": 42},
++                ("noop", _noop),
++            )
++        assert only == {}
++
++    def test_collision_routes_to_first_destination_with_warning(self) -> None:
++        # 'batch_size' is a named param of train_like only by default —
++        # construct a synthetic init that also takes batch_size to force
++        # the collision case.
++        def _init_with_overlap(self, adata, batch_size=128, **kwargs):
++            pass
++
++        with pytest.warns(UserWarning, match="batch_size"):
++            init, train = _split_kwargs_by_signature(
++                {"batch_size": 256},
++                ("init_overlap", _init_with_overlap),
++                ("train", _train_like),
++            )
++        # First destination in priority order wins on collision.
++        assert init == {"batch_size": 256}
++        assert train == {}
++
++    def test_destination_order_is_preserved_in_output(self) -> None:
++        # Reverse the order of (init, train) → the returned tuple must
++        # match the call order, not some internal canonicalisation.
++        train, init = _split_kwargs_by_signature(
++            {"n_hidden": 128, "max_epochs": 50},
++            ("train", _train_like),
++            ("init", _init_like),
++        )
++        assert train == {"max_epochs": 50}
++        assert init == {"n_hidden": 128}
++
++    def test_works_when_a_destination_signature_cannot_be_introspected(self) -> None:
++        # Some C-extension callables raise on inspect.signature. The
++        # helper should degrade gracefully: that destination accepts
++        # nothing by name and has no VAR_KEYWORD, so kwargs that name a
++        # param of it would not match. Use a builtin as a stand-in.
++        init, c_like = _split_kwargs_by_signature(
++            {"n_hidden": 64},
++            ("init", _init_like),
++            ("c_callable", print),  # introspectable but irrelevant params
++        )
++        assert init == {"n_hidden": 64}
++        assert c_like == {}
++
++    def test_real_scvi_signatures_when_available(self) -> None:
++        # Integration check against real scvi when it happens to be
++        # installed; otherwise skipped.
++        scvi = pytest.importorskip("scvi")
++        init, train = _split_kwargs_by_signature(
++            {"n_hidden": 256, "n_latent": 20, "max_epochs": 50,
++             "batch_size": 512, "early_stopping": True},
++            ("SCVI.__init__", scvi.model.SCVI.__init__),
++            ("SCVI.train", scvi.model.SCVI.train),
++        )
++        assert "n_hidden" in init and "n_latent" in init
++        assert "max_epochs" in train and "batch_size" in train and \
++               "early_stopping" in train
++        # And no leakage in the wrong direction.
++        assert "max_epochs" not in init
++        assert "n_hidden" not in train
+diff --git a/tests/test_single_batch_scvi_family.py b/tests/test_single_batch_scvi_family.py
+new file mode 100644
+index 000000000..4a517a8c7
+--- /dev/null
++++ b/tests/test_single_batch_scvi_family.py
+@@ -0,0 +1,158 @@
++"""Smoke + kwarg-routing tests for the scvi-tools-family branches of
++``ov.single.batch_correction``: SCVI, scANVI, totalVI, scPoli.
++
++Each test uses a tiny synthetic AnnData and trains for a single epoch
++(or a small ``max_epochs`` value) — enough to exercise the full code path
++(setup_anndata → kwarg split → model construction → train → latent
++write-back) without becoming a slow integration test. The scvi tests gate
++on ``pytest.importorskip("scvi")``; the scPoli test additionally gates on
++``pytest.importorskip("scarches")``.
++
++The intent is to lock the kwarg-routing contract (named init params land
++in ``__init__``, named train params land in ``.train``) against future
++scvi-tools / scArches API drift.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++import pytest
++import anndata as ad
++
++
++def _toy_adata_with_counts(n_per_batch=80, n_genes=120, n_batches=3, seed=0):
++    """Tiny synthetic counts AnnData with a per-batch additive shift and a
++    binary cell-type covariate. Counts go in ``adata.layers['counts']`` (raw)
++    and ``adata.X`` (also raw — scvi-family methods read from `layer='counts'`)."""
++    rng = np.random.default_rng(seed)
++    Xs, batches, cell_types = [], [], []
++    for bi in range(n_batches):
++        X = rng.poisson(lam=2.0, size=(n_per_batch, n_genes)).astype(np.float32)
++        # Per-batch overdispersion on the first 20 genes
++        X[:, :20] += rng.poisson(lam=bi + 1, size=(n_per_batch, 20))
++        # Cell-type A on first half, B on second half — adds counts on
++        # genes 20:40 vs 40:60
++        X[: n_per_batch // 2, 20:40] += 3
++        X[n_per_batch // 2:, 40:60] += 3
++        Xs.append(X)
++        batches.extend([f"batch_{bi}"] * n_per_batch)
++        cell_types.extend(["A"] * (n_per_batch // 2) + ["B"] * (n_per_batch - n_per_batch // 2))
++    X_all = np.vstack(Xs)
++    obs = pd.DataFrame({
++        "batch": batches, "celltype": cell_types,
++    }, index=[f"cell_{i}" for i in range(X_all.shape[0])])
++    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
++    adata = ad.AnnData(X=X_all, obs=obs, var=var)
++    adata.layers["counts"] = X_all.copy()
++    return adata
++
++
++# ── scVI ─────────────────────────────────────────────────────────────────────
++
++class TestSCVIRouting:
++    def test_scvi_kwargs_route_to_init_and_train(self) -> None:
++        pytest.importorskip("scvi")
++        from omicverse.single import batch_correction
++
++        adata = _toy_adata_with_counts()
++        model = batch_correction(
++            adata, batch_key="batch", methods="scVI",
++            # Init-side architecture params:
++            n_hidden=32, n_latent=8, dropout_rate=0.05,
++            # Train-side optimisation params:
++            max_epochs=1, batch_size=64, accelerator="cpu",
++        )
++        # Init kwargs took effect (not silently swallowed).
++        assert model.module.n_latent == 8
++        # Latent embedding written back.
++        assert "X_scVI" in adata.obsm
++        assert adata.obsm["X_scVI"].shape == (adata.n_obs, 8)
++
++
++# ── scANVI ───────────────────────────────────────────────────────────────────
++
++class TestSCANVI:
++    def test_scanvi_requires_labels_key(self) -> None:
++        pytest.importorskip("scvi")
++        from omicverse.single import batch_correction
++
++        adata = _toy_adata_with_counts()
++        with pytest.raises(ValueError, match="labels_key"):
++            batch_correction(adata, batch_key="batch", methods="scANVI")
++
++    def test_scanvi_runs_and_writes_latent(self) -> None:
++        pytest.importorskip("scvi")
++        from omicverse.single import batch_correction
++
++        adata = _toy_adata_with_counts()
++        # Mark a fraction of cells as "Unknown" so scANVI has a target.
++        adata.obs["celltype"] = adata.obs["celltype"].astype(object)
++        adata.obs.loc[adata.obs.index[::5], "celltype"] = "Unknown"
++        adata.obs["celltype"] = adata.obs["celltype"].astype("category")
++
++        model = batch_correction(
++            adata, batch_key="batch", methods="scANVI",
++            labels_key="celltype", unlabeled_category="Unknown",
++            n_latent=8,            # init-side
++            max_epochs=1,          # train-side
++            accelerator="cpu",     # train-side
++        )
++        assert model.module.n_latent == 8
++        assert "X_scANVI" in adata.obsm
++        assert adata.obsm["X_scANVI"].shape == (adata.n_obs, 8)
++
++
++# ── totalVI ──────────────────────────────────────────────────────────────────
++
++class TestTotalVI:
++    def test_totalvi_requires_protein_obsm_key(self) -> None:
++        pytest.importorskip("scvi")
++        from omicverse.single import batch_correction
++
++        adata = _toy_adata_with_counts()
++        with pytest.raises(ValueError, match="protein_expression_obsm_key"):
++            batch_correction(adata, batch_key="batch", methods="totalVI")
++
++    def test_totalvi_runs_with_fake_protein_matrix(self) -> None:
++        pytest.importorskip("scvi")
++        from omicverse.single import batch_correction
++
++        adata = _toy_adata_with_counts()
++        # Fake CITE-seq ADT counts: 15 proteins per cell.
++        rng = np.random.default_rng(1)
++        protein_counts = rng.poisson(lam=4.0, size=(adata.n_obs, 15)).astype(np.float32)
++        adata.obsm["protein_counts"] = protein_counts
++
++        model = batch_correction(
++            adata, batch_key="batch", methods="totalVI",
++            protein_expression_obsm_key="protein_counts",
++            n_latent=8,            # init-side
++            max_epochs=1,          # train-side
++            accelerator="cpu",     # train-side
++            batch_size=64,         # train-side
++        )
++        assert model.module.n_latent == 8
++        assert "X_totalVI" in adata.obsm
++        assert adata.obsm["X_totalVI"].shape == (adata.n_obs, 8)
++
++
++# ── scPoli ───────────────────────────────────────────────────────────────────
++
++class TestScPoli:
++    def test_scpoli_runs_and_writes_latent(self) -> None:
++        pytest.importorskip("scarches")
++        from omicverse.single import batch_correction
++
++        adata = _toy_adata_with_counts()
++        model = batch_correction(
++            adata, batch_key="batch", methods="scPoli",
++            cell_type_keys="celltype",
++            # Init-side scPoli params:
++            embedding_dims=5,
++            # Train-side scPoli.train params:
++            n_epochs=2, pretraining_epochs=1,
++        )
++        assert "X_scPoli" in adata.obsm
++        # scPoli's latent dimension is determined internally (latent_dim
++        # default 10 unless overridden) — assert presence + shape contract.
++        assert adata.obsm["X_scPoli"].shape[0] == adata.n_obs

@@ -1,0 +1,3041 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4340c9f86..2af68fc48 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -86,6 +86,7 @@ if (RSC_BUILD_EXTENSIONS)
+   add_nb_cuda_module(_bbknn_cuda        src/rapids_singlecell/_cuda/bbknn/bbknn.cu)
+   add_nb_cuda_module(_norm_cuda         src/rapids_singlecell/_cuda/norm/norm.cu)
+   add_nb_cuda_module(_gmm_cuda          src/rapids_singlecell/_cuda/gmm/gmm.cu)
++  add_nb_cuda_module(_guide_assignment_cuda src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu)
+   target_link_libraries(_gmm_cuda PRIVATE CUDA::cublas)
+   target_link_libraries(_gmm_cuda PRIVATE CUDA::cusolver)
+   add_nb_cuda_module(_mixscale_cuda     src/rapids_singlecell/_cuda/mixscale/mixscale.cu)
+@@ -106,7 +107,6 @@ if (RSC_BUILD_EXTENSIONS)
+   add_nb_cuda_module(_pv_cuda           src/rapids_singlecell/_cuda/pv/pv.cu)
+   add_nb_cuda_module(_edistance_cuda    src/rapids_singlecell/_cuda/edistance/edistance.cu)
+   add_nb_cuda_module(_sinkhorn_cuda     src/rapids_singlecell/_cuda/sinkhorn/sinkhorn.cu)
+-  add_nb_cuda_module(_guide_assignment_cuda src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu)
+   add_nb_cuda_module(_pseudobulk_cuda   src/rapids_singlecell/_cuda/pseudobulk/pseudobulk.cu)
+   add_nb_cuda_module(_hvg_cuda          src/rapids_singlecell/_cuda/hvg/hvg.cu)
+   add_nb_cuda_module(_kde_cuda          src/rapids_singlecell/_cuda/kde/kde.cu)
+diff --git a/docs/release-notes/0.19.0.md b/docs/release-notes/0.19.0.md
+index d7e43bfcf..bf6a8e645 100644
+--- a/docs/release-notes/0.19.0.md
++++ b/docs/release-notes/0.19.0.md
+@@ -5,11 +5,13 @@
+ * Add ``dtype="bfloat16"`` to {func}`~rapids_singlecell.pp.harmony_integrate`, which keeps the cluster assignments in bfloat16 to save GPU memory and time; several batch keys or the ``fast`` correction fall back to float32 with a warning {pr}`829` {smaller}`S Dicks`
+ * Add ``multi_gpu`` to {func}`~rapids_singlecell.pp.harmony_integrate` to run on several GPUs, with results bitwise identical to one GPU {pr}`830` {smaller}`S Dicks`
+ * Add ``shuffle_chunk_size`` to {func}`~rapids_singlecell.pp.harmony_integrate`, the number of consecutive same-batch cells dealt into each update block (default ``8``) {pr}`829` {smaller}`S Dicks`
++* Match {meth}`~rapids_singlecell.ptg.GuideAssignment.assign_mixture_model` to pertpy's mixture model and parameters {pr}`852` {smaller}`L Heumos`
+ 
+ ```{rubric} Performance
+ ```
+ * Speed up {func}`~rapids_singlecell.pp.harmony_integrate` and lower its peak GPU memory on large datasets, also for float64 or Fortran-ordered NumPy input; results stay bitwise reproducible, but seeded results differ from 0.18.1 {pr}`829` {smaller}`S Dicks`
+ * {func}`~rapids_singlecell.pp.harmony_integrate` with several batch keys that have thousands of levels in total runs slower than in 0.18.1 {pr}`829` {smaller}`S Dicks`
++* Speed up {class}`~rapids_singlecell.ptg.GuideAssignment` with CUDA kernels that read CSR, CSC and dense counts in place; {meth}`~rapids_singlecell.ptg.GuideAssignment.assign_to_max_guide` no longer densifies sparse input {pr}`852` {smaller}`L Heumos & S Dicks`
+ 
+ ```{rubric} Bug fixes
+ ```
+diff --git a/src/rapids_singlecell/_cuda/__init__.py b/src/rapids_singlecell/_cuda/__init__.py
+index 5b40e836f..4f2bc0d3c 100644
+--- a/src/rapids_singlecell/_cuda/__init__.py
++++ b/src/rapids_singlecell/_cuda/__init__.py
+@@ -24,8 +24,8 @@
+     "_edistance_cuda",
+     "_gsea_cuda",
+     "_gsva_cuda",
+-    "_guide_assignment_cuda",
+     "_gmm_cuda",
++    "_guide_assignment_cuda",
+     "_harmony_clustering_cuda",
+     "_harmony_correction_batched_cuda",
+     "_harmony_correction_cuda",
+diff --git a/src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu b/src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu
+index d1ab557b9..89dd27551 100644
+--- a/src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu
++++ b/src/rapids_singlecell/_cuda/guide_assignment/guide_assignment.cu
+@@ -3,102 +3,255 @@
+ #include "../nb_types.h"
+ 
+ #include "kernels_guide_assignment.cuh"
++#include "kernels_sparse.cuh"
+ 
+ using namespace nb::literals;
++namespace ga = guide_assignment;
+ 
+-template <bool F_ORDER>
+-static inline void launch_assign_threshold_dense(
+-    const float* X, const int* valid_guides, const float* lam, const float* mu,
+-    const float* sigma, const float* pi0, bool* assignments, float* thresholds,
+-    int n_cells, int n_guides, int n_valid_guides, float posterior_threshold,
+-    cudaStream_t stream) {
+-    if (n_valid_guides == 0) return;
++constexpr int SPARSE_BLOCK = 256;
+ 
+-    dim3 block(BLOCK_SIZE);
+-    dim3 grid(n_valid_guides);
+-    assign_threshold_dense_kernel<F_ORDER><<<grid, block, 0, stream>>>(
+-        X, valid_guides, lam, mu, sigma, pi0, assignments, thresholds, n_cells,
+-        n_guides, posterior_threshold);
+-    CUDA_CHECK_LAST_ERROR(assign_threshold_dense_kernel);
++template <typename T, typename IdxT, typename Device>
++ga::CscColumns<T, IdxT> csc_columns(gpu_array_c<const IdxT, Device>& indptr,
++                                    gpu_array_c<const IdxT, Device>& indices,
++                                    gpu_array_c<const T, Device>& data) {
++    return {indptr.data(), indices.data(), data.data()};
+ }
+ 
+-template <bool F_ORDER>
+-static inline void launch_fit_assign_dense(
+-    const float* X, bool* assignments, float* thresholds, float* lam, float* mu,
+-    float* sigma, float* pi0, bool* valid_mask, int* nonzero_counts,
+-    int* max_counts, int n_cells, int n_guides, int max_iter, float tol,
+-    float posterior_threshold, cudaStream_t stream) {
++inline unsigned int warp_blocks(long long n_rows) {
++    return static_cast<unsigned int>((n_rows * 32 + SPARSE_BLOCK - 1) /
++                                     SPARSE_BLOCK);
++}
++
++template <typename Columns, typename Device>
++void histogram_columns(Columns columns, long long n_guides, long long chunk,
++                       long long n_chunks,
++                       gpu_array_c<unsigned int, Device>& hist,
++                       gpu_array_c<unsigned long long, Device>& n_tail,
++                       gpu_array_c<unsigned long long, Device>& tail,
++                       std::uintptr_t stream) {
+     if (n_guides == 0) return;
++    const int cap = static_cast<int>(hist.shape(1));
++    ga::value_histogram_columns_kernel<<<dim3(n_guides, n_chunks), SPARSE_BLOCK,
++                                         cap * sizeof(unsigned int),
++                                         (cudaStream_t)stream>>>(
++        columns, chunk, cap, hist.data(), n_tail.data(), tail.data(),
++        tail.shape(0));
++    CUDA_CHECK_LAST_ERROR(value_histogram_columns_kernel);
++}
+ 
+-    dim3 block(BLOCK_SIZE);
+-    dim3 grid(n_guides);
+-    fit_assign_dense_kernel<F_ORDER><<<grid, block, 0, stream>>>(
+-        X, assignments, thresholds, lam, mu, sigma, pi0, valid_mask,
+-        nonzero_counts, max_counts, n_cells, n_guides, max_iter, tol,
+-        posterior_threshold);
+-    CUDA_CHECK_LAST_ERROR(fit_assign_dense_kernel);
++template <typename Device>
++void def_fit(nb::module_& m) {
++    m.def(
++        "fit_poisson_gauss",
++        [](gpu_array_c<const float, Device> values,
++           gpu_array_c<const float, Device> weights,
++           gpu_array_c<const int, Device> n_values,
++           gpu_array_c<const long long, Device> max_counts,
++           gpu_array_c<const float, Device> draws,
++           gpu_array_c<float, Device> params, gpu_array_c<float, Device> loss,
++           gpu_array_c<float, Device> out, int n_iter, std::uintptr_t stream) {
++            nb_require(values.ndim() == 2 && weights.ndim() == 2 &&
++                           n_values.ndim() == 1 && max_counts.ndim() == 1 &&
++                           draws.ndim() == 4 && params.ndim() == 3 &&
++                           loss.ndim() == 2 && out.ndim() == 2,
++                       "values and weights [guides, width], draws "
++                       "[3, seeds, 15, guides], params [starts, guides, 4], "
++                       "loss [starts, guides] and out [guides, 6] expected");
++            const size_t n_guides = values.shape(0);
++            const size_t n_starts = draws.shape(1) + ga::N_QUANTILES;
++            nb_require(
++                weights.shape(0) == n_guides &&
++                    weights.shape(1) == values.shape(1) &&
++                    n_values.shape(0) == n_guides &&
++                    max_counts.shape(0) == n_guides && draws.shape(0) == 3 &&
++                    draws.shape(2) == (size_t)ga::PRIOR_SAMPLES &&
++                    draws.shape(3) == n_guides && params.shape(0) == n_starts &&
++                    params.shape(1) == n_guides &&
++                    params.shape(2) == (size_t)ga::N_PARAMS &&
++                    loss.shape(0) == n_starts && loss.shape(1) == n_guides &&
++                    out.shape(0) == n_guides &&
++                    out.shape(1) == (size_t)ga::N_OUTPUTS,
++                "array shapes disagree on the number of guides or starts");
++            nb_require(n_starts <= (size_t)max_grid_dim_y(),
++                       "too many starts: lower n_init_seeds");
++            if (n_guides == 0) return;
++            ga::fit_poisson_gauss_kernel<<<
++                dim3(static_cast<unsigned int>(n_guides),
++                     static_cast<unsigned int>(n_starts)),
++                ga::BLOCK_SIZE, 0, (cudaStream_t)stream>>>(
++                values.data(), weights.data(), n_values.data(), draws.data(),
++                params.data(), loss.data(), static_cast<int>(n_guides),
++                static_cast<int>(values.shape(1)),
++                static_cast<int>(draws.shape(1)), n_iter);
++            CUDA_CHECK_LAST_ERROR(fit_poisson_gauss_kernel);
++            ga::select_threshold_kernel<<<static_cast<unsigned int>(n_guides),
++                                          ga::BLOCK_SIZE, 0,
++                                          (cudaStream_t)stream>>>(
++                params.data(), loss.data(), max_counts.data(), out.data(),
++                static_cast<int>(n_guides), static_cast<int>(n_starts));
++            CUDA_CHECK_LAST_ERROR(select_threshold_kernel);
++        },
++        "values"_a.noconvert(), "weights"_a.noconvert(),
++        "n_values"_a.noconvert(), "max_counts"_a.noconvert(),
++        "draws"_a.noconvert(), "params"_a.noconvert(), "loss"_a.noconvert(),
++        "out"_a.noconvert(), nb::kw_only(), "n_iter"_a, "stream"_a = 0);
+ }
+ 
+-template <typename Device, typename InContig, bool F_ORDER>
+-void def_assign_threshold_dense(nb::module_& m) {
++template <typename T, typename IdxT, typename Device>
++void def_sparse(nb::module_& m) {
++    using Idx = gpu_array_c<const IdxT, Device>;
++    using Data = gpu_array_c<const T, Device>;
++    using Out = gpu_array_c<IdxT, Device>;
++    using Hist = gpu_array_c<unsigned int, Device>;
++    using Counter = gpu_array_c<unsigned long long, Device>;
++    m.def(
++        "value_histogram_csr",
++        [](Idx indices, Data data, Hist hist, Counter n_tail, Counter tail,
++           std::uintptr_t stream) {
++            const long long nnz = static_cast<long long>(data.shape(0));
++            if (nnz == 0) return;
++            ga::value_histogram_csr_kernel<<<strided_grid(nnz, SPARSE_BLOCK),
++                                             SPARSE_BLOCK, 0,
++                                             (cudaStream_t)stream>>>(
++                indices.data(), data.data(), nnz,
++                static_cast<int>(hist.shape(1)), hist.data(), n_tail.data(),
++                tail.data(), tail.shape(0));
++            CUDA_CHECK_LAST_ERROR(value_histogram_csr_kernel);
++        },
++        "indices"_a.noconvert(), "data"_a.noconvert(), "hist"_a.noconvert(),
++        "n_tail"_a.noconvert(), "tail"_a.noconvert(), nb::kw_only(),
++        "stream"_a = 0);
++    m.def(
++        "value_histogram_csc",
++        [](Idx indptr, Idx indices, Data data, Hist hist, Counter n_tail,
++           Counter tail, long long chunk, long long n_chunks,
++           std::uintptr_t stream) {
++            histogram_columns(
++                csc_columns<T, IdxT, Device>(indptr, indices, data),
++                static_cast<long long>(indptr.shape(0)) - 1, chunk, n_chunks,
++                hist, n_tail, tail, stream);
++        },
++        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
++        "hist"_a.noconvert(), "n_tail"_a.noconvert(), "tail"_a.noconvert(),
++        nb::kw_only(), "chunk"_a, "n_chunks"_a, "stream"_a = 0);
++    m.def(
++        "assigned_csr",
++        [](Idx indptr, Idx indices, Data data,
++           gpu_array_c<const double, Device> thresholds, Out offsets,
++           Out out_indices, bool fill, std::uintptr_t stream) {
++            const long long n_rows =
++                static_cast<long long>(indptr.shape(0)) - 1;
++            if (n_rows <= 0) return;
++            auto kernel = fill ? ga::assigned_csr_kernel<T, IdxT, true>
++                               : ga::assigned_csr_kernel<T, IdxT, false>;
++            kernel<<<warp_blocks(n_rows), SPARSE_BLOCK, 0,
++                     (cudaStream_t)stream>>>(
++                indptr.data(), indices.data(), data.data(), thresholds.data(),
++                n_rows, offsets.data(), out_indices.data());
++            CUDA_CHECK_LAST_ERROR(assigned_csr_kernel);
++        },
++        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
++        "thresholds"_a.noconvert(), "offsets"_a.noconvert(),
++        "out_indices"_a.noconvert(), nb::kw_only(), "fill"_a, "stream"_a = 0);
+     m.def(
+-        "assign_threshold_dense",
+-        [](gpu_array_contig<const float, Device, InContig> X,
+-           gpu_array_c<const int, Device> valid_guides,
+-           gpu_array_c<const float, Device> lam,
+-           gpu_array_c<const float, Device> mu,
+-           gpu_array_c<const float, Device> sigma,
+-           gpu_array_c<const float, Device> pi0,
+-           gpu_array_c<bool, Device> assignments,
+-           gpu_array_c<float, Device> thresholds, int n_cells, int n_guides,
+-           int n_valid_guides, float posterior_threshold,
++        "assigned_csc",
++        [](Idx indptr, Idx indices, Data data,
++           gpu_array_c<const double, Device> thresholds, Out offsets,
++           Out out_indices, long long chunk, long long n_chunks, bool fill,
+            std::uintptr_t stream) {
+-            launch_assign_threshold_dense<F_ORDER>(
+-                X.data(), valid_guides.data(), lam.data(), mu.data(),
+-                sigma.data(), pi0.data(), assignments.data(), thresholds.data(),
+-                n_cells, n_guides, n_valid_guides, posterior_threshold,
+-                (cudaStream_t)stream);
++            const long long n_guides =
++                static_cast<long long>(indptr.shape(0)) - 1;
++            if (n_guides <= 0) return;
++            auto kernel = fill ? ga::assigned_csc_kernel<T, IdxT, true>
++                               : ga::assigned_csc_kernel<T, IdxT, false>;
++            kernel<<<dim3(n_guides, n_chunks), SPARSE_BLOCK, 0,
++                     (cudaStream_t)stream>>>(
++                csc_columns<T, IdxT, Device>(indptr, indices, data),
++                thresholds.data(), chunk, offsets.data(), out_indices.data());
++            CUDA_CHECK_LAST_ERROR(assigned_csc_kernel);
++        },
++        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
++        "thresholds"_a.noconvert(), "offsets"_a.noconvert(),
++        "out_indices"_a.noconvert(), nb::kw_only(), "chunk"_a, "n_chunks"_a,
++        "fill"_a, "stream"_a = 0);
++    m.def(
++        "max_guide_csr",
++        [](Idx indptr, Idx indices, Data data, Counter keys,
++           gpu_array_c<int, Device> guides, std::uintptr_t stream) {
++            const long long n_rows =
++                static_cast<long long>(indptr.shape(0)) - 1;
++            if (n_rows <= 0) return;
++            ga::max_guide_csr_kernel<T, IdxT>
++                <<<warp_blocks(n_rows), SPARSE_BLOCK, 0,
++                   (cudaStream_t)stream>>>(indptr.data(), indices.data(),
++                                           data.data(), n_rows, keys.data(),
++                                           guides.data());
++            CUDA_CHECK_LAST_ERROR(max_guide_csr_kernel);
+         },
+-        "X"_a, "valid_guides"_a, "lam"_a, "mu"_a, "sigma"_a, "pi0"_a,
+-        "assignments"_a, "thresholds"_a, nb::kw_only(), "n_cells"_a,
+-        "n_guides"_a, "n_valid_guides"_a, "posterior_threshold"_a,
++        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
++        "keys"_a.noconvert(), "guides"_a.noconvert(), nb::kw_only(),
+         "stream"_a = 0);
++    m.def(
++        "max_guide_csc",
++        [](Idx indptr, Idx indices, Data data, Counter keys,
++           gpu_array_c<int, Device> guides, long long chunk, long long n_chunks,
++           std::uintptr_t stream) {
++            const long long n_guides =
++                static_cast<long long>(indptr.shape(0)) - 1;
++            if (n_guides <= 0) return;
++            const auto columns =
++                csc_columns<T, IdxT, Device>(indptr, indices, data);
++            const dim3 grid(n_guides, n_chunks);
++            ga::max_key_csc_kernel<<<grid, SPARSE_BLOCK, 0,
++                                     (cudaStream_t)stream>>>(columns, chunk,
++                                                             keys.data());
++            CUDA_CHECK_LAST_ERROR(max_key_csc_kernel);
++            ga::max_guide_csc_kernel<<<grid, SPARSE_BLOCK, 0,
++                                       (cudaStream_t)stream>>>(
++                columns, chunk, keys.data(), guides.data());
++            CUDA_CHECK_LAST_ERROR(max_guide_csc_kernel);
++        },
++        "indptr"_a.noconvert(), "indices"_a.noconvert(), "data"_a.noconvert(),
++        "keys"_a.noconvert(), "guides"_a.noconvert(), nb::kw_only(), "chunk"_a,
++        "n_chunks"_a, "stream"_a = 0);
+ }
+ 
+-template <typename Device, typename InContig, bool F_ORDER>
+-void def_fit_assign_dense(nb::module_& m) {
++template <typename T, typename Device>
++void def_dense(nb::module_& m) {
+     m.def(
+-        "fit_assign_dense",
+-        [](gpu_array_contig<const float, Device, InContig> X,
+-           gpu_array_c<bool, Device> assignments,
+-           gpu_array_c<float, Device> thresholds,
+-           gpu_array_c<float, Device> lam, gpu_array_c<float, Device> mu,
+-           gpu_array_c<float, Device> sigma, gpu_array_c<float, Device> pi0,
+-           gpu_array_c<bool, Device> valid_mask,
+-           gpu_array_c<int, Device> nonzero_counts,
+-           gpu_array_c<int, Device> max_counts, int n_cells, int n_guides,
+-           int max_iter, float tol, float posterior_threshold,
+-           std::uintptr_t stream) {
+-            launch_fit_assign_dense<F_ORDER>(
+-                X.data(), assignments.data(), thresholds.data(), lam.data(),
+-                mu.data(), sigma.data(), pi0.data(), valid_mask.data(),
+-                nonzero_counts.data(), max_counts.data(), n_cells, n_guides,
+-                max_iter, tol, posterior_threshold, (cudaStream_t)stream);
++        "value_histogram_dense",
++        [](gpu_array<const T, Device> x, gpu_array_c<unsigned int, Device> hist,
++           gpu_array_c<unsigned long long, Device> n_tail,
++           gpu_array_c<unsigned long long, Device> tail, long long chunk,
++           long long n_chunks, std::uintptr_t stream) {
++            histogram_columns(
++                ga::DenseColumns<T>{x.data(),
++                                    static_cast<long long>(x.shape(0)),
++                                    static_cast<long long>(x.stride(0)),
++                                    static_cast<long long>(x.stride(1))},
++                static_cast<long long>(x.shape(1)), chunk, n_chunks, hist,
++                n_tail, tail, stream);
+         },
+-        "X"_a, "assignments"_a, "thresholds"_a, "lam"_a, "mu"_a, "sigma"_a,
+-        "pi0"_a, "valid_mask"_a, "nonzero_counts"_a, "max_counts"_a,
+-        nb::kw_only(), "n_cells"_a, "n_guides"_a, "max_iter"_a, "tol"_a,
+-        "posterior_threshold"_a, "stream"_a = 0);
++        "x"_a.noconvert(), "hist"_a.noconvert(), "n_tail"_a.noconvert(),
++        "tail"_a.noconvert(), nb::kw_only(), "chunk"_a, "n_chunks"_a,
++        "stream"_a = 0);
+ }
+ 
+ template <typename Device>
+ void register_bindings(nb::module_& m) {
+-    def_assign_threshold_dense<Device, nb::f_contig, true>(m);
+-    def_assign_threshold_dense<Device, nb::c_contig, false>(m);
+-    def_fit_assign_dense<Device, nb::f_contig, true>(m);
+-    def_fit_assign_dense<Device, nb::c_contig, false>(m);
++    def_fit<Device>(m);
++    def_sparse<float, int, Device>(m);
++    def_sparse<float, long long, Device>(m);
++    def_sparse<double, int, Device>(m);
++    def_sparse<double, long long, Device>(m);
++    def_dense<float, Device>(m);
++    def_dense<double, Device>(m);
+ }
+ 
+ NB_MODULE(_guide_assignment_cuda, m) {
+     REGISTER_GPU_BINDINGS(register_bindings, m);
++    m.attr("N_QUANTILES") = nb::int_(ga::N_QUANTILES);
++    m.attr("PRIOR_SAMPLES") = nb::int_(ga::PRIOR_SAMPLES);
++    m.attr("N_PARAMS") = nb::int_(ga::N_PARAMS);
++    m.attr("N_OUTPUTS") = nb::int_(ga::N_OUTPUTS);
+ }
+diff --git a/src/rapids_singlecell/_cuda/guide_assignment/kernels_guide_assignment.cuh b/src/rapids_singlecell/_cuda/guide_assignment/kernels_guide_assignment.cuh
+index 39ab7f530..44ba183da 100644
+--- a/src/rapids_singlecell/_cuda/guide_assignment/kernels_guide_assignment.cuh
++++ b/src/rapids_singlecell/_cuda/guide_assignment/kernels_guide_assignment.cuh
+@@ -4,363 +4,413 @@
+ 
+ #include <cmath>
+ 
+-constexpr int BLOCK_SIZE = 256;
+-constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+-constexpr int HIST_BINS = 4096;
++namespace guide_assignment {
+ 
+-template <typename T>
+-__device__ inline T warp_reduce_sum(T val) {
+-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+-        val += __shfl_down_sync(0xffffffff, val, offset);
+-    }
+-    return val;
++constexpr int BLOCK_SIZE = 128;
++constexpr int NUM_WARPS = BLOCK_SIZE / 32;
++constexpr int NEWTON_STEPS = 12;
++constexpr int PRIOR_SAMPLES = 15;
++constexpr int N_QUANTILES = 5;
++constexpr int N_PARAMS = 4;
++constexpr int N_OUTPUTS = 6;
++constexpr float TOL = 1e-7f;
++constexpr float LOG_SQRT_2PI = 0.91893853320467274f;
++constexpr double LOG_SQRT_2PI_D = 0.91893853320467274;
++constexpr float SCALE_FLOOR = 1e-3f;
++constexpr float LOG_SCALE_FLOOR = -6.9077552789821368f;
++constexpr float WEIGHT_FLOOR = 1e-6f;
++
++struct Params {
++    float rate;
++    float mu;
++    float scale;
++    float w_norm;
++};
++
++__device__ inline float quantile(int i) {
++    constexpr float q[N_QUANTILES] = {0.5f, 0.75f, 0.9f, 0.97f, 0.99f};
++    return q[i];
+ }
+ 
+-template <typename T>
+-__device__ inline T warp_reduce_max(T val) {
+-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+-        val = max(val, __shfl_down_sync(0xffffffff, val, offset));
++__device__ inline float warp_sum(float v) {
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        v += __shfl_down_sync(0xffffffff, v, offset);
+     }
+-    return val;
++    return v;
+ }
+ 
+-template <typename T>
+-__device__ inline T block_reduce_sum_thread0(T val, T* warp_sums) {
+-    int lane = threadIdx.x & (warpSize - 1);
+-    int warp = threadIdx.x >> 5;
+-    int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+-
+-    val = warp_reduce_sum(val);
++// Block-wide sums of N values, identical on every thread afterwards.
++template <int N>
++__device__ inline void block_sum(float (&s)[N], float (*partials)[4]) {
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++#pragma unroll
++    for (int k = 0; k < N; ++k) {
++        s[k] = warp_sum(s[k]);
++    }
++    __syncthreads();
+     if (lane == 0) {
+-        warp_sums[warp] = val;
++#pragma unroll
++        for (int k = 0; k < N; ++k) {
++            partials[warp][k] = s[k];
++        }
+     }
+     __syncthreads();
+-
+-    val = threadIdx.x < n_warps ? warp_sums[threadIdx.x] : static_cast<T>(0);
+-    if (warp == 0) {
+-        val = warp_reduce_sum(val);
++#pragma unroll
++    for (int k = 0; k < N; ++k) {
++        float total = 0.0f;
++#pragma unroll
++        for (int w = 0; w < NUM_WARPS; ++w) {
++            total += partials[w][k];
++        }
++        s[k] = total;
+     }
+-    return val;
+ }
+ 
+-template <typename T>
+-__device__ inline T block_reduce_max_thread0(T val, T* warp_maxes) {
+-    int lane = threadIdx.x & (warpSize - 1);
+-    int warp = threadIdx.x >> 5;
+-    int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+-
+-    val = warp_reduce_max(val);
++__device__ inline float block_max(float v, float (*partials)[4]) {
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        v = fmaxf(v, __shfl_down_sync(0xffffffff, v, offset));
++    }
++    __syncthreads();
+     if (lane == 0) {
+-        warp_maxes[warp] = val;
++        partials[warp][0] = v;
+     }
+     __syncthreads();
+-
+-    val = threadIdx.x < n_warps ? warp_maxes[threadIdx.x] : static_cast<T>(0);
+-    if (warp == 0) {
+-        val = warp_reduce_max(val);
++    float result = partials[0][0];
++#pragma unroll
++    for (int w = 1; w < NUM_WARPS; ++w) {
++        result = fmaxf(result, partials[w][0]);
+     }
+-    return val;
++    return result;
+ }
+ 
+-__device__ inline float poisson_log_prob(float value, float lam) {
+-    lam = fmaxf(lam, 1.0e-10f);
+-    return value * logf(lam) - lam - lgammaf(value + 1.0f);
++__device__ inline float block_inclusive_scan(float v, float& total,
++                                             float (*partials)[4]) {
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    for (int offset = 1; offset < 32; offset <<= 1) {
++        const float n = __shfl_up_sync(0xffffffff, v, offset);
++        if (lane >= offset) {
++            v += n;
++        }
++    }
++    __syncthreads();
++    if (lane == 31) {
++        partials[warp][0] = v;
++    }
++    __syncthreads();
++    total = 0.0f;
++#pragma unroll
++    for (int w = 0; w < NUM_WARPS; ++w) {
++        if (w < warp) {
++            v += partials[w][0];
++        }
++        total += partials[w][0];
++    }
++    return v;
+ }
+ 
+-__device__ inline float normal_log_prob(float value, float mu, float sigma) {
+-    constexpr float log_2pi = 1.8378770664093453f;
+-    sigma = fmaxf(sigma, 1.0e-10f);
+-    float z = (value - mu) / sigma;
+-    return -0.5f * z * z - logf(sigma) - 0.5f * log_2pi;
++__device__ inline float median15(const float* x, long long stride) {
++    float a[PRIOR_SAMPLES];
++    for (int i = 0; i < PRIOR_SAMPLES; ++i) {
++        const float value = x[i * stride];
++        int j = i;
++        while (j > 0 && a[j - 1] > value) {
++            a[j] = a[j - 1];
++            --j;
++        }
++        a[j] = value;
++    }
++    return a[PRIOR_SAMPLES / 2];
+ }
+ 
+-template <bool F_ORDER>
+-__device__ inline float load_guide_count(const float* __restrict__ X, int cell,
+-                                         int guide, int n_cells, int n_guides) {
+-    long long idx = F_ORDER ? static_cast<long long>(guide) * n_cells + cell
+-                            : static_cast<long long>(cell) * n_guides + guide;
+-    return X[idx];
++// draws is [3, n_init_seeds, 15, guides] for the rate, mean and scale.
++__device__ inline Params prior_init(const float* draws, int n_init_seeds,
++                                    int start, int guide, int n_guides) {
++    const long long plane =
++        static_cast<long long>(n_init_seeds) * PRIOR_SAMPLES * n_guides;
++    const float* d = draws +
++                     static_cast<long long>(start) * PRIOR_SAMPLES * n_guides +
++                     guide;
++    Params p;
++    p.rate = expf(median15(d, n_guides));
++    p.mu = 3.0f + 2.0f * median15(d + plane, n_guides);
++    p.scale = expf(2.0f + median15(d + 2 * plane, n_guides));
++    p.w_norm = 0.5f;
++    return p;
+ }
+ 
+-template <bool F_ORDER>
+-__global__ void assign_threshold_dense_kernel(
+-    const float* __restrict__ X, const int* __restrict__ valid_guides,
+-    const float* __restrict__ lam, const float* __restrict__ mu,
+-    const float* __restrict__ sigma, const float* __restrict__ pi0,
+-    bool* __restrict__ assignments, float* __restrict__ thresholds, int n_cells,
+-    int n_guides, float posterior_threshold) {
+-    int valid_idx = blockIdx.x;
+-    int guide = valid_guides[valid_idx];
+-    int tid = threadIdx.x;
+-
+-    __shared__ int max_counts[NUM_WARPS];
+-    __shared__ float guide_threshold;
+-
+-    int local_max = 0;
+-    for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-        float count =
+-            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
+-        int count_int = static_cast<int>(ceilf(count));
+-        local_max = max(local_max, count_int);
+-    }
+-    int guide_max_count = block_reduce_max_thread0(local_max, max_counts);
+-
+-    if (tid == 0) {
+-        float threshold = NAN;
+-        float guide_lam = lam[valid_idx];
+-        float guide_mu = mu[valid_idx];
+-        float guide_sigma = sigma[valid_idx];
+-        float guide_pi0 =
+-            fminf(fmaxf(pi0[valid_idx], 1.0e-10f), 1.0f - 1.0e-10f);
+-        float guide_pi1 = 1.0f - guide_pi0;
+-
+-        for (int raw_count = 1; raw_count <= guide_max_count; ++raw_count) {
+-            float log_count = log2f(static_cast<float>(raw_count));
+-            float log_p0 =
+-                poisson_log_prob(log_count, guide_lam) + logf(guide_pi0);
+-            float log_p1 = normal_log_prob(log_count, guide_mu, guide_sigma) +
+-                           logf(guide_pi1);
+-            float posterior = 1.0f / (1.0f + expf(log_p0 - log_p1));
+-            if (posterior > posterior_threshold) {
+-                threshold = static_cast<float>(raw_count);
+-                break;
++__device__ inline Params data_init(const float* __restrict__ v,
++                                   const float* __restrict__ w, int nv,
++                                   float sum_w, float vmax, float q,
++                                   float (*partials)[4]) {
++    const float total = fmaxf(sum_w, 1.0f);
++    float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++    float carry = 0.0f;
++    for (int base = 0; base < nv; base += BLOCK_SIZE) {
++        const int j = base + threadIdx.x;
++        const float wj = j < nv ? w[j] : 0.0f;
++        float chunk_total;
++        const float cumulative =
++            carry + block_inclusive_scan(wj, chunk_total, partials);
++        if (j < nv) {
++            const bool upper = (cumulative / total > q) && (wj > 0.0f);
++            if (upper) {
++                s[0] += wj;
++                s[1] += wj * v[j];
++            } else {
++                s[2] += wj;
++                s[3] += wj * v[j];
+             }
+         }
+-
+-        thresholds[valid_idx] = threshold;
+-        guide_threshold = threshold;
++        carry += chunk_total;
+     }
+-    __syncthreads();
+-
+-    bool has_threshold = !isnan(guide_threshold);
+-    for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-        float count =
+-            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
+-        assignments[static_cast<long long>(valid_idx) * n_cells + cell] =
+-            has_threshold && count >= guide_threshold;
++    block_sum<4>(s, partials);
++    const float n_up = s[0];
++    const float n_low = s[2];
++    Params p;
++    p.rate = fmaxf(s[3] / fmaxf(n_low, 1.0f), 0.05f);
++    p.mu = n_up > 0.0f ? s[1] / fmaxf(n_up, 1.0f) : vmax;
++    float ss[1] = {0.0f};
++    carry = 0.0f;
++    for (int base = 0; base < nv; base += BLOCK_SIZE) {
++        const int j = base + threadIdx.x;
++        const float wj = j < nv ? w[j] : 0.0f;
++        float chunk_total;
++        const float cumulative =
++            carry + block_inclusive_scan(wj, chunk_total, partials);
++        if (j < nv && (cumulative / total > q) && (wj > 0.0f)) {
++            const float d = v[j] - p.mu;
++            ss[0] += wj * d * d;
++        }
++        carry += chunk_total;
+     }
++    block_sum<1>(ss, partials);
++    p.scale = fmaxf(sqrtf(ss[0] / fmaxf(n_up, 1.0f)), 0.5f);
++    p.w_norm = fminf(fmaxf(n_up / total, 0.01f), 0.9f);
++    return p;
+ }
+ 
+-template <bool F_ORDER>
+-__global__ void fit_assign_dense_kernel(
+-    const float* __restrict__ X, bool* __restrict__ assignments,
+-    float* __restrict__ thresholds, float* __restrict__ lam_out,
+-    float* __restrict__ mu_out, float* __restrict__ sigma_out,
+-    float* __restrict__ pi0_out, bool* __restrict__ valid_mask,
+-    int* __restrict__ nonzero_counts, int* __restrict__ max_counts, int n_cells,
+-    int n_guides, int max_iter, float tol, float posterior_threshold) {
+-    int guide = blockIdx.x;
+-    int tid = threadIdx.x;
+-
+-    __shared__ float sum_log_warp[NUM_WARPS];
+-    __shared__ int nz_counts_warp[NUM_WARPS];
+-    __shared__ int raw_max_counts_warp[NUM_WARPS];
+-    __shared__ float red_n0_warp[NUM_WARPS];
+-    __shared__ float red_n1_warp[NUM_WARPS];
+-    __shared__ float red_sum_r0_y_warp[NUM_WARPS];
+-    __shared__ float red_sum_r1_y_warp[NUM_WARPS];
+-    __shared__ float red_sum_r1_y2_warp[NUM_WARPS];
+-    __shared__ int count_hist[HIST_BINS + 1];
+-    __shared__ float guide_threshold;
+-    __shared__ float guide_sum_log;
+-    __shared__ int guide_nz;
+-    __shared__ int guide_max_raw;
++__device__ inline void mixture_terms(float value, const Params& p,
++                                     float log_rate, float log_scale,
++                                     float log_w, float log1m_w, float& log_mix,
++                                     float& resp) {
++    const float log_pois = value * log_rate - p.rate - lgammaf(value + 1.0f);
++    const float z = (value - p.mu) / p.scale;
++    const float log_norm = -LOG_SQRT_2PI - log_scale - 0.5f * z * z;
++    const float log_norm_weighted = log_w + log_norm;
++    const float log_pois_weighted = log1m_w + log_pois;
++    const float upper = fmaxf(log_norm_weighted, log_pois_weighted);
++    log_mix =
++        upper + log1pf(expf(-fabsf(log_norm_weighted - log_pois_weighted)));
++    resp = expf(log_norm_weighted - log_mix);
++}
+ 
+-    float local_sum = 0.0f;
+-    int local_nz = 0;
+-    int local_max_raw = 0;
++// crispat's priors, up to additive constants.
++__device__ inline float log_prior(const Params& p) {
++    const float log_scale = logf(p.scale);
++    const float log_rate = logf(p.rate);
++    const float d = (p.mu - 3.0f) / 2.0f;
++    return -0.1f * log1pf(-p.w_norm) - 0.9f * logf(p.w_norm) - 0.5f * d * d -
++           log_scale - 0.5f * (log_scale - 2.0f) * (log_scale - 2.0f) -
++           log_rate - 0.5f * log_rate * log_rate;
++}
+ 
+-    for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-        float count =
+-            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
+-        if (count > 0.0f) {
+-            float log_count = log2f(count);
+-            local_sum += log_count;
+-            ++local_nz;
+-            local_max_raw = max(local_max_raw, static_cast<int>(ceilf(count)));
++__device__ inline float solve_log_scale(float sum_squares, float n_norm) {
++    float v = 0.5f * logf(fmaxf(sum_squares, 1e-12f) / fmaxf(n_norm, 1e-12f));
++    v = fminf(fmaxf(v, LOG_SCALE_FLOOR), 10.0f);
++    for (int i = 0; i < NEWTON_STEPS; ++i) {
++        const float e = sum_squares * expf(-2.0f * v);
++        const float f = e - (v - 2.0f) - n_norm - 1.0f;
++        const float next =
++            fminf(fmaxf(v - f / (-2.0f * e - 1.0f), LOG_SCALE_FLOOR), 10.0f);
++        if (next == v) {
++            break;
+         }
++        v = next;
+     }
++    return v;
++}
+ 
+-    float reduced_sum_log = block_reduce_sum_thread0(local_sum, sum_log_warp);
+-    int reduced_nz = block_reduce_sum_thread0(local_nz, nz_counts_warp);
+-    int reduced_max_raw =
+-        block_reduce_max_thread0(local_max_raw, raw_max_counts_warp);
+-
+-    if (tid == 0) {
+-        guide_sum_log = reduced_sum_log;
+-        guide_nz = reduced_nz;
+-        guide_max_raw = reduced_max_raw;
+-        nonzero_counts[guide] = guide_nz;
+-        max_counts[guide] = guide_max_raw;
+-        valid_mask[guide] = guide_nz >= 2 && guide_max_raw >= 2;
++__device__ inline float solve_log_rate(float sum_values, float n_pois) {
++    float log_rate = logf(fmaxf(sum_values, 1e-12f) / fmaxf(n_pois, 1e-12f));
++    log_rate = fminf(fmaxf(log_rate, -20.0f), 10.0f);
++    for (int i = 0; i < NEWTON_STEPS; ++i) {
++        const float e = n_pois * expf(log_rate);
++        const float g = sum_values - 1.0f - log_rate - e;
++        const float next =
++            fminf(fmaxf(log_rate - g / (-1.0f - e), -20.0f), 10.0f);
++        if (next == log_rate) {
++            break;
++        }
++        log_rate = next;
+     }
+-    __syncthreads();
++    return log_rate;
++}
+ 
+-    if (guide_nz < 2 || guide_max_raw < 2) {
+-        if (tid == 0) {
+-            thresholds[guide] = NAN;
+-            lam_out[guide] = NAN;
+-            mu_out[guide] = NAN;
+-            sigma_out[guide] = NAN;
+-            pi0_out[guide] = NAN;
+-            guide_threshold = NAN;
+-        }
+-        for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-            assignments[static_cast<long long>(guide) * n_cells + cell] = false;
++// Poisson sums per value, as in pertpy, not as differences of totals.
++template <bool SECOND_PASS>
++__device__ inline void e_step_sums(const float* __restrict__ values,
++                                   const float* __restrict__ weights, int nv,
++                                   const Params& p, float center, float (&s)[3],
++                                   float (*partials)[4]) {
++    const float log_rate = logf(p.rate);
++    const float log_scale = logf(p.scale);
++    const float log_w = logf(p.w_norm);
++    const float log1m_w = log1pf(-p.w_norm);
++    s[0] = 0.0f;
++    s[1] = 0.0f;
++    s[2] = 0.0f;
++    for (int j = threadIdx.x; j < nv; j += BLOCK_SIZE) {
++        float log_mix;
++        float resp;
++        mixture_terms(values[j], p, log_rate, log_scale, log_w, log1m_w,
++                      log_mix, resp);
++        const float w_resp = weights[j] * resp;
++        if (SECOND_PASS) {
++            const float d = values[j] - center;
++            const float w_rest = weights[j] - w_resp;
++            s[0] += w_resp * d * d;
++            s[1] += w_rest;
++            s[2] += w_rest * values[j];
++        } else {
++            s[0] += weights[j] * log_mix;
++            s[1] += w_resp;
++            s[2] += w_resp * values[j];
+         }
+-        return;
+     }
++    block_sum<3>(s, partials);
++}
+ 
+-    float n_valid = static_cast<float>(guide_nz);
+-    float mean_log = guide_sum_log / fmaxf(n_valid, 1.0f);
+-    float lam = fminf(fmaxf(mean_log * 0.5f, 0.01f), 0.5f);
+-    for (int bin = tid; bin <= HIST_BINS; bin += blockDim.x) {
+-        count_hist[bin] = 0;
++__global__ void fit_poisson_gauss_kernel(
++    const float* __restrict__ values, const float* __restrict__ weights,
++    const int* __restrict__ n_values, const float* __restrict__ draws,
++    float* __restrict__ params_out, float* __restrict__ loss_out, int n_guides,
++    int width, int n_init_seeds, int n_iter) {
++    const int guide = blockIdx.x;
++    const int start = blockIdx.y;
++    const int nv = n_values[guide];
++    const float* v = values + static_cast<long long>(guide) * width;
++    const float* w = weights + static_cast<long long>(guide) * width;
++    const long long slot = static_cast<long long>(start) * n_guides + guide;
++
++    __shared__ float partials[NUM_WARPS][4];
++
++    float s[3] = {0.0f, 0.0f, 0.0f};
++    float vmax = 0.0f;
++    for (int j = threadIdx.x; j < nv; j += BLOCK_SIZE) {
++        s[0] += w[j];
++        vmax = fmaxf(vmax, v[j]);
+     }
+-    __syncthreads();
+-
+-    for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-        float count =
+-            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
+-        if (count > 0.0f) {
+-            int bin = min(max(static_cast<int>(ceilf(count)), 1), HIST_BINS);
+-            atomicAdd(&count_hist[bin], 1);
++    block_sum<3>(s, partials);
++    const float sum_w = s[0];
++    vmax = block_max(vmax, partials);
++
++    Params p = start < n_init_seeds
++                   ? prior_init(draws, n_init_seeds, start, guide, n_guides)
++                   : data_init(v, w, nv, sum_w, vmax,
++                               quantile(start - n_init_seeds), partials);
++
++    float previous = INFINITY;
++    float current = 1e30f;
++    for (int iteration = 0; iteration < n_iter; ++iteration) {
++        e_step_sums<false>(v, w, nv, p, 0.0f, s, partials);
++        const float loss = -(s[0] + log_prior(p));
++        const float n_norm = s[1];
++        const float sum_resp_values = s[2];
++        const float precision = 1.0f / (p.scale * p.scale);
++        const float mu_new = (sum_resp_values * precision + 0.75f) /
++                             (n_norm * precision + 0.25f);
++        e_step_sums<true>(v, w, nv, p, mu_new, s, partials);
++        const float n_pois = s[1];
++        const float w_new = fminf(
++            fmaxf((n_norm - 0.9f) / (n_norm + n_pois - 1.0f), WEIGHT_FLOOR),
++            1.0f - WEIGHT_FLOOR);
++        const float scale_new =
++            fmaxf(expf(solve_log_scale(s[0], n_norm)), SCALE_FLOOR);
++        const float rate_new = expf(solve_log_rate(s[2], n_pois));
++        p = Params{rate_new, mu_new, scale_new, w_new};
++        previous = current;
++        current = loss;
++        if (!(fabsf(previous - current) > TOL * fabsf(current))) {
++            break;
+         }
+     }
+-    __syncthreads();
+ 
+-    __shared__ float init_mu;
+-    if (tid == 0) {
+-        int target = static_cast<int>(n_valid * 0.75f);
+-        int cumulative = 0;
+-        int percentile_bin = 1;
+-        for (int bin = 1; bin <= HIST_BINS; ++bin) {
+-            cumulative += count_hist[bin];
+-            if (cumulative > target) {
+-                percentile_bin = bin;
+-                break;
+-            }
+-        }
+-        float p75 = log2f(static_cast<float>(percentile_bin));
+-        init_mu = p75 > 0.5f ? p75 : 3.0f;
++    e_step_sums<false>(v, w, nv, p, 0.0f, s, partials);
++    if (threadIdx.x == 0) {
++        params_out[slot * N_PARAMS] = p.rate;
++        params_out[slot * N_PARAMS + 1] = p.mu;
++        params_out[slot * N_PARAMS + 2] = p.scale;
++        params_out[slot * N_PARAMS + 3] = p.w_norm;
++        loss_out[slot] = -(s[0] + log_prior(p));
+     }
+-    __syncthreads();
+-
+-    float mu = init_mu;
+-    float sigma = 1.0f;
+-    float pi0 = 0.85f;
+-
+-    for (int iter = 0; iter < max_iter; ++iter) {
+-        float local_n0 = 0.0f;
+-        float local_n1 = 0.0f;
+-        float local_sum_r0_y = 0.0f;
+-        float local_sum_r1_y = 0.0f;
+-        float local_sum_r1_y2 = 0.0f;
+-
+-        float safe_pi0 = fminf(fmaxf(pi0, 1.0e-10f), 1.0f - 1.0e-10f);
+-        float safe_pi1 = 1.0f - safe_pi0;
+-
+-        for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-            float count =
+-                load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
+-            if (count <= 0.0f) continue;
+-
+-            float y = log2f(count);
+-            float log_p0 = poisson_log_prob(y, lam) + logf(safe_pi0);
+-            float log_p1 = normal_log_prob(y, mu, sigma) + logf(safe_pi1);
+-            float r1 = 1.0f / (1.0f + expf(log_p0 - log_p1));
+-            float r0 = 1.0f - r1;
+-
+-            local_n0 += r0;
+-            local_n1 += r1;
+-            local_sum_r0_y += r0 * y;
+-            local_sum_r1_y += r1 * y;
+-            local_sum_r1_y2 += r1 * y * y;
+-        }
+-
+-        float n0 = block_reduce_sum_thread0(local_n0, red_n0_warp);
+-        float n1 = block_reduce_sum_thread0(local_n1, red_n1_warp);
+-        float sum_r0_y =
+-            block_reduce_sum_thread0(local_sum_r0_y, red_sum_r0_y_warp);
+-        float sum_r1_y =
+-            block_reduce_sum_thread0(local_sum_r1_y, red_sum_r1_y_warp);
+-        float sum_r1_y2 =
+-            block_reduce_sum_thread0(local_sum_r1_y2, red_sum_r1_y2_warp);
+-
+-        __shared__ float next_lam;
+-        __shared__ float next_mu;
+-        __shared__ float next_sigma;
+-        __shared__ float next_pi0;
+-        __shared__ bool converged;
+-
+-        if (tid == 0) {
+-            float lam_mle = sum_r0_y / fmaxf(n0, 1.0e-10f);
+-            float log_lam_mle = logf(fmaxf(lam_mle, 1.0e-10f));
+-            next_lam = expf((n0 * log_lam_mle) / (n0 + 1.0f));
+-
+-            float sigma_sq = sigma * sigma;
+-            next_mu = (sum_r1_y / fmaxf(sigma_sq, 1.0e-10f) + 3.0f / 4.0f) /
+-                      (n1 / fmaxf(sigma_sq, 1.0e-10f) + 1.0f / 4.0f);
+-
+-            float sigma_sq_mle = (sum_r1_y2 - 2.0f * next_mu * sum_r1_y +
+-                                  next_mu * next_mu * n1) /
+-                                 fmaxf(n1, 1.0e-10f);
+-            sigma_sq_mle = fmaxf(sigma_sq_mle, 0.0f);
+-            float sigma_mle = fmaxf(sqrtf(sigma_sq_mle), 1.0e-2f);
+-            next_sigma = fmaxf(
+-                expf((n1 * logf(sigma_mle) + 2.0f) / (n1 + 1.0f)), 1.0e-2f);
++}
+ 
+-            float denom = fmaxf(n_valid - 1.0f, 1.0e-10f);
+-            next_pi0 = (n0 - 0.1f) / denom;
+-            next_pi0 = fminf(fmaxf(next_pi0, 0.01f), 0.99f);
++__device__ inline bool posterior_above_half(double log_count, double rate,
++                                            double mu, double scale,
++                                            double w_norm) {
++    const double log_norm =
++        -LOG_SQRT_2PI_D - log(scale) -
++        0.5 * ((log_count - mu) / scale) * ((log_count - mu) / scale);
++    const double log_pois =
++        log_count * log(rate) - rate - lgamma(log_count + 1.0);
++    const double log_num = log(w_norm) + log_norm;
++    const double other = log(1.0 - w_norm) + log_pois;
++    const double upper = fmax(log_num, other);
++    const double log_den = upper + log1p(exp(-fabs(log_num - other)));
++    return exp(log_num - log_den) > 0.5;
++}
+ 
+-            float max_change =
+-                fmaxf(fmaxf(fabsf(next_lam - lam), fabsf(next_mu - mu)),
+-                      fmaxf(fabsf(next_sigma - sigma), fabsf(next_pi0 - pi0)));
+-            converged = max_change < tol;
++// out: rate, mu, scale, w_norm, loss, threshold; nan without a fit.
++__global__ void select_threshold_kernel(
++    const float* __restrict__ params, const float* __restrict__ loss,
++    const long long* __restrict__ max_counts, float* __restrict__ out,
++    int n_guides, int n_starts) {
++    const int guide = blockIdx.x;
++    __shared__ long long first;
++
++    int best = -1;
++    float best_loss = INFINITY;
++    for (int start = 0; start < n_starts; ++start) {
++        const long long slot = static_cast<long long>(start) * n_guides + guide;
++        const float* q = params + slot * N_PARAMS;
++        const bool admissible = isfinite(loss[slot]) && q[1] > q[0] &&
++                                q[3] > 2.0f * WEIGHT_FLOOR &&
++                                q[2] > 2.0f * SCALE_FLOOR;
++        if (admissible && loss[slot] < best_loss) {
++            best_loss = loss[slot];
++            best = start;
+         }
+-        __syncthreads();
+-
+-        lam = next_lam;
+-        mu = next_mu;
+-        sigma = next_sigma;
+-        pi0 = next_pi0;
+-        bool done = converged;
+-        __syncthreads();
+-        if (done) break;
+     }
+-
+-    if (tid == 0) {
+-        float threshold = NAN;
+-        float safe_pi0 = fminf(fmaxf(pi0, 1.0e-10f), 1.0f - 1.0e-10f);
+-        float safe_pi1 = 1.0f - safe_pi0;
+-
+-        for (int raw_count = 1; raw_count <= guide_max_raw; ++raw_count) {
+-            float log_count = log2f(static_cast<float>(raw_count));
+-            float log_p0 = poisson_log_prob(log_count, lam) + logf(safe_pi0);
+-            float log_p1 =
+-                normal_log_prob(log_count, mu, sigma) + logf(safe_pi1);
+-            float posterior = 1.0f / (1.0f + expf(log_p0 - log_p1));
+-            if (posterior > posterior_threshold) {
+-                threshold = static_cast<float>(raw_count);
+-                break;
+-            }
++    if (best < 0) {
++        return;
++    }
++    const float* q =
++        params + (static_cast<long long>(best) * n_guides + guide) * N_PARAMS;
++    const long long max_count = max_counts[guide];
++    if (threadIdx.x == 0) {
++        first = max_count + 1;
++    }
++    __syncthreads();
++    for (long long t = threadIdx.x + 1; t <= max_count; t += BLOCK_SIZE) {
++        if (posterior_above_half(log2(static_cast<double>(t)), q[0], q[1], q[2],
++                                 q[3])) {
++            atomicMin(&first, t);
++            break;
+         }
+-
+-        lam_out[guide] = lam;
+-        mu_out[guide] = mu;
+-        sigma_out[guide] = sigma;
+-        pi0_out[guide] = pi0;
+-        thresholds[guide] = threshold;
+-        guide_threshold = threshold;
+     }
+     __syncthreads();
+-
+-    bool has_threshold = !isnan(guide_threshold);
+-    for (int cell = tid; cell < n_cells; cell += blockDim.x) {
+-        float count =
+-            load_guide_count<F_ORDER>(X, cell, guide, n_cells, n_guides);
+-        assignments[static_cast<long long>(guide) * n_cells + cell] =
+-            has_threshold && count >= guide_threshold;
++    if (threadIdx.x == 0) {
++        float* o = out + static_cast<long long>(guide) * N_OUTPUTS;
++        for (int k = 0; k < N_PARAMS; ++k) {
++            o[k] = q[k];
++        }
++        o[N_PARAMS] = best_loss;
++        o[N_PARAMS + 1] = first <= max_count ? static_cast<float>(first) : NAN;
+     }
+ }
++
++}  // namespace guide_assignment
+diff --git a/src/rapids_singlecell/_cuda/guide_assignment/kernels_sparse.cuh b/src/rapids_singlecell/_cuda/guide_assignment/kernels_sparse.cuh
+new file mode 100644
+index 000000000..45f3d988c
+--- /dev/null
++++ b/src/rapids_singlecell/_cuda/guide_assignment/kernels_sparse.cuh
+@@ -0,0 +1,264 @@
++#pragma once
++
++#include <cuda_runtime.h>
++
++#include <climits>
++
++namespace guide_assignment {
++
++template <typename T, typename IdxT>
++struct CscColumns {
++    const IdxT* indptr;
++    const IdxT* indices;
++    const T* data;
++    __device__ long long begin(int g) const {
++        return indptr[g];
++    }
++    __device__ long long end(int g) const {
++        return indptr[g + 1];
++    }
++    __device__ double value(int, long long j) const {
++        return data[j];
++    }
++};
++
++template <typename T>
++struct DenseColumns {
++    const T* x;
++    long long n_rows;
++    long long row_stride;
++    long long col_stride;
++    __device__ long long begin(int) const {
++        return 0;
++    }
++    __device__ long long end(int) const {
++        return n_rows;
++    }
++    __device__ double value(int g, long long j) const {
++        return x[j * row_stride + g * col_stride];
++    }
++};
++
++template <typename Columns>
++__device__ inline void column_chunk(const Columns& columns, long long chunk,
++                                    long long& first, long long& last) {
++    const int g = blockIdx.x;
++    first = columns.begin(g) + blockIdx.y * chunk;
++    last = min(columns.end(g), first + chunk);
++}
++
++__device__ inline void count_value(double v, int guide, int cap,
++                                   unsigned int* bins,
++                                   unsigned long long* n_tail,
++                                   unsigned long long* tail,
++                                   unsigned long long capacity) {
++    if (v == 0.0) {
++        return;
++    }
++    if (v >= 1.0 && v < cap && v == trunc(v)) {
++        atomicAdd(&bins[static_cast<int>(v)], 1u);
++    } else {
++        const unsigned long long pos = atomicAdd(n_tail, 1ull);
++        if (pos < capacity) {
++            tail[pos] = (static_cast<unsigned long long>(guide) << 32) |
++                        __float_as_uint(static_cast<float>(v));
++        }
++    }
++}
++
++template <typename T, typename IdxT>
++__global__ void value_histogram_csr_kernel(
++    const IdxT* __restrict__ indices, const T* __restrict__ data, long long nnz,
++    int cap, unsigned int* __restrict__ hist, unsigned long long* n_tail,
++    unsigned long long* tail, unsigned long long capacity) {
++    for (long long j =
++             blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
++         j < nnz; j += static_cast<long long>(gridDim.x) * blockDim.x) {
++        const int guide = static_cast<int>(indices[j]);
++        count_value(data[j], guide, cap,
++                    hist + static_cast<long long>(guide) * cap, n_tail, tail,
++                    capacity);
++    }
++}
++
++template <typename Columns>
++__global__ void value_histogram_columns_kernel(Columns columns, long long chunk,
++                                               int cap,
++                                               unsigned int* __restrict__ hist,
++                                               unsigned long long* n_tail,
++                                               unsigned long long* tail,
++                                               unsigned long long capacity) {
++    extern __shared__ unsigned int bins[];
++    const int guide = blockIdx.x;
++    long long first, last;
++    column_chunk(columns, chunk, first, last);
++    if (first >= last) {
++        return;
++    }
++    for (int i = threadIdx.x; i < cap; i += blockDim.x) {
++        bins[i] = 0u;
++    }
++    __syncthreads();
++    for (long long j = first + threadIdx.x; j < last; j += blockDim.x) {
++        count_value(columns.value(guide, j), guide, cap, bins, n_tail, tail,
++                    capacity);
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < cap; i += blockDim.x) {
++        if (bins[i]) {
++            atomicAdd(&hist[static_cast<long long>(guide) * cap + i], bins[i]);
++        }
++    }
++}
++
++template <typename T, typename IdxT, bool FILL>
++__global__ void assigned_csr_kernel(const IdxT* __restrict__ indptr,
++                                    const IdxT* __restrict__ indices,
++                                    const T* __restrict__ data,
++                                    const double* __restrict__ thresholds,
++                                    long long n_rows,
++                                    IdxT* __restrict__ offsets,
++                                    IdxT* __restrict__ out_indices) {
++    const long long row =
++        (blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x) / 32;
++    if (row >= n_rows) {
++        return;
++    }
++    const int lane = threadIdx.x & 31;
++    const long long end = indptr[row + 1];
++    long long written = FILL ? offsets[row] : 0;
++    for (long long base = indptr[row]; base < end; base += 32) {
++        const long long j = base + lane;
++        const bool hit = j < end && data[j] >= thresholds[indices[j]];
++        const unsigned int mask = __ballot_sync(0xffffffff, hit);
++        if (FILL && hit) {
++            out_indices[written + __popc(mask & ((1u << lane) - 1u))] =
++                indices[j];
++        }
++        written += __popc(mask);
++    }
++    if (!FILL && lane == 0) {
++        offsets[row] = static_cast<IdxT>(written);
++    }
++}
++
++// Counts go to offsets[guide * n_chunks + chunk].
++template <typename T, typename IdxT, bool FILL>
++__global__ void assigned_csc_kernel(CscColumns<T, IdxT> columns,
++                                    const double* __restrict__ thresholds,
++                                    long long chunk, IdxT* __restrict__ offsets,
++                                    IdxT* __restrict__ out_indices) {
++    __shared__ int warp_hits[32];
++    const int guide = blockIdx.x;
++    long long first, last;
++    column_chunk(columns, chunk, first, last);
++    if (first >= last) {
++        return;
++    }
++    const long long slot =
++        static_cast<long long>(guide) * gridDim.y + blockIdx.y;
++    const double threshold = thresholds[guide];
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    long long written = FILL ? offsets[slot] : 0;
++    for (long long base = first; base < last; base += blockDim.x) {
++        const long long j = base + threadIdx.x;
++        const bool hit = j < last && columns.value(guide, j) >= threshold;
++        const unsigned int mask = __ballot_sync(0xffffffff, hit);
++        if (lane == 0) {
++            warp_hits[warp] = __popc(mask);
++        }
++        __syncthreads();
++        int before = 0;
++        int total = 0;
++        for (int w = 0; w < static_cast<int>(blockDim.x >> 5); ++w) {
++            before += w < warp ? warp_hits[w] : 0;
++            total += warp_hits[w];
++        }
++        if (FILL && hit) {
++            out_indices[written + before + __popc(mask & ((1u << lane) - 1u))] =
++                columns.indices[j];
++        }
++        written += total;
++        __syncthreads();
++    }
++    if (!FILL && threadIdx.x == 0) {
++        offsets[slot] = static_cast<IdxT>(written);
++    }
++}
++
++// NaN is largest, as for np.argmax; key 0 is below every value.
++__device__ inline unsigned long long order_key(double v) {
++    if (isnan(v)) {
++        return ~0ull;
++    }
++    const unsigned long long bits = __double_as_longlong(v == 0.0 ? 0.0 : v);
++    return (bits >> 63) ? ~bits : (bits | 0x8000000000000000ull);
++}
++
++template <typename T, typename IdxT>
++__global__ void max_guide_csr_kernel(const IdxT* __restrict__ indptr,
++                                     const IdxT* __restrict__ indices,
++                                     const T* __restrict__ data,
++                                     long long n_rows,
++                                     unsigned long long* __restrict__ keys,
++                                     int* __restrict__ guides) {
++    const long long row =
++        (blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x) / 32;
++    if (row >= n_rows) {
++        return;
++    }
++    const int lane = threadIdx.x & 31;
++    unsigned long long best_key = 0;
++    int best_guide = INT_MAX;
++    for (long long j = indptr[row] + lane; j < indptr[row + 1]; j += 32) {
++        const unsigned long long key = order_key(data[j]);
++        const int guide = static_cast<int>(indices[j]);
++        if (key > best_key || (key == best_key && guide < best_guide)) {
++            best_key = key;
++            best_guide = guide;
++        }
++    }
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        const unsigned long long key =
++            __shfl_down_sync(0xffffffff, best_key, offset);
++        const int guide = __shfl_down_sync(0xffffffff, best_guide, offset);
++        if (key > best_key || (key == best_key && guide < best_guide)) {
++            best_key = key;
++            best_guide = guide;
++        }
++    }
++    if (lane == 0) {
++        keys[row] = best_key;
++        guides[row] = best_key ? best_guide : -1;
++    }
++}
++
++template <typename T, typename IdxT>
++__global__ void max_key_csc_kernel(CscColumns<T, IdxT> columns, long long chunk,
++                                   unsigned long long* __restrict__ keys) {
++    long long first, last;
++    column_chunk(columns, chunk, first, last);
++    for (long long j = first + threadIdx.x; j < last; j += blockDim.x) {
++        atomicMax(&keys[columns.indices[j]], order_key(columns.data[j]));
++    }
++}
++
++// guides start at -1, which as unsigned is above every guide.
++template <typename T, typename IdxT>
++__global__ void max_guide_csc_kernel(
++    CscColumns<T, IdxT> columns, long long chunk,
++    const unsigned long long* __restrict__ keys, int* __restrict__ guides) {
++    const int guide = blockIdx.x;
++    long long first, last;
++    column_chunk(columns, chunk, first, last);
++    for (long long j = first + threadIdx.x; j < last; j += blockDim.x) {
++        const IdxT row = columns.indices[j];
++        if (order_key(columns.data[j]) == keys[row]) {
++            atomicMin(reinterpret_cast<unsigned int*>(&guides[row]),
++                      static_cast<unsigned int>(guide));
++        }
++    }
++}
++
++}  // namespace guide_assignment
+diff --git a/src/rapids_singlecell/_cuda/nb_types.h b/src/rapids_singlecell/_cuda/nb_types.h
+index 968f5f6b0..59050c82f 100644
+--- a/src/rapids_singlecell/_cuda/nb_types.h
++++ b/src/rapids_singlecell/_cuda/nb_types.h
+@@ -46,8 +46,7 @@ inline int device_attribute(cudaDeviceAttr attribute) {
+ /// Mismatches become clean Python errors, not out-of-bounds launches.
+ inline void nb_require(bool cond, const char* what) {
+     if (!cond) {
+-        throw std::invalid_argument(
+-            std::string("rank_genes_groups CUDA binding: ") + what);
++        throw std::invalid_argument(std::string("CUDA binding: ") + what);
+     }
+ }
+ 
+diff --git a/src/rapids_singlecell/get/_anndata.py b/src/rapids_singlecell/get/_anndata.py
+index 05e4af924..0fc323ee1 100644
+--- a/src/rapids_singlecell/get/_anndata.py
++++ b/src/rapids_singlecell/get/_anndata.py
+@@ -5,6 +5,7 @@
+ 
+ import cupy as cp
+ import numpy as np
++from cupyx.scipy.sparse import coo_matrix as coo_matrix_gpu
+ from cupyx.scipy.sparse import csc_matrix as csc_matrix_gpu
+ from cupyx.scipy.sparse import csr_matrix as csr_matrix_gpu
+ from dask.array import Array as DaskArray
+@@ -26,7 +27,7 @@
+ if TYPE_CHECKING:
+     from anndata import AnnData
+ 
+-GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu]  # noqa: UP007
++GPU_ARRAY_TYPE = Union[cp.ndarray, csr_matrix_gpu, csc_matrix_gpu, coo_matrix_gpu]  # noqa: UP007
+ CPU_ARRAY_TYPE = Union[np.ndarray, csr_matrix_cpu, csc_matrix_cpu]  # noqa: UP007
+ 
+ 
+diff --git a/src/rapids_singlecell/pertpy_gpu/_guide_assignment.py b/src/rapids_singlecell/pertpy_gpu/_guide_assignment.py
+index 94b679474..2e3060763 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_guide_assignment.py
++++ b/src/rapids_singlecell/pertpy_gpu/_guide_assignment.py
+@@ -1,39 +1,320 @@
+ from __future__ import annotations
+ 
+ import warnings
+-from typing import TYPE_CHECKING
++from functools import partial
++from typing import TYPE_CHECKING, Literal
+ 
+ import cupy as cp
+ import numpy as np
+ import pandas as pd
++from cupyx.scipy.sparse import csc_matrix as cp_csc
++from cupyx.scipy.sparse import csr_matrix as cp_csr
+ from cupyx.scipy.sparse import issparse as cp_issparse
++from cupyx.scipy.sparse import isspmatrix_csc, isspmatrix_csr
++from scverse_misc import Deprecation, deprecated_arg
+ 
++from rapids_singlecell._cuda import _guide_assignment_cuda as _ga
+ from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
+ 
++_HISTOGRAM_CAP = 1024
++_HISTOGRAM_BINS = 1 << 24
++_COLUMN_CHUNK = 4096
++_COLUMN_BLOCKS = 1 << 20
++_LABEL_BYTES = 1 << 28
++_LEARNING_RATE_DEPRECATION = Deprecation(
++    "0.19.0",
++    "The mixture model is fit by EM, which has no learning rate. The argument is ignored.",
++)
++
+ if TYPE_CHECKING:
++    from collections.abc import Sequence
++
+     from anndata import AnnData
++    from cupyx.scipy.sparse import spmatrix
+ 
+-_PACKED_READOUT_MAX_GUIDES = 32
+-_PACKED_READOUT_MIN_ASSIGNABLE_CELLS = 250_000
+-_GROUPED_READOUT_MAX_GUIDES = 128
+-_SUBSET_READOUT_MAX_ASSIGNABLE_FRACTION = 0.25
+-_MIXTURE_MODEL_VAR_COLUMNS = [
++_MIXTURE_MODEL_VAR_COLUMNS = (
+     "poisson_rate",
+     "gaussian_mean",
+     "gaussian_std",
+     "mix_probs_0",
+     "mix_probs_1",
+     "threshold",
+-]
++    "final_loss",
++)
++
++
++def _format_guides(names: Sequence[str] | np.ndarray, limit: int = 10) -> str:
++    shown = ", ".join(names[:limit])
++    return shown if len(names) <= limit else f"{shown} and {len(names) - limit} more"
++
++
++def _layout(X: cp.ndarray | spmatrix) -> cp.ndarray | cp_csr | cp_csc:
++    """CSR or CSC ``X`` with float32 or float64 values for the sparse kernels, or dense ``X`` likewise.
++
++    Other sparse formats become CSR, other dtypes float32, and matrices with mixed index dtypes or strided arrays are rebuilt.
++    """
++    if cp_issparse(X):
++        if not (isspmatrix_csc(X) or isspmatrix_csr(X)):
++            X = X.tocsr()
++        arrays = (X.data, X.indices, X.indptr)
++        if X.indices.dtype != X.indptr.dtype or not all(a.flags.c_contiguous for a in arrays):
++            data, indices, indptr = map(cp.ascontiguousarray, arrays)
++            X = type(X)((data, indices, indptr), shape=X.shape)
++    return X if X.dtype in (cp.float32, cp.float64) else X.astype(cp.float32)
++
++
++def _column_chunks(X: cp.ndarray | cp_csr | cp_csc) -> tuple[int, int]:
++    """Entries per block and blocks per column of CSC or dense ``X``, so long columns fill the GPU."""
++    if isspmatrix_csc(X) and X.shape[1]:
++        longest = int(cp.diff(X.indptr).max())
++    else:
++        longest = X.shape[0]
++    # Grid dimension y allows 65535 blocks per column.
++    n_chunks = min(-(-longest // _COLUMN_CHUNK), _COLUMN_BLOCKS // max(X.shape[1], 1), 65535)
++    n_chunks = max(n_chunks, 1)
++    return max(-(-longest // n_chunks), 1), n_chunks
++
++
++def _distinct_values(
++    X: cp.ndarray | cp_csr | cp_csc, n_guides: int
++) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
++    """Sorted distinct non-zero values and their multiplicities per guide, zero padded.
++
++    Integer counts below ``_HISTOGRAM_CAP`` are counted in a per-guide histogram by the CSR, CSC or dense kernel, the few other values are sorted.
++    Also returns the number of distinct values, the number of non-zero cells and the maximum count per guide.
++    """
++    data = X.data if cp_issparse(X) else X
++    top = float(data.max()) if data.size else 0.0
++    # NaN or large counts get the full histogram, the tail takes the rest.
++    cap = int(top) + 1 if top < _HISTOGRAM_CAP else _HISTOGRAM_CAP
++    cap = min(cap, max(_HISTOGRAM_BINS // max(n_guides, 1), 2))
++    hist = cp.zeros((n_guides, cap), dtype=cp.uint32)
++    n_tail = cp.zeros(1, dtype=cp.uint64)
++    tail = cp.empty(max(data.size // 64, 1024), dtype=cp.uint64)
++    if isspmatrix_csr(X):
++        histogram = partial(_ga.value_histogram_csr, X.indices, X.data)
++    else:
++        chunk, n_chunks = _column_chunks(X)
++        histogram = (
++            partial(_ga.value_histogram_csc, X.indptr, X.indices, X.data)
++            if isspmatrix_csc(X)
++            else partial(_ga.value_histogram_dense, X)
++        )
++        histogram = partial(histogram, chunk=chunk, n_chunks=n_chunks)
++    for _ in range(2):
++        histogram(hist, n_tail, tail, stream=cp.cuda.get_current_stream().ptr)
++        if int(n_tail[0]) <= tail.size:
++            break
++        tail = cp.empty(int(n_tail[0]), dtype=cp.uint64)
++        hist[:] = 0
++        n_tail[:] = 0
++    tail = tail[: int(n_tail[0])]
++    # The bits of non-negative floats sort like the floats, so keys sort by guide, then value.
++    bins = cp.flatnonzero(hist)
++    keys = cp.concatenate(
++        [
++            ((bins // cap).astype(cp.uint64) << 32) | (bins % cap).astype(cp.float32).view(cp.uint32),
++            tail,
++        ]
++    )
++    counts = cp.concatenate([hist.ravel()[bins], cp.ones(tail.size, dtype=cp.uint32)])
++    keys, inverse = cp.unique(keys, return_inverse=True)
++    multiplicity = cp.bincount(inverse, weights=counts).astype(cp.float32)
++    guide = (keys >> 32).astype(cp.int64)
++    value = (keys & 0xFFFFFFFF).astype(cp.uint32).view(cp.float32)
++    n_distinct = cp.bincount(guide, minlength=n_guides).astype(cp.int32)
++    rank = cp.arange(keys.size) - (cp.cumsum(n_distinct) - n_distinct)[guide]
++    width = int(n_distinct.max()) if n_guides else 0
++    values_padded = cp.zeros((n_guides, width), dtype=cp.float32)
++    weights_padded = cp.zeros((n_guides, width), dtype=cp.float32)
++    values_padded[guide, rank] = cp.log2(value)
++    weights_padded[guide, rank] = multiplicity
++    last = cp.flatnonzero(cp.diff(guide, append=-1))
++    max_counts = cp.zeros(n_guides, dtype=cp.float32)
++    max_counts[guide[last]] = value[last]
++    return (
++        values_padded,
++        weights_padded,
++        n_distinct,
++        weights_padded.sum(axis=1),
++        max_counts,
++    )
++
++
++def _fit_mixture(
++    values: cp.ndarray,
++    weights: cp.ndarray,
++    n_values: cp.ndarray,
++    max_counts: cp.ndarray,
++    *,
++    n_iter: int,
++    n_init_seeds: int,
++    seed: int,
++) -> np.ndarray:
++    """Rate, mean, std, Gaussian weight, loss and threshold of every guide by multi-start MAP-EM, nan without an admissible fit.
++
++    Every guide starts from ``n_init_seeds`` prior medians, as crispat, and from five quantile splits of its values.
++    """
++    n_guides = values.shape[0]
++    rng = cp.random.default_rng(seed)
++    draws = cp.stack(
++        [rng.standard_normal((n_init_seeds, _ga.PRIOR_SAMPLES, n_guides), dtype=cp.float32) for _ in range(3)]
++    )
++    n_starts = n_init_seeds + _ga.N_QUANTILES
++    out = cp.full((n_guides, _ga.N_OUTPUTS), cp.nan, dtype=cp.float32)
++    _ga.fit_poisson_gauss(
++        values,
++        weights,
++        n_values,
++        max_counts.astype(cp.int64),
++        draws,
++        cp.empty((n_starts, n_guides, _ga.N_PARAMS), dtype=cp.float32),
++        cp.empty((n_starts, n_guides), dtype=cp.float32),
++        out,
++        n_iter=n_iter,
++        stream=cp.cuda.get_current_stream().ptr,
++    )
++    return cp.asnumpy(out).astype(np.float64)
++
++
++def _assigned(X: cp.ndarray | cp_csr | cp_csc, thresholds: cp.ndarray) -> cp.ndarray | cp_csr | cp_csc:
++    """Binary matrix in the layout of ``X`` of the entries at or above their guide's threshold.
++
++    Thresholds are rounded to the precision of ``X``, as a scalar would be, and a NaN threshold assigns nothing.
++    """
++    thresholds = thresholds.astype(X.dtype if X.dtype.kind == "f" else cp.float64)
++    if not cp_issparse(X):
++        return (X >= thresholds).astype(cp.int8)
++    if isspmatrix_csc(X):
++        chunk, n_chunks = _column_chunks(X)
++        assigned = partial(_ga.assigned_csc, chunk=chunk, n_chunks=n_chunks)
++        n_slots = X.shape[1] * n_chunks
++    else:
++        assigned, n_chunks, n_slots = _ga.assigned_csr, 1, X.shape[0]
++    args = (X.indptr, X.indices, X.data, thresholds.astype(cp.float64))
++    stream = cp.cuda.get_current_stream().ptr
++    offsets = cp.zeros(n_slots + 1, dtype=X.indptr.dtype)
++    assigned(*args, offsets[1:], offsets[:0], fill=False, stream=stream)
++    cp.cumsum(offsets, out=offsets)
++    indices = cp.empty(int(offsets[-1]), dtype=X.indptr.dtype)
++    assigned(*args, offsets, indices, fill=True, stream=stream)
++    return (cp_csc if isspmatrix_csc(X) else cp_csr)(
++        (
++            cp.ones(indices.size, dtype=cp.float32),
++            indices,
++            cp.ascontiguousarray(offsets[::n_chunks]),
++        ),
++        shape=X.shape,
++    )
++
++
++def _cell_major(binary):
++    """CSR form of a binary assignment matrix with sorted guides in every cell; duplicate entries are summed, as in pertpy."""
++    if cp_issparse(binary):
++        cells = binary.tocsr()
++        cells.sum_duplicates()
++        return cells
++    rows, cols = cp.nonzero(binary)
++    indptr = cp.searchsorted(rows, cp.arange(binary.shape[0] + 1))
++    return cp_csr((cp.ones(cols.size, dtype=cp.float32), cols, indptr), shape=binary.shape)
++
++
++def _max_guide(X) -> tuple[np.ndarray, np.ndarray]:
++    """Largest stored count of every cell of sparse ``X`` and its guide, ``-1`` for cells without stored counts.
++
++    As in pertpy's sparse path implicit zeros are ignored; ties go to the first guide, which is pertpy's first stored entry for canonical input.
++    """
++    stream = cp.cuda.get_current_stream().ptr
++    keys = cp.zeros(X.shape[0], dtype=cp.uint64)
++    guides = cp.full(X.shape[0], -1, dtype=cp.int32)
++    if isspmatrix_csc(X):
++        chunk, n_chunks = _column_chunks(X)
++        _ga.max_guide_csc(
++            X.indptr,
++            X.indices,
++            X.data,
++            keys,
++            guides,
++            chunk=chunk,
++            n_chunks=n_chunks,
++            stream=stream,
++        )
++    else:
++        _ga.max_guide_csr(X.indptr, X.indices, X.data, keys, guides, stream=stream)
++    # Inverse of the kernels' order_key; the key 0 of cells without counts decodes to NaN.
++    bits = cp.where((keys >> 63) != 0, keys & 0x7FFFFFFFFFFFFFFF, ~keys)
++    return cp.asnumpy(bits.view(cp.float64)).astype(X.dtype), cp.asnumpy(guides)
++
++
++def _per_cell_assignments(
++    indptr: cp.ndarray,
++    indices: cp.ndarray,
++    guide_names: np.ndarray,
++    *,
++    no_grna_assigned_key: str,
++    max_assignments_per_cell: int,
++    multiple_grna_assigned_key: str,
++    multiple_grna_assignment_string: str,
++) -> pd.Categorical:
++    """Per-cell assignment labels from the CSR structure of the binary assignment."""
++    n_cells = indptr.size - 1
++    n_guides = len(guide_names)
++    n_assigned = cp.diff(indptr)
++    if any(multiple_grna_assignment_string in name for name in guide_names):
++        warnings.warn(
++            "Some guide names contain the separator "
++            f"{multiple_grna_assignment_string!r}, so assignments of several guides "
++            "to one cell cannot be split unambiguously. "
++            "Pass a different `multiple_grna_assignment_string`.",
++            UserWarning,
++            stacklevel=4,
++        )
++    labels = [
++        np.array([no_grna_assigned_key, multiple_grna_assigned_key], dtype=str),
++        guide_names,
++    ]
++    codes = cp.zeros(n_cells, dtype=cp.int64)
++    single = n_assigned == 1
++    codes[single] = 2 + indices[indptr[:-1][single]]
++    multi = (n_assigned > 1) & (n_assigned <= max_assignments_per_cell)
++    with_separator = np.char.add(multiple_grna_assignment_string, guide_names)
++    offset = 2 + n_guides
++    for size in cp.asnumpy(cp.unique(n_assigned[multi])).tolist():
++        cells = cp.flatnonzero(multi & (n_assigned == size))
++        members = indices[indptr[cells][:, None] + cp.arange(size)]
++        order = cp.lexsort(members.T[::-1])
++        members = members[order]
++        new_row = cp.ones(cells.size, dtype=cp.bool_)
++        new_row[1:] = (members[1:] != members[:-1]).any(axis=1)
++        inverse = cp.empty(cells.size, dtype=cp.int64)
++        inverse[order] = cp.cumsum(new_row) - 1
++        codes[cells] = offset + inverse
++        unique = cp.asnumpy(members[new_row])
++        joined = guide_names[unique[:, 0]]
++        for j in range(1, size):
++            joined = np.char.add(joined, with_separator[unique[:, j]])
++        labels.append(joined)
++        offset += len(joined)
++    codes[n_assigned > max_assignments_per_cell] = 1
++    codes_cpu = cp.asnumpy(codes)
++    widest = max(label.dtype.itemsize for label in labels)
++    if offset * widest > _LABEL_BYTES:
++        labels = [label.astype(object) for label in labels]
++    names = np.concatenate(labels)
++    # Sorted distinct labels, as the categories of pertpy's pd.Categorical.
++    used = np.zeros(names.size, dtype=bool)
++    used[codes_cpu] = True
++    used = np.flatnonzero(used)
++    categories, category_codes = np.unique(names[used], return_inverse=True)
++    remap = np.empty(names.size, dtype=np.intp)
++    remap[used] = category_codes
++    return pd.Categorical.from_codes(remap[codes_cpu], pd.Index(categories))
+ 
+ 
+ class GuideAssignment:
+     """GPU-accelerated guide RNA assignment.
+ 
+-    Provides threshold-based and mixture-model-based methods for assigning
+-    cells to guide RNAs, compatible with pertpy's ``GuideAssignment`` API.
+-    The mixture model fits a Poisson-Gaussian mixture per guide with batched
+-    EM on GPU, yielding orders-of-magnitude speedup.
++    Provides the threshold-based and mixture-model-based methods of pertpy's ``GuideAssignment`` with the same parameters and results.
+     """
+ 
+     def assign_by_threshold(
+@@ -46,8 +327,8 @@ def assign_by_threshold(
+     ) -> None:
+         """Assign cells to gRNAs exceeding a count threshold.
+ 
+-        Each cell is assigned to every gRNA with at least
+-        ``assignment_threshold`` counts. Expects unnormalized count data.
++        Each cell is assigned to every gRNA with at least ``assignment_threshold`` counts.
++        Expects unnormalized count data.
+ 
+         Parameters
+         ----------
+@@ -56,25 +337,15 @@ def assign_by_threshold(
+         assignment_threshold
+             Minimum count for a viable assignment.
+         layer
+-            Layer with raw counts. Uses ``adata.X`` if ``None``.
++            Layer with raw counts.
++            Uses ``adata.X`` if ``None``.
+         output_layer
+-            Key under which the binary assignment matrix is stored
+-            in ``adata.layers``.
++            Key under which the binary assignment matrix is stored in ``adata.layers``.
+         """
+         X = X_to_GPU(_get_obs_rep(adata, layer=layer))
+-
+-        if cp_issparse(X):
+-            new_data = cp.where(
+-                X.data >= assignment_threshold,
+-                X.dtype.type(1),
+-                X.dtype.type(0),
+-            )
+-            result = X.copy()
+-            result.data = new_data
+-        else:
+-            result = cp.where(X >= assignment_threshold, cp.int8(1), cp.int8(0))
+-
+-        _set_obs_rep(adata, result, layer=output_layer)
++        X = _layout(X) if cp_issparse(X) else X
++        binary = _assigned(X, cp.full(X.shape[1], assignment_threshold))
++        _set_obs_rep(adata, binary, layer=output_layer)
+ 
+     def assign_to_max_guide(
+         self,
+@@ -87,9 +358,10 @@ def assign_to_max_guide(
+     ) -> None:
+         """Assign each cell to its most expressed gRNA.
+ 
+-        Each cell is assigned to the gRNA with the highest count, provided
+-        that count is at least ``assignment_threshold``. Expects
+-        unnormalized count data.
++        Each cell is assigned to the gRNA with the highest count, provided that count is at least ``assignment_threshold``.
++        Ties are resolved in favour of the first of the tied gRNAs.
++        For sparse input, as in pertpy, only stored counts are considered.
++        Expects unnormalized count data.
+ 
+         Parameters
+         ----------
+@@ -98,410 +370,164 @@ def assign_to_max_guide(
+         assignment_threshold
+             Minimum count for a viable assignment.
+         layer
+-            Layer with raw counts. Uses ``adata.X`` if ``None``.
++            Layer with raw counts.
++            Uses ``adata.X`` if ``None``.
+         obs_key
+             Column in ``adata.obs`` where the assignment is stored.
+         no_grna_assigned_key
+             Label for cells with no guide above threshold.
+         """
+         X = X_to_GPU(_get_obs_rep(adata, layer=layer))
+-        var_names = np.asarray(adata.var_names)
+-
+-        if cp_issparse(X):
+-            X_dense = X.toarray()
++        if not X.shape[1]:
++            max_values = max_positions = np.full(X.shape[0], -1)
++        elif cp_issparse(X):
++            max_values, max_positions = _max_guide(_layout(X))
+         else:
+-            X_dense = X
+-
+-        max_vals = X_dense.max(axis=1)
+-        max_idx = X_dense.argmax(axis=1)
+-
+-        max_vals_cpu = cp.asnumpy(max_vals).ravel()
+-        max_idx_cpu = cp.asnumpy(max_idx).ravel()
+-
+-        assigned = np.full(adata.n_obs, no_grna_assigned_key, dtype=object)
+-        above = max_vals_cpu >= assignment_threshold
+-        assigned[above] = var_names[max_idx_cpu[above]]
+-
+-        adata.obs[obs_key] = assigned
+-
++            max_values = cp.asnumpy(X.max(axis=1))
++            max_positions = cp.asnumpy(X.argmax(axis=1))
++        # Position -1 picks the appended key.
++        labels = np.append(adata.var_names.to_numpy(), no_grna_assigned_key)
++        assigned = (max_positions >= 0) & (max_values >= assignment_threshold)
++        adata.obs[obs_key] = labels[np.where(assigned, max_positions, -1)]
++
++    @deprecated_arg("learning_rate", _LEARNING_RATE_DEPRECATION)
+     def assign_mixture_model(
+         self,
+         adata: AnnData,
+         *,
++        model: Literal["poisson_gauss_mixture"] = "poisson_gauss_mixture",
+         layer: str | None = None,
+         assigned_guides_key: str = "assigned_guide",
++        output_layer: str | None = "assigned_guides",
+         no_grna_assigned_key: str = "negative",
+         max_assignments_per_cell: int = 5,
+         multiple_grna_assigned_key: str = "multiple",
+         multiple_grna_assignment_string: str = "+",
+         only_return_results: bool = False,
+-        max_iter: int = 90,
+-        tol: float = 1e-4,
+-        posterior_threshold: float = 0.5,
++        show_progress: bool = False,
++        n_iter: int = 1000,
++        learning_rate: float = 0.01,
++        n_init_seeds: int = 10,
++        seed: int = 2024,
+     ) -> np.ndarray | None:
+-        """Assign gRNAs using a GPU-accelerated Poisson–Gaussian mixture model.
++        """Assign gRNAs to cells using a Poisson-Gaussian mixture model.
+ 
+-        Fits a two-component mixture (Poisson background + Gaussian signal)
+-        to the log₂-transformed non-zero counts of each guide simultaneously
+-        using batched Expectation-Maximization on GPU. The fitted model is
+-        converted to an integer raw-count threshold; the default posterior
+-        cutoff matches pertpy's threshold rule.
++        The model, priors and per-guide thresholding rule are those of ``crispat.ga_poisson_gauss`` and of pertpy's ``assign_mixture_model``.
++        For each guide, the log2 of its non-zero UMI counts is modelled as a mixture of a continuous Poisson background and a Gaussian on-target component with priors ``weights ~ Dirichlet([0.9, 0.1])``, ``mu ~ Normal(3, 2)``, ``scale ~ LogNormal(2, 1)`` and ``lam ~ LogNormal(0, 1)``.
++        A cell is assigned to a guide if its UMI count is at least the smallest integer ``t`` for which ``P(Normal | log2(t)) > 0.5``.
++
++        The MAP estimate is found by multi-start EM on the distinct count values of every guide, for all guides in parallel on the GPU.
++        The lowest-loss solution is kept after discarding label-switched optima and degenerate optima in which the Gaussian weight vanishes or the Gaussian collapses onto a single count value.
+ 
+         Parameters
+         ----------
+         adata
+             Annotated data matrix with guide RNA counts.
++        model
++            The mixture model to use.
++            Only ``"poisson_gauss_mixture"`` is supported.
+         layer
+-            Layer with raw counts. Uses ``adata.X`` if ``None``.
++            Layer with raw counts.
++            Uses ``adata.X`` if ``None``.
+         assigned_guides_key
+-            Key in ``adata.obs`` for storing the assignment result.
++            Per-cell assignment is saved on ``adata.obs[assigned_guides_key]``.
++        output_layer
++            The binary cell-by-guide assignment matrix is saved on ``adata.layers[output_layer]``, or not at all if ``None``.
++            Unlike the per-cell assignment it is not capped by ``max_assignments_per_cell``.
+         no_grna_assigned_key
+-            Label for cells negative for all gRNAs.
++            Key to use when a cell is negative for all gRNAs.
+         max_assignments_per_cell
+-            Maximum number of gRNAs a cell can be assigned to.
++            Maximum number of gRNAs that can be assigned to a cell.
+         multiple_grna_assigned_key
+-            Label for cells exceeding ``max_assignments_per_cell``.
++            Key to use when more than ``max_assignments_per_cell`` gRNAs are assigned.
+         multiple_grna_assignment_string
+-            Delimiter for joining multiple guide names.
++            Separator used to join multiple gRNAs assigned to one cell.
+         only_return_results
+-            If ``True``, return assignments without modifying ``adata``.
+-        max_iter
+-            Maximum number of EM iterations.
+-        tol
+-            Convergence tolerance on parameter changes.
+-        posterior_threshold
+-            Minimum posterior probability of the Gaussian component required
+-            for a raw UMI count to define the assignment threshold.
++            If ``True``, do not modify ``adata`` and return the assignment array.
++        show_progress
++            Whether to print a progress line.
++        n_iter
++            Maximum number of EM iterations per start.
++        learning_rate
++            Deprecated and ignored.
++        n_init_seeds
++            Number of prior-median initialisations per guide.
++        seed
++            Random seed used for the prior-median initialisations.
+ 
+         Returns
+         -------
+-        If ``only_return_results`` is ``True``, returns an array of
+-            assignments. Otherwise modifies ``adata`` in-place and returns
+-            ``None``.
++        The per-cell assignments if ``only_return_results`` is ``True``, else ``None``.
+         """
+-        _validate_mixture_model_args(
+-            max_assignments_per_cell=max_assignments_per_cell,
+-            max_iter=max_iter,
+-            tol=tol,
+-            posterior_threshold=posterior_threshold,
+-        )
+-
++        if model != "poisson_gauss_mixture":
++            raise ValueError("Model not implemented. Please use 'poisson_gauss_mixture'.")
+         X = X_to_GPU(_get_obs_rep(adata, layer=layer))
+-        if cp_issparse(X):
+-            from rapids_singlecell.preprocessing._utils import _sparse_to_dense
+-
+-            if X.dtype != cp.float32:
+-                X = X.astype(cp.float32)
+-            X = _sparse_to_dense(X, order="F")
+-        else:
+-            X = X.astype(cp.float32, copy=False)
+-            if not (X.flags.c_contiguous or X.flags.f_contiguous):
+-                X = cp.ascontiguousarray(X)
+-
+-        var_names = np.asarray(adata.var_names)
+-        assignments, thresholds, lam, mu, sigma, pi0, valid_guides = _fit_assign_cuda(
+-            X,
+-            max_iter=max_iter,
+-            tol=tol,
+-            posterior_threshold=posterior_threshold,
+-        )
++        guide_names = np.asarray(adata.var_names, dtype=str)
++        n_guides = X.shape[1]
++
++        X = _layout(X)
++        data = X.data if cp_issparse(X) else X
++        if bool((data < 0).any()):
++            raise ValueError(
++                "Data contains negative values. Please use non-negative data for guide "
++                "assignment with the Mixture Model."
++            )
++        values_padded, weights_padded, n_distinct, nonzero_counts, max_counts = _distinct_values(X, n_guides)
+ 
+-        if len(valid_guides) == 0:
++        fittable = cp.asnumpy((nonzero_counts >= 2) & (max_counts >= 2))
++        skipped = np.flatnonzero(~fittable)
++        if skipped.size:
+             warnings.warn(
+-                "No guides have enough expressing cells for mixture model fitting.",
++                f"Skipping {skipped.size} guides with fewer than 2 expressing cells or a "
++                f"maximum count below 2: {_format_guides(guide_names[skipped])}.",
+                 UserWarning,
+-                stacklevel=2,
++                stacklevel=3,
+             )
+-            series = pd.Series(
+-                no_grna_assigned_key,
+-                index=adata.obs_names,
++
++        fittable_idx = np.flatnonzero(fittable)
++        estimates = np.full((n_guides, _ga.N_OUTPUTS), np.nan)
++        if fittable_idx.size > 0:
++            if show_progress:
++                print(f"Fitting Poisson-Gaussian mixture for {fittable_idx.size} guides in parallel.")
++            idx = cp.asarray(fittable_idx)
++            estimates[fittable_idx] = _fit_mixture(
++                values_padded[idx],
++                weights_padded[idx],
++                n_distinct[idx],
++                max_counts[idx],
++                n_iter=n_iter,
++                n_init_seeds=n_init_seeds,
++                seed=seed,
+             )
+-            if only_return_results:
+-                return series.values
+-            adata.obs[assigned_guides_key] = series.values
+-            return None
+-
+-        lam_cpu = cp.asnumpy(lam.ravel())
+-        mu_cpu = cp.asnumpy(mu.ravel())
+-        sigma_cpu = cp.asnumpy(sigma.ravel())
+-        pi0_cpu = cp.asnumpy(pi0.ravel())
+-        thresholds_cpu = cp.asnumpy(thresholds.ravel())
+-
+-        valid_var_names = var_names[np.asarray(valid_guides, dtype=np.intp)]
+-        series_values = _assignments_to_labels(
+-            assignments,
+-            valid_var_names,
+-            max_assignments_per_cell=max_assignments_per_cell,
++            unassignable = fittable_idx[np.isnan(estimates[fittable_idx, 5])]
++            if unassignable.size:
++                warnings.warn(
++                    f"No positive population found for {unassignable.size} guides, which "
++                    "are not assigned to any cell: "
++                    f"{_format_guides(guide_names[unassignable])}.",
++                    UserWarning,
++                    stacklevel=3,
++                )
++
++        rate, mean, std, weight, loss, thresholds = estimates.T
++        binary = _assigned(X, cp.asarray(thresholds))
++        cells = _cell_major(binary)
++        assignments = _per_cell_assignments(
++            cells.indptr,
++            cells.indices,
++            guide_names,
+             no_grna_assigned_key=no_grna_assigned_key,
++            max_assignments_per_cell=max_assignments_per_cell,
+             multiple_grna_assigned_key=multiple_grna_assigned_key,
+             multiple_grna_assignment_string=multiple_grna_assignment_string,
+         )
+-
+         if only_return_results:
+-            return series_values
+-
+-        adata.var[_MIXTURE_MODEL_VAR_COLUMNS] = np.nan
+-        valid_var_index = adata.var_names[np.asarray(valid_guides, dtype=np.intp)]
+-        adata.var.loc[valid_var_index, "poisson_rate"] = lam_cpu
+-        adata.var.loc[valid_var_index, "gaussian_mean"] = mu_cpu
+-        adata.var.loc[valid_var_index, "gaussian_std"] = sigma_cpu
+-        adata.var.loc[valid_var_index, "mix_probs_0"] = pi0_cpu
+-        adata.var.loc[valid_var_index, "mix_probs_1"] = 1.0 - pi0_cpu
+-        adata.var.loc[valid_var_index, "threshold"] = thresholds_cpu
+-
+-        adata.obs[assigned_guides_key] = series_values
++            return np.asarray(assignments)
++
++        columns = (rate, mean, std, 1.0 - weight, weight, thresholds, loss)
++        for column, estimate in zip(_MIXTURE_MODEL_VAR_COLUMNS, columns, strict=True):
++            adata.var[column] = estimate
++        adata.obs[assigned_guides_key] = assignments
++        if output_layer is not None:
++            _set_obs_rep(adata, binary, layer=output_layer)
+         return None
+-
+-
+-def _assignments_to_labels(
+-    assignments: cp.ndarray | np.ndarray,
+-    guide_names: np.ndarray,
+-    *,
+-    max_assignments_per_cell: int,
+-    no_grna_assigned_key: str,
+-    multiple_grna_assigned_key: str,
+-    multiple_grna_assignment_string: str,
+-) -> np.ndarray:
+-    """Convert guide-by-cell assignments to pertpy-style cell labels.
+-
+-    The dispatcher keeps all label creation in one place:
+-    high-guide GPU count gating, packed small-guide patterns, grouped
+-    medium-guide readout, and the exact fallback.
+-    """
+-    n_guides, n_cells = assignments.shape
+-
+-    if isinstance(assignments, cp.ndarray) and n_guides > _GROUPED_READOUT_MAX_GUIDES:
+-        num_guides_assigned_gpu = assignments.sum(axis=0)
+-        assignable_gpu = (num_guides_assigned_gpu > 0) & (num_guides_assigned_gpu <= max_assignments_per_cell)
+-        assignable_count_gpu = cp.count_nonzero(assignable_gpu)
+-        assignable_count = int(assignable_count_gpu.item())
+-
+-        negative_count = int(cp.count_nonzero(num_guides_assigned_gpu == 0).item())
+-        if assignable_count == 0:
+-            if negative_count == 0:
+-                return np.full(n_cells, multiple_grna_assigned_key, dtype=object)
+-            if negative_count == n_cells:
+-                return np.full(n_cells, no_grna_assigned_key, dtype=object)
+-
+-            num_guides_assigned = cp.asnumpy(num_guides_assigned_gpu)
+-            labels = np.empty(n_cells, dtype=object)
+-            labels[num_guides_assigned == 0] = no_grna_assigned_key
+-            labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
+-            return labels
+-
+-        assignable_fraction = assignable_count / n_cells
+-        if assignable_fraction <= _SUBSET_READOUT_MAX_ASSIGNABLE_FRACTION:
+-            assignable_idx_gpu = cp.flatnonzero(assignable_gpu)
+-            assignable_idx = cp.asnumpy(assignable_idx_gpu)
+-            subset_assignments = cp.asnumpy(assignments[:, assignable_idx_gpu])
+-
+-            num_guides_assigned = cp.asnumpy(num_guides_assigned_gpu)
+-            labels = np.empty(n_cells, dtype=object)
+-            labels[num_guides_assigned == 0] = no_grna_assigned_key
+-            labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
+-            labels[assignable_idx] = _assignments_to_labels(
+-                subset_assignments,
+-                guide_names,
+-                no_grna_assigned_key=no_grna_assigned_key,
+-                max_assignments_per_cell=max_assignments_per_cell,
+-                multiple_grna_assigned_key=multiple_grna_assigned_key,
+-                multiple_grna_assignment_string=multiple_grna_assignment_string,
+-            )
+-            return labels
+-
+-    if isinstance(assignments, cp.ndarray):
+-        assignments = cp.asnumpy(assignments)
+-
+-    num_guides_assigned = assignments.sum(axis=0)
+-
+-    assignable = (num_guides_assigned > 0) & (num_guides_assigned <= max_assignments_per_cell)
+-    assignable_count = int(assignable.sum())
+-    if guide_names.size <= _PACKED_READOUT_MAX_GUIDES and assignable_count >= _PACKED_READOUT_MIN_ASSIGNABLE_CELLS:
+-        labels = np.empty(n_cells, dtype=object)
+-        labels[num_guides_assigned == 0] = no_grna_assigned_key
+-        labels[(num_guides_assigned > 0) & ~assignable] = multiple_grna_assigned_key
+-
+-        packed = np.packbits(assignments[:, assignable].T, axis=1, bitorder="little")
+-        padded = np.zeros((packed.shape[0], np.dtype(np.uint64).itemsize), dtype=np.uint8)
+-        padded[:, : packed.shape[1]] = packed
+-        codes = padded.view(np.uint64).ravel()
+-
+-        unique_codes, inverse = np.unique(codes, return_inverse=True)
+-        unique_labels = np.empty(unique_codes.size, dtype=object)
+-        guide_bits = np.arange(guide_names.size, dtype=np.uint64)
+-        one = np.uint64(1)
+-        for i, code in enumerate(unique_codes):
+-            selected = ((code >> guide_bits) & one).astype(bool)
+-            unique_labels[i] = multiple_grna_assignment_string.join(guide_names[selected].tolist())
+-
+-        labels[assignable] = unique_labels[inverse]
+-        return labels
+-
+-    labels = np.empty(n_cells, dtype=object)
+-    labels[num_guides_assigned == 0] = no_grna_assigned_key
+-
+-    single_assignment = num_guides_assigned == 1
+-    if single_assignment.any():
+-        labels[single_assignment] = guide_names[np.argmax(assignments[:, single_assignment], axis=0)]
+-
+-    multi_assignment = assignable & (num_guides_assigned > 1)
+-    if guide_names.size <= _GROUPED_READOUT_MAX_GUIDES:
+-        max_join_count = min(max_assignments_per_cell, guide_names.size)
+-        for n_assigned in range(2, max_join_count + 1):
+-            cell_indices = np.flatnonzero(num_guides_assigned == n_assigned)
+-            if cell_indices.size == 0:
+-                continue
+-            _rows, guide_indices = np.nonzero(assignments[:, cell_indices].T)
+-            guide_indices = guide_indices.reshape(cell_indices.size, n_assigned)
+-            labels[cell_indices] = [
+-                multiple_grna_assignment_string.join(guide_names[row].tolist()) for row in guide_indices
+-            ]
+-        labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
+-        return labels
+-
+-    for cell_idx in np.flatnonzero(multi_assignment):
+-        labels[cell_idx] = multiple_grna_assignment_string.join(guide_names[assignments[:, cell_idx]].tolist())
+-
+-    labels[num_guides_assigned > max_assignments_per_cell] = multiple_grna_assigned_key
+-    return labels
+-
+-
+-def _validate_fit_args(*, max_iter: int, tol: float, posterior_threshold: float) -> None:
+-    if max_iter < 1:
+-        raise ValueError("max_iter must be at least 1.")
+-    if tol <= 0:
+-        raise ValueError("tol must be positive.")
+-    if not 0 < posterior_threshold < 1:
+-        raise ValueError("posterior_threshold must be between 0 and 1.")
+-
+-
+-def _validate_mixture_model_args(
+-    *,
+-    max_assignments_per_cell: int,
+-    max_iter: int,
+-    tol: float,
+-    posterior_threshold: float,
+-) -> None:
+-    _validate_fit_args(
+-        max_iter=max_iter,
+-        tol=tol,
+-        posterior_threshold=posterior_threshold,
+-    )
+-    if max_assignments_per_cell < 1:
+-        raise ValueError("max_assignments_per_cell must be at least 1.")
+-
+-
+-def _fit_assign_cuda(
+-    X: cp.ndarray,
+-    *,
+-    max_iter: int,
+-    tol: float,
+-    posterior_threshold: float,
+-) -> tuple[
+-    cp.ndarray,
+-    cp.ndarray,
+-    cp.ndarray,
+-    cp.ndarray,
+-    cp.ndarray,
+-    cp.ndarray,
+-    list[int],
+-]:
+-    """Fit and assign all guides with the nanobind/CUDA EM kernel."""
+-    _validate_fit_args(
+-        max_iter=max_iter,
+-        tol=tol,
+-        posterior_threshold=posterior_threshold,
+-    )
+-
+-    from rapids_singlecell._cuda import _guide_assignment_cuda
+-
+-    if _guide_assignment_cuda is None:
+-        raise ImportError(
+-            "The _guide_assignment_cuda extension is not available. Build rapids-singlecell with CUDA extensions."
+-        )
+-
+-    if not (X.flags.c_contiguous or X.flags.f_contiguous):
+-        X = cp.ascontiguousarray(X)
+-
+-    n_cells, n_guides = X.shape
+-    assignments_all = cp.empty((n_guides, n_cells), dtype=cp.bool_)
+-    thresholds_all = cp.empty((n_guides, 1), dtype=cp.float32)
+-    lam_all = cp.empty((n_guides, 1), dtype=cp.float32)
+-    mu_all = cp.empty((n_guides, 1), dtype=cp.float32)
+-    sigma_all = cp.empty((n_guides, 1), dtype=cp.float32)
+-    pi0_all = cp.empty((n_guides, 1), dtype=cp.float32)
+-    valid_mask = cp.empty(n_guides, dtype=cp.bool_)
+-    nonzero_counts = cp.empty(n_guides, dtype=cp.int32)
+-    max_counts = cp.empty(n_guides, dtype=cp.int32)
+-
+-    _guide_assignment_cuda.fit_assign_dense(
+-        X,
+-        assignments_all,
+-        thresholds_all,
+-        lam_all,
+-        mu_all,
+-        sigma_all,
+-        pi0_all,
+-        valid_mask,
+-        nonzero_counts,
+-        max_counts,
+-        n_cells=n_cells,
+-        n_guides=n_guides,
+-        max_iter=int(max_iter),
+-        tol=float(tol),
+-        posterior_threshold=float(posterior_threshold),
+-        stream=cp.cuda.get_current_stream().ptr,
+-    )
+-
+-    valid_mask_cpu = cp.asnumpy(valid_mask).astype(bool)
+-    nonzero_counts_cpu = cp.asnumpy(nonzero_counts)
+-    max_counts_cpu = cp.asnumpy(max_counts)
+-
+-    for guide, (nz_count, max_count) in enumerate(zip(nonzero_counts_cpu, max_counts_cpu, strict=True)):
+-        if 0 < nz_count < 2:
+-            warnings.warn(
+-                f"Skipping guide index {guide} as there are less than 2 cells expressing the guide.",
+-                UserWarning,
+-                stacklevel=4,
+-            )
+-        elif nz_count >= 2 and max_count < 2:
+-            warnings.warn(
+-                f"Skipping guide index {guide} as the maximum UMI count is less than 2.",
+-                UserWarning,
+-                stacklevel=4,
+-            )
+-
+-    valid_guides = np.flatnonzero(valid_mask_cpu).tolist()
+-    if len(valid_guides) == 0:
+-        empty_2d = cp.empty((0, 1), dtype=cp.float32)
+-        return (
+-            cp.empty((0, n_cells), dtype=cp.bool_),
+-            empty_2d,
+-            empty_2d,
+-            empty_2d,
+-            empty_2d,
+-            empty_2d,
+-            [],
+-        )
+-
+-    if len(valid_guides) == n_guides:
+-        return (
+-            assignments_all,
+-            thresholds_all,
+-            lam_all,
+-            mu_all,
+-            sigma_all,
+-            pi0_all,
+-            valid_guides,
+-        )
+-
+-    valid_guides_gpu = cp.asarray(valid_guides, dtype=cp.int32)
+-    return (
+-        assignments_all[valid_guides_gpu],
+-        thresholds_all[valid_guides_gpu],
+-        lam_all[valid_guides_gpu],
+-        mu_all[valid_guides_gpu],
+-        sigma_all[valid_guides_gpu],
+-        pi0_all[valid_guides_gpu],
+-        valid_guides,
+-    )
+diff --git a/tests/pertpy/test_guide_assignment.py b/tests/pertpy/test_guide_assignment.py
+index d0feef90b..91e81bf16 100644
+--- a/tests/pertpy/test_guide_assignment.py
++++ b/tests/pertpy/test_guide_assignment.py
+@@ -7,236 +7,154 @@
+ from anndata import AnnData
+ from cupyx.scipy.sparse import csc_matrix as gpu_csc
+ from cupyx.scipy.sparse import csr_matrix as gpu_csr
++from fast_array_utils.conv import to_dense
+ 
+ import rapids_singlecell as rsc
+-from rapids_singlecell.get import X_to_CPU
+-from rapids_singlecell.pertpy_gpu._guide_assignment import _fit_assign_cuda
+-
+-
+-@pytest.fixture
+-def guide_adata() -> AnnData:
+-    """Synthetic guide RNA dataset with clear bimodal signal.
+-
+-    200 cells, 8 guides.  For each guide, ~30 % of cells have high counts
+-    (signal, drawn from Poisson(lambda=50)) and the rest have low counts
+-    (background, drawn from Poisson(lambda=2)).
+-    """
+-    rng = np.random.default_rng(42)
+-    n_cells = 200
+-    n_guides = 8
+-    n_signal = 60  # 30% signal
+-
++from rapids_singlecell.pertpy_gpu import _guide_assignment
++
++
++def _synthetic_counts(
++    rng: np.random.Generator,
++    n_cells: int,
++    n_guides: int,
++    *,
++    frac_pos: float,
++    log2_mean: float,
++    background: float,
++) -> tuple[np.ndarray, np.ndarray]:
+     X = np.zeros((n_cells, n_guides), dtype=np.float32)
++    truth = np.zeros((n_cells, n_guides), dtype=bool)
+     for g in range(n_guides):
+-        bg = rng.poisson(lam=2, size=n_cells - n_signal).astype(np.float32)
+-        sig = rng.poisson(lam=50, size=n_signal).astype(np.float32)
+-        X[:, g] = np.concatenate([bg, sig])
+-        rng.shuffle(X[:, g])
+-
+-    var = pd.DataFrame(index=[f"guide_{i}" for i in range(n_guides)])
+-    obs = pd.DataFrame(index=[f"cell_{i}" for i in range(n_cells)])
+-    return AnnData(X=cp.array(X), obs=obs, var=var)
++        is_pos = rng.random(n_cells) < frac_pos
++        X[is_pos, g] = np.clip(np.round(2 ** rng.normal(log2_mean, 0.6, is_pos.sum())), 1, None)
++        X[~is_pos, g] = rng.poisson(background, (~is_pos).sum())
++        truth[is_pos, g] = True
++    return X, truth
++
++
++def _adata(X: np.ndarray) -> AnnData:
++    return AnnData(
++        X=cp.asarray(X),
++        obs=pd.DataFrame(index=[f"cell_{i}" for i in range(X.shape[0])]),
++        var=pd.DataFrame(index=[f"guide_{i}" for i in range(X.shape[1])]),
++    )
+ 
+ 
+ @pytest.fixture
+-def guide_adata_sparse(guide_adata: AnnData) -> AnnData:
+-    """Same data as guide_adata but stored as CuPy CSR sparse."""
+-    adata = guide_adata.copy()
+-    adata.X = gpu_csr(adata.X)
+-    return adata
+-
++def guide_adata() -> tuple[AnnData, np.ndarray]:
++    """800 cells by 12 guides with 12 % positive cells per guide."""
++    X, truth = _synthetic_counts(np.random.default_rng(0), 800, 12, frac_pos=0.12, log2_mean=5.0, background=0.8)
++    return _adata(X), truth
+ 
+-# ------------------------------------------------------------------ #
+-#  assign_by_threshold
+-# ------------------------------------------------------------------ #
+ 
+-
+-def test_assign_by_threshold(guide_adata: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_by_threshold(guide_adata, assignment_threshold=5)
+-
+-    result = X_to_CPU(guide_adata.layers["assigned_guides"])
+-    X = X_to_CPU(guide_adata.X)
+-
+-    expected = (X >= 5).astype(np.int8)
+-    np.testing.assert_array_equal(result, expected)
+-
+-
+-def test_assign_by_threshold_sparse(guide_adata_sparse: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_by_threshold(guide_adata_sparse, assignment_threshold=5)
+-
+-    result = X_to_CPU(guide_adata_sparse.layers["assigned_guides"]).toarray()
+-    X = X_to_CPU(guide_adata_sparse.X).toarray()
+-
+-    expected = (X >= 5).astype(np.int8)
+-    np.testing.assert_array_equal(result, expected)
+-
+-
+-def test_assign_by_threshold_sparse_csc(guide_adata: AnnData) -> None:
+-    adata = guide_adata.copy()
+-    adata.X = gpu_csc(adata.X)
+-
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_by_threshold(adata, assignment_threshold=5)
+-
+-    result = adata.layers["assigned_guides"]
+-    assert isinstance(result, gpu_csc)
+-
+-    result = X_to_CPU(result).toarray()
+-    expected = (X_to_CPU(adata.X).toarray() >= 5).astype(np.int8)
+-    np.testing.assert_array_equal(result, expected)
+-
+-
+-# ------------------------------------------------------------------ #
+-#  assign_to_max_guide
+-# ------------------------------------------------------------------ #
+-
+-
+-def test_assign_to_max_guide(guide_adata: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_to_max_guide(guide_adata, assignment_threshold=5)
+-
+-    assigned = guide_adata.obs["assigned_guide"]
+-    X = X_to_CPU(guide_adata.X)
+-
+-    for i in range(guide_adata.n_obs):
+-        row = X[i]
+-        max_val = row.max()
+-        if max_val >= 5:
+-            expected_guide = guide_adata.var_names[int(row.argmax())]
+-            assert assigned.iloc[i] == expected_guide, f"Cell {i}: expected {expected_guide}, got {assigned.iloc[i]}"
+-        else:
+-            assert assigned.iloc[i] == "Negative", f"Cell {i}: expected Negative, got {assigned.iloc[i]}"
+-
+-
+-def test_assign_to_max_guide_sparse(guide_adata_sparse: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_to_max_guide(guide_adata_sparse, assignment_threshold=5)
+-
+-    assigned = guide_adata_sparse.obs["assigned_guide"]
+-    X = X_to_CPU(guide_adata_sparse.X).toarray()
+-
+-    for i in range(guide_adata_sparse.n_obs):
+-        row = X[i]
+-        max_val = row.max()
+-        if max_val >= 5:
+-            expected_guide = guide_adata_sparse.var_names[int(row.argmax())]
+-            assert assigned.iloc[i] == expected_guide
+-        else:
+-            assert assigned.iloc[i] == "Negative"
+-
+-
+-def test_assign_to_max_guide_below_threshold() -> None:
+-    """All counts below threshold → all Negative."""
+-    rng = np.random.default_rng(0)
+-    X = rng.poisson(lam=1, size=(50, 4)).astype(np.float32)
+-    adata = AnnData(
+-        X=cp.array(X),
+-        var=pd.DataFrame(index=[f"g{i}" for i in range(4)]),
+-        obs=pd.DataFrame(index=[f"c{i}" for i in range(50)]),
++@pytest.fixture
++def tiny_adata() -> AnnData:
++    return _adata(np.array([[6, 0, 2], [1, 5, 0], [0, 1, 7]], dtype=np.float32))
++
++
++@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
++def test_assign_by_threshold(tiny_adata: AnnData, storage: str) -> None:
++    if storage != "dense":
++        tiny_adata.X = (gpu_csr if storage == "csr" else gpu_csc)(tiny_adata.X)
++    rsc.ptg.GuideAssignment().assign_by_threshold(tiny_adata, assignment_threshold=5)
++
++    result = tiny_adata.layers["assigned_guides"]
++    assert type(result) is type(tiny_adata.X)
++    if storage == "dense":
++        assert result.dtype == cp.int8
++    else:
++        assert result.nnz == 3
++    np.testing.assert_array_equal(
++        to_dense(result, to_cpu_memory=True), (to_dense(tiny_adata.X, to_cpu_memory=True) >= 5).astype(np.int8)
+     )
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_to_max_guide(adata, assignment_threshold=100)
+-    assert (adata.obs["assigned_guide"] == "Negative").all()
+-
+ 
+-# ------------------------------------------------------------------ #
+-#  assign_mixture_model
+-# ------------------------------------------------------------------ #
+ 
++@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
++def test_assign_to_max_guide(tiny_adata: AnnData, storage: str) -> None:
++    if storage != "dense":
++        tiny_adata.X = (gpu_csr if storage == "csr" else gpu_csc)(tiny_adata.X)
++    rsc.ptg.GuideAssignment().assign_to_max_guide(tiny_adata, assignment_threshold=6)
++    assert tuple(tiny_adata.obs["assigned_guide"]) == ("guide_0", "Negative", "guide_2")
+ 
+-def test_mixture_model_separation(guide_adata: AnnData) -> None:
+-    """EM should separate the clearly bimodal signal."""
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_mixture_model(guide_adata, max_iter=100)
+-
+-    # Check that at least some cells are assigned (not all negative)
+-    assigned = guide_adata.obs["assigned_guide"]
+-    n_assigned = (assigned != "negative").sum()
+-    assert n_assigned > 0, "No cells were assigned to any guide"
+-
+-    # With such clear separation (Poisson(2) vs Poisson(50)),
+-    # most high-count cells should be positive
+-    X = X_to_CPU(guide_adata.X)
+-
+-    # For each guide, cells with count >= 20 should mostly be assigned
+-    for g in range(X.shape[1]):
+-        high_count_cells = X[:, g] >= 20
+-        if high_count_cells.sum() == 0:
+-            continue
+-        # At least 80% of high-count cells should have this guide in assignment
+-        guide_name = guide_adata.var_names[g]
+-        has_guide = assigned.str.contains(guide_name, na=False)
+-        overlap = (high_count_cells & has_guide.values).sum()
+-        assert overlap / high_count_cells.sum() >= 0.8, (
+-            f"Guide {guide_name}: only {overlap}/{high_count_cells.sum()} high-count cells assigned"
+-        )
+ 
+-
+-def test_mixture_model_stores_params(guide_adata: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_mixture_model(guide_adata)
+-
+-    for col in [
++def test_mixture_model_recovers_known_positives(
++    guide_adata: tuple[AnnData, np.ndarray],
++) -> None:
++    adata, truth = guide_adata
++    rsc.ptg.GuideAssignment().assign_mixture_model(adata)
++
++    thresholds = np.nan_to_num(adata.var["threshold"].to_numpy(), nan=np.inf)
++    pred = to_dense(adata.X, to_cpu_memory=True) >= thresholds[None, :]
++    assert (pred == truth).mean() > 0.98
++    assert (pred & truth).sum() / truth.sum() > 0.9
++    assert (pred & ~truth).sum() <= 0.005 * truth.size
++
++    layer = adata.layers["assigned_guides"]
++    assert type(layer) is type(adata.X)
++    np.testing.assert_array_equal(to_dense(layer, to_cpu_memory=True), pred.astype(np.int8))
++    for col in (
+         "poisson_rate",
+         "gaussian_mean",
+         "gaussian_std",
+         "mix_probs_0",
+         "mix_probs_1",
+         "threshold",
+-    ]:
+-        assert col in guide_adata.var.columns, f"Missing column: {col}"
+-
+-    # Parameters should be finite for all guides
+-    for col in ["poisson_rate", "gaussian_mean", "gaussian_std"]:
+-        vals = guide_adata.var[col].dropna()
+-        assert len(vals) > 0, f"No values for {col}"
+-        assert np.all(np.isfinite(vals)), f"Non-finite values in {col}"
++        "final_loss",
++    ):
++        assert np.isfinite(adata.var[col]).all()
++    assert (adata.var["gaussian_mean"] > adata.var["poisson_rate"]).all()
+ 
+-    # Poisson rate should be < Gaussian mean (anti-flip)
+-    rates = guide_adata.var["poisson_rate"].dropna()
+-    means = guide_adata.var["gaussian_mean"].dropna()
+-    assert (rates < means).all(), "Poisson rate should be < Gaussian mean"
+ 
+-    assert guide_adata.var["threshold"].dropna().ge(1).all()
++def test_mixture_model_high_moi_keeps_component_order() -> None:
++    """With half of the cells positive, the Gaussian must stay the on-target component."""
++    X, truth = _synthetic_counts(np.random.default_rng(0), 2000, 3, frac_pos=0.5, log2_mean=6.0, background=1.0)
++    adata = _adata(X)
++    rsc.ptg.GuideAssignment().assign_mixture_model(adata)
+ 
++    thresholds = adata.var["threshold"].to_numpy()
++    assert np.all(thresholds > 1)
++    assert (adata.var["gaussian_mean"] > adata.var["poisson_rate"]).all()
++    assert ((X >= thresholds[None, :]) == truth).mean() > 0.99
+ 
+-def test_mixture_model_overwrites_existing_var_columns(guide_adata: AnnData) -> None:
+-    guide_adata.var["threshold"] = pd.Categorical(["old"] * guide_adata.n_vars)
+-    guide_adata.var["poisson_rate"] = "old"
+ 
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_mixture_model(guide_adata)
++def test_mixture_model_multiple_guides(guide_adata: tuple[AnnData, np.ndarray]) -> None:
++    adata, _ = guide_adata
++    rsc.ptg.GuideAssignment().assign_mixture_model(
++        adata, max_assignments_per_cell=1, multiple_grna_assigned_key="too_many"
++    )
++    n_assigned = to_dense(adata.layers["assigned_guides"], to_cpu_memory=True).sum(axis=1)
++    assigned = adata.obs["assigned_guide"].astype(str).to_numpy()
++    assert (n_assigned > 1).any()
++    assert (assigned[n_assigned == 0] == "negative").all()
++    assert (assigned[n_assigned > 1] == "too_many").all()
+ 
+-    assert pd.api.types.is_float_dtype(guide_adata.var["threshold"])
+-    assert pd.api.types.is_float_dtype(guide_adata.var["poisson_rate"])
+-    assert guide_adata.var["threshold"].dropna().ge(1).all()
+-    assert np.isfinite(guide_adata.var["poisson_rate"].dropna()).all()
++    rsc.ptg.GuideAssignment().assign_mixture_model(adata, output_layer=None)
++    joined = adata.obs["assigned_guide"].astype(str).to_numpy()[n_assigned == 2]
++    assert all(len(label.split("+")) == 2 for label in joined)
+ 
+ 
+-def test_mixture_model_sparse_input(guide_adata_sparse: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_mixture_model(guide_adata_sparse)
++def test_mixture_model_only_return_results(
++    guide_adata: tuple[AnnData, np.ndarray],
++) -> None:
++    adata, _ = guide_adata
++    result = rsc.ptg.GuideAssignment().assign_mixture_model(adata, only_return_results=True)
+ 
+-    assigned = guide_adata_sparse.obs["assigned_guide"]
+-    n_assigned = (assigned != "negative").sum()
+-    assert n_assigned > 0
++    assert isinstance(result, np.ndarray)
++    assert result.shape == (adata.n_obs,)
++    assert "assigned_guide" not in adata.obs
++    assert "threshold" not in adata.var
++    assert "assigned_guides" not in adata.layers
+ 
+ 
+-@pytest.mark.parametrize("layer_kind", ["dense", "csr", "csc"])
+-def test_mixture_model_layer_is_honored(guide_adata: AnnData, layer_kind: str) -> None:
+-    adata = guide_adata.copy()
+-    layer_counts = guide_adata.X.copy()
+-    if layer_kind == "csr":
+-        layer_counts = gpu_csr(layer_counts)
+-    elif layer_kind == "csc":
+-        layer_counts = gpu_csc(layer_counts)
+-    adata.layers["raw_guides"] = layer_counts
+-    adata.X = cp.zeros_like(guide_adata.X)
++def test_mixture_model_layer_is_honored(
++    guide_adata: tuple[AnnData, np.ndarray],
++) -> None:
++    adata, _ = guide_adata
++    adata.layers["raw_guides"] = gpu_csc(adata.X)
++    adata.X = cp.zeros_like(adata.X)
+ 
+     ga = rsc.ptg.GuideAssignment()
+-    with pytest.warns(UserWarning, match="No guides"):
++    with pytest.warns(UserWarning, match="Skipping 12 guides"):
+         x_result = ga.assign_mixture_model(adata, only_return_results=True)
+     layer_result = ga.assign_mixture_model(adata, layer="raw_guides", only_return_results=True)
+ 
+@@ -244,179 +162,190 @@ def test_mixture_model_layer_is_honored(guide_adata: AnnData, layer_kind: str) -
+     assert np.count_nonzero(layer_result != "negative") > 0
+ 
+ 
+-def test_mixture_model_only_return_results(guide_adata: AnnData) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    obs_columns = guide_adata.obs.columns.copy()
+-    var_columns = guide_adata.var.columns.copy()
+-    result = ga.assign_mixture_model(guide_adata, only_return_results=True)
++def test_mixture_model_skips_low_count_guides() -> None:
++    X = np.zeros((200, 4), dtype=np.float32)
++    X[0, 1] = 1
++    X[:50, 2] = 1
++    rng = np.random.default_rng(0)
++    is_pos = rng.random(200) < 0.15
++    X[is_pos, 3] = np.round(2 ** rng.normal(5.0, 0.6, is_pos.sum()))
++    X[~is_pos, 3] = rng.poisson(0.8, (~is_pos).sum())
++    adata = _adata(X)
+ 
+-    assert result is not None
+-    assert len(result) == guide_adata.n_obs
+-    assert isinstance(result, np.ndarray)
+-    assert guide_adata.obs.columns.equals(obs_columns)
+-    assert guide_adata.var.columns.equals(var_columns)
++    with pytest.warns(UserWarning, match="Skipping 3 guides .*: guide_0, guide_1, guide_2"):
++        rsc.ptg.GuideAssignment().assign_mixture_model(adata)
++    assert adata.var["threshold"].isna().tolist() == [True, True, True, False]
+ 
+ 
+-@pytest.mark.parametrize(
+-    ("kwargs", "match"),
+-    [
+-        ({"posterior_threshold": 1.0}, "posterior_threshold"),
+-        ({"max_iter": 0}, "max_iter"),
+-        ({"tol": 0.0}, "tol"),
+-        ({"max_assignments_per_cell": 0}, "max_assignments_per_cell"),
+-    ],
+-)
+-def test_mixture_model_invalid_args_before_data_access(
+-    guide_adata: AnnData, kwargs: dict[str, float | int], match: str
++def test_mixture_model_rejects_negative_values_and_unknown_model(
++    tiny_adata: AnnData,
+ ) -> None:
+-    ga = rsc.ptg.GuideAssignment()
+-    with pytest.raises(ValueError, match=match):
+-        ga.assign_mixture_model(guide_adata, layer="missing_layer", **kwargs)
+-
+-
+-def test_mixture_model_cuda_assignments_are_bool(guide_adata: AnnData) -> None:
+-    from rapids_singlecell._cuda import _guide_assignment_cuda
+-
+-    if _guide_assignment_cuda is None:
+-        pytest.skip("_guide_assignment_cuda extension is not available")
+-
+-    assignments, *_ = _fit_assign_cuda(
+-        cp.ascontiguousarray(guide_adata.X.astype(cp.float32, copy=False)),
+-        max_iter=90,
+-        tol=1e-4,
+-        posterior_threshold=0.645,
++    with pytest.raises(ValueError, match="Model not implemented"):
++        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata, model="not_a_model")
++    tiny_adata.X[0, 0] = -1
++    with pytest.raises(ValueError, match="negative values"):
++        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata)
++
++
++@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
++def test_mixture_model_rejects_negative_values_next_to_nan(tiny_adata: AnnData, storage: str) -> None:
++    tiny_adata.X[0, 0] = -1
++    tiny_adata.X[1, 1] = cp.nan
++    if storage != "dense":
++        tiny_adata.X = (gpu_csr if storage == "csr" else gpu_csc)(tiny_adata.X)
++    with pytest.raises(ValueError, match="negative values"):
++        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata)
++
++
++def _layouts(X: np.ndarray) -> dict:
++    """The same counts as dense C/F, CSR, CSC, COO, int64 or mixed indices, float64 and unsorted CSR."""
++    csr = gpu_csr(cp.asarray(X))
++    wide = csr.copy()
++    wide.indptr, wide.indices = (
++        wide.indptr.astype(cp.int64),
++        wide.indices.astype(cp.int64),
+     )
+-
+-    assert assignments.dtype == cp.bool_
+-
+-
+-def test_mixture_model_cuda_c_and_f_layouts_match(guide_adata: AnnData) -> None:
+-    from rapids_singlecell._cuda import _guide_assignment_cuda
+-
+-    if _guide_assignment_cuda is None:
+-        pytest.skip("_guide_assignment_cuda extension is not available")
+-
+-    X_c = cp.ascontiguousarray(guide_adata.X.astype(cp.float32, copy=False))
+-    X_f = cp.asfortranarray(guide_adata.X.astype(cp.float32, copy=False))
+-
+-    c_result = _fit_assign_cuda(
+-        X_c,
+-        max_iter=90,
+-        tol=1e-4,
+-        posterior_threshold=0.645,
++    wide_csc = gpu_csc(cp.asarray(X, dtype=cp.float64))
++    wide_csc.indptr, wide_csc.indices = (
++        wide_csc.indptr.astype(cp.int64),
++        wide_csc.indices.astype(cp.int64),
+     )
+-    f_result = _fit_assign_cuda(
+-        X_f,
+-        max_iter=90,
+-        tol=1e-4,
+-        posterior_threshold=0.645,
+-    )
+-
+-    for c_value, f_value in zip(c_result[:-1], f_result[:-1], strict=True):
+-        cp.testing.assert_array_equal(c_value, f_value)
+-    assert c_result[-1] == f_result[-1]
+-
+-
+-def test_mixture_model_skip_low_count() -> None:
+-    """Guides with < 2 expressing cells should be skipped with a warning."""
+-    X = np.zeros((50, 3), dtype=np.float32)
+-    # guide 0: only 1 cell expressing
+-    X[0, 0] = 10.0
+-    # guide 1: no cells expressing
+-    # guide 2: good signal
+-    X[:20, 2] = np.random.default_rng(0).poisson(lam=50, size=20).astype(np.float32)
+-
+-    adata = AnnData(
+-        X=cp.array(X),
+-        var=pd.DataFrame(index=["low", "empty", "good"]),
+-        obs=pd.DataFrame(index=[f"c{i}" for i in range(50)]),
+-    )
+-
++    mixed = csr.copy()
++    mixed.indptr = mixed.indptr.astype(cp.int64)
++    indptr = cp.asnumpy(csr.indptr)
++    reverse = np.concatenate([np.arange(start, end)[::-1] for start, end in zip(indptr[:-1], indptr[1:], strict=True)])
++    unsorted = gpu_csr((csr.data[reverse], csr.indices[reverse], csr.indptr), shape=csr.shape)
++    return {
++        "dense C": cp.asarray(X),
++        "dense F": cp.asfortranarray(cp.asarray(X)),
++        "csr": csr,
++        "csc": gpu_csc(cp.asarray(X)),
++        "coo": csr.tocoo(),
++        "int64 indices": wide,
++        "int64 float64 csc": wide_csc,
++        "mixed index dtypes": mixed,
++        "float64": csr.astype(cp.float64),
++        "unsorted csr": unsorted,
++    }
++
++
++def test_layouts_match(guide_adata: tuple[AnnData, np.ndarray], monkeypatch: pytest.MonkeyPatch) -> None:
++    adata, _ = guide_adata
++    X = cp.asnumpy(adata.X)
+     ga = rsc.ptg.GuideAssignment()
+-    with pytest.warns(UserWarning, match="less than 2 cells"):
+-        ga.assign_mixture_model(adata)
+-
+-    # "good" guide should have some assignments
+-    assigned = adata.obs["assigned_guide"]
+-    assert assigned.str.contains("good", na=False).any()
+-
+-
+-def test_mixture_model_skip_max_count_below_two() -> None:
+-    """Guides whose non-zero counts never reach 2 UMIs are skipped."""
+-    X = np.zeros((50, 2), dtype=np.float32)
+-    X[:25, :] = 1.0
+-
+-    adata = AnnData(
+-        X=cp.array(X),
+-        var=pd.DataFrame(index=["one_a", "one_b"]),
+-        obs=pd.DataFrame(index=[f"c{i}" for i in range(50)]),
+-    )
+-
+-    ga = rsc.ptg.GuideAssignment()
+-    with pytest.warns(UserWarning, match="maximum UMI count is less than 2"):
+-        ga.assign_mixture_model(adata)
+-
+-    assert (adata.obs["assigned_guide"] == "negative").all()
+-
+-
+-def test_multiple_guide_assignment() -> None:
+-    """Cells assigned to multiple guides get joined names."""
+-    rng = np.random.default_rng(99)
+-    n_cells = 100
+-    n_guides = 3
+-
+-    # All cells get high counts for guide 0 and 1, low for guide 2
+-    X = np.zeros((n_cells, n_guides), dtype=np.float32)
+-    X[:, 0] = rng.poisson(lam=50, size=n_cells).astype(np.float32)
+-    X[:, 1] = rng.poisson(lam=50, size=n_cells).astype(np.float32)
+-    # guide 2: mix of low and high
+-    X[:30, 2] = rng.poisson(lam=50, size=30).astype(np.float32)
+-    X[30:, 2] = rng.poisson(lam=2, size=70).astype(np.float32)
+-
+-    # Add some background cells
+-    bg_cells = rng.choice(n_cells, size=20, replace=False)
+-    X[bg_cells, 0] = rng.poisson(lam=2, size=20).astype(np.float32)
+-    X[bg_cells, 1] = rng.poisson(lam=2, size=20).astype(np.float32)
+-
+-    adata = AnnData(
+-        X=cp.array(X),
+-        var=pd.DataFrame(index=["gA", "gB", "gC"]),
+-        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_cells)]),
+-    )
+-
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_mixture_model(adata)
+-
+-    assigned = adata.obs["assigned_guide"]
+-    # Some cells should have multi-guide assignments (containing "+")
+-    has_multi = assigned.str.contains("+", na=False, regex=False)
+-    assert has_multi.any(), "Expected some cells with multiple guide assignments"
+-
++    reference = adata.copy()
++    ga.assign_mixture_model(reference)
++    monkeypatch.setattr(_guide_assignment, "_HISTOGRAM_CAP", 8)
++    monkeypatch.setattr(_guide_assignment, "_COLUMN_CHUNK", 7)
++    for name, layout in _layouts(X).items():
++        a = AnnData(X=layout, obs=adata.obs.copy(), var=adata.var.copy())
++        ga.assign_mixture_model(a)
++        if name != "coo":
++            assert type(a.layers["assigned_guides"]) is type(layout)
++        ga.assign_to_max_guide(a, assignment_threshold=3, obs_key="max_guide")
++        ga.assign_by_threshold(a, assignment_threshold=3, output_layer="threshold")
++        np.testing.assert_array_equal(a.var["threshold"], reference.var["threshold"], err_msg=name)
++        np.testing.assert_array_equal(a.obs["assigned_guide"], reference.obs["assigned_guide"], err_msg=name)
++        np.testing.assert_array_equal(
++            to_dense(a.layers["assigned_guides"], to_cpu_memory=True),
++            to_dense(reference.layers["assigned_guides"], to_cpu_memory=True),
++            err_msg=name,
++        )
++        np.testing.assert_array_equal(to_dense(a.layers["threshold"], to_cpu_memory=True), X >= 3, err_msg=name)
++        best = np.where(X.max(axis=1) >= 3, X.argmax(axis=1), -1)
++        expected = np.append(adata.var_names, "Negative")[best]
++        np.testing.assert_array_equal(a.obs["max_guide"], expected, err_msg=name)
++
++
++@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
++def test_assign_to_max_guide_nan_ties_and_empty_cells(storage: str) -> None:
++    X = np.array([[np.nan, 5, 0], [2, 2, 0], [0, 0, 0], [-0.0, 0, 0]], np.float32)
++    adata = _adata(X)
++    if storage != "dense":
++        adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
++    rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=1)
++    assert list(adata.obs["assigned_guide"]) == [
++        "Negative",
++        "guide_0",
++        "Negative",
++        "Negative",
++    ]
++
++
++@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
++def test_assign_to_max_guide_without_guides(storage: str) -> None:
++    adata = _adata(np.zeros((3, 0), np.float32))
++    if storage != "dense":
++        adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
++    rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=1)
++    assert list(adata.obs["assigned_guide"]) == ["Negative"] * 3
++
++
++@pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
++def test_thresholds_compare_in_data_precision(storage: str) -> None:
++    adata = _adata(np.array([[0.7, 0.2]], np.float32))
++    if storage != "dense":
++        adata.X = (gpu_csr if storage == "csr" else gpu_csc)(adata.X)
++    rsc.ptg.GuideAssignment().assign_by_threshold(adata, assignment_threshold=0.7)
++    rsc.ptg.GuideAssignment().assign_to_max_guide(adata, assignment_threshold=0.7)
++    np.testing.assert_array_equal(to_dense(adata.layers["assigned_guides"], to_cpu_memory=True), [[1, 0]])
++    assert list(adata.obs["assigned_guide"]) == ["guide_0"]
++
++
++def test_mixture_model_rejects_too_many_starts_and_bad_shapes(
++    tiny_adata: AnnData,
++) -> None:
++    with pytest.raises(ValueError, match="n_init_seeds"):
++        rsc.ptg.GuideAssignment().assign_mixture_model(tiny_adata, n_init_seeds=70000)
++    zeros = cp.zeros((2, 1), cp.float32)
++    with pytest.raises(ValueError, match="shapes"):
++        _guide_assignment._ga.fit_poisson_gauss(
++            zeros,
++            zeros,
++            cp.zeros(2, cp.int32),
++            cp.zeros(2, cp.int64),
++            cp.zeros((3, 1, 15, 2), cp.float32),
++            cp.zeros((6, 2, 4), cp.float32),
++            cp.zeros((6, 2), cp.float32),
++            cp.zeros((1, 6), cp.float32),
++            n_iter=1,
++        )
+ 
+-def test_multiple_guide_max_cap() -> None:
+-    """Cells exceeding max_assignments_per_cell get the multiple key."""
+-    rng = np.random.default_rng(7)
+-    n_cells = 50
+-    n_guides = 6
+ 
+-    # All cells get very high counts for all guides
+-    X = rng.poisson(lam=100, size=(n_cells, n_guides)).astype(np.float32)
+-    # Add some background cells for EM to separate
+-    X[:10, :] = rng.poisson(lam=2, size=(10, n_guides)).astype(np.float32)
++def _pertpy_labels(binary: np.ndarray, names: np.ndarray, **kwargs) -> pd.Categorical:
++    """pertpy's per-cell labels of a dense binary assignment."""
++    cap = kwargs.get("max_assignments_per_cell", 5)
++    out = np.full(len(binary), kwargs.get("no_grna_assigned_key", "negative"), object)
++    for i, row in enumerate(binary):
++        guides = names[np.flatnonzero(row)]
++        if 1 <= guides.size <= cap:
++            out[i] = "+".join(guides)
++    out[binary.sum(axis=1) > cap] = kwargs.get("multiple_grna_assigned_key", "multiple")
++    return pd.Categorical(out)
+ 
+-    adata = AnnData(
+-        X=cp.array(X),
+-        var=pd.DataFrame(index=[f"g{i}" for i in range(n_guides)]),
+-        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_cells)]),
+-    )
+ 
+-    ga = rsc.ptg.GuideAssignment()
+-    ga.assign_mixture_model(
+-        adata,
+-        max_assignments_per_cell=2,
+-        multiple_grna_assigned_key="too_many",
++@pytest.mark.parametrize(
++    ("names", "kwargs"),
++    [
++        (None, {"no_grna_assigned_key": "none", "multiple_grna_assigned_key": "none"}),
++        (None, {"multiple_grna_assigned_key": "guide_0+guide_1"}),
++        (None, {"max_assignments_per_cell": 0}),
++        (None, {"max_assignments_per_cell": 1}),
++        (["a", "a", "b", "b", "c", "c", "d", "d", "e", "e", "f", "f"], {}),
++    ],
++)
++def test_mixture_model_labels_match_pertpy(
++    guide_adata: tuple[AnnData, np.ndarray], names: list | None, kwargs: dict
++) -> None:
++    adata, _ = guide_adata
++    if names is not None:
++        adata.var_names = names
++    rsc.ptg.GuideAssignment().assign_mixture_model(adata, **kwargs)
++    expected = _pertpy_labels(
++        to_dense(adata.layers["assigned_guides"], to_cpu_memory=True) > 0,
++        np.asarray(adata.var_names, dtype=object),
++        **kwargs,
+     )
+-
+-    assigned = adata.obs["assigned_guide"]
+-    # Some cells should be capped
+-    assert (assigned == "too_many").any(), "Expected some cells capped at max assignments"
++    labels = adata.obs["assigned_guide"]
++    assert list(labels.cat.categories) == list(expected.categories)
++    np.testing.assert_array_equal(labels.astype(str), np.asarray(expected, dtype=str))

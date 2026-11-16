@@ -1,0 +1,292 @@
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index 1eba52db1..1d4b3451e 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -32,6 +32,7 @@ use noodles_sam as sam;
+ use noodles_sam::alignment::record::cigar::op::Kind;
+ use noodles_sam::alignment::record::data::field::{Tag, Value};
+ use noodles_sam::Header;
++use rayon::prelude::*;
+ use serde::Serialize;
+ 
+ use error_model::{AlignmentModel, AlnOp, SharedAlignmentModel};
+@@ -1431,44 +1432,52 @@ fn apply_bias_correction(
+         bias_dump.exp3_pos = masses(erc);
+     }
+ 
+-    for tid in 0..num_refs {
+-        if alphas[tid] < 1e-8 {
+-            continue;
+-        }
+-        let s = ref_bytes[tid].as_slice();
+-        let pos_vecs: Option<(Vec<f64>, Vec<f64>)> =
+-            pos_models.as_ref().map(|(ofw, orc, efw, erc)| {
+-                let lc = length_class.expect("positional bias requires length classes")[tid];
+-                let rl = s.len();
+-                let (mut o5, mut e5) = (vec![0.0; rl], vec![0.0; rl]);
+-                let (mut o3, mut e3) = (vec![0.0; rl], vec![0.0; rl]);
+-                ofw[lc].project_weights(&mut o5);
+-                efw[lc].project_weights(&mut e5);
+-                orc[lc].project_weights(&mut o3);
+-                erc[lc].project_weights(&mut e3);
+-                (
+-                    salmon_model::positional_factor(&o5, &e5),
+-                    salmon_model::positional_factor(&o3, &e3),
+-                )
+-            });
+-        let bias = salmon_model::BiasInputs {
+-            seq: seq_tab.as_ref().map(|(f, r)| (f, r)),
+-            gc: gc_ratio_model.as_ref().map(|g| (g, gc_store.view(tid))),
+-            pos: pos_vecs
+-                .as_ref()
+-                .map(|(pf, pr)| (pf.as_slice(), pr.as_slice())),
+-        };
+-        eff_lengths[tid] = salmon_model::corrected_effective_length_full(
+-            s,
+-            &fld_cdf,
+-            fld_low,
+-            fld_high,
+-            &bias,
+-            eff_lengths[tid],
+-            bias_speed_samp,
+-            no_bias_length_threshold,
+-        );
+-    }
++    // Each transcript's correction is independent. Reads mode already performs
++    // this sweep with rayon; doing the same here prevents RAD/alignment mode from
++    // serializing its dominant bias-correction phase. Each worker writes one
++    // disjoint effective length, and the arithmetic within a transcript is
++    // unchanged, so thread count cannot alter the numerical result.
++    eff_lengths[..num_refs]
++        .par_iter_mut()
++        .enumerate()
++        .for_each(|(tid, eff_length)| {
++            if alphas[tid] < 1e-8 {
++                return;
++            }
++            let s = ref_bytes[tid].as_slice();
++            let pos_vecs: Option<(Vec<f64>, Vec<f64>)> =
++                pos_models.as_ref().map(|(ofw, orc, efw, erc)| {
++                    let lc = length_class.expect("positional bias requires length classes")[tid];
++                    let rl = s.len();
++                    let (mut o5, mut e5) = (vec![0.0; rl], vec![0.0; rl]);
++                    let (mut o3, mut e3) = (vec![0.0; rl], vec![0.0; rl]);
++                    ofw[lc].project_weights(&mut o5);
++                    efw[lc].project_weights(&mut e5);
++                    orc[lc].project_weights(&mut o3);
++                    erc[lc].project_weights(&mut e3);
++                    (
++                        salmon_model::positional_factor(&o5, &e5),
++                        salmon_model::positional_factor(&o3, &e3),
++                    )
++                });
++            let bias = salmon_model::BiasInputs {
++                seq: seq_tab.as_ref().map(|(f, r)| (f, r)),
++                gc: gc_ratio_model.as_ref().map(|g| (g, gc_store.view(tid))),
++                pos: pos_vecs
++                    .as_ref()
++                    .map(|(pf, pr)| (pf.as_slice(), pr.as_slice())),
++            };
++            *eff_length = salmon_model::corrected_effective_length_full(
++                s,
++                &fld_cdf,
++                fld_low,
++                fld_high,
++                &bias,
++                *eff_length,
++                bias_speed_samp,
++                no_bias_length_threshold,
++            );
++        });
+     bias_dump
+ }
+ 
+diff --git a/crates/salmon-align/tests/alignment_bias.rs b/crates/salmon-align/tests/alignment_bias.rs
+new file mode 100644
+index 000000000..392a7d892
+--- /dev/null
++++ b/crates/salmon-align/tests/alignment_bias.rs
+@@ -0,0 +1,77 @@
++//! Smoke coverage for bias correction through the direct alignment-mode entry
++//! point. RAD has more exhaustive invariance coverage; this test ensures the
++//! shared correction remains wired into BAM/SAM quantification.
++
++use salmon_align::{quantify_alignments, AlignQuantOptions};
++use std::io::Write;
++use std::path::{Path, PathBuf};
++
++fn write_fixture(dir: &Path) -> (PathBuf, PathBuf) {
++    let sam = dir.join("bias.sam");
++    let fasta = dir.join("transcripts.fa");
++    let names = ["txA", "txB", "txC"];
++    let mut file = std::fs::File::create(&sam).unwrap();
++    writeln!(file, "@HD\tVN:1.6\tSO:queryname").unwrap();
++    for name in names {
++        writeln!(file, "@SQ\tSN:{name}\tLN:3000").unwrap();
++    }
++
++    let mut fragment = 0;
++    for (tid, count) in [(0usize, 200), (1, 150), (2, 250)] {
++        for i in 0..count {
++            let left = 1 + (i * 7) % 2500;
++            let right = left + 200;
++            writeln!(
++                file,
++                "r{fragment}\t99\t{}\t{left}\t60\t100M\t=\t{right}\t300\t*\t*",
++                names[tid]
++            )
++            .unwrap();
++            writeln!(
++                file,
++                "r{fragment}\t147\t{}\t{right}\t60\t100M\t=\t{left}\t-300\t*\t*",
++                names[tid]
++            )
++            .unwrap();
++            fragment += 1;
++        }
++    }
++
++    let ref_seqs: Vec<Vec<u8>> = (0..names.len())
++        .map(|tid| (0..3000).map(|pos| b"ACGT"[(pos + tid) % 4]).collect())
++        .collect();
++    let mut file = std::fs::File::create(&fasta).unwrap();
++    for (name, seq) in names.iter().zip(&ref_seqs) {
++        writeln!(file, ">{name}\n{}", String::from_utf8_lossy(seq)).unwrap();
++    }
++    (sam, fasta)
++}
++
++#[test]
++fn all_bias_alignment_mode_smoke() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (sam, fasta) = write_fixture(tmp.path());
++    let out = tmp.path().join("quant");
++    let mut opts = AlignQuantOptions::new(sam, out);
++    opts.lib_type = "IU".to_string();
++    opts.no_error_model = true;
++    opts.transcripts = Some(fasta);
++    opts.seq_bias = true;
++    opts.gc_bias = true;
++    opts.pos_bias = true;
++
++    let result = rayon::ThreadPoolBuilder::new()
++        .num_threads(4)
++        .build()
++        .unwrap()
++        .install(|| quantify_alignments(&opts).expect("all-bias alignment quantification"));
++
++    assert_eq!(result.num_mapped, 600);
++    assert!(result.eff_lengths.iter().all(|value| value.is_finite()));
++    assert!(!result.bias_dump.obs_gc.is_empty());
++    assert!(!result.bias_dump.exp_gc.is_empty());
++    assert!(!result.bias_dump.obs5_seq.is_empty());
++    assert!(!result.bias_dump.exp5_seq.is_empty());
++    assert!(!result.bias_dump.obs5_pos.is_empty());
++    assert!(!result.bias_dump.exp5_pos.is_empty());
++}
+diff --git a/crates/salmon-align/tests/rad_input.rs b/crates/salmon-align/tests/rad_input.rs
+index 05dcc06c3..838c4c970 100644
+--- a/crates/salmon-align/tests/rad_input.rs
++++ b/crates/salmon-align/tests/rad_input.rs
+@@ -582,14 +582,8 @@ fn pos_bias_rad_runs() {
+     );
+ }
+ 
+-/// Bias correction can take its reference sequences directly via
+-/// `AlignQuantOptions::ref_seqs` instead of a `-t` FASTA — the path
+-/// `--deterministic` uses to hand phase-2 the index's own sequences. No
+-/// `transcripts` is set here.
+-#[test]
+-fn gc_bias_rad_uses_ref_seqs_without_transcripts() {
+-    let tmp = tempfile::tempdir().unwrap();
+-    let rad = tmp.path().join("maps.rad");
++fn bias_ref_seq_fixture(tmp: &Path) -> (std::path::PathBuf, Vec<Vec<u8>>) {
++    let rad = tmp.join("maps.rad");
+     let names = ["t0", "t1", "t2"];
+     let lens = [3000u32, 3000, 3000];
+     let mut frags: Vec<Vec<(u32, Option<u16>, i32)>> = Vec::new();
+@@ -607,6 +601,18 @@ fn gc_bias_rad_uses_ref_seqs_without_transcripts() {
+         .map(|&l| (0..l).map(|j| b"ACGT"[(j as usize) % 4]).collect())
+         .collect();
+ 
++    (rad, ref_seqs)
++}
++
++/// Bias correction can take its reference sequences directly via
++/// `AlignQuantOptions::ref_seqs` instead of a `-t` FASTA — the path
++/// `--deterministic` uses to hand phase-2 the index's own sequences. No
++/// `transcripts` is set here.
++#[test]
++fn gc_bias_rad_uses_ref_seqs_without_transcripts() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (rad, ref_seqs) = bias_ref_seq_fixture(tmp.path());
++
+     let mut o = opts_for(&tmp.path().join("quant"));
+     o.gc_bias = true;
+     o.ref_seqs = Some(ref_seqs);
+@@ -622,3 +628,65 @@ fn gc_bias_rad_uses_ref_seqs_without_transcripts() {
+         "GC bias dump should be populated from the supplied ref_seqs"
+     );
+ }
++
++/// The per-transcript correction must produce finite, bit-identical results
++/// across thread counts.
++#[test]
++fn all_bias_rad_is_thread_invariant() {
++    let tmp = tempfile::tempdir().unwrap();
++    let (rad, ref_seqs) = bias_ref_seq_fixture(tmp.path());
++
++    let run = |label: &str, threads: usize| {
++        let mut o = opts_for(&tmp.path().join(format!("quant_{label}")));
++        o.seq_bias = true;
++        o.gc_bias = true;
++        o.pos_bias = true;
++        o.ref_seqs = Some(ref_seqs.clone());
++        assert!(o.transcripts.is_none(), "this path must not need -t");
++        std::fs::create_dir_all(&o.output_dir).unwrap();
++        rayon::ThreadPoolBuilder::new()
++            .num_threads(threads)
++            .build()
++            .unwrap()
++            .install(|| quantify_rad(&o, &rad).expect("quantify_rad via ref_seqs"))
++    };
++
++    let single = run("bias_1t", 1);
++    let parallel = run("bias_8t", 8);
++    assert!(
++        single.eff_lengths.iter().all(|value| value.is_finite()),
++        "single-thread effective lengths must be finite"
++    );
++    assert!(
++        parallel.eff_lengths.iter().all(|value| value.is_finite()),
++        "parallel effective lengths must be finite"
++    );
++    assert_eq!(single.eff_lengths, parallel.eff_lengths);
++    assert_eq!(single.counts, parallel.counts);
++    assert_eq!(single.tpm, parallel.tpm);
++    assert_eq!(single.bias_dump.obs_gc, parallel.bias_dump.obs_gc);
++    assert_eq!(single.bias_dump.exp_gc, parallel.bias_dump.exp_gc);
++    assert_eq!(single.bias_dump.obs5_seq, parallel.bias_dump.obs5_seq);
++    assert_eq!(single.bias_dump.obs3_seq, parallel.bias_dump.obs3_seq);
++    assert_eq!(single.bias_dump.exp5_seq, parallel.bias_dump.exp5_seq);
++    assert_eq!(single.bias_dump.exp3_seq, parallel.bias_dump.exp3_seq);
++    assert_eq!(single.bias_dump.obs5_pos, parallel.bias_dump.obs5_pos);
++    assert_eq!(single.bias_dump.obs3_pos, parallel.bias_dump.obs3_pos);
++    assert_eq!(single.bias_dump.exp5_pos, parallel.bias_dump.exp5_pos);
++    assert_eq!(single.bias_dump.exp3_pos, parallel.bias_dump.exp3_pos);
++
++    let sum: f64 = parallel.counts.iter().sum();
++    assert!((sum - 600.0).abs() < 1.0, "Σcounts = {sum}");
++    assert_eq!(parallel.num_mapped, 600);
++    assert!(
++        !parallel.bias_dump.obs_gc.is_empty() && !parallel.bias_dump.exp_gc.is_empty(),
++        "GC bias dump should be populated from the supplied ref_seqs"
++    );
++    assert!(
++        !parallel.bias_dump.obs5_seq.is_empty()
++            && !parallel.bias_dump.exp5_seq.is_empty()
++            && !parallel.bias_dump.obs5_pos.is_empty()
++            && !parallel.bias_dump.exp5_pos.is_empty(),
++        "sequence and positional bias dumps should be populated"
++    );
++}

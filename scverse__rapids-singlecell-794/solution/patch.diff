@@ -1,0 +1,449 @@
+diff --git a/src/rapids_singlecell/pertpy_gpu/_base.py b/src/rapids_singlecell/pertpy_gpu/_base.py
+index 506b94204..d7bf5dcbf 100644
+--- a/src/rapids_singlecell/pertpy_gpu/_base.py
++++ b/src/rapids_singlecell/pertpy_gpu/_base.py
+@@ -9,6 +9,7 @@
+ from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+ from cupyx.scipy.sparse import issparse as cp_issparse
+ 
++from rapids_singlecell._keys import _embedding_keys, _existing_preset_keys
+ from rapids_singlecell.get import X_to_GPU, _get_obs_rep, _set_obs_rep
+ from rapids_singlecell.tools._utils import _choose_representation
+ 
+@@ -290,7 +291,19 @@ def _choose_representation_gpu(
+     Always returns a float32 representation: neighbor selection does not need
+     float64 precision, and the cuVS backends (ivfflat/cagra) only accept float32.
+     """
+-    rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
++    try:
++        rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
++    except ValueError:
++        # A preset PCA with fewer than ``n_pcs`` components is recomputed;
++        # an explicit ``use_rep`` or a missing ``.X`` keeps the original error.
++        pca_keys = _existing_preset_keys(adata, "pca") if use_rep is None else None
++        if pca_keys is None or adata.X is None:
++            raise
++        from rapids_singlecell.preprocessing import pca
++
++        key_added = None if pca_keys == _embedding_keys("pca", None) else pca_keys.obsm
++        pca(adata, n_comps=n_pcs, key_added=key_added)
++        rep = _choose_representation(adata, use_rep=use_rep, n_pcs=n_pcs)
+     rep = _to_dense_gpu(rep)
+     rep = cp.asarray(rep, dtype=cp.float32)
+     if n_pcs is not None and n_pcs < rep.shape[1]:
+diff --git a/src/rapids_singlecell/preprocessing/_harmony/__init__.py b/src/rapids_singlecell/preprocessing/_harmony/__init__.py
+index 370239ce3..fc2dc440f 100644
+--- a/src/rapids_singlecell/preprocessing/_harmony/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_harmony/__init__.py
+@@ -478,6 +478,9 @@ def _initialize_centroids(
+     # that contains every observed batch stratum: reproducible and cheaper than
+     # fitting every cell.
+     n_init_cells = min(Z_norm.shape[0], _KMEANS_INIT_CELLS_PER_CLUSTER * n_clusters)
++    if n_init_cells < cat_offsets.size - 1:
++        n_strata = int(cp.count_nonzero(cp.diff(cat_offsets)))
++        n_init_cells = max(n_init_cells, n_strata)
+     Z_init = Z_norm
+     if n_init_cells < Z_norm.shape[0]:
+         sample_indices = _stratified_sample_indices(
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/__init__.py b/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
+index 9d6cc6c36..99402b4ab 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/__init__.py
+@@ -114,6 +114,8 @@ def neighbors(
+         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
+     metric
+         A known metric's name or a callable that returns a distance.
++        For ``inner_product``, ``distances`` stores raw similarities; UMAP and
++        Gaussian weighting use positive score gaps, with self at distance zero.
+     metric_kwds
+         Options for the metric.
+     method
+@@ -243,6 +245,7 @@ def neighbors(
+         n_neighbors=n_neighbors,
+         rng=rng,
+         method=method,
++        metric=metric,
+     )
+     if connectivities.nnz >= np.iinfo(np.int32).max:
+         connectivities = connectivities.get().tocsr()
+@@ -332,6 +335,8 @@ def bbknn(
+         Please ensure that the chosen algorithm is compatible with your dataset and the specific requirements of your search problem.
+     metric
+         A known metric's name or a callable that returns a distance.
++        For ``inner_product``, ``distances`` stores raw similarities; graph
++        weighting uses positive score gaps, with self at distance zero.
+     metric_kwds
+         Options for the metric.
+     algorithm_kwds
+@@ -438,7 +443,8 @@ def bbknn(
+     # Sort each row so neighbors are ordered closest-first across all batches.
+     # fuzzy_simplicial_set uses the first non-zero distance per row as the
+     # local-connectivity rho; unsorted input collapses sigma and weights.
+-    order = cp.argsort(knn_dist, axis=1)
++    # ``inner_product`` stores similarities, so larger is closer.
++    order = cp.argsort(-knn_dist if metric == "inner_product" else knn_dist, axis=1)
+     row_idx = cp.arange(n_obs)[:, None]
+     knn_dist = knn_dist[row_idx, order]
+     knn_indices = knn_indices[row_idx, order]
+@@ -466,6 +472,10 @@ def bbknn(
+         n_obs=n_obs,
+         n_neighbors=total_neighbors,
+         rng=rng,
++        metric=metric,
++        batch_codes=cp.asarray(np.searchsorted(unique_batches, batch_array))
++        if metric == "inner_product"
++        else None,
+     )
+     if connectivities.nnz >= np.iinfo(np.int32).max:
+         connectivities = connectivities.get().tocsr()
+diff --git a/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py b/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py
+index 81e23d332..6fee8684f 100644
+--- a/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py
++++ b/src/rapids_singlecell/preprocessing/_neighbors/_neighbors.py
+@@ -264,6 +264,36 @@ def _get_connectivities_jaccard(
+     return W
+ 
+ 
++def _inner_product_distances(
++    knn_indices: cp.ndarray,
++    similarities: cp.ndarray,
++    *,
++    batch_codes: cp.ndarray | None = None,
++) -> tuple[cp.ndarray, cp.ndarray]:
++    """Prepare row-local score gaps with one self-neighbor for graph weighting."""
++    n_obs, k = knn_indices.shape
++    self_indices = cp.arange(n_obs, dtype=knn_indices.dtype)[:, None]
++    scores = cp.where(knn_indices == self_indices, -cp.inf, similarities)
++    if batch_codes is not None:
++        # Replace self within its own batch, preserving BBKNN's batch balance.
++        same_batch = batch_codes[knn_indices] == batch_codes[:, None]
++        replace = cp.argmin(cp.where(same_batch, scores, cp.inf), axis=1)
++        scores[cp.arange(n_obs), replace] = -cp.inf
++    order = cp.argsort(-scores, axis=1)[:, : k - 1]
++    indices = cp.take_along_axis(knn_indices, order, axis=1)
++    scores = cp.take_along_axis(scores, order, axis=1)
++    gaps = scores[:, :1] - scores
++    if k > 1:
++        # A positive offset keeps UMAP's rho on the best nonself neighbor;
++        # using the local span preserves score differences without a global shift.
++        span = gaps[:, -1:]
++        gaps += cp.where(span > 0, span, 1)
++    return (
++        cp.concatenate((self_indices, indices), axis=1),
++        cp.concatenate((cp.zeros((n_obs, 1), dtype=similarities.dtype), gaps), axis=1),
++    )
++
++
+ def _calc_connectivities(
+     knn_indices: cp.ndarray,
+     knn_dist: cp.ndarray,
+@@ -272,6 +302,8 @@ def _calc_connectivities(
+     n_neighbors: int,
+     rng: np.random.Generator,
+     method: Literal["umap", "gauss", "jaccard"] = "umap",
++    metric: _Metrics = "euclidean",
++    batch_codes: cp.ndarray | None = None,
+ ) -> cp_sparse.spmatrix:
+     """Compute connectivities from KNN arrays.
+ 
+@@ -289,11 +321,19 @@ def _calc_connectivities(
+         Random generator (a seed is drawn for the UMAP fuzzy simplicial set).
+     method
+         Method for computing connectivities.
++    metric
++        Search metric; inner-product similarities are converted for weighting.
++    batch_codes
++        Per-cell batch codes for preserving BBKNN's self-neighbor allocation.
+ 
+     Returns
+     -------
+     CuPy sparse matrix on GPU.
+     """
++    if metric == "inner_product" and method != "jaccard":
++        knn_indices, knn_dist = _inner_product_distances(
++            knn_indices, knn_dist, batch_codes=batch_codes
++        )
+     if method == "gauss":
+         return _get_connectivities_gauss(
+             knn_indices,
+diff --git a/src/rapids_singlecell/squidpy_gpu/_niche.py b/src/rapids_singlecell/squidpy_gpu/_niche.py
+index a451acee4..a53a832ba 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_niche.py
++++ b/src/rapids_singlecell/squidpy_gpu/_niche.py
+@@ -818,6 +818,7 @@ def _neighborhood_profile(
+     if adj.dtype != cp.float32:
+         adj = adj.astype(cp.float32)
+     adj.eliminate_zeros()
++    adj.data[:] = 1.0
+ 
+     if distance == 1 or weights is None:
+         weights = [1.0] * distance
+@@ -831,6 +832,7 @@ def _neighborhood_profile(
+     for hop in range(distance):
+         if hop > 0:
+             adj_k = adj_k @ adj
++            adj_k.data[:] = 1.0
+         counts = adj_k @ one_hot  # (n_obs, n_cats) dense
+         if not abs_nhood:
+             row_sum = counts.sum(axis=1, keepdims=True)
+diff --git a/tests/pertpy/test_mixscape.py b/tests/pertpy/test_mixscape.py
+index e6f48fb5e..28b863f96 100644
+--- a/tests/pertpy/test_mixscape.py
++++ b/tests/pertpy/test_mixscape.py
+@@ -191,6 +191,49 @@ def test_perturbation_signature_writes_layer(mixscape_adata):
+     assert mixscape_adata.layers["X_pert"].shape == mixscape_adata.shape
+ 
+ 
++@pytest.mark.parametrize("analyzer", [rsc.ptg.Mixscape, rsc.ptg.Mixscale])
++@pytest.mark.parametrize("preset", list(rsc.Preset))
++@pytest.mark.parametrize("pca_keys", [("X_pca",), ("pca",), ("X_pca", "pca")])
++def test_perturbation_signature_recomputes_short_pca(
++    mixscape_adata, analyzer, preset, pca_keys
++):
++    adata = mixscape_adata
++    selected_key = pca_keys[0]
++    key_added = None if selected_key == "X_pca" else selected_key
++    with rsc.settings.override(preset=preset, N_PCS=3):
++        rsc.pp.pca(adata, n_comps=2, key_added=key_added)
++        if len(pca_keys) > 1:
++            rsc.pp.pca(adata, n_comps=6, key_added="pca")
++        expected = adata.copy()
++        rsc.pp.pca(expected, n_comps=4, key_added=key_added)
++
++        for target in (adata, expected):
++            analyzer().perturbation_signature(
++                target, pert_key="gene_target", control="NT", n_pcs=4
++            )
++
++    assert adata.obsm[selected_key].shape[1] == 4
++    assert set(adata.obsm) == set(pca_keys)
++    if len(pca_keys) > 1:
++        np.testing.assert_array_equal(adata.obsm["pca"], expected.obsm["pca"])
++    cp.testing.assert_allclose(adata.layers["X_pert"], expected.layers["X_pert"])
++
++
++@pytest.mark.parametrize("use_rep", ["X_pca", "pca", "custom"])
++def test_perturbation_signature_explicit_rep_is_not_recomputed(mixscape_adata, use_rep):
++    adata = mixscape_adata
++    adata.obsm[use_rep] = np.zeros((adata.n_obs, 2), dtype=np.float32)
++    with (
++        rsc.settings.override(N_PCS=3),
++        pytest.raises(ValueError, match="does not have enough Dimensions"),
++    ):
++        rsc.ptg.Mixscape().perturbation_signature(
++            adata, pert_key="gene_target", control="NT", use_rep=use_rep, n_pcs=4
++        )
++    assert adata.obsm[use_rep].shape[1] == 2
++    assert "pca" not in adata.uns
++
++
+ def test_mixscape_requires_signature(mixscape_adata):
+     with pytest.raises(KeyError, match="X_pert"):
+         rsc.ptg.Mixscape().mixscape(
+diff --git a/tests/test_harmony.py b/tests/test_harmony.py
+index e3d7f09b8..431c4d46f 100644
+--- a/tests/test_harmony.py
++++ b/tests/test_harmony.py
+@@ -170,6 +170,38 @@ def test_harmony_stratified_sample_known_quotas():
+     np.testing.assert_array_equal(counts, [0, 1, 1, 3, 0, 4])
+ 
+ 
++@pytest.mark.filterwarnings("ignore:Harmony did not converge")
++@pytest.mark.parametrize("batch_key", ["stratum", ["row", "column"]])
++def test_harmony_initialization_sample_covers_strata(batch_key, monkeypatch):
++    rng = np.random.default_rng(0)
++    strata = np.tile(np.arange(9), 2)
++    adata = ad.AnnData(
++        X=None,
++        obs=pd.DataFrame(
++            {
++                "stratum": pd.Categorical(strata, categories=np.arange(12)),
++                "row": strata // 3,
++                "column": strata % 3,
++            },
++            index=[f"cell_{i}" for i in range(strata.size)],
++        ),
++        obsm={"X_pca": rng.normal(size=(strata.size, 4)).astype(np.float32)},
++    )
++    monkeypatch.setattr(harmony_module, "_KMEANS_INIT_CELLS_PER_CLUSTER", 2)
++    rsc.pp.harmony_integrate(
++        adata,
++        batch_key,
++        n_clusters=2,
++        max_iter_harmony=1,
++        max_iter_clustering=2,
++        block_proportion=1.0,
++        random_state=0,
++    )
++
++    assert adata.obsm["X_pca_harmony"].shape == (strata.size, 4)
++    assert np.isfinite(adata.obsm["X_pca_harmony"]).all()
++
++
+ def test_harmony_joint_code_overflow_fallback_is_one_dimensional():
+     n_covariates = 64
+     batch_codes = np.stack(
+diff --git a/tests/test_neighbors.py b/tests/test_neighbors.py
+index 41c061ba7..561b654e8 100644
+--- a/tests/test_neighbors.py
++++ b/tests/test_neighbors.py
+@@ -47,6 +47,90 @@ def test_umap_connectivities_euclidean(algo):
+     assert np.allclose(adata.obsp["connectivities"].toarray(), connectivities_umap)
+ 
+ 
++@pytest.mark.parametrize("batch_balanced", [False, True])
++def test_inner_product_connectivities_match_cosine(batch_balanced):
++    X = np.random.default_rng(0).random((100, 5), dtype=np.float32)
++    X /= np.linalg.norm(X, axis=1, keepdims=True)
++    cosine, inner_product = AnnData(X.copy()), AnnData(X.copy())
++    for adata, metric in [(cosine, "cosine"), (inner_product, "inner_product")]:
++        if batch_balanced:
++            adata.obs["batch"] = np.arange(adata.n_obs) % 2
++            bbknn(
++                adata,
++                batch_key="batch",
++                neighbors_within_batch=5,
++                trim=0,
++                metric=metric,
++            )
++        else:
++            neighbors(adata, n_neighbors=10, metric=metric)
++    np.testing.assert_allclose(
++        inner_product.obsp["connectivities"].toarray(),
++        cosine.obsp["connectivities"].toarray(),
++        atol=1e-4,
++    )
++
++
++@pytest.mark.parametrize("method", ["umap", "gauss"])
++@pytest.mark.parametrize("sparse", [False, True])
++def test_inner_product_unnormalized_connectivities(method, sparse):
++    X = np.random.default_rng(8).normal(size=(40, 5)).astype(np.float32)
++    X *= np.geomspace(0.1, 10, len(X))[:, None]
++    products = X @ X.T
++    k = 6
++    expected_indices = np.argsort(-products, axis=1)[:, :k]
++    assert np.any(expected_indices[:, 0] != np.arange(len(X)))
++    assert np.any(~np.any(expected_indices == np.arange(len(X))[:, None], axis=1))
++    graphs = []
++    for scale in [1, 10]:
++        adata = AnnData(sc_sparse.csr_matrix(X * scale) if sparse else X * scale)
++        neighbors(adata, n_neighbors=k, metric="inner_product", method=method)
++        distances = adata.obsp["distances"]
++        indices = distances.indices.reshape(len(X), k)
++        np.testing.assert_array_equal(
++            np.sort(indices, axis=1), np.sort(expected_indices, axis=1)
++        )
++        np.testing.assert_allclose(
++            distances.data.reshape(len(X), k),
++            products[np.arange(len(X))[:, None], indices] * scale**2,
++            rtol=1e-5,
++        )
++        graph = adata.obsp["connectivities"]
++        assert np.all(np.isfinite(graph.data))
++        assert np.all((graph.data > 0) & (graph.data <= 1))
++        assert np.any(graph.data < 0.9)
++        assert not np.any(graph.diagonal())
++        graphs.append(graph.toarray())
++    np.testing.assert_allclose(graphs[0], graphs[1], atol=1e-4)
++
++
++@pytest.mark.parametrize("method", ["umap", "gauss"])
++def test_inner_product_tied_scores(method):
++    adata = AnnData(np.ones((10, 2), dtype=np.float32))
++    neighbors(adata, n_neighbors=4, metric="inner_product", method=method)
++    graph = adata.obsp["connectivities"]
++    assert graph.nnz > 0
++    assert np.all(np.isfinite(graph.data))
++    assert np.all((graph.data > 0) & (graph.data <= 1))
++    assert not np.any(graph.diagonal())
++
++
++def test_inner_product_bbknn_preserves_cross_batch_neighbors():
++    adata = AnnData(np.array([[1], [2], [-1], [-2]], dtype=np.float32))
++    adata.obs["batch"] = ["a", "a", "b", "b"]
++    bbknn(
++        adata,
++        batch_key="batch",
++        neighbors_within_batch=1,
++        metric="inner_product",
++        trim=0,
++    )
++    np.testing.assert_array_equal(
++        adata.obsp["connectivities"].toarray(),
++        [[0, 0, 1, 1], [0, 0, 1, 0], [1, 1, 0, 0], [1, 0, 0, 0]],
++    )
++
++
+ @pytest.mark.parametrize("algo", ["brute", "ivfflat", "cagra", "ivfpq", "nn_descent"])
+ def test_algo(algo):
+     adata = pbmc68k_reduced()
+diff --git a/tests/test_niche.py b/tests/test_niche.py
+index 7d79af08e..5df3f864a 100644
+--- a/tests/test_niche.py
++++ b/tests/test_niche.py
+@@ -7,7 +7,7 @@
+ import numpy as np
+ import pandas as pd
+ import pytest
+-from anndata import read_h5ad
++from anndata import AnnData, read_h5ad
+ from cupyx.scipy import sparse as sparse_gpu
+ from scipy import sparse
+ 
+@@ -180,6 +180,55 @@ def test_n_hop_neighbors(adata):
+     assert "nhood_niche_res=0.5" in adata.obs.columns
+ 
+ 
++@pytest.mark.parametrize("weighted", [False, True])
++@pytest.mark.parametrize("on_gpu", [False, True])
++@pytest.mark.parametrize("abs_nhood", [False, True])
++def test_neighborhood_profile_counts_unique_neighbors(weighted, on_gpu, abs_nhood):
++    # Cell 3 is reachable from cell 0 by two paths, cell 4 by one.
++    # Cell 5 has no label and an explicitly stored zero self-edge.
++    edge_weights = [2, 5, 7, 3, 1, 4] if weighted else [1] * 6
++    graph = sparse.csr_matrix(
++        (edge_weights + [0], ([0, 0, 0, 1, 1, 2, 5], [1, 2, 5, 3, 4, 3, 5])),
++        shape=(6, 6),
++        dtype=np.float32,
++    )
++    a = AnnData(
++        obs=pd.DataFrame(
++            {GROUPS: pd.Categorical(["A", "A", "B", "A", "B", None])},
++            index=[str(i) for i in range(6)],
++        ),
++        obsp={
++            SPATIAL_CONNECTIVITIES_KEY: sparse_gpu.csr_matrix(graph)
++            if on_gpu
++            else graph
++        },
++    )
++    before = graph.copy()
++
++    profile = cp.asnumpy(
++        _neighborhood_profile(
++            a,
++            groups=GROUPS,
++            distance=2,
++            weights=[1.0, 0.5],
++            abs_nhood=abs_nhood,
++            key=SPATIAL_CONNECTIVITIES_KEY,
++        )
++    )
++
++    expected = (
++        [[1.5, 1.5], [1, 1], [1, 0], [0, 0], [0, 0], [0, 0]]
++        if abs_nhood
++        else [[0.5, 0.5], [1 / 3, 1 / 3], [2 / 3, 0], [0, 0], [0, 0], [0, 0]]
++    )
++    np.testing.assert_allclose(profile, expected)
++    after = a.obsp[SPATIAL_CONNECTIVITIES_KEY]
++    if on_gpu:
++        after = after.get()
++    for attr in ("data", "indices", "indptr"):
++        np.testing.assert_array_equal(getattr(after, attr), getattr(before, attr))
++
++
+ def test_min_niche_size_relabels_all(adata):
+     """min_niche_size > n_obs should send every cell to 'not_a_niche'."""
+     calculate_niche(

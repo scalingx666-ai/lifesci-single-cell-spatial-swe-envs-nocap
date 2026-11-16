@@ -1,0 +1,325 @@
+diff --git a/crates/salmon-align/src/bam_rad.rs b/crates/salmon-align/src/bam_rad.rs
+index 26007a28d..3b7eb10c7 100644
+--- a/crates/salmon-align/src/bam_rad.rs
++++ b/crates/salmon-align/src/bam_rad.rs
+@@ -108,7 +108,11 @@ pub fn write_alignment_rad(
+     let num_refs = names.len();
+     anyhow::ensure!(num_refs > 0, "BAM header has no reference sequences");
+ 
+-    let bias_on = opts.seq_bias || opts.gc_bias || opts.pos_bias;
++    // Gated on `!no_length_correction` like the reads-mode twin: without
++    // length correction the requant disables bias, so baking bias seeds here
++    // would spend a naive eq-class pass + seed EM on abundances nothing can
++    // ever consume (#1140).
++    let bias_on = (opts.seq_bias || opts.gc_bias || opts.pos_bias) && !opts.no_length_correction;
+     // Paired unless the library type is explicitly single-end (matches the
+     // alignment-mode `paired_lib` derivation in `quantify_alignments`).
+     let is_paired = !matches!(opts.lib_type.as_str(), "U" | "SF" | "SR" | "S");
+@@ -214,10 +218,17 @@ pub fn write_alignment_rad(
+     // ---- end-of-pass bake (single quant pass) ----------------------------
+     let (frag_dist, det_fmt) = fld.finish(opts.fld_mean, opts.fld_sd);
+     writer.set_frag_length_dist(frag_dist.log_pmf());
+-    let resolved_fmt = expected_format.or(det_fmt);
+-    if let Some(f) = resolved_fmt {
++    // Two different questions, two different precedences (#1140). The baked
++    // library-format tag answers "what did the pass observe?" — detected wins,
++    // matching the reads-mode writer — so `quantify_rad` can compare it against
++    // an explicit `-l` and fire `library_type_mismatch`; baking the user's
++    // assertion instead silenced that diagnostic on this path and echoed the
++    // assertion back as `detected_library_type`. Filtering below answers "what
++    // did the user ask for?" — expected wins, like every strand filter.
++    if let Some(f) = det_fmt.or(expected_format) {
+         writer.set_library_format(f.format_id());
+     }
++    let resolved_fmt = expected_format.or(det_fmt);
+ 
+     if let Some(nb) = naive.as_ref() {
+         // Rough seed EM on the naive (uniform-weight) eq-classes, with
+diff --git a/crates/salmon-align/src/genome_project.rs b/crates/salmon-align/src/genome_project.rs
+index 7d8eb4a11..4a38a9010 100644
+--- a/crates/salmon-align/src/genome_project.rs
++++ b/crates/salmon-align/src/genome_project.rs
+@@ -201,10 +201,13 @@ pub fn project_genome_bam_to_rad(
+         "A" | "IU" | "U" => None,
+         s => LibraryFormat::parse(s).ok(),
+     };
+-    let resolved_fmt = expected_format.or(det_fmt);
+-    if let Some(f) = resolved_fmt {
++    // Tag bake: detected wins, matching the reads-mode writer, so an explicit
++    // `-l` can still fire `library_type_mismatch` downstream; the filter below
++    // keeps expected-wins (see the same split in `bam_rad.rs`, #1140).
++    if let Some(f) = det_fmt.or(expected_format) {
+         writer.set_library_format(f.format_id());
+     }
++    let resolved_fmt = expected_format.or(det_fmt);
+     if let Some(nb) = naive.as_ref() {
+         let cond_means = frag_dist.conditional_means();
+         let eff_lengths: Vec<f64> = lengths
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index 2417a74b1..9eb2c411f 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -2775,6 +2775,19 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         counts.diagnostics()
+     };
+ 
++    // Warn wherever the mass was actually dropped — this writer is shared by
++    // every quantify_rad driver and the online alignment path, so the 2.6.0
++    // default surfaces the condition it computes instead of only recording it
++    // silently in meta_info.json (#1140: the warning previously lived only in
++    // the deprecated drivers).
++    if res.inference_truncated_mass > 0.0 {
++        tracing::warn!(
++            "{:.3} fragments of equivalence-class mass could not be assigned (every member \
++             transcript was truncated below the min-alpha threshold); reported as \
++             inference_truncated_mass in meta_info.json",
++            res.inference_truncated_mass
++        );
++    }
+     let meta = MetaInfo {
+         salmon_version: SALMON_VERSION.to_string(),
+         // What kind of posterior samples were actually produced, so tximport
+@@ -2874,11 +2887,16 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         },
+         total_time_seconds: res.total_seconds,
+         peak_rss_kb: res.peak_rss_kb,
+-        // The run's own diagnostics plus the library-format warnings, so
+-        // `meta_info.json` carries every machine-readable concern (#1140).
++        // The run's own diagnostics, the library-format warnings, and any
++        // driver-supplied diagnostics (`extra_diagnostics`, e.g. phase 1's
++        // AS-tag warning), so `meta_info.json` carries every machine-readable
++        // concern (#1140). Appended here, in the writer both `quantify_rad`
++        // and `quantify_alignments` share, so the field's promise holds on
++        // every path rather than only the RAD one.
+         diagnostics: {
+             let mut d = res.diagnostics.clone();
+             d.extend(lib_diags.iter().cloned());
++            d.extend(opts.extra_diagnostics.iter().cloned());
+             d
+         },
+         call: "quant".to_string(),
+diff --git a/crates/salmon-align/src/rad.rs b/crates/salmon-align/src/rad.rs
+index eaaec494d..c974b5dd5 100644
+--- a/crates/salmon-align/src/rad.rs
++++ b/crates/salmon-align/src/rad.rs
+@@ -2237,17 +2237,18 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+     let requested_lib = LibraryFormat::parse(&opts.lib_type)
+         .map(|f| f.canonical().to_string())
+         .unwrap_or_else(|_| opts.lib_type.clone());
+-    let mut diagnostics = salmon_core::input_diagnostics(
++    let diagnostics = salmon_core::input_diagnostics(
+         num_processed,
+         num_mapped,
+         auto_detect,
+         &requested_lib,
+         detected_library_type.as_deref(),
+     );
+-    // Phase-1 diagnostics the driver handed in, merged before logging so they
+-    // are both spoken and recorded like this pass's own.
+-    diagnostics.extend(opts.extra_diagnostics.iter().cloned());
+-    for d in &diagnostics {
++    // Phase-1 diagnostics the driver handed in are *spoken* here alongside
++    // this pass's own; *recording* into meta_info.json happens once, in the
++    // shared output writer, so the alignment path honours the field too
++    // (#1140 — do not extend `diagnostics` with them here or they double).
++    for d in diagnostics.iter().chain(opts.extra_diagnostics.iter()) {
+         if d.severity == "error" {
+             tracing::error!("{}", d.message);
+         } else {
+diff --git a/crates/salmon-align/tests/deterministic_bam.rs b/crates/salmon-align/tests/deterministic_bam.rs
+index 6cac2ac4f..68379164a 100644
+--- a/crates/salmon-align/tests/deterministic_bam.rs
++++ b/crates/salmon-align/tests/deterministic_bam.rs
+@@ -365,3 +365,67 @@ fn the_error_model_path_says_nothing_about_as() {
+     let summary = write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
+     assert!(summary.score_tag_warning.is_none());
+ }
++
++/// The baked library-format tag records what the pass *observed* (detected
++/// wins), matching the reads-mode deterministic writer — so an explicit `-l`
++/// that contradicts the alignments fires `library_type_mismatch` in phase 2.
++/// The writer used to bake the user's assertion (expected wins), which both
++/// silenced that diagnostic on this path and echoed the assertion back as
++/// `detected_library_type` (#1140, audit F18).
++#[test]
++fn a_wrong_explicit_lib_type_is_diagnosed() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = write_sam(dir.path()); // fixture pairs are ISF
++
++    let out = dir.path().join("wrong");
++    let rad = dir.path().join("wrong.rad");
++    let mut opts = opts_for(&sam, &out);
++    opts.lib_type = "ISR".to_string();
++    write_alignment_rad(&opts, &rad, ChunkCodec::None).unwrap();
++    quantify_rad(&opts, &rad).unwrap();
++    let meta = std::fs::read_to_string(out.join("aux_info").join("meta_info.json")).unwrap();
++    assert!(
++        meta.contains("library_type_mismatch"),
++        "an ISR assertion over ISF alignments must be diagnosed: {meta}"
++    );
++    assert!(
++        meta.contains("observed format 'ISF'"),
++        "the diagnostic must name what was actually observed: {meta}"
++    );
++
++    // Control: the matching -l draws no complaint.
++    let out_ok = dir.path().join("right");
++    let rad_ok = dir.path().join("right.rad");
++    let mut opts_ok = opts_for(&sam, &out_ok);
++    opts_ok.lib_type = "ISF".to_string();
++    write_alignment_rad(&opts_ok, &rad_ok, ChunkCodec::None).unwrap();
++    quantify_rad(&opts_ok, &rad_ok).unwrap();
++    let meta_ok = std::fs::read_to_string(out_ok.join("aux_info").join("meta_info.json")).unwrap();
++    assert!(
++        !meta_ok.contains("library_type_mismatch"),
++        "a correct explicit -l must not be flagged: {meta_ok}"
++    );
++}
++
++/// `extra_diagnostics` is documented as appended on every path, but only
++/// `quantify_rad` honoured it — the online alignment path dropped the
++/// driver's diagnostics silently (#1140, audit F20). The append now lives in
++/// the shared output writer; this pins the alignment path.
++#[test]
++fn driver_diagnostics_reach_meta_on_the_alignment_path() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = write_sam(dir.path());
++    let out = dir.path().join("q");
++    let mut opts = opts_for(&sam, &out);
++    opts.extra_diagnostics.push(salmon_core::Diagnostic::new(
++        "test_probe_diagnostic",
++        "warning",
++        "carried across from the driver".to_string(),
++    ));
++    salmon_align::quantify_alignments(&opts).unwrap();
++    let meta = std::fs::read_to_string(out.join("aux_info").join("meta_info.json")).unwrap();
++    assert!(
++        meta.contains("test_probe_diagnostic"),
++        "driver-supplied diagnostics must reach meta_info.json on the online -a path: {meta}"
++    );
++}
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index 6db48d435..040d45568 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -390,7 +390,11 @@ struct QuantArgs {
+     /// `piscem map-bulk`) to quantify directly, in parallel.
+     #[arg(long = "rad", conflicts_with_all = ["alignments", "mates1", "mates2", "unmated"])]
+     rad: Option<PathBuf>,
+-    /// Transcriptome FASTA (alignment mode `-a`): enables the alignment error model.
++    /// Transcriptome FASTA for alignment mode (`-a`) and RAD-input mode
++    /// (`--rad`): supplies the reference sequences that seq/GC bias correction
++    /// needs, and (under `--online -a`) enables the alignment error model — the
++    /// default alignment path takes `--errorModel` instead. Ignored in reads
++    /// mode, where the index already carries the sequences.
+     #[arg(short = 't', long = "targets")]
+     targets: Option<PathBuf>,
+     /// Disable the alignment error model (alignment mode).
+@@ -1285,7 +1289,6 @@ fn run_deterministic(
+     rad_out: Option<PathBuf>,
+     scratch_dir: Option<&std::path::Path>,
+     keep_rad: bool,
+-    bias_targets: Option<PathBuf>,
+     gene_map: Option<&GeneMapOpts>,
+     out_dir: &std::path::Path,
+     // The live mapping spinner, owned here so it can be stopped the moment
+@@ -1345,7 +1348,11 @@ fn run_deterministic(
+     // needs (the RAD path, the bias targets) is known by now, and building it
+     // here is what keeps "the phase-2 options" meaning the user's request rather
+     // than whatever phase 1 left behind.
+-    let mut q = requant_options(&map_opts, &rad_path, out_dir, bias_targets);
++    // No `-t` fallback here: reads mode warns and ignores the flag (the index
++    // carries the reference sequences; see the bias load below). The
++    // `bias_targets` seam on `requant_options` exists for the alignment/RAD
++    // drivers, which have no index to fall back on.
++    let mut q = requant_options(&map_opts, &rad_path, out_dir, None);
+ 
+     // Phase 1 — map once, write the RAD (bakes the deterministic FLD + resolved
+     // library format), skipping the online EM: quantification happens in phase 2.
+@@ -1412,9 +1419,12 @@ fn run_deterministic(
+ 
+     // Phase 2 — deterministic quant from the RAD (fixed baked FLD + library
+     // format ⇒ order-independent eq-classes + EM). Mirrors the `--rad` knob wiring.
+-    // Bias needs the reference sequence. Prefer the index's own sequences (we
+-    // already built the index for phase 1), so the user need not pass `-t`; an
+-    // explicit `-t` is still honoured as a fallback.
++    // Bias needs the reference sequence, and in reads mode it always comes
++    // from the index (which carries the sequences by construction — we just
++    // mapped against it); `-t` is warned-and-ignored at dispatch. A previous
++    // comment here claimed `-t` was "honoured as a fallback", but the fallback
++    // was unreachable: with bias on this load always wins, with bias off the
++    // sequences are never read (#1140).
+     if bias_on {
+         q.ref_seqs = Some(
+             salmon_index::load_ref_seqs(&map_opts.index_dir)
+@@ -1827,6 +1837,14 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     }
+     // Alignment-based mode: quantify directly from a BAM.
+     if let Some(bam) = args.alignments {
++        if args.index.is_some() {
++            // Accepted-but-inert flags must say so (#1140): the BAM is
++            // quantified as given; no index is consulted in this mode.
++            tracing::warn!(
++                "-i/--index is ignored in alignment mode (-a): the input alignments are \
++                 quantified directly and the index is never consulted"
++            );
++        }
+         warn_unsupported_mapping_output(
+             &args.write_mappings,
+             &args.write_bam,
+@@ -1985,14 +2003,8 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+                 res.num_eq_classes
+             );
+         }
+-        if res.inference_truncated_mass > 0.0 {
+-            tracing::warn!(
+-                "{:.3} fragments of equivalence-class mass could not be assigned (every member \
+-                 transcript was truncated below the min-alpha threshold); reported as \
+-                 inference_truncated_mass in meta_info.json",
+-                res.inference_truncated_mass
+-            );
+-        }
++        // The truncated-mass warning now fires in the shared output writer,
++        // covering this path and every quantify_rad driver alike (#1140).
+         if let Some(gm) = &gene_map {
+             write_gene_level(
+                 &out_dir,
+@@ -2009,6 +2021,13 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+ 
+     // RAD-input mode: quantify directly from a RAD file of mappings, in parallel.
+     if let Some(rad_path) = args.rad {
++        if args.index.is_some() {
++            // Accepted-but-inert flags must say so (#1140), same as `-a` above.
++            tracing::warn!(
++                "-i/--index is ignored in RAD-input mode (--rad): the RAD's own reference \
++                 table is used and the index is never consulted"
++            );
++        }
+         warn_unsupported_mapping_output(
+             &args.write_mappings,
+             &args.write_bam,
+@@ -2091,6 +2110,16 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         "the number of -1 and -2 files must match"
+     );
+     let index = args.index.context("reads mode requires -i/--index")?;
++    if args.targets.is_some() {
++        // Accepted-but-inert flags must say so (#1140). Both reads paths ignore
++        // `-t`: bias correction loads the reference sequences from the index
++        // (which carries them by construction), and the alignment error model
++        // it enables belongs to alignment input (`-a`).
++        tracing::warn!(
++            "-t/--targets is ignored in reads mode: bias correction uses the index's own \
++             reference sequences, and the alignment error model applies only to -a input"
++        );
++    }
+ 
+     let mut opts = QuantOptions::new(index, args.output);
+     opts.mates1 = args.mates1;
+@@ -2212,7 +2241,6 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             rad_out,
+             args.rad_scratch_dir.as_deref(),
+             args.keep_rad,
+-            args.targets.clone(),
+             gene_map.as_ref(),
+             &out_dir,
+             spinner,

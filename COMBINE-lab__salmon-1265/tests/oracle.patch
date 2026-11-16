@@ -1,0 +1,1319 @@
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index be353af23..f4a06f9b0 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -2176,14 +2176,14 @@ fn apply_bias_correction(
+                     )
+                 });
+             let bias = salmon_model::BiasInputs {
+-                seq: seq_tab.as_ref().map(|(f, r)| (f, r)),
++                seq: seq_tab.as_ref().map(|(f, r)| (f, r, s)),
+                 gc: gc_ratio_model.as_ref().map(|g| (g, gc_store.view(tid))),
+                 pos: pos_vecs
+                     .as_ref()
+                     .map(|(pf, pr)| (pf.as_slice(), pr.as_slice())),
+             };
+             *eff_length = salmon_model::corrected_effective_length_full(
+-                s,
++                s.len(),
+                 &fld_cdf,
+                 fld_low,
+                 fld_high,
+diff --git a/crates/salmon-core/src/lib.rs b/crates/salmon-core/src/lib.rs
+index 85be91ace..0169de3e3 100644
+--- a/crates/salmon-core/src/lib.rs
++++ b/crates/salmon-core/src/lib.rs
+@@ -57,7 +57,7 @@ pub use libtype::{
+     LibFormatSummary, NUM_LIB_FORMATS,
+ };
+ pub use progress::ProgressCounters;
+-pub use refprovider::RefProvider;
++pub use refprovider::{pack_bases, OtherRun, RefProvider, RefView};
+ pub use timing::PhaseTimer;
+ 
+ pub use error::{Result, SalmonError};
+diff --git a/crates/salmon-core/src/refprovider.rs b/crates/salmon-core/src/refprovider.rs
+index 7995e9521..16d8551fb 100644
+--- a/crates/salmon-core/src/refprovider.rs
++++ b/crates/salmon-core/src/refprovider.rs
+@@ -15,11 +15,11 @@ pub trait RefProvider {
+     /// Number of references.
+     fn num_refs(&self) -> usize;
+ 
+-    /// Forward-strand sequence of reference `tid` (ASCII `ACGT`).
++    /// Forward-strand sequence of reference `tid`.
+     ///
+-    /// Returns a borrowed slice rather than a copy: transcriptomes are hundreds
++    /// Returns a borrowed view rather than a copy: transcriptomes are hundreds
+     /// of megabytes and this is called for every alignment.
+-    fn ref_seq(&self, tid: u32) -> &[u8];
++    fn ref_view(&self, tid: u32) -> RefView<'_>;
+ 
+     /// Whether reference `tid` is a decoy (genomic) sequence.
+     ///
+@@ -34,3 +34,499 @@ pub trait RefProvider {
+         false
+     }
+ }
++
++/// A stretch of reference bytes that two bits cannot hold (`N`, IUPAC codes,
++/// lowercase): `len` copies of `byte` from position `start` of the concatenation.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OtherRun {
++    pub start: u64,
++    pub len: u32,
++    pub byte: u8,
++}
++
++/// The base for each two-bit code; the code of a base is `(byte >> 1) & 3`.
++const BASES: [u8; 4] = *b"ACTG";
++
++/// The four bases held by each packed byte.
++static UNPACKED: [[u8; 4]; 256] = {
++    let mut t = [[0u8; 4]; 256];
++    let mut i = 0;
++    while i < 256 {
++        t[i] = [
++            BASES[i & 3],
++            BASES[(i >> 2) & 3],
++            BASES[(i >> 4) & 3],
++            BASES[(i >> 6) & 3],
++        ];
++        i += 1;
++    }
++    t
++};
++
++#[inline]
++fn is_acgt(b: u8) -> bool {
++    (b == b'A') | (b == b'C') | (b == b'G') | (b == b'T')
++}
++
++/// Pack `bytes` into `out`, one byte per four bases, and append what two bits
++/// cannot hold to `runs`. `start` is the position of `bytes[0]` in the
++/// concatenation. `out` must hold `bytes.len().div_ceil(4)` bytes.
++pub fn pack_bases(bytes: &[u8], out: &mut [u8], start: u64, runs: &mut Vec<OtherRun>) {
++    let (chunks, rest) = bytes.as_chunks::<4>();
++    for (c, o) in chunks.iter().zip(out.iter_mut()) {
++        let w = u32::from_le_bytes(*c);
++        let x = (w >> 1) & 0x0303_0303;
++        let y = x | (x >> 6);
++        *o = (y | (y >> 12)) as u8;
++    }
++    if !rest.is_empty() {
++        let mut o = 0u8;
++        for (i, &b) in rest.iter().enumerate() {
++            o |= ((b >> 1) & 3) << (2 * i);
++        }
++        out[bytes.len() / 4] = o;
++    }
++    if bytes.iter().fold(true, |ok, &b| ok & is_acgt(b)) {
++        return;
++    }
++    for (i, &b) in bytes.iter().enumerate() {
++        if is_acgt(b) {
++            continue;
++        }
++        let pos = start + i as u64;
++        match runs.last_mut() {
++            Some(r) if r.byte == b && r.start + u64::from(r.len) == pos && r.len < u32::MAX => {
++                r.len += 1;
++            }
++            _ => runs.push(OtherRun {
++                start: pos,
++                len: 1,
++                byte: b,
++            }),
++        }
++    }
++}
++
++/// One reference's bases, stored as they are or at two bits per base.
++#[derive(Clone, Copy)]
++pub enum RefView<'a> {
++    Bytes(&'a [u8]),
++    Packed {
++        /// the packed concatenation of all references
++        bits: &'a [u8],
++        /// where this reference starts in the concatenation
++        start: u64,
++        len: usize,
++        /// the runs that overlap this reference
++        other: &'a [OtherRun],
++    },
++}
++
++impl<'a> RefView<'a> {
++    /// A reference's view into a packed concatenation; `runs` covers all of it.
++    #[inline]
++    pub fn packed(bits: &'a [u8], start: u64, end: u64, runs: &'a [OtherRun]) -> Self {
++        let other = if runs.is_empty() {
++            runs
++        } else {
++            let lo = runs.partition_point(|r| r.start + u64::from(r.len) <= start);
++            let hi = lo + runs[lo..].partition_point(|r| r.start < end);
++            &runs[lo..hi]
++        };
++        Self::Packed {
++            bits,
++            start,
++            len: (end - start) as usize,
++            other,
++        }
++    }
++
++    #[inline]
++    pub fn len(&self) -> usize {
++        match *self {
++            Self::Bytes(b) => b.len(),
++            Self::Packed { len, .. } => len,
++        }
++    }
++
++    #[inline]
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    /// The byte at position `i`, which must be in range.
++    #[inline]
++    pub fn base(&self, i: usize) -> u8 {
++        match *self {
++            Self::Bytes(b) => b[i],
++            Self::Packed {
++                bits,
++                start,
++                len,
++                other,
++            } => {
++                debug_assert!(i < len);
++                let abs = start + i as u64;
++                let code = bits[(abs >> 2) as usize] >> ((abs & 3) * 2);
++                if !other.is_empty() {
++                    let k = other.partition_point(|r| r.start + u64::from(r.len) <= abs);
++                    if let Some(r) = other.get(k) {
++                        if r.start <= abs {
++                            return r.byte;
++                        }
++                    }
++                }
++                BASES[(code & 3) as usize]
++            }
++        }
++    }
++
++    /// The bytes of `lo..hi`: borrowed where they are stored as they are, and
++    /// otherwise decoded into `buf`.
++    #[inline]
++    pub fn slice<'b>(&self, lo: usize, hi: usize, buf: &'b mut Vec<u8>) -> &'b [u8]
++    where
++        'a: 'b,
++    {
++        match *self {
++            Self::Bytes(b) => &b[lo..hi],
++            Self::Packed {
++                bits,
++                start,
++                len,
++                other,
++            } => {
++                assert!(lo <= hi && hi <= len);
++                decode(bits, start + lo as u64, start + hi as u64, other, buf)
++            }
++        }
++    }
++
++    /// How many leading bases of `query` match the reference from position `r`
++    /// on, as [`Self::base`] compared without regard to case, with `N` never
++    /// matching; `query` must fit. `None` when this view has no fast path and
++    /// the bases must be compared one at a time.
++    ///
++    /// Packed bases are compared a word at a time, and the bytes of a run one
++    /// at a time, so a reference with a few `N` runs (a genome decoy) keeps the
++    /// fast path everywhere else.
++    #[inline]
++    pub fn match_right(&self, query: &[u8], r: usize) -> Option<usize> {
++        let Self::Packed {
++            bits, start, other, ..
++        } = *self
++        else {
++            return None;
++        };
++        let begin = start as usize + r;
++        let end = begin + query.len();
++        // The runs that overlap `begin..end`, in order.
++        let first = other.partition_point(|x| run_end(x) <= begin);
++        let mut abs = begin;
++        for run in &other[first..] {
++            let rs = (run.start as usize).max(abs);
++            if rs >= end {
++                break;
++            }
++            let i = abs - begin;
++            let n = words_right(bits, abs, &query[i..i + (rs - abs)]);
++            if abs + n < rs {
++                return Some(i + n);
++            }
++            abs = rs;
++            while abs < run_end(run).min(end) {
++                if !run_base_eq(query[abs - begin], run.byte) {
++                    return Some(abs - begin);
++                }
++                abs += 1;
++            }
++        }
++        let i = abs - begin;
++        Some(i + words_right(bits, abs, &query[i..]))
++    }
++
++    /// How many trailing bases of `query` match the reference just before
++    /// position `r`; see [`Self::match_right`].
++    #[inline]
++    pub fn match_left(&self, query: &[u8], r: usize) -> Option<usize> {
++        let Self::Packed {
++            bits, start, other, ..
++        } = *self
++        else {
++            return None;
++        };
++        // One past the base to compare next, walking down to `floor`.
++        let top = start as usize + r;
++        let floor = top - query.len();
++        // The runs that overlap `floor..top`, walked from the last.
++        let last = other.partition_point(|x| (x.start as usize) < top);
++        let first = other[..last].partition_point(|x| run_end(x) <= floor);
++        let mut abs = top;
++        for run in other[first..last].iter().rev() {
++            let re = run_end(run).min(abs);
++            if re <= floor {
++                break;
++            }
++            let done = top - abs;
++            let q = &query[..query.len() - done];
++            let n = words_left(bits, abs, &q[q.len() - (abs - re)..]);
++            if abs - n > re {
++                return Some(done + n);
++            }
++            abs = re;
++            while abs > (run.start as usize).max(floor) {
++                if !run_base_eq(query[abs - 1 - floor], run.byte) {
++                    return Some(top - abs);
++                }
++                abs -= 1;
++            }
++        }
++        let done = top - abs;
++        Some(done + words_left(bits, abs, &query[..query.len() - done]))
++    }
++}
++
++/// One past the last position of `run`.
++#[inline]
++fn run_end(run: &OtherRun) -> usize {
++    (run.start + u64::from(run.len)) as usize
++}
++
++/// [`RefView::base`]'s comparison for a reference byte held in a run: equal
++/// without regard to case, and never for `N`.
++#[inline]
++fn run_base_eq(q: u8, r: u8) -> bool {
++    let u = q.to_ascii_uppercase();
++    u == r.to_ascii_uppercase() && u != b'N'
++}
++
++/// How many leading bases of `query` match the packed bases from `abs` on,
++/// where no run overlaps them.
++#[inline]
++fn words_right(bits: &[u8], mut abs: usize, query: &[u8]) -> usize {
++    let mut i = 0;
++    while i < query.len() {
++        let idx = abs >> 2;
++        let mut w = match bits.get(idx..idx + 8) {
++            Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
++            None => {
++                let mut t = [0u8; 8];
++                t[..bits.len() - idx].copy_from_slice(&bits[idx..]);
++                u64::from_le_bytes(t)
++            }
++        } >> ((abs & 3) * 2);
++        let take = (32 - (abs & 3)).min(query.len() - i);
++        for &q in &query[i..i + take] {
++            if q & 0xDF != BASES[(w & 3) as usize] {
++                return i;
++            }
++            w >>= 2;
++            i += 1;
++        }
++        abs += take;
++    }
++    i
++}
++
++/// How many trailing bases of `query` match the packed bases just before
++/// `abs`, where no run overlaps them.
++#[inline]
++fn words_left(bits: &[u8], mut abs: usize, query: &[u8]) -> usize {
++    let mut i = 0;
++    while i < query.len() {
++        let idx = (abs - 1) >> 2;
++        let lo = idx.saturating_sub(7);
++        let mut t = [0u8; 8];
++        t[7 - (idx - lo)..].copy_from_slice(&bits[lo..=idx]);
++        // The next base on top.
++        let p = (abs - 1) & 3;
++        let mut w = u64::from_le_bytes(t) << ((3 - p) * 2);
++        let take = ((idx - lo) * 4 + p + 1).min(query.len() - i);
++        let end = query.len() - i;
++        for &q in query[end - take..end].iter().rev() {
++            if q & 0xDF != BASES[(w >> 62) as usize] {
++                return i;
++            }
++            w <<= 2;
++            i += 1;
++        }
++        abs -= take;
++    }
++    i
++}
++
++/// The bytes of `lo..hi`, decoded into `out`, which they need not start.
++fn decode<'b>(bits: &[u8], lo: u64, hi: u64, other: &[OtherRun], out: &'b mut Vec<u8>) -> &'b [u8] {
++    // Whole packed bytes, trimmed to the bases asked for at the end.
++    let skip = (lo & 3) as usize;
++    let n = (hi - lo) as usize;
++    let first = (lo >> 2) as usize;
++    let last = (hi as usize).div_ceil(4);
++    let want = (last - first) * 4;
++    if out.len() < want {
++        out.resize(want, 0);
++    }
++    let (chunks, _) = out[..want].as_chunks_mut::<4>();
++    for (c, &b) in chunks.iter_mut().zip(&bits[first..last]) {
++        *c = UNPACKED[b as usize];
++    }
++    let bases = &mut out[skip..skip + n];
++    let first = other.partition_point(|r| r.start + u64::from(r.len) <= lo);
++    for r in other[first..].iter().take_while(|r| r.start < hi) {
++        let s = r.start.max(lo);
++        let e = (r.start + u64::from(r.len)).min(hi);
++        if s < e {
++            bases[(s - lo) as usize..(e - lo) as usize].fill(r.byte);
++        }
++    }
++    bases
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Every window of a packed sequence reads back as the bytes it came from.
++    #[test]
++    fn packed_views_read_back_the_bytes() {
++        let seq: Vec<u8> = b"ACGTTGCANNNNACGTacgtRYACGTAGGCTNACG".to_vec();
++        for split in [4, 8, 12, 16] {
++            let mut bits = vec![0u8; seq.len().div_ceil(4)];
++            let mut runs = Vec::new();
++            // Packed in two blocks, as the loader does.
++            let (a, b) = seq.split_at(split);
++            let (oa, ob) = bits.split_at_mut(split / 4);
++            pack_bases(a, oa, 0, &mut runs);
++            pack_bases(b, ob, split as u64, &mut runs);
++            let mut buf = Vec::new();
++            for start in 0..seq.len() {
++                for end in start..=seq.len() {
++                    let v = RefView::packed(&bits, start as u64, end as u64, &runs);
++                    assert_eq!(v.len(), end - start);
++                    for i in 0..v.len() {
++                        assert_eq!(v.base(i), seq[start + i], "{start} {end} {i}");
++                    }
++                    for lo in 0..=v.len() {
++                        for hi in lo..=v.len() {
++                            assert_eq!(v.slice(lo, hi, &mut buf), &seq[start + lo..start + hi]);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    /// With runs of `N` and IUPAC codes in the reference, including one that
++    /// crosses the boundary between two packed blocks, the comparisons still
++    /// agree with comparing base by base, `N` never matching.
++    #[test]
++    fn matches_agree_with_bases_across_runs() {
++        let mut x = 99u64;
++        let mut seq: Vec<u8> = (0..400)
++            .map(|_| {
++                x = x
++                    .wrapping_mul(6364136223846793005)
++                    .wrapping_add(1442695040888963407);
++                b"ACGT"[(x >> 60) as usize & 3]
++            })
++            .collect();
++        for (at, run) in [
++            (0, &b"NN"[..]),
++            (37, b"NNNNN"),
++            (61, b"NNNNNN"),
++            (67, b"R"),
++            (130, b"Y"),
++            (131, b"YY"),
++            (398, b"NN"),
++        ] {
++            seq[at..at + run.len()].copy_from_slice(run);
++        }
++        let mut bits = vec![0u8; seq.len().div_ceil(4)];
++        let mut runs = Vec::new();
++        // Two blocks, split inside the run at 61..67, as the loader can.
++        let (a, b) = seq.split_at(64);
++        let (oa, ob) = bits.split_at_mut(16);
++        pack_bases(a, oa, 0, &mut runs);
++        pack_bases(b, ob, 64, &mut runs);
++        let eq = |q: u8, r: u8| {
++            let u = q.to_ascii_uppercase();
++            u == r.to_ascii_uppercase() && u != b'N'
++        };
++        let v = RefView::packed(&bits, 5, 395, &runs);
++        for r in 0..=v.len() {
++            for take in [0, 1, 3, 31, 33, 70, 200] {
++                let n = take.min(v.len() - r);
++                let mut q: Vec<u8> = seq[5 + r..5 + r + n].to_ascii_lowercase();
++                for cut in [n, n / 2] {
++                    if cut < n {
++                        q[cut] = if q[cut].eq_ignore_ascii_case(&b'A') {
++                            b'C'
++                        } else {
++                            b'A'
++                        };
++                    }
++                    let want = (0..n).take_while(|&i| eq(q[i], v.base(r + i))).count();
++                    assert_eq!(
++                        v.match_right(&q, r),
++                        Some(want),
++                        "right r={r} n={n} cut={cut}"
++                    );
++                }
++                let n = take.min(r);
++                let q: Vec<u8> = seq[5 + r - n..5 + r].to_vec();
++                let want = (0..n)
++                    .take_while(|&i| eq(q[n - 1 - i], v.base(r - 1 - i)))
++                    .count();
++                assert_eq!(v.match_left(&q, r), Some(want), "left r={r} n={n}");
++            }
++        }
++    }
++
++    /// The word-at-a-time comparisons agree with comparing base by base.
++    #[test]
++    fn matches_agree_with_bases() {
++        let mut x = 12345u64;
++        let seq: Vec<u8> = (0..300)
++            .map(|_| {
++                x = x
++                    .wrapping_mul(6364136223846793005)
++                    .wrapping_add(1442695040888963407);
++                b"ACGT"[(x >> 60) as usize & 3]
++            })
++            .collect();
++        let mut bits = vec![0u8; seq.len().div_ceil(4)];
++        pack_bases(&seq, &mut bits, 0, &mut Vec::new());
++        let v = RefView::packed(&bits, 7, 290, &[]);
++        for r in 0..v.len() {
++            for take in [0, 1, 5, 33, 70, 200] {
++                let n = take.min(v.len() - r);
++                let mut q: Vec<u8> = seq[7 + r..7 + r + n].to_ascii_lowercase();
++                for cut in [n, n / 2, n / 3] {
++                    if cut < n {
++                        q[cut] = b'N';
++                    }
++                    let want = q
++                        .iter()
++                        .enumerate()
++                        .take_while(|&(i, &b)| b.to_ascii_uppercase() == v.base(r + i))
++                        .count();
++                    assert_eq!(v.match_right(&q, r), Some(want));
++                }
++                let n = take.min(r);
++                let mut q: Vec<u8> = seq[7 + r - n..7 + r].to_vec();
++                for cut in [n, n / 2, n / 3] {
++                    if cut < n {
++                        q[n - 1 - cut] = b'N';
++                    }
++                    let want = q
++                        .iter()
++                        .rev()
++                        .enumerate()
++                        .take_while(|&(i, &b)| b == v.base(r - 1 - i))
++                        .count();
++                    assert_eq!(v.match_left(&q, r), Some(want));
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/salmon-index/src/lib.rs b/crates/salmon-index/src/lib.rs
+index a5cdc44cc..b304d3b97 100644
+--- a/crates/salmon-index/src/lib.rs
++++ b/crates/salmon-index/src/lib.rs
+@@ -1355,12 +1355,93 @@ pub struct SalmonIndex {
+     /// needed for selective-alignment extension and seq/GC bias, so skipping the
+     /// read avoids holding a multi-GB decoy genome resident.
+     refseq: Vec<u8>,
++    /// the same sequences at two bits per base, in place of `refseq` under
++    /// [`RefseqLoad::Packed`]
++    packed: PackedRefseq,
+     /// offsets into `refseq` (`num_refs + 1` entries); empty iff `!refseq_loaded`
+     ref_offsets: Vec<u64>,
+     /// whether the reference sequence bytes were loaded
+     refseq_loaded: bool,
+ }
+ 
++/// How [`SalmonIndex::load_with_opts`] holds the reference sequences.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RefseqLoad {
++    /// Not at all: nothing will read them.
++    None,
++    /// One byte per base, for callers of [`SalmonIndex::ref_seq`] (bias models).
++    Bytes,
++    /// Two bits per base, for mapping, which reads them through
++    /// [`RefProvider::ref_view`](salmon_core::RefProvider::ref_view).
++    Packed,
++}
++
++/// `refseq.bin` at two bits per base; see [`salmon_core::pack_bases`].
++#[derive(Default)]
++struct PackedRefseq {
++    bits: Vec<u8>,
++    other: Vec<salmon_core::OtherRun>,
++    /// For each reference, the range of `other` that overlaps it (a run that
++    /// crosses from one reference into the next is in both). Looking the runs
++    /// up by binary search on every `ref_view` cost 5% of a genome-decoy run,
++    /// which calls it once per seed.
++    runs_of: Vec<(u32, u32)>,
++}
++
++impl PackedRefseq {
++    /// Pack the file directly into its final buffer, so that one byte per base
++    /// is never in memory; block by block across threads, so loading takes no
++    /// longer than reading the file whole.
++    fn load(path: &Path) -> Result<Self> {
++        use std::io::{Read, Seek, SeekFrom};
++        /// bases per block; a multiple of 4 so that blocks start on a packed byte
++        const BLOCK: usize = 1 << 22;
++        let len = std::fs::metadata(path)
++            .with_context(|| format!("reading {REFSEQ_FILE}"))?
++            .len() as usize;
++        let mut bits = vec![0u8; len.div_ceil(4)];
++        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
++        let per_thread = (bits.len().div_ceil(threads)).max(1);
++        let parts: Vec<Vec<salmon_core::OtherRun>> = std::thread::scope(|scope| {
++            let workers: Vec<_> = bits
++                .chunks_mut(per_thread)
++                .enumerate()
++                .map(|(t, out)| {
++                    scope.spawn(move || -> Result<Vec<salmon_core::OtherRun>> {
++                        let first = (t * per_thread * 4) as u64;
++                        let mut f = std::fs::File::open(path)?;
++                        f.seek(SeekFrom::Start(first))?;
++                        let total = (len - first as usize).min(out.len() * 4);
++                        let mut buf = vec![0u8; BLOCK.min(total)];
++                        let mut runs = Vec::new();
++                        let mut done = 0;
++                        for o in out.chunks_mut(BLOCK / 4) {
++                            let n = (total - done).min(BLOCK);
++                            f.read_exact(&mut buf[..n])?;
++                            salmon_core::pack_bases(&buf[..n], o, first + done as u64, &mut runs);
++                            done += n;
++                        }
++                        Ok(runs)
++                    })
++                })
++                .collect();
++            workers
++                .into_iter()
++                .map(|w| w.join().expect("refseq loader panicked"))
++                .collect::<Result<Vec<_>>>()
++        })
++        .with_context(|| format!("reading {REFSEQ_FILE}"))?;
++        // A run can cross from one block or thread into the next, which only
++        // leaves it in two pieces: lookups take the first that covers a position.
++        let other = parts.concat();
++        Ok(Self {
++            bits,
++            other,
++            runs_of: Vec::new(),
++        })
++    }
++}
++
+ /// Load just the per-reference forward sequences from an index directory, in
+ /// transcript-id order (decoys included), without loading the (multi-GB) SSHash
+ /// dictionary. Reads only `refseq.bin` + `refseq_offsets.json`. Used to feed
+@@ -1387,7 +1468,7 @@ impl SalmonIndex {
+     /// Load a salmon index from a directory produced by [`build`], including the
+     /// reference sequence bytes (needed for selective alignment and seq/GC bias).
+     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
+-        Self::load_with_opts(dir, true)
++        Self::load_with_opts(dir, RefseqLoad::Bytes)
+     }
+ 
+     /// Load a salmon index, optionally skipping the reference sequence bytes.
+@@ -1397,7 +1478,7 @@ impl SalmonIndex {
+     /// `--gcBias`): [`ref_seq`](Self::ref_seq) / [`refseq_concat`](Self::refseq_concat)
+     /// then must not be called, but the index loads without the (potentially
+     /// multi-GB, with a genome decoy) reference sequence resident.
+-    pub fn load_with_opts(dir: impl AsRef<Path>, load_refseq: bool) -> Result<Self> {
++    pub fn load_with_opts(dir: impl AsRef<Path>, load_refseq: RefseqLoad) -> Result<Self> {
+         let dir = dir.as_ref();
+         // Guard: a C++ salmon (pufferfish) index is not readable by salmon 2.0 —
+         // the index format changed. Detect it (no sshash `index.ssi`, but
+@@ -1460,23 +1541,42 @@ impl SalmonIndex {
+         // Load the EC table when the index has one (enables pseudoalignment-only mode).
+         let inner = ReferenceIndex::load(&index_prefix, info.has_ec_table, false)
+             .with_context(|| format!("loading piscem index at {}", index_prefix.display()))?;
+-        let (refseq, ref_offsets) = if load_refseq {
+-            let refseq = std::fs::read(dir.join(REFSEQ_FILE))
+-                .with_context(|| format!("reading {REFSEQ_FILE}"))?;
+-            let ref_offsets: Vec<u64> = serde_json::from_slice(
++        let refseq = match load_refseq {
++            RefseqLoad::Bytes => std::fs::read(dir.join(REFSEQ_FILE))
++                .with_context(|| format!("reading {REFSEQ_FILE}"))?,
++            _ => Vec::new(),
++        };
++        let packed = match load_refseq {
++            RefseqLoad::Packed => PackedRefseq::load(&dir.join(REFSEQ_FILE))?,
++            _ => PackedRefseq::default(),
++        };
++        let ref_offsets: Vec<u64> = if load_refseq == RefseqLoad::None {
++            Vec::new()
++        } else {
++            serde_json::from_slice(
+                 &std::fs::read(dir.join(REFSEQ_OFFSETS_FILE))
+                     .with_context(|| format!("reading {REFSEQ_OFFSETS_FILE}"))?,
+-            )?;
+-            (refseq, ref_offsets)
+-        } else {
+-            (Vec::new(), Vec::new())
++            )?
+         };
++        let mut packed = packed;
++        if !packed.bits.is_empty() {
++            let other = &packed.other;
++            packed.runs_of = ref_offsets
++                .windows(2)
++                .map(|w| {
++                    let lo = other.partition_point(|r| r.start + u64::from(r.len) <= w[0]);
++                    let hi = other.partition_point(|r| r.start < w[1]);
++                    (lo as u32, hi.max(lo) as u32)
++                })
++                .collect();
++        }
+         Ok(Self {
+             inner,
+             info,
+             refseq,
++            packed,
+             ref_offsets,
+-            refseq_loaded: load_refseq,
++            refseq_loaded: load_refseq != RefseqLoad::None,
+         })
+     }
+ 
+@@ -1487,9 +1587,9 @@ impl SalmonIndex {
+ 
+     /// Forward-strand sequence of reference `tid`.
+     ///
+-    /// Panics if the index was loaded without the reference sequence
+-    /// (`load_refseq == false`); callers in sketch-without-bias mode must not
+-    /// reach the alignment/bias paths that call this.
++    /// Panics unless the index was loaded with [`RefseqLoad::Bytes`]; callers
++    /// in sketch-without-bias mode must not reach the alignment/bias paths that
++    /// call this, and mapping reads through `ref_view`.
+     pub fn ref_seq(&self, tid: u32) -> &[u8] {
+         debug_assert!(
+             self.refseq_loaded,
+@@ -1562,8 +1662,20 @@ impl salmon_core::RefProvider for SalmonIndex {
+     fn num_refs(&self) -> usize {
+         self.num_refs()
+     }
+-    fn ref_seq(&self, tid: u32) -> &[u8] {
+-        self.ref_seq(tid)
++    #[inline]
++    fn ref_view(&self, tid: u32) -> salmon_core::RefView<'_> {
++        if self.packed.bits.is_empty() {
++            return salmon_core::RefView::Bytes(self.ref_seq(tid));
++        }
++        let start = self.ref_offsets[tid as usize];
++        let end = self.ref_offsets[tid as usize + 1];
++        let (lo, hi) = self.packed.runs_of[tid as usize];
++        salmon_core::RefView::Packed {
++            bits: &self.packed.bits,
++            start,
++            len: (end - start) as usize,
++            other: &self.packed.other[lo as usize..hi as usize],
++        }
+     }
+     fn is_decoy(&self, tid: u32) -> bool {
+         // O(1) range test (matching C++ salmon's `tid >= firstDecoyIndex`). The
+diff --git a/crates/salmon-map/src/align.rs b/crates/salmon-map/src/align.rs
+index 1afab0fb4..360b4e64b 100644
+--- a/crates/salmon-map/src/align.rs
++++ b/crates/salmon-map/src/align.rs
+@@ -34,6 +34,7 @@
+ //! ksw2 charges `gapo + gape * len` per gap, which we pass through directly.
+ 
+ use crate::chain::MemChain;
++use salmon_core::RefView;
+ 
+ /// Affine-gap scoring and validation thresholds (salmon `--ma/--mp/--go/--ge`,
+ /// `--minScoreFraction`). Penalties are positive magnitudes.
+@@ -147,6 +148,16 @@ pub fn align_chain(
+     ref_seq: &[u8],
+     chain: &MemChain,
+     cfg: &AlignConfig,
++) -> Option<Alignment> {
++    align_chain_view(read, RefView::Bytes(ref_seq), chain, cfg)
++}
++
++/// [`align_chain`], reading the reference through a view.
++pub fn align_chain_view(
++    read: &[u8],
++    ref_seq: RefView<'_>,
++    chain: &MemChain,
++    cfg: &AlignConfig,
+ ) -> Option<Alignment> {
+     align_chain_above(
+         read,
+@@ -160,7 +171,7 @@ pub fn align_chain(
+ /// [`align_chain`], with the exact score even when the alignment is not valid.
+ pub fn align_chain_exact(
+     read: &[u8],
+-    ref_seq: &[u8],
++    ref_seq: RefView<'_>,
+     chain: &MemChain,
+     cfg: &AlignConfig,
+ ) -> Option<Alignment> {
+@@ -169,7 +180,7 @@ pub fn align_chain_exact(
+ 
+ fn align_chain_above(
+     read: &[u8],
+-    ref_seq: &[u8],
++    ref_seq: RefView<'_>,
+     chain: &MemChain,
+     cfg: &AlignConfig,
+     floor: i32,
+@@ -220,8 +231,11 @@ fn align_chain_above(
+             if win_end <= win_start {
+                 return None;
+             }
+-            let rwin = &ref_seq[win_start as usize..win_end as usize];
+-            ksw2_align_score(query, rwin, cfg)
++            REF_WINDOW.with(|buf| {
++                let buf = &mut buf.borrow_mut();
++                let rwin = ref_seq.slice(win_start as usize, win_end as usize, buf);
++                ksw2_align_score(query, rwin, cfg)
++            })
+         } else {
+             // PuffAligner-style: exact-MEM segments + DP of inter-MEM gaps/flanks.
+             anchored_score_above(query, ref_seq, &chain.mems, cfg, floor)
+@@ -246,6 +260,9 @@ thread_local! {
+     /// the DNA5-encoded query/target buffers between small gap/flank DPs.
+     static KSW_SCRATCH: std::cell::RefCell<KswScratch> =
+         std::cell::RefCell::new(KswScratch::default());
++    /// Per-thread buffer for the reference bytes of one gap or flank.
++    static REF_WINDOW: std::cell::RefCell<Vec<u8>> =
++        const { std::cell::RefCell::new(Vec::new()) };
+     /// Per-thread reverse complements for [`align_chain`].
+     static ALIGN_QUERY: std::cell::RefCell<RevcompMemo> =
+         std::cell::RefCell::new(RevcompMemo::default());
+@@ -466,7 +483,7 @@ fn anchored_align_score(
+     mems: &[crate::mem::Mem],
+     cfg: &AlignConfig,
+ ) -> i32 {
+-    anchored_score_above(query, ref_seq, mems, cfg, NO_FLOOR)
++    anchored_score_above(query, RefView::Bytes(ref_seq), mems, cfg, NO_FLOOR)
+ }
+ 
+ /// A floor no score reaches down to, for when every score matters.
+@@ -477,7 +494,7 @@ const NO_FLOOR: i32 = i32::MIN / 2;
+ /// last, knowing what they must reach, since they take most of the DP.
+ fn anchored_score_above(
+     query: &[u8],
+-    ref_seq: &[u8],
++    ref_seq: RefView<'_>,
+     mems: &[crate::mem::Mem],
+     cfg: &AlignConfig,
+     floor: i32,
+@@ -485,6 +502,20 @@ fn anchored_score_above(
+     if mems.is_empty() {
+         return i32::MIN / 4;
+     }
++    let mut buf = REF_WINDOW.with(|b| std::mem::take(&mut *b.borrow_mut()));
++    let score = anchored_score_in(query, ref_seq, mems, cfg, floor, &mut buf);
++    REF_WINDOW.with(|b| *b.borrow_mut() = buf);
++    score
++}
++
++fn anchored_score_in(
++    query: &[u8],
++    ref_seq: RefView<'_>,
++    mems: &[crate::mem::Mem],
++    cfg: &AlignConfig,
++    floor: i32,
++    buf: &mut Vec<u8>,
++) -> i32 {
+     let qlen = query.len() as i32;
+     let reflen = ref_seq.len() as i32;
+     let m = cfg.match_score as i32;
+@@ -515,7 +546,7 @@ fn anchored_score_above(
+                 .min(nxt.read_start) as usize;
+             let t_lo = (mem.ref_end() - ov).max(mem.ref_start).min(nxt.ref_start) as usize;
+             let qg = &query[q_lo..nxt.read_start as usize];
+-            let tg = &ref_seq[t_lo..nxt.ref_start as usize];
++            let tg = ref_seq.slice(t_lo, nxt.ref_start as usize, buf);
+             score += cached_gap_score(qg, tg, cfg);
+         }
+     }
+@@ -530,7 +561,7 @@ fn anchored_score_above(
+         let qf = &query[0..first.read_start as usize];
+         let r_lo = (first.ref_start - first.read_start - cfg.indel_margin as i32).max(0);
+         let r_hi = first.ref_start.max(0);
+-        let tf = &ref_seq[r_lo as usize..r_hi as usize];
++        let tf = ref_seq.slice(r_lo as usize, r_hi as usize, buf);
+         let need = floor + 1 - score - q3 * m;
+         let s = cached_flank_score(qf, tf, cfg, /*anchor_right=*/ true, need);
+         if s < need {
+@@ -544,7 +575,7 @@ fn anchored_score_above(
+         let qf = &query[last.read_end() as usize..qlen as usize];
+         let r_hi =
+             (last.ref_end() + (qlen - last.read_end()) + cfg.indel_margin as i32).min(reflen);
+-        let tf = &ref_seq[last.ref_end() as usize..r_hi as usize];
++        let tf = ref_seq.slice(last.ref_end() as usize, r_hi as usize, buf);
+         let need = floor + 1 - score;
+         let s = cached_flank_score(qf, tf, cfg, /*anchor_right=*/ false, need);
+         if s < need {
+diff --git a/crates/salmon-map/src/extend.rs b/crates/salmon-map/src/extend.rs
+index 210a8e150..f851889ee 100644
+--- a/crates/salmon-map/src/extend.rs
++++ b/crates/salmon-map/src/extend.rs
+@@ -40,7 +40,7 @@ use piscem_rs::mapping::projected_hits::ProjectedHits;
+ use piscem_rs::mapping::streaming_query::PiscemStreamingQuery;
+ use sshash_lib::dispatch_on_k;
+ 
+-use salmon_core::RefProvider;
++use salmon_core::{RefProvider, RefView};
+ 
+ use crate::align::revcomp;
+ use crate::chain::chain_mems;
+@@ -62,7 +62,7 @@ fn base_eq(a: u8, b: u8) -> bool {
+ /// `query`/`ref_seq` are in the query frame: the caller passes the forward read
+ /// (forward group) or its reverse complement (reverse group), and `m`'s
+ /// coordinates are already expressed in that frame.
+-pub fn extend_mem(query: &[u8], ref_seq: &[u8], m: Mem) -> Mem {
++pub fn extend_mem(query: &[u8], ref_seq: RefView<'_>, m: Mem) -> Mem {
+     extend_mem_within(query, ref_seq, m, 0, ref_seq.len() as i32)
+ }
+ 
+@@ -76,7 +76,7 @@ pub fn extend_mem(query: &[u8], ref_seq: &[u8], m: Mem) -> Mem {
+ /// exactly as pufferfish's `expandHitEfficient` (which stops at `CONTIG_END`).
+ pub fn extend_mem_within(
+     query: &[u8],
+-    ref_seq: &[u8],
++    ref_seq: RefView<'_>,
+     mut m: Mem,
+     ref_lo: i32,
+     ref_hi: i32,
+@@ -85,12 +85,25 @@ pub fn extend_mem_within(
+     let reflen = ref_seq.len() as i32;
+     let hi = ref_hi.min(reflen);
+ 
++    // A packed reference compares a word's worth of bases at a time.
++    let left = m.read_start.min(m.ref_start - ref_lo).max(0) as usize;
++    let right = (qlen - m.read_end()).min(hi - m.ref_end()).max(0) as usize;
++    let lq = &query[m.read_start as usize - left..m.read_start as usize];
++    let rq = &query[m.read_end() as usize..m.read_end() as usize + right];
++    if let (Some(l), Some(r)) = (
++        ref_seq.match_left(lq, m.ref_start as usize),
++        ref_seq.match_right(rq, m.ref_end() as usize),
++    ) {
++        let (l, r) = (l as i32, r as i32);
++        return Mem::new(m.read_start - l, m.ref_start - l, m.len + l + r);
++    }
++
+     // Extend left along the shared diagonal, not past the unitig start.
+     while m.read_start > 0
+         && m.ref_start > ref_lo
+         && base_eq(
+             query[(m.read_start - 1) as usize],
+-            ref_seq[(m.ref_start - 1) as usize],
++            ref_seq.base((m.ref_start - 1) as usize),
+         )
+     {
+         m.read_start -= 1;
+@@ -101,7 +114,10 @@ pub fn extend_mem_within(
+     // Extend right along the shared diagonal, not past the unitig end.
+     while m.read_end() < qlen
+         && m.ref_end() < hi
+-        && base_eq(query[m.read_end() as usize], ref_seq[m.ref_end() as usize])
++        && base_eq(
++            query[m.read_end() as usize],
++            ref_seq.base(m.ref_end() as usize),
++        )
+     {
+         m.len += 1;
+     }
+@@ -131,7 +147,7 @@ pub fn candidates_from_raw_hits_unimems<R: RefProvider>(
+ 
+     let mut candidates = Vec::new();
+     for ((tid, is_fw), seeds) in groups {
+-        let ref_seq = refs.ref_seq(tid);
++        let ref_seq = refs.ref_view(tid);
+         let query: &[u8] = if is_fw { read } else { &rc };
+ 
+         // Extend each seed to its uni-MEM; same-diagonal seeds extend to an
+@@ -395,7 +411,7 @@ pub fn candidates_from_raw_hits_true_unimems<R: RefProvider>(
+                 let seed = Mem::new(rs, rp.pos as i32, k);
+                 let e = extend_mem_within(
+                     query,
+-                    refs.ref_seq(tid),
++                    refs.ref_view(tid),
+                     seed,
+                     base_pos,
+                     base_pos + contig_len,
+@@ -626,8 +642,8 @@ mod tests {
+         fn num_refs(&self) -> usize {
+             self.seqs.len()
+         }
+-        fn ref_seq(&self, tid: u32) -> &[u8] {
+-            &self.seqs[tid as usize]
++        fn ref_view(&self, tid: u32) -> RefView<'_> {
++            RefView::Bytes(&self.seqs[tid as usize])
+         }
+     }
+ 
+@@ -653,7 +669,7 @@ mod tests {
+         let reference = gen_seq(300, 7);
+         let read = reference[50..130].to_vec();
+         let seed = Mem::new(0, 50, 31);
+-        let e = extend_mem(&read, &reference, seed);
++        let e = extend_mem(&read, RefView::Bytes(&reference), seed);
+         assert_eq!(e.read_start, 0);
+         assert_eq!(e.ref_start, 50);
+         assert_eq!(e.len, 80, "seed should extend to the full 80 bp match");
+@@ -670,9 +686,9 @@ mod tests {
+         let reference = gen_seq(300, 7);
+         let read = reference[50..130].to_vec();
+         let seed = Mem::new(0, 50, 31);
+-        let ref_mem = extend_mem(&read, &reference, seed);
++        let ref_mem = extend_mem(&read, RefView::Bytes(&reference), seed);
+         assert_eq!(ref_mem.len, 80, "reference MEM crosses freely");
+-        let uni = extend_mem_within(&read, &reference, seed, 50, 100);
++        let uni = extend_mem_within(&read, RefView::Bytes(&reference), seed, 50, 100);
+         assert_eq!(uni.ref_start, 50);
+         assert_eq!(uni.ref_end(), 100, "uni-MEM must stop at the unitig end");
+         assert_eq!(uni.len, 50);
+@@ -691,7 +707,7 @@ mod tests {
+         } else {
+             b'A'
+         };
+-        let e = extend_mem(&read, &reference, Mem::new(0, 50, 31));
++        let e = extend_mem(&read, RefView::Bytes(&reference), Mem::new(0, 50, 31));
+         // right edge stops just before the mismatch; left edge reaches read 0.
+         assert_eq!(e.read_start, 0);
+         assert_eq!(e.ref_end(), break_at as i32);
+diff --git a/crates/salmon-map/src/lib.rs b/crates/salmon-map/src/lib.rs
+index 68c0c8274..eaab594a2 100644
+--- a/crates/salmon-map/src/lib.rs
++++ b/crates/salmon-map/src/lib.rs
+@@ -55,7 +55,9 @@ pub mod pair;
+ pub mod score;
+ pub mod sketch;
+ 
+-pub use align::{align_chain, align_in_window, perfect_score, AlignConfig, Alignment};
++pub use align::{
++    align_chain, align_chain_view, align_in_window, perfect_score, AlignConfig, Alignment,
++};
+ pub use chain::{chain_mems, ChainConfig, MemChain};
+ pub use collect::{
+     best_per_target, candidates_from_raw_hits, collect_read_mems, MappingCandidate,
+diff --git a/crates/salmon-map/src/mapper.rs b/crates/salmon-map/src/mapper.rs
+index 1c231f612..18155c27a 100644
+--- a/crates/salmon-map/src/mapper.rs
++++ b/crates/salmon-map/src/mapper.rs
+@@ -26,7 +26,7 @@ use piscem_rs::index::reference_index::ReferenceIndex;
+ use piscem_rs::mapping::hit_searcher::HitSearcher;
+ use salmon_core::{LibraryFormat, MateStatus, ReadOrientation, ReadStrandedness, ReadType};
+ 
+-use crate::align::{align_chain, align_in_window, AlignConfig};
++use crate::align::{align_chain_view as align_chain, align_in_window, AlignConfig};
+ use crate::collect::{
+     best_per_target, collect_read_mems, consensus_filter, MappingCandidate, MemCollectorConfig,
+ };
+@@ -51,7 +51,7 @@ use crate::pair::{join_reads_and_filter, PairingConfig};
+ use crate::score::{
+     finalize_mappings_counted_into, MapScratch, RawMapping, ScoreConfig, ScoredMapping,
+ };
+-use salmon_core::RefProvider;
++use salmon_core::{RefProvider, RefView};
+ 
+ /// Full mapper configuration.
+ #[derive(Debug, Clone, Default)]
+@@ -192,7 +192,7 @@ pub fn map_single_read_into<'idx, R: RefProvider>(
+     );
+     raw.reserve(cands.len());
+     for c in cands {
+-        if let Some(aln) = align_chain(read, refs.ref_seq(c.tid), &c.chain, &cfg.align) {
++        if let Some(aln) = align_chain(read, refs.ref_view(c.tid), &c.chain, &cfg.align) {
+             if aln.valid {
+                 // single-end observed strandedness: sense if forward, else antisense
+                 let strand = if c.is_fw {
+@@ -331,7 +331,7 @@ pub fn map_read_pair_into<'idx, R: RefProvider>(
+             if !matches!(j.status, MateStatus::PairedEndPaired) {
+                 continue;
+             }
+-            let refseq = refs.ref_seq(j.tid);
++            let refseq = refs.ref_view(j.tid);
+             let al = align_chain(r1, refseq, &j.left.as_ref().unwrap().chain, &cfg.align);
+             let ar = align_chain(r2, refseq, &j.right.as_ref().unwrap().chain, &cfg.align);
+             pre.push((k, al, ar));
+@@ -348,7 +348,7 @@ pub fn map_read_pair_into<'idx, R: RefProvider>(
+             MateStatus::PairedEndPaired => {
+                 let l = j.left.as_ref().unwrap();
+                 let r = j.right.as_ref().unwrap();
+-                let refseq = refs.ref_seq(j.tid);
++                let refseq = refs.ref_view(j.tid);
+                 let (al, ar) = match scratch.pair_alns.get(pre_next) {
+                     Some(&(pk, al, ar)) if pk == k => {
+                         pre_next += 1;
+@@ -429,7 +429,7 @@ pub fn map_read_pair_into<'idx, R: RefProvider>(
+                 let anchor = j.left.as_ref().unwrap();
+                 push_orphan_or_recovered(
+                     raw,
+-                    index_seq(refs, j.tid),
++                    refs.ref_view(j.tid),
+                     r1,
+                     r2,
+                     anchor,
+@@ -444,7 +444,7 @@ pub fn map_read_pair_into<'idx, R: RefProvider>(
+                 let anchor = j.right.as_ref().unwrap();
+                 push_orphan_or_recovered(
+                     raw,
+-                    index_seq(refs, j.tid),
++                    refs.ref_view(j.tid),
+                     r2,
+                     r1,
+                     anchor,
+@@ -488,11 +488,6 @@ pub fn map_read_pair_into<'idx, R: RefProvider>(
+     });
+ }
+ 
+-#[inline]
+-fn index_seq<R: RefProvider>(refs: &R, tid: u32) -> &[u8] {
+-    refs.ref_seq(tid)
+-}
+-
+ /// read1's `AS` component for an orphan, given the anchor (placed mate) score.
+ ///
+ /// The SAM writer reconstructs read2's score as `score - r1_score` (see
+@@ -589,7 +584,7 @@ pub fn debug_best_mapping<'idx, R: RefProvider>(
+     );
+     let best = cands.iter().max_by_key(|c| c.chain.covered_read_bases())?;
+     let aln =
+-        crate::align::align_chain_exact(read, refs.ref_seq(best.tid), &best.chain, &cfg.align)?;
++        crate::align::align_chain_exact(read, refs.ref_view(best.tid), &best.chain, &cfg.align)?;
+     Some(DebugMapping {
+         tid: best.tid,
+         is_fw: best.is_fw,
+@@ -611,7 +606,7 @@ pub fn debug_best_mapping<'idx, R: RefProvider>(
+ #[allow(clippy::too_many_arguments)]
+ fn push_orphan_or_recovered<R: RefProvider>(
+     raw: &mut Vec<RawMapping>,
+-    refseq: &[u8],
++    refseq: RefView<'_>,
+     anchor_read: &[u8],
+     partner_read: &[u8],
+     anchor: &MappingCandidate,
+@@ -743,13 +738,14 @@ fn push_orphan_or_recovered<R: RefProvider>(
+ /// Returns `(partner_alignment_score, fragment_length)` on success.
+ fn recover_mate(
+     partner_read: &[u8],
+-    refseq: &[u8],
++    refseq: RefView<'_>,
+     anchor: &MappingCandidate,
+     cfg: &MapConfig,
+     revcomp_buf: &mut Vec<u8>,
+ ) -> Option<(i32, i32)> {
+     let max_frag = cfg.pair.max_fragment_len;
+     let reflen = refseq.len() as i32;
++    let mut window = Vec::new();
+     // Projected read extent (may overhang the transcript ends).
+     let a_s = anchor.proj_start();
+     let a_e = anchor.proj_end();
+@@ -764,7 +760,7 @@ fn recover_mate(
+         crate::align::revcomp_into(partner_read, revcomp_buf);
+         let aln = align_in_window(
+             revcomp_buf,
+-            &refseq[win_start as usize..win_end as usize],
++            refseq.slice(win_start as usize, win_end as usize, &mut window),
+             &cfg.align,
+         )?;
+         if !aln.valid {
+@@ -781,7 +777,7 @@ fn recover_mate(
+         }
+         let aln = align_in_window(
+             partner_read,
+-            &refseq[win_start as usize..win_end as usize],
++            refseq.slice(win_start as usize, win_end as usize, &mut window),
+             &cfg.align,
+         )?;
+         if !aln.valid {
+diff --git a/crates/salmon-map/src/score.rs b/crates/salmon-map/src/score.rs
+index 07c1e942e..c619d1d0a 100644
+--- a/crates/salmon-map/src/score.rs
++++ b/crates/salmon-map/src/score.rs
+@@ -650,8 +650,8 @@ mod tests {
+         fn num_refs(&self) -> usize {
+             u32::MAX as usize
+         }
+-        fn ref_seq(&self, _tid: u32) -> &[u8] {
+-            &[]
++        fn ref_view(&self, _tid: u32) -> salmon_core::RefView<'_> {
++            salmon_core::RefView::Bytes(&[])
+         }
+         fn is_decoy(&self, tid: u32) -> bool {
+             tid >= self.0
+diff --git a/crates/salmon-map/tests/collect_on_index.rs b/crates/salmon-map/tests/collect_on_index.rs
+index d8d87fd13..1258f6fc6 100644
+--- a/crates/salmon-map/tests/collect_on_index.rs
++++ b/crates/salmon-map/tests/collect_on_index.rs
+@@ -21,8 +21,8 @@ impl RefProvider for IdxRefs<'_> {
+     fn num_refs(&self) -> usize {
+         self.0.num_refs()
+     }
+-    fn ref_seq(&self, tid: u32) -> &[u8] {
+-        self.0.ref_seq(tid)
++    fn ref_view(&self, tid: u32) -> salmon_core::RefView<'_> {
++        salmon_core::RefView::Bytes(self.0.ref_seq(tid))
+     }
+ }
+ 
+diff --git a/crates/salmon-model/examples/conv_bench.rs b/crates/salmon-model/examples/conv_bench.rs
+index 32845b91b..303a37484 100644
+--- a/crates/salmon-model/examples/conv_bench.rs
++++ b/crates/salmon-model/examples/conv_bench.rs
+@@ -95,7 +95,7 @@ fn main() {
+                 pos: None,
+             };
+             acc += corrected_effective_length_full(
+-                seq,
++                seq.len(),
+                 &cdf,
+                 fld_low,
+                 fld_high,
+diff --git a/crates/salmon-model/src/bias.rs b/crates/salmon-model/src/bias.rs
+index c5f942b4a..719a2b453 100644
+--- a/crates/salmon-model/src/bias.rs
++++ b/crates/salmon-model/src/bias.rs
+@@ -85,8 +85,9 @@ pub fn positional_factor_into(obs: &[f64], exp: &[f64], out: &mut Vec<f64>) {
+ #[derive(Clone, Copy, Default)]
+ pub struct BiasInputs<'a> {
+     /// `(fw, rc)` precomputed `obs − exp` log-bias tables for the 5′/3′
+-    /// sequence-bias factors (`--seqBias`). Built once per quant run.
+-    pub seq: Option<(&'a LogBiasTable, &'a LogBiasTable)>,
++    /// sequence-bias factors (`--seqBias`), built once per quant run, and this
++    /// transcript's sequence, which only this term reads.
++    pub seq: Option<(&'a LogBiasTable, &'a LogBiasTable, &'a [u8])>,
+     /// GC ratio model + this transcript's cumulative-GC view (`--gcBias`)
+     pub gc: Option<(&'a GcFragModel, GcView<'a>)>,
+     /// per-position 5'/3' positional-bias factors (`--posBias`), transcript-length sized
+@@ -113,7 +114,7 @@ impl BiasInputs<'_> {
+ /// the correction is allowed to shrink the length only so far.
+ #[allow(clippy::too_many_arguments)]
+ pub fn corrected_effective_length_full(
+-    seq: &[u8],
++    ref_len: usize,
+     cdf: &[f64],
+     fld_low: usize,
+     fld_high: usize,
+@@ -132,7 +133,6 @@ pub fn corrected_effective_length_full(
+     } else {
+         1
+     };
+-    let ref_len = seq.len();
+     // How much of the transcript the uncorrected effective length has "used up";
+     // also the floor's basis below.
+     let unprocessed = (ref_len as i32 - elen as i32).max(0);
+@@ -153,7 +153,8 @@ pub fn corrected_effective_length_full(
+     let have_seq = bias.seq.is_some();
+     let mut fw: Vec<f64> = Vec::new();
+     let mut rc: Vec<f64> = Vec::new();
+-    if let Some((tab_fw, tab_rc)) = bias.seq {
++    if let Some((tab_fw, tab_rc, seq)) = bias.seq {
++        debug_assert_eq!(seq.len(), ref_len);
+         fw = vec![1.0f64; ref_len];
+         rc = vec![1.0f64; ref_len];
+         let cu = CONTEXT_LEFT;
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index fa508bd36..ff53c9b6b 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -49,7 +49,7 @@ use piscem_rs::mapping::hit_searcher::SkippingStrategy;
+ 
+ use salmon_core::{LibraryFormat, PhaseTimer, ReadType};
+ use salmon_eqclass::EquivalenceClassBuilder;
+-use salmon_index::SalmonIndex;
++use salmon_index::{RefseqLoad, SalmonIndex};
+ use salmon_infer::optimize_packed_with_init;
+ pub use salmon_infer::{EmAccel, EmOptions, EmStop};
+ use salmon_map::MapConfig;
+@@ -438,8 +438,16 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     // (seq/GC; positional bias is sequence-free). In sketch mode without seq/GC
+     // bias we can skip loading them entirely — with a genome decoy this is a
+     // multi-GB resident-memory saving.
+-    let need_refseq = !opts.sketch || opts.seq_bias || opts.gc_bias;
+-    let salmon = SalmonIndex::load_with_opts(&opts.index_dir, need_refseq)
++    // The bias models read whole transcripts as bytes; mapping only reads short
++    // windows, so it holds them at two bits per base.
++    let refseq_load = if opts.seq_bias || opts.gc_bias {
++        RefseqLoad::Bytes
++    } else if !opts.sketch {
++        RefseqLoad::Packed
++    } else {
++        RefseqLoad::None
++    };
++    let salmon = SalmonIndex::load_with_opts(&opts.index_dir, refseq_load)
+         .with_context(|| format!("loading index {}", opts.index_dir.display()))?;
+     let num_refs = salmon.num_refs();
+     timer.mark("index_load");
+@@ -1238,8 +1246,9 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+                 if tid >= num_targets || em.alphas[tid] < 1e-8 {
+                     return eff_lengths[tid];
+                 }
+-                let s = salmon.ref_seq(tid as u32);
+-                let ref_len = s.len();
++                // Only sequence bias reads the bases; the other terms need the
++                // length alone, so `--posBias` needs no sequence held as bytes.
++                let ref_len = salmon.ref_len(tid) as usize;
+                 // Per-position 5'/3' positional-bias factors (obs/exp projected).
+                 // `project_weights` derives its output length from the slice it is
+                 // given, so each buffer is resized to this transcript before use.
+@@ -1264,7 +1273,9 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+                     salmon_model::positional_factor_into(&scratch.o3, &scratch.e3, &mut scratch.pr);
+                 }
+                 let bias = salmon_model::BiasInputs {
+-                    seq: seq_tab.as_ref().map(|(f, r)| (f, r)),
++                    seq: seq_tab
++                        .as_ref()
++                        .map(|(f, r)| (f, r, salmon.ref_seq(tid as u32))),
+                     gc: gc_ratio_model
+                         .as_ref()
+                         .map(|g| (g, store.unwrap().view(tid))),
+@@ -1273,7 +1284,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+                         .map(|_| (scratch.pf.as_slice(), scratch.pr.as_slice())),
+                 };
+                 salmon_model::corrected_effective_length_full(
+-                    s,
++                    ref_len,
+                     &fld_cdf,
+                     fld_low,
+                     fld_high,

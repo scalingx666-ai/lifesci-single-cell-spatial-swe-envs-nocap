@@ -1,0 +1,378 @@
+diff --git a/omicverse/pp/_preprocess.py b/omicverse/pp/_preprocess.py
+index b515b8cc5..cf603a2da 100644
+--- a/omicverse/pp/_preprocess.py
++++ b/omicverse/pp/_preprocess.py
+@@ -838,7 +838,8 @@ def preprocess(
+         import rapids_singlecell as rsc
+         data_load_start = time.time()
+         if method_list[0] == 'shiftlog': # Size normalization + scanpy batch aware HVGs selection
+-            rsc.pp.normalize_total(
++            from . import _rsc_compat as _rscc  # any rapids-singlecell release
++            _rscc.normalize_total(
+                 adata,
+                 target_sum=target_sum,
+                 exclude_highly_expressed=normalize_exclude_highly_expressed,
+@@ -1534,7 +1535,8 @@ def pca(adata, n_pcs=50, layer='scaled',inplace=True,random_state=SEED_DEFAULT,b
+         adata.uns[key + '|cum_sum_eigenvalues'] = adata.uns['pca']['variance']
+     else:
+         import rapids_singlecell as rsc
+-        rsc.pp.pca(adata, layer=layer,n_comps=n_pcs,**kwargs)
++        from . import _rsc_compat as _rscc  # any rapids-singlecell release
++        rsc.pp.pca(adata, layer=layer,n_comps=n_pcs,**_rscc.pca_kwargs(kwargs))
+         adata.obsm[key + '|X_pca'] = adata.obsm['X_pca']
+         adata.varm[key + '|pca_loadings'] = adata.varm['PCs']
+         adata.uns[key + '|pca_var_ratios'] = adata.uns['pca']['variance_ratio']
+@@ -1772,10 +1774,11 @@ def neighbors(
+     else:
+         print(f"{EMOJI['gpu']} Using RAPIDS GPU to calculate neighbors...")
+         import rapids_singlecell as rsc
++        from . import _rsc_compat as _rscc  # any rapids-singlecell release
+         rsc.pp.neighbors(adata,use_rep=use_rep,n_neighbors=n_neighbors, n_pcs=n_pcs,
+-                         random_state=random_state,algorithm=method,metric=metric,
++                         random_state=random_state,metric=metric,
+                          metric_kwds=metric_kwds,
+-                         key_added=key_added,copy=copy,**kwargs)
++                         key_added=key_added,copy=copy,**_rscc.neighbors_kwargs(method, kwargs))
+     add_reference(adata,'scanpy','neighbors with scanpy')
+     note(backend=f"omicverse({settings.mode}) · method={method}",
+          viz=[{"function": "ov.pl.neighbor_degree_histogram", "kwargs": {}}])
+diff --git a/omicverse/pp/_qc.py b/omicverse/pp/_qc.py
+index 597259624..a642cb441 100644
+--- a/omicverse/pp/_qc.py
++++ b/omicverse/pp/_qc.py
+@@ -1830,10 +1830,11 @@ def qc_gpu(adata, mode='seurat',
+     # UMIs exceed n_cells (S100A8, LYZ, FCGR3B, ...) was removed. rapids-singlecell
+     # exposes min_genes/max_genes/min_cells/max_cells separately, matching the CPU
+     # path's _filter_cells_impl / _filter_genes_impl.
+-    rsc.pp.filter_cells(adata, min_genes=min_genes)
+-    rsc.pp.filter_cells(adata, max_genes=int(max_genes_ratio*adata.shape[1]))
+-    rsc.pp.filter_genes(adata, min_cells=min_cells)
+-    rsc.pp.filter_genes(adata, max_cells=int(max_cells_ratio*adata.shape[0]))
++    from . import _rsc_compat as _rscc  # any rapids-singlecell release
++    _rscc.filter_cells(adata, min_genes=min_genes)
++    _rscc.filter_cells(adata, max_genes=int(max_genes_ratio*adata.shape[1]))
++    _rscc.filter_genes(adata, min_cells=min_cells)
++    _rscc.filter_genes(adata, max_cells=int(max_cells_ratio*adata.shape[0]))
+     
+     cells_final_filtered = cells_before_final - adata.shape[0]
+     genes_final_filtered = genes_before_final - adata.shape[1]
+diff --git a/omicverse/pp/_rsc_compat.py b/omicverse/pp/_rsc_compat.py
+new file mode 100644
+index 000000000..5ed30ba0c
+--- /dev/null
++++ b/omicverse/pp/_rsc_compat.py
+@@ -0,0 +1,197 @@
++"""Calls into rapids-singlecell that work across its releases.
++
++omicverse's GPU mode calls rapids-singlecell (``rsc``), whose API changed
++between releases:
++
++* ``pp.filter_cells`` / ``pp.filter_genes``: up to 0.11 they take
++  ``qc_var`` / ``min_count`` / ``max_count`` and filter on an existing
++  ``.obs`` / ``.var`` column (which may be stale after earlier filtering);
++  0.12 and later take ``min_genes`` / ``max_genes`` / ``min_counts`` /
++  ``max_counts`` (and ``min_cells`` / ``max_cells`` for genes), like Scanpy.
++* ``pp.normalize_total``: ``exclude_highly_expressed`` / ``max_fraction``
++  exist from 0.14 on, and ``target_sum=None`` means the median of the
++  non-zero per-cell counts from 0.14 on but the median over all cells
++  (zeros included) before; the wrapper always uses the non-zero median.
++* ``pp.filter_cells`` / ``pp.filter_genes`` (0.12+) accept one threshold
++  per call, as in Scanpy.
++* ``pp.pca``: ``use_highly_variable`` is rejected from 0.17 on (use
++  ``mask_var``).
++
++Each wrapper calls rsc directly when the installed release has the
++argument, and otherwise computes the same result on the GPU itself (Scanpy
++semantics), so omicverse behaves the same with any rsc version.
++"""
++from __future__ import annotations
++
++import inspect
++from functools import lru_cache
++
++import numpy as np
++
++
++def _rsc():
++    import rapids_singlecell as rsc
++    return rsc
++
++
++@lru_cache(maxsize=None)
++def _params(qualname: str) -> frozenset:
++    obj = _rsc()
++    for part in qualname.split("."):
++        obj = getattr(obj, part)
++    try:
++        return frozenset(inspect.signature(obj).parameters)
++    except (TypeError, ValueError):  # pragma: no cover
++        return frozenset()
++
++
++def _counts(X, axis: int, nonzero: bool):
++    """Per-row (axis=1) or per-column (axis=0) sums or nonzero counts, on the GPU."""
++    import cupy as cp
++    import cupyx.scipy.sparse as csp
++    if csp.issparse(X):
++        Y = X.copy()
++        if nonzero:
++            Y.data = (Y.data > 0).astype(cp.float32)
++        out = Y.sum(axis=axis)
++    else:
++        out = (X > 0).sum(axis=axis) if nonzero else X.sum(axis=axis)
++    return cp.asnumpy(cp.asarray(out)).ravel()
++
++
++def _bounds_mask(values, lo, hi):
++    keep = np.ones(values.shape[0], dtype=bool)
++    if lo is not None:
++        keep &= values >= lo
++    if hi is not None:
++        keep &= values <= hi
++    return keep
++
++
++def filter_cells(adata, *, min_genes=None, max_genes=None, min_counts=None, max_counts=None):
++    """``rsc.pp.filter_cells`` with Scanpy arguments, for any rsc release."""
++    if "min_genes" in _params("pp.filter_cells"):
++        # one threshold per call; each cell's fate depends on its own counts only
++        for k, v in dict(min_genes=min_genes, max_genes=max_genes,
++                         min_counts=min_counts, max_counts=max_counts).items():
++            if v is not None:
++                _rsc().pp.filter_cells(adata, **{k: v})
++        return
++    keep = np.ones(adata.n_obs, dtype=bool)
++    if min_genes is not None or max_genes is not None:
++        keep &= _bounds_mask(_counts(adata.X, 1, True), min_genes, max_genes)
++    if min_counts is not None or max_counts is not None:
++        keep &= _bounds_mask(_counts(adata.X, 1, False), min_counts, max_counts)
++    if not keep.all():
++        adata._inplace_subset_obs(keep)
++
++
++def filter_genes(adata, *, min_cells=None, max_cells=None, min_counts=None, max_counts=None):
++    """``rsc.pp.filter_genes`` with Scanpy arguments, for any rsc release."""
++    if "min_cells" in _params("pp.filter_genes"):
++        for k, v in dict(min_cells=min_cells, max_cells=max_cells,
++                         min_counts=min_counts, max_counts=max_counts).items():
++            if v is not None:
++                _rsc().pp.filter_genes(adata, **{k: v})
++        return
++    keep = np.ones(adata.n_vars, dtype=bool)
++    if min_cells is not None or max_cells is not None:
++        keep &= _bounds_mask(_counts(adata.X, 0, True), min_cells, max_cells)
++    if min_counts is not None or max_counts is not None:
++        keep &= _bounds_mask(_counts(adata.X, 0, False), min_counts, max_counts)
++    if not keep.all():
++        adata._inplace_subset_var(keep)
++
++
++def normalize_total(adata, *, target_sum=None, exclude_highly_expressed=False,
++                    max_fraction=0.05, layer=None):
++    """``rsc.pp.normalize_total`` incl. ``exclude_highly_expressed``, for any rsc release.
++
++    Without native support the size factors are computed as Scanpy does: a
++    gene is excluded if it exceeds ``max_fraction`` of the total counts of
++    any cell; each cell is scaled to ``target_sum`` (default: the median of
++    the non-zero size factors).
++    """
++    params = _params("pp.normalize_total")
++    native = "exclude_highly_expressed" in params
++    if not exclude_highly_expressed and not native and target_sum is None:
++        # releases before 0.14 take the median over all cells, zeros included
++        import cupy as cp
++        X = adata.X if layer is None else adata.layers[layer]
++        totals = cp.asarray(X.sum(axis=1)).ravel()
++        nz = totals[totals > 0]
++        target_sum = float(cp.median(nz)) if nz.size else 1.0
++    if not exclude_highly_expressed or native:
++        kw = {"target_sum": target_sum}
++        if layer is not None:
++            kw["layer"] = layer
++        if exclude_highly_expressed:
++            kw.update(exclude_highly_expressed=True, max_fraction=max_fraction)
++        _rsc().pp.normalize_total(adata, **kw)
++        return
++    import cupy as cp
++    import cupyx.scipy.sparse as csp
++    X = adata.X if layer is None else adata.layers[layer]
++    totals = cp.asarray(X.sum(axis=1)).ravel()
++    if csp.issparse(X):
++        coo = X.tocoo()
++        hi = coo.data > max_fraction * totals[coo.row]
++        bad = cp.zeros(X.shape[1], dtype=bool)
++        bad[coo.col[hi]] = True
++        # counts over the kept genes = totals - counts of the excluded genes
++        excl = bad[coo.col]
++        counts = totals - cp.bincount(coo.row[excl], weights=coo.data[excl].astype(cp.float64),
++                                      minlength=X.shape[0])
++    else:
++        keep = ~(X > max_fraction * totals[:, None]).any(axis=0)
++        counts = X[:, keep].sum(axis=1)
++    counts = counts.astype(cp.float64)
++    if target_sum is None:
++        nz = counts[counts > 0]
++        target_sum = float(cp.median(nz)) if nz.size else 1.0
++    scale = cp.where(counts > 0, target_sum / cp.where(counts > 0, counts, 1.0), 1.0)
++    if csp.issparse(X):
++        X = csp.diags(scale.astype(X.dtype)) @ X
++    else:
++        X = X * scale[:, None].astype(X.dtype)
++    if layer is None:
++        adata.X = X
++    else:
++        adata.layers[layer] = X
++
++
++def pca_kwargs(kwargs: dict) -> dict:
++    """Translate ``use_highly_variable`` for rsc releases that only take ``mask_var``."""
++    kwargs = dict(kwargs)
++    if "use_highly_variable" in kwargs and "use_highly_variable" not in _params("pp.pca"):
++        use_hv = kwargs.pop("use_highly_variable")
++        if use_hv and "mask_var" not in kwargs:
++            kwargs["mask_var"] = "highly_variable"
++        elif use_hv is False and "mask_var" not in kwargs:
++            kwargs["mask_var"] = None
++    return kwargs
++
++
++_CONNECTIVITY_METHODS = ("umap", "gauss", "jaccard")
++
++
++def neighbors_kwargs(method, kwargs: dict) -> dict:
++    """Map omicverse's ``neighbors(method=...)`` onto ``rsc.pp.neighbors``.
++
++    omicverse's ``method`` names the connectivity kernel ('umap' / 'gauss'),
++    which rsc calls ``method`` (from 0.14 on); rsc's ``algorithm`` is the kNN
++    search ('brute', 'cagra', 'ivfflat', ...).  A kNN algorithm name passed
++    as ``method`` is forwarded as ``algorithm``.
++    """
++    kwargs = dict(kwargs)
++    params = _params("pp.neighbors")
++    if method in _CONNECTIVITY_METHODS:
++        if "method" in params:
++            kwargs["method"] = method
++        elif method != "umap":
++            raise ValueError(
++                f"rapids-singlecell {_rsc().__version__} only computes UMAP connectivities; "
++                f"method={method!r} needs rapids-singlecell >= 0.14")
++    elif method is not None:
++        kwargs.setdefault("algorithm", method)
++    return kwargs
+diff --git a/pyproject.toml b/pyproject.toml
+index e2c1e7e2c..9a0dded0f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -101,7 +101,7 @@ dependencies = [
+     # Multithreaded C++ kernels behind the default backend='cpp' (QC, normalize,
+     # HVG, scale, PCA, neighbors, UMAP, Leiden, COSG); backend='python' or a
+     # missing install falls back to the original code.
+-    'anndataoom-fast>=0.1.1',
++    'anndataoom-fast>=0.1.2',
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/tests/pp/test_rsc_compat.py b/tests/pp/test_rsc_compat.py
+new file mode 100644
+index 000000000..19fcd6a67
+--- /dev/null
++++ b/tests/pp/test_rsc_compat.py
+@@ -0,0 +1,98 @@
++"""omicverse's rapids-singlecell wrappers give Scanpy's results with any rsc release."""
++import numpy as np
++import pytest
++import scipy.sparse as sp
++
++rsc = pytest.importorskip("rapids_singlecell")
++cp = pytest.importorskip("cupy")
++try:
++    cp.cuda.runtime.getDeviceCount()
++except Exception:  # pragma: no cover
++    pytest.skip("no CUDA device", allow_module_level=True)
++
++
++def _adata(seed=0, n=600, g=300):
++    import anndata as ad
++    rs = np.random.RandomState(seed)
++    X = sp.random(n, g, density=0.08, random_state=rs, format="csr", dtype=np.float32)
++    X.data = np.ceil(X.data * 20).astype(np.float32)
++    X[:5, 0] = 5000.0          # a highly expressed gene in a few cells
++    X[10:20] = 0               # empty cells
++    X.eliminate_zeros()
++    a = ad.AnnData(X)
++    a.obs_names = [f"c{i}" for i in range(n)]
++    a.var_names = [f"g{j}" for j in range(g)]
++    return a
++
++
++def _to_gpu(a):
++    a = a.copy()
++    rsc.get.anndata_to_GPU(a)
++    return a
++
++
++@pytest.mark.parametrize("kw", [dict(min_genes=15), dict(max_genes=30), dict(min_counts=50),
++                                dict(min_genes=10, max_counts=400)])
++def test_filter_cells_matches_scanpy(kw):
++    import scanpy as sc
++    from omicverse.pp import _rsc_compat as rc
++    a = _adata()
++    ref = a.copy()
++    for k, v in kw.items():
++        sc.pp.filter_cells(ref, **{k: v})
++    g = _to_gpu(a)
++    rc.filter_cells(g, **kw)
++    assert list(g.obs_names) == list(ref.obs_names)
++
++
++@pytest.mark.parametrize("kw", [dict(min_cells=40), dict(max_cells=60), dict(min_counts=300)])
++def test_filter_genes_matches_scanpy(kw):
++    import scanpy as sc
++    from omicverse.pp import _rsc_compat as rc
++    a = _adata(1)
++    ref = a.copy()
++    sc.pp.filter_genes(ref, **kw)
++    g = _to_gpu(a)
++    rc.filter_genes(g, **kw)
++    assert list(g.var_names) == list(ref.var_names)
++
++
++@pytest.mark.parametrize("exclude", [False, True])
++@pytest.mark.parametrize("target_sum", [None, 1e4])
++def test_normalize_total_matches_scanpy(exclude, target_sum):
++    import scanpy as sc
++    from omicverse.pp import _rsc_compat as rc
++    a = _adata(2)
++    # Reference: Scanpy on a dense matrix, whose default target is the median
++    # of the non-zero per-cell counts, as rapids-singlecell >= 0.14 (Scanpy's
++    # sparse path takes the median over all cells, zeros included).
++    ref = a.copy()
++    ref.X = ref.X.toarray()
++    sc.pp.normalize_total(ref, target_sum=target_sum, exclude_highly_expressed=exclude, max_fraction=0.2)
++    g = _to_gpu(a)
++    rc.normalize_total(g, target_sum=target_sum, exclude_highly_expressed=exclude, max_fraction=0.2)
++    got = g.X.get().toarray() if hasattr(g.X, "get") else np.asarray(g.X)
++    np.testing.assert_allclose(got, ref.X, rtol=2e-6, atol=1e-5)
++
++
++def test_pca_kwargs_translation():
++    from omicverse.pp import _rsc_compat as rc
++    out = rc.pca_kwargs({"use_highly_variable": True, "svd_solver": "auto"})
++    if "use_highly_variable" in rc._params("pp.pca"):
++        assert out["use_highly_variable"] is True
++    else:
++        assert out == {"mask_var": "highly_variable", "svd_solver": "auto"}
++
++
++def test_neighbors_kwargs_translation():
++    from omicverse.pp import _rsc_compat as rc
++    has_method = "method" in rc._params("pp.neighbors")
++    out = rc.neighbors_kwargs("umap", {"foo": 1})
++    assert "algorithm" not in out and out["foo"] == 1
++    assert out.get("method") == ("umap" if has_method else None)
++    assert rc.neighbors_kwargs("brute", {}) == {"algorithm": "brute"}
++    if has_method:
++        assert rc.neighbors_kwargs("gauss", {}) == {"method": "gauss"}
++    else:
++        with pytest.raises(ValueError):
++            rc.neighbors_kwargs("gauss", {})

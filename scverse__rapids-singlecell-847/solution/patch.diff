@@ -1,0 +1,175 @@
+diff --git a/docs/release-notes/0.18.1.md b/docs/release-notes/0.18.1.md
+index 8db0e317f..659af31d2 100644
+--- a/docs/release-notes/0.18.1.md
++++ b/docs/release-notes/0.18.1.md
+@@ -9,6 +9,8 @@
+ ```{rubric} Bug fixes
+ ```
+ * Fix {func}`~rapids_singlecell.pp.regress_out` with cuML 26.10, which removed the ``convert_dtype`` argument of ``LinearRegression.fit`` {smaller}`S Dicks`
++* Align the Geary's C ``pval_norm`` of {func}`~rapids_singlecell.gr.spatial_autocorr` with squidpy 1.8.2, which uses Geary's own normality variance instead of Moran's I {pr}`847` {smaller}`S Dicks`
++* {func}`~rapids_singlecell.gr.calculate_niche` with ``flavor="utag"`` runs the PCA on the implicit smoothed matrix for sparse data, which fixes failures on unexpressed genes and on large panels (the smoothed matrix overflowed cuSPARSE) {pr}`847` {smaller}`S Dicks`
+ 
+ ```{rubric} Misc
+ ```
+diff --git a/src/rapids_singlecell/squidpy_gpu/_niche.py b/src/rapids_singlecell/squidpy_gpu/_niche.py
+index 9fb3f8fd0..c415e8ffe 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_niche.py
++++ b/src/rapids_singlecell/squidpy_gpu/_niche.py
+@@ -781,11 +781,31 @@ def _nhood_embedding(
+ 
+ def _utag_embedding(adata: AnnData, *, key: str) -> cp.ndarray:
+     """UTAG-smoothed expression, PCA-reduced."""
+-    inner = AnnData(
+-        X=_utag_features(adata, key), obs=pd.DataFrame(index=adata.obs_names.copy())
++    adj, X = _utag_operands(adata, key)
++    if not sparse_gpu.issparse(X):
++        inner = AnnData(X=adj @ X, obs=pd.DataFrame(index=adata.obs_names.copy()))
++        rsc.pp.pca(inner, key_added=None)
++        return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
++
++    # Sparse A @ X has ~mean-degree times the nnz of X (billions on large panels):
++    # run the PCA on the implicit, mean-centered operator A @ X instead.
++    from cupyx.scipy.sparse.linalg import LinearOperator
++
++    from rapids_singlecell.preprocessing._sparse_pca._svd_lanczos import lanczos_svd
++
++    n = X.shape[0]
++    adj_t, X_t = adj.T, X.T  # CSC views, no copies
++    mean = X_t @ (adj_t @ cp.ones(n, dtype=X.dtype)) / n
++    op = LinearOperator(
++        X.shape,
++        matvec=lambda v: adj @ (X @ v) - mean @ v,
++        rmatvec=lambda u: X_t @ (adj_t @ u) - mean * u.sum(),
++        matmat=lambda V: adj @ (X @ V) - (mean @ V)[None, :],
++        rmatmat=lambda U: X_t @ (adj_t @ U) - cp.outer(mean, U.sum(axis=0)),
++        dtype=X.dtype,
+     )
+-    rsc.pp.pca(inner, key_added=None)
+-    return cp.asarray(inner.obsm[_embedding_keys("pca", None).obsm])
++    U, S, _ = lanczos_svd(op, k=min(rsc.settings.N_PCS, min(X.shape) - 1), rng=0)
++    return U * S
+ 
+ 
+ def _cellcharter_embedding(
+@@ -876,6 +896,14 @@ def _neighborhood_profile(
+ 
+ def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matrix:
+     """L1-row-normalize the spatial adjacency and propagate expression: D^-1 A @ X."""
++    adj, X = _utag_operands(adata, key)
++    return adj @ X
++
++
++def _utag_operands(
++    adata: AnnData, key: str
++) -> tuple[sparse_gpu.csr_matrix, cp.ndarray | sparse_gpu.csr_matrix]:
++    """L1-row-normalized spatial adjacency and float32 expression on the GPU."""
+     from rapids_singlecell._cuda import _norm_cuda as _nc
+ 
+     adj = rsc.get.X_to_GPU(adata.obsp[key]).copy()
+@@ -889,12 +917,7 @@ def _utag_features(adata: AnnData, key: str) -> cp.ndarray | sparse_gpu.csr_matr
+         stream=cp.cuda.get_current_stream().ptr,
+     )
+ 
+-    X = rsc.get.X_to_GPU(adata.X).astype(cp.float32)
+-    if sparse_gpu.issparse(X):
+-        out = adj @ X
+-        return out.tocsr()
+-    out = adj @ X
+-    return out
++    return adj, rsc.get.X_to_GPU(adata.X).astype(cp.float32)
+ 
+ 
+ def _cellcharter_features(
+diff --git a/src/rapids_singlecell/squidpy_gpu/_utils.py b/src/rapids_singlecell/squidpy_gpu/_utils.py
+index fda58b385..403eb8f79 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_utils.py
++++ b/src/rapids_singlecell/squidpy_gpu/_utils.py
+@@ -116,11 +116,14 @@ def _analytic_pval(score: np.ndarray, g: spmatrix | np.ndarray, params: dict[str
+     s0, s1, s2 = _g_moments(g)
+     n = g.shape[0]
+     s02 = s0 * s0
+-    n2 = n * n
+-    v_num = n2 * s1 - n * s2 + 3 * s02
+-    v_den = (n - 1) * (n + 1) * s02
+-
+-    Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
++    if params["mode"] == "gearyC":
++        # Geary's C has its own normality variance (Cliff & Ord 1981; esda ``Geary``)
++        Vscore_norm = ((2 * s1 + s2) * (n - 1) - 4 * s02) / (2 * (n + 1) * s02)
++    else:
++        n2 = n * n
++        v_num = n2 * s1 - n * s2 + 3 * s02
++        v_den = (n - 1) * (n + 1) * s02
++        Vscore_norm = v_num / v_den - (1.0 / (n - 1)) ** 2
+     seScore_norm = Vscore_norm ** (1 / 2.0)
+ 
+     z_norm = (score - params["expected"]) / seScore_norm
+diff --git a/tests/test_autocorr.py b/tests/test_autocorr.py
+index 4fb504d9b..e79b52793 100644
+--- a/tests/test_autocorr.py
++++ b/tests/test_autocorr.py
+@@ -6,7 +6,7 @@
+ import numpy as np
+ import pytest
+ from anndata import read_h5ad
+-from scipy import sparse
++from scipy import sparse, stats
+ 
+ from rapids_singlecell.gr import spatial_autocorr
+ 
+@@ -293,3 +293,26 @@ def test_autocorr_permutation_shape(mode, n_perms, use_sparse):
+     assert perms.shape == (n_perms, n_genes), (
+         f"Expected ({n_perms}, {n_genes}), got {perms.shape}"
+     )
++
++
++@pytest.mark.parametrize(("mode", "stat"), [("moran", "I"), ("geary", "C")])
++def test_autocorr_analytic_variance(mode, stat):
++    """Analytic variance follows Cliff & Ord 1981 for each statistic (esda Moran/Geary)."""
++    adata = read_h5ad(Path(__file__).parent / Path("_data/dummy.h5ad"))
++    w = sparse.csr_matrix(adata.obsp["spatial_connectivities"], dtype=np.float64)
++    n, s0 = w.shape[0], w.sum()
++    s1 = (w + w.T).multiply(w + w.T).sum() / 2
++    deg = np.asarray(w.sum(0)).ravel() + np.asarray(w.sum(1)).ravel()
++    s2 = deg @ deg
++    if mode == "moran":
++        var = (n * n * s1 - n * s2 + 3 * s0**2) / ((n * n - 1) * s0**2)
++        var -= 1 / (n - 1) ** 2
++    else:
++        var = ((2 * s1 + s2) * (n - 1) - 4 * s0**2) / (2 * (n + 1) * s0**2)
++    df = spatial_autocorr(
++        adata, mode=mode, transformation=False, copy=True, corr_method=None
++    )
++    np.testing.assert_allclose(df["var_norm"], var, rtol=1e-10)
++    expected = -1 / (n - 1) if mode == "moran" else 1.0
++    z = (df[stat] - expected) / np.sqrt(var)
++    np.testing.assert_allclose(df["pval_norm"], stats.norm.sf(np.abs(z)), rtol=1e-6)
+diff --git a/tests/test_niche.py b/tests/test_niche.py
+index 5df3f864a..b2e335ad9 100644
+--- a/tests/test_niche.py
++++ b/tests/test_niche.py
+@@ -277,6 +277,24 @@ def test_determinism_utag_same_seed(adata):
+     )
+ 
+ 
++@pytest.mark.parametrize("to_sparse", [False, True])
++def test_utag_unexpressed_gene(adata, to_sparse):
++    """An all-zero gene (common in large panels) carries no variance and must not break PCA."""
++    a1, a2 = adata[:, 1:].copy(), adata.copy()
++    X = np.asarray(a2.X.todense() if sparse.issparse(a2.X) else a2.X, dtype=np.float32)
++    X[:, 0] = 0
++    a1.X = X[:, 1:]
++    a2.X = sparse.csr_matrix(X) if to_sparse else X
++    for a in (a1, a2):
++        calculate_niche(
++            a, flavor="utag", n_neighbors=10, resolutions=0.5, random_state=7
++        )
++    np.testing.assert_array_equal(
++        a1.obs["utag_niche_res=0.5"].astype(str).values,
++        a2.obs["utag_niche_res=0.5"].astype(str).values,
++    )
++
++
+ def test_unknown_flavor_raises(adata):
+     with pytest.raises(ValueError, match="Unknown flavor"):
+         calculate_niche(adata, flavor="bogus", n_neighbors=10, resolutions=0.5)

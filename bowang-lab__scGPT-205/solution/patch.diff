@@ -1,0 +1,431 @@
+diff --git a/scgpt/model/generation_model.py b/scgpt/model/generation_model.py
+index 62cef1fab..2ce62c0c1 100644
+--- a/scgpt/model/generation_model.py
++++ b/scgpt/model/generation_model.py
+@@ -39,8 +39,11 @@ def __init__(
+         pert_pad_id: int = 2,
+         do_mvc: bool = False,
+         domain_spec_batchnorm: Union[bool, str] = False,
++        n_input_bins: Optional[int] = 0,
+         cell_emb_style: str = "cls",
+         mvc_decoder_style: str = "inner product",
++        decoder_activation: Optional[str] = None,
++        decoder_adaptive_bias: bool = False,
+         ecs_threshold: float = 0.3,
+         explicit_zero_prob: bool = False,
+         use_fast_transformer: bool = False,
+@@ -55,31 +58,19 @@ def __init__(
+         self.pert_pad_id = pert_pad_id
+         self.ecs_threshold = ecs_threshold
+         self.domain_spec_batchnorm = domain_spec_batchnorm
++        self.n_input_bins = n_input_bins
+         self.cell_emb_style = cell_emb_style
+         self.explicit_zero_prob = explicit_zero_prob
+         self.norm_scheme = "pre" if pre_norm else "post"
+         if cell_emb_style not in ["cls", "avg-pool", "w-pool"]:
+             raise ValueError(f"Unknown cell_emb_style: {cell_emb_style}")
+-        if use_fast_transformer:
+-            try:
+-                from flash_attn.flash_attention import FlashMHA
+-            except ImportError:
+-                import warnings
+-
+-                warnings.warn(
+-                    "flash-attn is not installed, using pytorch transformer instead. "
+-                    "Set use_fast_transformer=False to avoid this warning. "
+-                    "Installing flash-attn is highly recommended."
+-                )
+-                use_fast_transformer = False
+-        self.use_fast_transformer = use_fast_transformer
+ 
+         self.encoder = GeneEncoder(ntoken, d_model, padding_idx=vocab[pad_token])
+         self.value_encoder = ContinuousValueEncoder(d_model, dropout)
+         self.pert_encoder = nn.Embedding(3, d_model, padding_idx=pert_pad_id)
+ 
+-        print("Using simple batchnorm instead of domain specific batchnorm")
+-        self.bn = nn.BatchNorm1d(d_model, eps=6.1e-5)
++        # print("Using simple batchnorm instead of domain specific batchnorm")
++        # self.bn = nn.BatchNorm1d(d_model, eps=6.1e-5)
+ 
+         if use_fast_transformer:
+             if fast_transformer_backend == "linear":
+@@ -103,9 +94,11 @@ def __init__(
+             self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+ 
+         # self.decoder = nn.Linear(d_model, 1)
+-        self.decoder = ExprDecoder(
++        self.decoder = AffineExprDecoder(
+             d_model,
+             explicit_zero_prob=explicit_zero_prob,
++            activation=decoder_activation,
++            adaptive_bias=decoder_adaptive_bias,
+         )
+         self.cls_decoder = ClsDecoder(d_model, n_cls, nlayers=nlayers_cls)
+         if do_mvc:
+@@ -115,9 +108,6 @@ def __init__(
+                 explicit_zero_prob=explicit_zero_prob,
+             )
+ 
+-        self.sim = Similarity(temp=0.5)
+-        self.creterion_cce = nn.CrossEntropyLoss()
+-
+         self.init_weights()
+ 
+     def init_weights(self) -> None:
+@@ -137,7 +127,7 @@ def _encode(
+         perts = self.pert_encoder(input_pert_flags)  # (batch, seq_len, embsize)
+         total_embs = src + values + perts
+ 
+-        total_embs = self.bn(total_embs.permute(0, 2, 1)).permute(0, 2, 1)
++        # total_embs = self.bn(total_embs.permute(0, 2, 1)).permute(0, 2, 1)
+         output = self.transformer_encoder(
+             total_embs, src_key_padding_mask=src_key_padding_mask
+         )
+@@ -203,11 +193,21 @@ def forward(
+             do_sample = True
+             logger.warning("Auto set do_sample to True when model is in eval mode.")
+ 
++        # binning input gene values
++        if self.n_input_bins > 0:
++            from ..preprocess import binning
++
++            processed_values = torch.stack(
++                [binning(row, n_bins=self.n_input_bins) for row in values], dim=0
++            ).to(values.device)
++        else:
++            processed_values = values
++
+         transformer_output = self._encode(
+-            src, values, input_pert_flags, src_key_padding_mask
++            src, processed_values, input_pert_flags, src_key_padding_mask
+         )
+         output = {}
+-        mlm_output = self.decoder(transformer_output)
++        mlm_output = self.decoder(transformer_output, values)
+         if self.explicit_zero_prob and do_sample:
+             bernoulli = Bernoulli(probs=mlm_output["zero_probs"])
+             output["mlm_output"] = bernoulli.sample() * mlm_output["pred"]
+@@ -360,6 +360,114 @@ def forward(self, x: Tensor) -> Tensor:
+         return x
+ 
+ 
++class AffineExprDecoder(nn.Module):
++    def __init__(
++        self,
++        d_model: int,
++        explicit_zero_prob: bool = False,
++        activation: Optional[str] = None,
++        tanh_coeff: bool = False,
++        adaptive_bias: bool = False,
++    ):
++        """
++        Predict the expression value of each gene in an affine like form of Ax + b.
++        This decoder takes two ExprDecoder intrinsically to genrate the coefficient A and bias b.
++
++        Args:
++            d_model: The embedding dimension.
++            explicit_zero_prob: If True, predict the probability of each gene being
++                zero.
++            activation: The activation function for the coefficient A and bias b.
++            tanh_coeff: If True, use tanh activation for the coefficient A.
++            adaptive_bias: If True, use a learnable bias for the bias b.
++        """
++        super().__init__()
++        self.explicit_zero_prob = explicit_zero_prob
++        self.tanh_coeff = tanh_coeff
++        self.adaptive_bias = adaptive_bias
++        self.coeff_decoder = ExprDecoder(d_model, explicit_zero_prob=explicit_zero_prob)
++        self.bias_decoder = ExprDecoder(d_model, explicit_zero_prob=explicit_zero_prob)
++
++        self.activation = activation
++        if activation is not None:
++            assert hasattr(nn, activation), f"Unknown activation: {activation}"
++            self.activation = getattr(nn, activation)()
++
++    def forward(self, x: Tensor, values: Tensor) -> Tensor:
++        """
++        Args:
++            x: Tensor, shape [batch_size, seq_len, embsize]
++            values: Tensor, shape [batch_size, seq_len]
++
++        Returns:
++            output Tensor of shape [batch_size, seq_len]
++        """
++        coeff = self.coeff_decoder(x)
++        bias = self.bias_decoder(x)
++
++        if self.activation is not None:
++            coeff["pred"] = self.activation(coeff["pred"])
++            bias["pred"] = self.activation(bias["pred"])
++
++        # if self.tanh_coeff:
++        #     coeff["pred"] = 1 + torch.tanh(coeff["pred"])
++
++        if self.adaptive_bias:
++            # bias["pred"] = bias["pred"] * values.mean(dim=1, keepdim=True)
++            non_zero_value_mean = values.sum(dim=1, keepdim=True) / (values != 0).sum(
++                dim=1, keepdim=True
++            )
++            bias["pred"] = bias["pred"] * non_zero_value_mean
++
++        if self.explicit_zero_prob:
++            return {
++                "pred": coeff["pred"] * values + bias["pred"],
++                "zero_probs": coeff["zero_probs"],
++            }
++
++        return dict(pred=coeff["pred"] * values + bias["pred"])
++
++
++class TokenEmbedding(nn.Module):
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        padding_idx: Optional[int] = None,
++        zero_out_idx: Optional[int] = None,
++    ):
++        """
++        Generic token embedding module.
++
++        Args:
++            num_embeddings: The number of tokens.
++            embedding_dim: The embedding dimension.
++            padding_idx: The index of the padding token.
++            zero_out_idx: Indicate if any idx embedding should be zero vector.
++        """
++        super().__init__()
++        self.embedding = nn.Embedding(
++            num_embeddings, embedding_dim, padding_idx=padding_idx
++        )
++        self.enc_norm = nn.LayerNorm(embedding_dim)
++
++        self.zero_out_idx = zero_out_idx
++        if zero_out_idx is not None:
++            self._fill_idx_with_zero(zero_out_idx)
++            zero_vector = self(zero_out_idx)
++            assert torch.all(zero_vector == 0.0)
++            assert not zero_vector.requires_grad
++
++    def _fill_idx_with_zero(self, idx) -> None:
++        with torch.no_grad():
++            self.embedding.weight[idx].fill_(0)
++
++    def forward(self, x: Tensor) -> Tensor:
++        x = self.embedding(x)  # (batch, seq_len, embsize)
++        x = self.enc_norm(x)
++        return x
++
++
+ class PositionalEncoding(nn.Module):
+     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+         super().__init__()
+diff --git a/scgpt/utils/util.py b/scgpt/utils/util.py
+index 53cd080b6..692fc7461 100644
+--- a/scgpt/utils/util.py
++++ b/scgpt/utils/util.py
+@@ -11,7 +11,6 @@
+ import torch
+ import pandas as pd
+ from anndata import AnnData
+-import scib
+ from matplotlib import pyplot as plt
+ from matplotlib import axes
+ from IPython import get_ipython
+@@ -103,6 +102,11 @@ def get_git_commit():
+     return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+ 
+ 
++def get_git_diff():
++    commit = get_git_commit()
++    return subprocess.check_output(["git", "diff", commit]).decode("utf-8").strip()
++
++
+ def histogram(
+     *data: List[np.ndarray],
+     label: List[str] = ["train", "valid"],
+@@ -370,6 +374,8 @@ def eval_scib_metrics(
+     label_key: str = "celltype",
+     notes: Optional[str] = None,
+ ) -> Dict:
++    import scib
++
+     results = scib.metrics.metrics(
+         adata,
+         adata_int=adata,
+@@ -420,6 +426,175 @@ def eval_scib_metrics(
+     return result_dict
+ 
+ 
++def compute_perturbation_metrics(
++    results: Dict,
++    ctrl_adata: AnnData,
++    non_zero_genes: bool = False,
++    return_raw: bool = False,
++) -> Dict:
++    """
++    Given results from a model run and the ground truth, compute metrics
++
++    Args:
++        results (:obj:`Dict`): The results from a model run
++        ctrl_adata (:obj:`AnnData`): The adata of the control condtion
++        non_zero_genes (:obj:`bool`, optional): Whether to only consider non-zero
++            genes in the ground truth when computing metrics
++        return_raw (:obj:`bool`, optional): Whether to return the raw metrics or
++            the mean of the metrics. Default is False.
++
++    Returns:
++        :obj:`Dict`: The metrics computed
++    """
++    from scipy.stats import pearsonr
++
++    # metrics:
++    #   Pearson correlation of expression on all genes, on DE genes,
++    #   Pearson correlation of expression change on all genes, on DE genes,
++
++    metrics_across_genes = {
++        "pearson": [],
++        "pearson_de": [],
++        "pearson_delta": [],
++        "pearson_de_delta": [],
++    }
++
++    metrics_across_conditions = {
++        "pearson": [],
++        "pearson_delta": [],
++    }
++
++    conditions = np.unique(results["pert_cat"])
++    assert not "ctrl" in conditions, "ctrl should not be in test conditions"
++    condition2idx = {c: np.where(results["pert_cat"] == c)[0] for c in conditions}
++
++    mean_ctrl = np.array(ctrl_adata.X.mean(0)).flatten()  # (n_genes,)
++    assert ctrl_adata.X.max() <= 1000, "gene expression should be log transformed"
++
++    true_perturbed = results["truth"]  # (n_cells, n_genes)
++    assert true_perturbed.max() <= 1000, "gene expression should be log transformed"
++    true_mean_perturbed_by_condition = np.array(
++        [true_perturbed[condition2idx[c]].mean(0) for c in conditions]
++    )  # (n_conditions, n_genes)
++    true_mean_delta_by_condition = true_mean_perturbed_by_condition - mean_ctrl
++    zero_rows = np.where(np.all(true_mean_perturbed_by_condition == 0, axis=1))[
++        0
++    ].tolist()
++    zero_cols = np.where(np.all(true_mean_perturbed_by_condition == 0, axis=0))[
++        0
++    ].tolist()
++
++    pred_perturbed = results["pred"]  # (n_cells, n_genes)
++    pred_mean_perturbed_by_condition = np.array(
++        [pred_perturbed[condition2idx[c]].mean(0) for c in conditions]
++    )  # (n_conditions, n_genes)
++    pred_mean_delta_by_condition = pred_mean_perturbed_by_condition - mean_ctrl
++
++    def corr_over_genes(x, y, conditions, res_list, skip_rows=[], non_zero_mask=None):
++        """compute pearson correlation over genes for each condition"""
++        for i, c in enumerate(conditions):
++            if i in skip_rows:
++                continue
++            x_, y_ = x[i], y[i]
++            if non_zero_mask is not None:
++                x_ = x_[non_zero_mask[i]]
++                y_ = y_[non_zero_mask[i]]
++            res_list.append(pearsonr(x_, y_)[0])
++
++    corr_over_genes(
++        true_mean_perturbed_by_condition,
++        pred_mean_perturbed_by_condition,
++        conditions,
++        metrics_across_genes["pearson"],
++        zero_rows,
++        non_zero_mask=true_mean_perturbed_by_condition != 0 if non_zero_genes else None,
++    )
++    corr_over_genes(
++        true_mean_delta_by_condition,
++        pred_mean_delta_by_condition,
++        conditions,
++        metrics_across_genes["pearson_delta"],
++        zero_rows,
++        non_zero_mask=true_mean_perturbed_by_condition != 0 if non_zero_genes else None,
++    )
++
++    def find_DE_genes(adata, condition, geneid2idx, non_zero_genes=False, top_n=20):
++        """
++        Find the DE genes for a condition
++        """
++        key_components = next(
++            iter(adata.uns["rank_genes_groups_cov_all"].keys())
++        ).split("_")
++        assert len(key_components) == 3, "rank_genes_groups_cov_all key is not valid"
++
++        condition_key = "_".join([key_components[0], condition, key_components[2]])
++
++        de_genes = adata.uns["rank_genes_groups_cov_all"][condition_key]
++        if non_zero_genes:
++            de_genes = adata.uns["top_non_dropout_de_20"][condition_key]
++            # de_genes = adata.uns["rank_genes_groups_cov_all"][condition_key]
++            # de_genes = de_genes[adata.uns["non_zeros_gene_idx"][condition_key]]
++            # assert len(de_genes) > top_n
++
++        de_genes = de_genes[:top_n]
++
++        de_idx = [geneid2idx[i] for i in de_genes]
++
++        return de_idx, de_genes
++
++    geneid2idx = dict(zip(ctrl_adata.var.index.values, range(len(ctrl_adata.var))))
++    de_idx = {
++        c: find_DE_genes(ctrl_adata, c, geneid2idx, non_zero_genes)[0]
++        for c in conditions
++    }
++    mean_ctrl_de = np.array(
++        [mean_ctrl[de_idx[c]] for c in conditions]
++    )  # (n_conditions, n_diff_genes)
++
++    true_mean_perturbed_by_condition_de = np.array(
++        [
++            true_mean_perturbed_by_condition[i, de_idx[c]]
++            for i, c in enumerate(conditions)
++        ]
++    )  # (n_conditions, n_diff_genes)
++    zero_rows_de = np.where(np.all(true_mean_perturbed_by_condition_de == 0, axis=1))[
++        0
++    ].tolist()
++    true_mean_delta_by_condition_de = true_mean_perturbed_by_condition_de - mean_ctrl_de
++
++    pred_mean_perturbed_by_condition_de = np.array(
++        [
++            pred_mean_perturbed_by_condition[i, de_idx[c]]
++            for i, c in enumerate(conditions)
++        ]
++    )  # (n_conditions, n_diff_genes)
++    pred_mean_delta_by_condition_de = pred_mean_perturbed_by_condition_de - mean_ctrl_de
++
++    corr_over_genes(
++        true_mean_perturbed_by_condition_de,
++        pred_mean_perturbed_by_condition_de,
++        conditions,
++        metrics_across_genes["pearson_de"],
++        zero_rows_de,
++    )
++    corr_over_genes(
++        true_mean_delta_by_condition_de,
++        pred_mean_delta_by_condition_de,
++        conditions,
++        metrics_across_genes["pearson_de_delta"],
++        zero_rows_de,
++    )
++
++    if not return_raw:
++        for k, v in metrics_across_genes.items():
++            metrics_across_genes[k] = np.mean(v)
++        for k, v in metrics_across_conditions.items():
++            metrics_across_conditions[k] = np.mean(v)
++    metrics = metrics_across_genes
++
++    return metrics
++
++
+ # wrapper to make sure all methods are called only on the main process
+ def main_process_only(func):
+     @functools.wraps(func)

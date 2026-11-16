@@ -1,0 +1,323 @@
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index c72f5065a..acfd4f6cc 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -57,7 +57,7 @@ use salmon_model::dumps::{dump_bias_models_to_file, BiasDump};
+ use salmon_model::{FragmentLengthDistribution, LibraryTypeDetector, SBModel};
+ pub use salmon_rad::ChunkCodec;
+ 
+-use processor::{QuantProcessor, Shared};
++use processor::{QuantProcessor, Shared, UnmappedWriter};
+ 
+ pub use output::write_outputs;
+ 
+@@ -401,10 +401,19 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let num_dovetail = AtomicU64::new(0);
+     let num_frags_filtered_vm = AtomicU64::new(0);
+     let num_below_threshold_vm = AtomicU64::new(0);
+-    // collector for `--writeUnmappedNames` (names of unmapped fragments)
+-    let unmapped_collector: Option<std::sync::Mutex<Vec<String>>> = opts
+-        .write_unmapped_names
+-        .then(|| std::sync::Mutex::new(Vec::new()));
++    // `--writeUnmappedNames`: open the file up front and let workers stream into
++    // it per batch. Opening here also surfaces an unwritable output directory
++    // before the mapping pass rather than after it.
++    let unmapped_collector: Option<std::sync::Mutex<UnmappedWriter>> = if opts.write_unmapped_names
++    {
++        std::fs::create_dir_all(opts.output_dir.join("aux_info")).context("creating aux_info")?;
++        Some(std::sync::Mutex::new(
++            UnmappedWriter::create(&opts.output_dir.join("aux_info").join("unmapped_names.txt"))
++                .context("creating unmapped_names.txt")?,
++        ))
++    } else {
++        None
++    };
+     let nthreads = if opts.num_threads == 0 {
+         std::thread::available_parallelism()
+             .map(|n| n.get())
+@@ -693,18 +702,13 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     // Write aux_info/unmapped_names.txt ("<name> <status>" per line; the port maps
+     // unmapped fragments as "u" — orphan/decoy sub-codes await mapper-reason
+     // reporting, tracked with the *_vm counters).
+-    if let Some(collector) = &unmapped_collector {
+-        use std::io::Write as _;
+-        let names = collector.lock().unwrap();
+-        std::fs::create_dir_all(opts.output_dir.join("aux_info")).context("creating aux_info")?;
+-        let mut w = std::io::BufWriter::new(
+-            std::fs::File::create(opts.output_dir.join("aux_info").join("unmapped_names.txt"))
+-                .context("creating unmapped_names.txt")?,
+-        );
+-        for line in names.iter() {
+-            writeln!(w, "{line}")?;
+-        }
+-        w.flush()?;
++    // Every worker has joined, so nothing more will be written: flush and close.
++    if let Some(collector) = unmapped_collector {
++        collector
++            .into_inner()
++            .unwrap()
++            .finish()
++            .context("writing unmapped_names.txt")?;
+     }
+ 
+     // Resolve the library type: the detected format (when auto), else the
+diff --git a/crates/salmon-quant/src/processor.rs b/crates/salmon-quant/src/processor.rs
+index 5b4de4a61..6c8a48af3 100644
+--- a/crates/salmon-quant/src/processor.rs
++++ b/crates/salmon-quant/src/processor.rs
+@@ -149,8 +149,10 @@ pub(crate) struct Shared<'a> {
+     pub num_dovetail: &'a AtomicU64,
+     pub num_frags_filtered_vm: &'a AtomicU64,
+     pub num_below_threshold_vm: &'a AtomicU64,
+-    /// when set, collect the names of unmapped fragments (`--writeUnmappedNames`)
+-    pub unmapped_names: Option<&'a Mutex<Vec<String>>>,
++    /// when set, the open `unmapped_names.txt` writer (`--writeUnmappedNames`).
++    /// Workers stream into it per batch rather than accumulating every name for
++    /// the whole run; see [`QuantProcessor::unmapped`].
++    pub unmapped_names: Option<&'a Mutex<UnmappedWriter>>,
+     /// when set, write per-mapping SAM records (`--writeMappings`)
+     pub sam: Option<&'a crate::sam::SamWriter>,
+     /// when set, encode per-mapping BAM records into reusable worker chunks
+@@ -330,8 +332,13 @@ pub(crate) struct QuantProcessor<'a> {
+     pub gcbias: Option<GcFragModel>,
+     /// per-thread observed (5', 3') positional-bias models, per length class
+     pub posbias: Option<(Vec<SimplePosBias>, Vec<SimplePosBias>)>,
+-    /// per-thread collected unmapped-fragment names (merged in on_thread_complete)
+-    pub unmapped: Vec<String>,
++    /// per-thread unmapped-fragment name lines, flushed to the shared writer per
++    /// batch (like `sam_buf`) rather than held for the whole run. This used to be
++    /// a `Vec<String>` that grew until the process exited — one heap `String` per
++    /// unmapped read, retained to the end. On a heavily contaminated sample that
++    /// is tens of GB of small strings for output that could have been written
++    /// as it was produced.
++    pub unmapped: String,
+     /// per-thread SAM record buffer (flushed to the shared writer per batch)
+     pub sam_buf: String,
+     /// per-thread raw BAM record chunk; allocated only for `--writeBam`. Holds
+@@ -370,7 +377,7 @@ impl<'a> QuantProcessor<'a> {
+             seqbias,
+             gcbias,
+             posbias,
+-            unmapped: Vec::new(),
++            unmapped: String::new(),
+             sam_buf: String::new(),
+             bam_scratch: shared.bam.map(|output| output.scratch()),
+             rad_buf: shared.rad.map(|rad| {
+@@ -1095,28 +1102,69 @@ fn accumulate_vm_stats(maps_empty: bool, counters: &mut Counters) {
+ 
+ /// Merge this thread's observed bias models (sequence and GC) into the shared
+ /// accumulators.
+-/// The read name written to unmapped_names.txt: the id up to the first
+-/// whitespace (the conventional fragment name), lossily decoded.
+-fn read_name(id: &[u8]) -> String {
++/// The open `unmapped_names.txt`, shared by every worker.
++///
++/// Workers buffer their own lines and hand over a block per batch, so the lock
++/// is taken once per batch rather than once per unmapped read, and no name is
++/// held in memory beyond the batch that produced it.
++pub struct UnmappedWriter {
++    w: std::io::BufWriter<std::fs::File>,
++}
++
++impl UnmappedWriter {
++    /// Create (or truncate) `unmapped_names.txt` at `path`.
++    pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
++        Ok(Self {
++            // 1 MiB: this is a bulk sequential text stream, like the SAM writer.
++            w: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?),
++        })
++    }
++
++    /// Append one worker's buffered lines.
++    fn write_block(&mut self, block: &str) -> std::io::Result<()> {
++        use std::io::Write as _;
++        self.w.write_all(block.as_bytes())
++    }
++
++    /// Flush buffered bytes to the file. Called once, after every worker has
++    /// finished, so a truncated file cannot be mistaken for a complete one.
++    pub fn finish(mut self) -> std::io::Result<()> {
++        use std::io::Write as _;
++        self.w.flush()
++    }
++}
++
++/// Append one `"<name> u"` line to this worker's buffer.
++///
++/// The name is the id up to the first whitespace (the conventional fragment
++/// name), lossily decoded. Written straight into the buffer, so an unmapped read
++/// costs no heap allocation of its own — the old path built a `String` per read
++/// and pushed it into a `Vec` that lived for the whole run.
++fn push_unmapped_name(buf: &mut String, id: &[u8]) {
+     let end = id
+         .iter()
+         .position(|b| b.is_ascii_whitespace())
+         .unwrap_or(id.len());
+-    String::from_utf8_lossy(&id[..end]).into_owned()
++    buf.push_str(&String::from_utf8_lossy(&id[..end]));
++    buf.push_str(" u\n");
+ }
+ 
+-/// Merge this thread's collected unmapped-fragment names into the shared list.
++/// Write this worker's buffered unmapped names to the shared file and clear the
++/// buffer. Called per batch and again when the thread finishes, so the names
++/// leave memory as they are produced instead of accumulating for the whole run.
+ /// Fold this worker's private counter tallies into the shared atomics.
+ fn merge_counters(proc: &QuantProcessor) {
+     proc.counters.merge_into(&proc.shared);
+ }
+ 
+-fn merge_unmapped(proc: &mut QuantProcessor) {
++fn flush_unmapped(proc: &mut QuantProcessor) -> std::io::Result<()> {
+     if let Some(shared) = proc.shared.unmapped_names {
+         if !proc.unmapped.is_empty() {
+-            shared.lock().unwrap().append(&mut proc.unmapped);
++            shared.lock().unwrap().write_block(&proc.unmapped)?;
++            proc.unmapped.clear();
+         }
+     }
++    Ok(())
+ }
+ 
+ /// Merge this worker's private bias models into the shared ones.
+@@ -1250,7 +1298,7 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+                 placements.clear();
+             }
+             if placements.is_empty() && sh.unmapped_names.is_some() {
+-                unmapped.push(format!("{} u", read_name(r1.id())));
++                push_unmapped_name(unmapped, r1.id());
+             }
+             if !sh.sketch {
+                 accumulate_vm_stats(placements.is_empty(), counters);
+@@ -1311,6 +1359,7 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+         // next batch's per-fragment reads are stable (see `record`). No-op once the
+         // final FLD cache is taken; amortized over the whole batch.
+         self.shared.fld.refresh_online();
++        flush_unmapped(self)?;
+         flush_sam(self)?;
+         flush_bam(self)?;
+         flush_rad(self)?;
+@@ -1320,7 +1369,7 @@ impl<'a, 'r> PairedParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+         merge_counters(self);
+         merge_bias(self);
+-        merge_unmapped(self);
++        flush_unmapped(self)?;
+         flush_sam(self)?;
+         flush_bam(self)?;
+         flush_rad(self)?;
+@@ -1406,7 +1455,7 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+                 placements.clear();
+             }
+             if placements.is_empty() && sh.unmapped_names.is_some() {
+-                unmapped.push(format!("{} u", read_name(rec.id())));
++                push_unmapped_name(unmapped, rec.id());
+             }
+             if !sh.sketch {
+                 accumulate_vm_stats(placements.is_empty(), counters);
+@@ -1461,6 +1510,7 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+         // next batch's per-fragment reads are stable (see `record`). No-op once the
+         // final FLD cache is taken; amortized over the whole batch.
+         self.shared.fld.refresh_online();
++        flush_unmapped(self)?;
+         flush_sam(self)?;
+         flush_bam(self)?;
+         flush_rad(self)?;
+@@ -1470,7 +1520,7 @@ impl<'a, 'r> ParallelProcessor<RefRecord<'r>> for QuantProcessor<'a> {
+     fn on_thread_complete(&mut self) -> paraseq::Result<()> {
+         merge_counters(self);
+         merge_bias(self);
+-        merge_unmapped(self);
++        flush_unmapped(self)?;
+         flush_sam(self)?;
+         flush_bam(self)?;
+         flush_rad(self)?;
+diff --git a/crates/salmon-quant/tests/quant_end_to_end.rs b/crates/salmon-quant/tests/quant_end_to_end.rs
+index 7a4437c7a..b83172c4c 100644
+--- a/crates/salmon-quant/tests/quant_end_to_end.rs
++++ b/crates/salmon-quant/tests/quant_end_to_end.rs
+@@ -748,3 +748,84 @@ fn mates_orphaning_to_different_transcripts_are_one_orphan_fragment() {
+         "both transcripts should receive orphan mass: {counts:?}"
+     );
+ }
++
++/// `--writeUnmappedNames` must name exactly the fragments that did not map, and
++/// must not hold them all in memory to do it.
++///
++/// The names used to accumulate in a `Vec<String>` — one heap `String` per
++/// unmapped read, retained until the process exited. On a contaminated sample
++/// that is unbounded: measured at 1620 MB peak RSS for 10M unmapped fragments,
++/// against 159 MB once the names are streamed to the file per batch.
++///
++/// The fixture mixes reads simulated from the transcriptome with reads drawn
++/// from an unrelated sequence, so the expected unmapped set is known exactly.
++#[test]
++fn write_unmapped_names_lists_exactly_the_unmapped_fragments() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path();
++    let (fasta, r1, r2, _truth) = simulate(dir);
++
++    // Append foreign fragments that cannot map to the indexed transcriptome.
++    let foreign = gen_seq(4000, 987_654);
++    const N_FOREIGN: usize = 50;
++    let r1f = dir.join("mixed_1.fq");
++    let r2f = dir.join("mixed_2.fq");
++    std::fs::copy(&r1, &r1f).unwrap();
++    std::fs::copy(&r2, &r2f).unwrap();
++    let mut w = FastqWriters {
++        r1: std::io::BufWriter::new(std::fs::OpenOptions::new().append(true).open(&r1f).unwrap()),
++        r2: std::io::BufWriter::new(std::fs::OpenOptions::new().append(true).open(&r2f).unwrap()),
++    };
++    let mut expected = Vec::new();
++    for i in 0..N_FOREIGN {
++        let pos = i * 20;
++        let s1 = foreign[pos..pos + READ_LEN].to_vec();
++        let s2 = revcomp(&foreign[pos + 200..pos + 200 + READ_LEN]);
++        // `write_pair` names them `r{id}`; keep clear of the simulated ids.
++        let id = 1_000_000 + i;
++        w.write_pair(id, &s1, &s2);
++        expected.push(format!("r{id}/1"));
++    }
++    w.r1.flush().unwrap();
++    w.r2.flush().unwrap();
++    drop(w);
++
++    let idx_dir = dir.join("idx");
++    let mut bopts = IndexBuildOptions::new(vec![fasta], idx_dir.clone());
++    bopts.threads = 1;
++    build(&bopts).expect("build index");
++
++    let out = dir.join("quant");
++    let mut opts = QuantOptions::new(idx_dir, out.clone());
++    opts.mates1 = vec![r1f];
++    opts.mates2 = vec![r2f];
++    opts.lib_type = "IU".to_string();
++    opts.num_threads = 2;
++    opts.write_unmapped_names = true;
++    quantify(&opts).expect("quantify");
++
++    let txt = std::fs::read_to_string(out.join("aux_info").join("unmapped_names.txt"))
++        .expect("unmapped_names.txt must exist");
++
++    // Every line is "<name> u"; the file must be complete (final newline) so a
++    // truncated flush cannot pass as a full one.
++    assert!(
++        txt.ends_with('\n'),
++        "file must end with a newline, so a truncated write is detectable"
++    );
++    let mut got: Vec<&str> = txt
++        .lines()
++        .map(|l| {
++            let (name, status) = l.rsplit_once(' ').expect("each line is \"<name> u\"");
++            assert_eq!(status, "u", "unexpected status in {l:?}");
++            name
++        })
++        .collect();
++    got.sort_unstable();
++    let mut want: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
++    want.sort_unstable();
++    assert_eq!(
++        got, want,
++        "unmapped_names.txt must list exactly the foreign fragments"
++    );
++}

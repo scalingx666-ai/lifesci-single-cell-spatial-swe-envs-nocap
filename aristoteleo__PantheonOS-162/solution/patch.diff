@@ -1,0 +1,848 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 5e5ac630e..660df0cff 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -385,6 +385,49 @@ COPY --from=builder /app /app
+ RUN chmod +x /app/docker/docker-entrypoint-dual-mode.sh && \
+     cp /app/docker/docker-entrypoint-dual-mode.sh /usr/local/bin/docker-entrypoint.sh
+ 
++# Root the package managers in the Volume, so what a user installs outlives the
++# container — see docker/pantheon-userspace.sh for what and why.
++#
++# The apt shim goes in /usr/local/bin, which every default PATH searches before
++# /usr/bin, and is installed HERE rather than earlier on purpose: every
++# apt-get above is a build step that must reach the real apt, and this layer is
++# after all of them.
++RUN cp /app/docker/pantheon-userspace.sh /usr/local/bin/pantheon-userspace.sh && \
++    chmod +x /usr/local/bin/pantheon-userspace.sh && \
++    cp /app/docker/pantheon-apt /usr/local/bin/apt && \
++    ln -sf /usr/local/bin/apt /usr/local/bin/apt-get && \
++    chmod +x /usr/local/bin/apt && \
++    printf '. /usr/local/bin/pantheon-userspace.sh\n' > /etc/profile.d/99-pantheon-userspace.sh && \
++    printf '\n# Pantheon: root the package managers in the Volume (see the script).\n[ -f /usr/local/bin/pantheon-userspace.sh ] && . /usr/local/bin/pantheon-userspace.sh\n' \
++        >> /etc/bash.bashrc
++
++# micromamba — one static binary, ~5MB, no Python of its own. It is here for
++# the case the four package managers above genuinely cannot serve: R and
++# Bioconductor packages that Debian would have to compile from source, and
++# bioconda's command-line tools. Envs land on the Volume (MAMBA_ROOT_PREFIX in
++# pantheon-userspace.sh) so they persist like everything else.
++#
++# Version pinned rather than :latest, the same way monolith and tectonic are
++# above, so a rebuild does not silently change the tool. Non-fatal: a sandbox
++# that boots without it is still a working sandbox.
++RUN (curl -Ls --retry 3 --retry-delay 5 --max-time 120 \
++     https://micro.mamba.pm/api/micromamba/linux-64/2.9.0 \
++     | tar -xj -C /tmp bin/micromamba && \
++     mv /tmp/bin/micromamba /usr/local/bin/micromamba && \
++     chmod +x /usr/local/bin/micromamba) || \
++    echo "Warning: micromamba download failed, skipping (installable at runtime)"
++
++# `conda` and `mamba` name the same thing here — the names everyone already
++# types, and there is no second implementation to confuse them with. These are
++# for non-interactive callers (scripts, the agent's shell tool); interactive
++# shells additionally get functions from pantheon-userspace.sh, because
++# `activate` has to run in the caller's shell and a subprocess cannot do it.
++RUN printf '#!/bin/sh\nexec micromamba "$@"\n' > /usr/local/bin/conda && \
++    printf '#!/bin/sh\nexec micromamba "$@"\n' > /usr/local/bin/mamba && \
++    chmod +x /usr/local/bin/conda /usr/local/bin/mamba && \
++    cp /app/docker/pantheon-analysis-env /usr/local/bin/pantheon-analysis-env && \
++    chmod +x /usr/local/bin/pantheon-analysis-env
++
+ # Set default working directory
+ WORKDIR /workspace
+ 
+diff --git a/docker/docker-entrypoint-dual-mode.sh b/docker/docker-entrypoint-dual-mode.sh
+index 4a44aa6a9..347d02341 100755
+--- a/docker/docker-entrypoint-dual-mode.sh
++++ b/docker/docker-entrypoint-dual-mode.sh
+@@ -6,6 +6,36 @@ echo "Pantheon Docker Container"
+ echo "Mode: ${PANTHEON_MODE:-hub}"
+ echo "========================================="
+ 
++# Point pip, npm, R and apt at the Volume, so software a user installs is still
++# there after the sandbox is recreated. Sourced (not run) so the exports reach
++# the agent and every pty it spawns; see docker/pantheon-userspace.sh.
++#
++# Guarded on both sides: an older image may not carry the script, and a failure
++# inside it must cost the user a package manager, never their sandbox — `set -e`
++# is suspended for the whole of an `||` list, including the sourced body.
++if [ -f /usr/local/bin/pantheon-userspace.sh ]; then
++    . /usr/local/bin/pantheon-userspace.sh || echo "[userspace] skipped (non-fatal)"
++    echo "  User prefix:   ${PANTHEON_USER_PREFIX:-unset}"
++    echo "  Analysis env:  ${PANTHEON_ANALYSIS_PYTHON:-not built yet}"
++fi
++
++# Build or repair the analysis env. In the BACKGROUND, and deliberately so: it
++# costs ~20 s of network the first time and almost nothing after, and startup
++# latency is the one thing users feel every session. Until the env is ready the
++# sandbox runs on /venv with the flat prefix, which is a working sandbox.
++#
++# EVERY boot, not only when the env is missing. Skipping it once the env exists
++# was wrong twice over: an env whose creation was interrupted — a sandbox
++# reclaimed mid-build — would keep its python and therefore never be repaired,
++# and the kernelspec that lets the notebook toolset reach the env is written
++# into the image, which is ephemeral, so it has to be re-registered each boot
++# or jupyter silently loses the env after every rebuild. The script is
++# idempotent and takes ~2 s when there is nothing to do (measured), against a
++# first build of ~20 s.
++if [ -x /usr/local/bin/pantheon-analysis-env ]; then
++    ( /usr/local/bin/pantheon-analysis-env > /tmp/pantheon-analysis-env.log 2>&1 || true ) &
++fi
++
+ # ========== MODE DETECTION ==========
+ if [ "${PANTHEON_MODE}" = "standalone" ]; then
+     echo "[STANDALONE MODE] Starting with auto-start-nats and auto-ui"
+@@ -102,7 +132,7 @@ EOF
+ 
+     # Start command: use pantheon ui instead of pantheon.chatroom
+     # Run in background with tee to display logs and capture to file
+-    python -m pantheon ui \
++    "${PANTHEON_RUNTIME_PYTHON:-python}" -m pantheon ui \
+         --workspace_path="${WORKSPACE}" \
+         --auto-start-nats \
+         --auto-ui="${FRONTEND_URL}" \
+@@ -434,10 +464,10 @@ EOF
+     # Execute the command with ID_HASH parameter
+     if [ $# -eq 0 ]; then
+         # No arguments provided, use default command with ID_HASH
+-        exec python -m pantheon.chatroom --id_hash="${ID_HASH}" ${SYNC_FLAG}
++        exec "${PANTHEON_RUNTIME_PYTHON:-python}" -m pantheon.chatroom --id_hash="${ID_HASH}" ${SYNC_FLAG}
+     else
+         # Arguments provided, pass them to pantheon.chatroom with ID_HASH
+         # This ensures ID_HASH is always used for stable service_id generation
+-        exec python -m pantheon.chatroom --id_hash="${ID_HASH}" ${SYNC_FLAG} "$@"
++        exec "${PANTHEON_RUNTIME_PYTHON:-python}" -m pantheon.chatroom --id_hash="${ID_HASH}" ${SYNC_FLAG} "$@"
+     fi
+ fi
+diff --git a/docker/pantheon-analysis-env b/docker/pantheon-analysis-env
+new file mode 100755
+index 000000000..5606a456d
+--- /dev/null
++++ b/docker/pantheon-analysis-env
+@@ -0,0 +1,241 @@
++#!/bin/bash
++# Build the default analysis environment on the Volume.
++#
++# /venv is the agent's runtime and should stay small enough to reason about:
++# what PantheonOS itself needs, nothing else. Analysis packages — scanpy,
++# Seurat, whatever a project needs — belong somewhere separate, so that
++# upgrading one cannot take the sandbox down with it, and so that two projects
++# with incompatible pins can each have their own.
++#
++# That separate place is a conda env on the Volume, which means it persists for
++# the same reason everything else in <prefix> does.
++#
++# The env is bridged back to /venv with a .pth, for two reasons. loky spawns
++# each interpreter as a fresh process and unpickles the job function there, so
++# the interpreter cannot start at all unless `pantheon` is importable from it.
++# And it means the analysis env only has to carry what the analysis needs — the
++# runtime's own packages are visible without being duplicated.
++#
++# Bridging works because the env pins the SAME CPython minor version as /venv,
++# so the C ABI matches and /venv's compiled wheels import cleanly. Verified in
++# a sandbox: pantheon, pydantic 2.12.5, numpy 2.4.2, pandas 3.0.5 all import
++# from a conda-forge python 3.12.13. That pin is not decoration — an env built
++# on a different minor version would fail on the first compiled import.
++#
++# Idempotent: safe to run on every boot, does nothing once the env is there.
++
++set -u
++
++# Everything below installs INTO the env, so a --target inherited from the
++# fallback configuration would divert it straight back out again. Cleared once,
++# here, rather than remembered at each call site.
++unset PIP_TARGET
++
++PREFIX="${PANTHEON_USER_PREFIX:-${WORKSPACE:-/workspace}/.local}"
++export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$PREFIX/micromamba}"
++ENV_NAME="${PANTHEON_ANALYSIS_ENV:-analysis}"
++ENV_DIR="$MAMBA_ROOT_PREFIX/envs/$ENV_NAME"
++
++# R lives here too, not in the image. Debian's R can only install a package by
++# compiling it, so anything with a C dependency fails on missing headers and
++# `apt install libxml2-dev` does not help — R's configure does not look in the
++# unpacked-.deb prefix. conda-forge ships those same packages already built.
++#
++# The set is overridable so a workspace that never touches R can drop it:
++# PANTHEON_ANALYSIS_PACKAGES="pip" costs ~40 s less and a few hundred MB.
++# The baseline the personal environment inherits from: the analysis stack, in
++# the image, the same for everyone and free at runtime. The personal env holds
++# only what this user added.
++BASELINE="${PANTHEON_BASELINE_ENV:-/opt/pantheon/envs/analysis}"
++
++# What the personal environment itself is built with. Deliberately thin — R and
++# the analysis stack come from the baseline, so this is only enough to have an
++# environment at all. It is what makes first boot ~70 s instead of minutes.
++EXTRA_PKGS="${PANTHEON_ANALYSIS_PACKAGES:-pip}"
++PKG_MARKER="$ENV_DIR/.pantheon-packages"
++
++command -v micromamba >/dev/null 2>&1 || { echo "[analysis-env] micromamba not present; skipping"; exit 0; }
++
++# The CPython minor version to match. Taken from the BASELINE when there is
++# one, because that is the larger body of compiled packages being borrowed —
++# a mismatch there fails on the first `import scanpy`, not on something
++# obscure. Falls back to the runtime when no baseline is present.
++if [ -x "$BASELINE/bin/python" ]; then
++    PYVER="$("$BASELINE/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
++    BASELINE_SITE="$("$BASELINE/bin/python" -c 'import site; print(site.getsitepackages()[0])')"
++else
++    PYVER="$("${PANTHEON_RUNTIME_PYTHON:-/venv/bin/python}" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null \
++             || python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
++    BASELINE_SITE=""
++fi
++RUNTIME_SITE="$("${PANTHEON_RUNTIME_PYTHON:-/venv/bin/python}" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null \
++                || python3 -c 'import site; print(site.getsitepackages()[0])')"
++
++# One builder at a time. The entrypoint starts this on every boot and it can
++# also be run by hand; two micromamba processes unpacking into one prefix is
++# how a half-built env gets made in the first place.
++LOCK="$MAMBA_ROOT_PREFIX/.$ENV_NAME.lock"
++mkdir -p "$MAMBA_ROOT_PREFIX"
++if command -v flock >/dev/null 2>&1; then
++    exec 9>"$LOCK"
++    flock -n 9 || { echo "[analysis-env] another build is already running; leaving it to that one"; exit 0; }
++fi
++
++# "Does the interpreter actually start" — not "is there a file called python".
++# An interrupted unpack leaves a binary that dies with "No module named
++# 'encodings'" before it can run a single line, and that is the state this has
++# to recognise. `-c ''` is the cheapest possible proof that it works.
++env_usable=false
++if [ -x "$ENV_DIR/bin/python" ] && "$ENV_DIR/bin/python" -c '' >/dev/null 2>&1; then
++    env_usable=true
++fi
++
++if [ "$env_usable" != true ]; then
++    if [ -e "$ENV_DIR" ]; then
++        # Moved aside rather than deleted, and then deleted in the background.
++        # `create` refuses a prefix that already exists, so the directory has to
++        # go before the rebuild — but the Volume is network-backed and removing
++        # ~11k files takes long enough that a sandbox can be reclaimed in the
++        # middle of it, which is exactly how this state was reached. A rename is
++        # atomic and instant; the rebuild starts immediately.
++        echo "[analysis-env] '$ENV_NAME' is unusable (interrupted build); rebuilding"
++        BROKEN="$ENV_DIR.broken.$$"
++        mv "$ENV_DIR" "$BROKEN" 2>/dev/null && ( rm -rf "$BROKEN" >/dev/null 2>&1 & )
++    else
++        echo "[analysis-env] creating '$ENV_NAME' (python $PYVER) — first time on this workspace"
++    fi
++    micromamba create -y -q -n "$ENV_NAME" -c conda-forge "python=$PYVER" $EXTRA_PKGS >/dev/null 2>&1 || {
++        echo "[analysis-env] creation failed; the sandbox keeps using /venv"
++        exit 0
++    }
++elif [ ! -x "$ENV_DIR/bin/pip" ]; then
++    # A working python with no pip is a build that stopped late rather than
++    # early — worth repairing in place, since the expensive part is already on
++    # disk. `create` will not touch an existing prefix, so this is `install`.
++    echo "[analysis-env] '$ENV_NAME' has no pip; repairing in place"
++    micromamba install -y -q -n "$ENV_NAME" -c conda-forge $EXTRA_PKGS >/dev/null 2>&1 || {
++        echo "[analysis-env] repair failed; the sandbox keeps using /venv"
++        exit 0
++    }
++fi
++
++# Bring an EXISTING env up to date. Adding a package to the list above only
++# affected freshly created envs, so a workspace that already had one never got
++# R: `micromamba create` had been skipped, and nothing else installed it. The
++# set the env was built with is recorded, and any change to it is reconciled —
++# which is also what makes PANTHEON_ANALYSIS_PACKAGES take effect on a
++# workspace that already exists rather than only on a brand new one.
++if [ "$(cat "$PKG_MARKER" 2>/dev/null)" != "$EXTRA_PKGS" ]; then
++    echo "[analysis-env] updating '$ENV_NAME' packages: $EXTRA_PKGS"
++    if micromamba install -y -q -n "$ENV_NAME" -c conda-forge $EXTRA_PKGS >/dev/null 2>&1; then
++        printf '%s\n' "$EXTRA_PKGS" > "$PKG_MARKER"
++    else
++        echo "[analysis-env] could not install: $EXTRA_PKGS (keeping what is there)"
++    fi
++fi
++
++# Written every run, not just at creation: an agent-image update moves the
++# runtime's site-packages, and a bridge pointing at the old one would leave the
++# env unable to import pantheon — which is to say unable to run anything.
++SITE="$("$ENV_DIR/bin/python" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null)"
++if [ -n "$SITE" ] && [ -d "$SITE" ]; then
++    # Two fallbacks, in this order, both AFTER the env's own site-packages:
++    # the baseline for the analysis stack, then the runtime so `pantheon`
++    # itself is importable. What the user installed is found first, which is
++    # what makes `pip install scanpy==x` in the personal env take effect over
++    # the baseline's copy.
++    #
++    # Rewritten on every run, and compared against what it should be. An
++    # env built by an older image bridges somewhere else entirely — to /venv
++    # only, before there was a baseline — and its readiness marker says
++    # nothing about that: the marker means "this env works", not "this env
++    # was built the way the current image builds them". That distinction cost
++    # a verification round: the env was reused, the bridge was never rewritten,
++    # and `import scvi` failed while everything reported healthy.
++    BRIDGE="$SITE/zzz-pantheon-runtime.pth"
++    WANT=""
++    [ -n "$BASELINE_SITE" ] && [ -d "$BASELINE_SITE" ] && WANT="$BASELINE_SITE"
++    [ -n "$RUNTIME_SITE" ] && [ -d "$RUNTIME_SITE" ] && WANT="$WANT${WANT:+
++}$RUNTIME_SITE"
++    if [ "$(cat "$BRIDGE" 2>/dev/null)" != "$WANT" ]; then
++        echo "[analysis-env] rewiring the bridge to $BASELINE"
++        printf '%s\n' "$WANT" > "$BRIDGE"
++    fi
++fi
++
++# A kernelspec, so the notebook toolset can reach this env too.
++#
++# That toolset already crosses interpreters properly — AsyncKernelManager takes
++# a kernel_name and jupyter resolves it to whatever python the spec names — so
++# registering one here is all it takes, and a second env registers a second
++# spec. No patching involved, unlike the interpreter toolset.
++#
++# --prefix=/usr/local rather than the default: kernelspecs are cheap to write
++# and belong to the image, and writing them per-boot keeps them pointing at
++# whatever the env currently is. PIP_TARGET is cleared for the install so that
++# ipykernel lands in the env rather than being diverted to the flat prefix.
++# Asked as "can this interpreter import ipykernel", NOT as "is ipykernel in
++# this env's site-packages". The bridge means the runtime's copy is importable
++# from here, so the env usually needs none of its own — and testing for the
++# directory got that exactly backwards: pip reported ipykernel already
++# satisfied (correctly, via the bridge), installed nothing, the directory test
++# stayed false, and the kernelspec was never written. The spec names the env's
++# python either way, which is the part that matters.
++if ! "$ENV_DIR/bin/python" -c 'import ipykernel' >/dev/null 2>&1; then
++    echo "[analysis-env] adding ipykernel"
++    "$ENV_DIR/bin/pip" install -q ipykernel >/dev/null 2>&1 || true
++fi
++if "$ENV_DIR/bin/python" -c 'import ipykernel' >/dev/null 2>&1; then
++    "$ENV_DIR/bin/python" -m ipykernel install --prefix=/usr/local \
++        --name "$ENV_NAME" --display-name "Python ($ENV_NAME)" >/dev/null 2>&1 \
++        || echo "[analysis-env] kernelspec registration failed; notebook will not see $ENV_NAME"
++else
++    echo "[analysis-env] no ipykernel; notebook will not see $ENV_NAME"
++fi
++
++# A CRAN mirror, which conda's R does not come with. Debian's r-base ships
++# /etc/R/Rprofile.site carrying one, so `install.packages("XML")` just worked
++# before; conda's build has no site profile at all, and the same call answers
++# "trying to use CRAN without setting a mirror" — a regression created by
++# moving R here, not by anything the user did.
++if [ -d "$ENV_DIR/lib/R/etc" ] && [ ! -f "$ENV_DIR/lib/R/etc/Rprofile.site" ]; then
++    cat > "$ENV_DIR/lib/R/etc/Rprofile.site" <<'RPROFILE'
++# Written by pantheon-analysis-env. conda's r-base ships no site profile, so
++# without this every install.packages() call has to name a mirror.
++local({
++    r <- getOption("repos")
++    if (is.null(r[["CRAN"]]) || r[["CRAN"]] == "@CRAN@") {
++        r["CRAN"] <- "https://cloud.r-project.org"
++        options(repos = r)
++    }
++})
++RPROFILE
++fi
++
++# The R kernel, registered the same way and for the same reason: a kernelspec
++# is all it takes for the notebook toolset to reach another interpreter, and
++# this one happens not to be Python. Written into the ephemeral image, so like
++# the Python spec it is re-registered on every boot.
++if [ -x "$ENV_DIR/bin/R" ] && [ -d "$ENV_DIR/lib/R/library/IRkernel" ]; then
++    "$ENV_DIR/bin/R" --quiet --no-save -e \
++        "IRkernel::installspec(name='ir-$ENV_NAME', displayname='R ($ENV_NAME)', prefix='/usr/local')" \
++        >/dev/null 2>&1 || echo "[analysis-env] R kernelspec registration failed"
++fi
++
++# Checked rather than assumed — a half-built env that cannot import the runtime
++# would break every interpreter the agent opens, and failing here (leaving the
++# sandbox on /venv) is much cheaper than failing there.
++# The marker is what pantheon-userspace.sh gates on, and it is written ONLY
++# here, after the env has proved it can start and import the runtime. An
++# interrupted build leaves a python that cannot even find `encodings` —
++# observed, not imagined — and testing for an executable file would have put
++# that broken interpreter first on the user's PATH, which is worse than having
++# no env at all.
++if "$ENV_DIR/bin/python" -c 'import pantheon' >/dev/null 2>&1; then
++    touch "$ENV_DIR/.pantheon-ready"
++    echo "[analysis-env] ✓ $ENV_NAME ready ($ENV_DIR)"
++else
++    rm -f "$ENV_DIR/.pantheon-ready"
++    echo "[analysis-env] ✗ $ENV_NAME cannot import the runtime; leaving it unused"
++    exit 1
++fi
+diff --git a/docker/pantheon-apt b/docker/pantheon-apt
+new file mode 100755
+index 000000000..5df4ee98f
+--- /dev/null
++++ b/docker/pantheon-apt
+@@ -0,0 +1,107 @@
++#!/bin/bash
++# `apt install X` — but installed onto the Volume, so it is still there tomorrow.
++#
++# Real apt writes to /usr, which belongs to the image, so anything installed
++# that way is erased the next time the sandbox is recreated. This intercepts
++# ONLY `install` and does the same job against the persistent prefix instead:
++# fetch the .deb and its dependencies, unpack them under $PANTHEON_USER_PREFIX,
++# and let the PATH/LD_LIBRARY_PATH set by pantheon-userspace.sh find them.
++#
++# Everything else — update, search, show, list, remove, policy — is handed to
++# the real apt untouched, because those either read state or are already
++# correct. Set PANTHEON_APT_PASSTHROUGH=1 to disable interception entirely.
++#
++# Dependencies already present in the image are skipped by apt itself, which is
++# right: the image will still provide them after a rebuild. Only what the image
++# lacks is fetched, so the Volume holds the difference and nothing more.
++
++set -euo pipefail
++
++# Passthrough goes to whichever of the two the caller actually typed; the
++# fetching below always uses apt-get, whose CLI is the stable one ("apt does
++# not have a stable CLI interface" is apt's own warning about itself).
++REAL="/usr/bin/${0##*/}"
++[ -x "$REAL" ] || REAL="/usr/bin/apt-get"
++APTGET="/usr/bin/apt-get"
++
++PREFIX="${PANTHEON_USER_PREFIX:-${WORKSPACE:-/workspace}/.local}"
++CACHE="$PREFIX/aptcache"
++ROOT="$PREFIX/opt"
++
++# apt's own privilege-dropping cannot stat the Volume the way it expects, and
++# its lock files must live somewhere writable, so both are pointed at the
++# prefix. These options only affect where apt reads and writes, not what it
++# resolves — dependency solving is still apt's.
++APT_OPTS=(-o "Dir::Cache=$CACHE"
++          -o "Dir::State::lists=$CACHE/lists"
++          -o "Debug::NoLocking=1"
++          -o "APT::Sandbox::User=root"
++          -o "APT::Get::Assume-Yes=true")
++
++passthrough() { exec "$REAL" "$@"; }
++
++[ "${PANTHEON_APT_PASSTHROUGH:-0}" = "1" ] && passthrough "$@"
++
++# Find the subcommand — the first bare word, so global flags before it are fine
++# — and drop it, keeping the flags and package names that follow.
++verb=""
++rest=()
++for a in "$@"; do
++    if [ -z "$verb" ]; then
++        case "$a" in -*) rest+=("$a") ;; *) verb="$a" ;; esac
++    else
++        rest+=("$a")
++    fi
++done
++
++case "$verb" in
++    install|reinstall) ;;
++    *) passthrough "$@" ;;
++esac
++
++mkdir -p "$CACHE/archives/partial" "$CACHE/lists/partial" "$ROOT"
++
++# Package lists live on the Volume too, so this cost is paid once rather than
++# on every boot. They do go stale — a mirror rotates and the recorded URLs
++# 404 — which is what the retry below is for.
++if [ -z "$(ls -A "$CACHE/lists" 2>/dev/null | grep -v partial || true)" ]; then
++    echo "[pantheon] fetching package lists (first time on this workspace)..."
++    "$APTGET" "${APT_OPTS[@]}" update -qq || true
++fi
++
++echo "[pantheon] installing into $ROOT (persists across sandbox restarts)"
++
++# --download-only: apt resolves and fetches, but never touches /usr. Unpacking
++# is ours to do, below.
++if ! "$APTGET" "${APT_OPTS[@]}" install --download-only -qq "${rest[@]}" 2>&1 | sed 's/^/[apt] /'; then
++    echo "[pantheon] retrying with refreshed package lists..."
++    "$APTGET" "${APT_OPTS[@]}" update -qq || true
++    "$APTGET" "${APT_OPTS[@]}" install --download-only -qq "${rest[@]}" 2>&1 | sed 's/^/[apt] /'
++fi
++
++shopt -s nullglob
++debs=("$CACHE"/archives/*.deb)
++if [ ${#debs[@]} -eq 0 ]; then
++    echo "[pantheon] nothing new to unpack — already provided by the base image."
++    exit 0
++fi
++
++# dpkg -x unpacks the archive without consulting or updating the dpkg database,
++# which is what makes this work without root and without owning /usr. The
++# trade-off is that maintainer scripts do not run, so a package whose setup is
++# more than "put these files here" (a system service, a user account) will not
++# be fully configured. Command-line tools and libraries — which is what people
++# install here — are exactly the case this does handle.
++count=0
++for d in "${debs[@]}"; do
++    dpkg -x "$d" "$ROOT" 2>/dev/null && count=$((count + 1))
++done
++rm -f "${debs[@]}"
++
++echo "[pantheon] ✓ unpacked $count package(s)"
++for p in "${rest[@]}"; do
++    case "$p" in -*) continue ;; esac
++    if [ -x "$ROOT/usr/bin/$p" ]; then
++        echo "[pantheon]   $p → $ROOT/usr/bin/$p"
++    fi
++done
+diff --git a/docker/pantheon-userspace.sh b/docker/pantheon-userspace.sh
+new file mode 100755
+index 000000000..558a547cf
+--- /dev/null
++++ b/docker/pantheon-userspace.sh
+@@ -0,0 +1,215 @@
++#!/bin/bash
++# Root every package manager in the Volume, so what a user installs survives.
++#
++# A sandbox is recreated often — on restart, after an idle reclaim, and on every
++# agent-image update — and only the Volume survives that. Anything written to
++# /usr, /opt or the venv is part of the image and is gone with it, which is why
++# "I installed vim yesterday and today it is missing" kept happening.
++#
++# Rather than photographing the container and replaying it, this points the
++# package managers themselves at the half of the filesystem that persists. The
++# packages are then just files on the Volume: they need no snapshot, they cannot
++# drift out of alignment with the base image, and an image upgrade leaves them
++# untouched instead of erasing them.
++#
++# Measured on staging, each one installed and then verified in a *different*
++# sandbox after a release/recreate cycle:
++#
++#   pip install cowsay          → /workspace/.local/pylibs      SURVIVED
++#   npm install -g left-pad     → /workspace/.local/lib          SURVIVED
++#   install.packages("jsonlite")→ /workspace/.local/Rlib         SURVIVED
++#   apt install samtools        → /workspace/.local/opt          SURVIVED
++#
++# Sourced by the entrypoint (so the agent and every pty it spawns inherit it),
++# by /etc/bash.bashrc (which is what an INTERACTIVE shell reads — the pty runs
++# `bash -i`, which never reads /etc/profile.d, so without this the terminal
++# only ever sees the environment as it was at boot), and by /etc/profile.d for
++# login shells.
++#
++# Re-sourcing therefore happens constantly and must be harmless. It is also the
++# point: the analysis env is built in the background AFTER boot, so the shell
++# that re-evaluates this is the one that finds it, without waiting for a
++# restart. Every PATH entry is added only if it is not already there.
++
++PANTHEON_USER_PREFIX="${PANTHEON_USER_PREFIX:-${WORKSPACE:-/workspace}/.local}"
++export PANTHEON_USER_PREFIX
++
++# Prepend, but only once. This file is sourced repeatedly — every interactive
++# shell re-reads it — and a plain PATH="$new:$PATH" would grow without bound.
++_pantheon_prepend_path() {
++    case ":$PATH:" in
++        *":$1:"*) ;;
++        *) PATH="$1:$PATH" ;;
++    esac
++}
++
++# Captured BEFORE anything below touches PATH, and it has to be: the analysis
++# env goes on the front of PATH further down, which would otherwise make bare
++# `python` mean the env — and the entrypoint launches the agent with bare
++# `python`. The agent would then be running on the very environment the user is
++# free to upgrade and break, which is the exact arrangement all of this exists
++# to prevent. Everything that must run on the runtime uses this name instead.
++PANTHEON_RUNTIME_PYTHON="${PANTHEON_RUNTIME_PYTHON:-$(command -v python || command -v python3)}"
++export PANTHEON_RUNTIME_PYTHON
++
++mkdir -p "$PANTHEON_USER_PREFIX"/{bin,pylibs,Rlib,opt,aptcache/archives/partial,aptcache/lists/partial} 2>/dev/null
++
++# ---------------------------------------------------------------- executables
++# Two roots: `bin` for things that install a binary directly (npm, cargo, go,
++# and pip's console scripts), `opt` for the unpacked-.deb tree, which keeps the
++# distribution's own /usr/bin layout.
++_pantheon_prepend_path "$PANTHEON_USER_PREFIX/opt/bin"
++_pantheon_prepend_path "$PANTHEON_USER_PREFIX/opt/usr/bin"
++_pantheon_prepend_path "$PANTHEON_USER_PREFIX/bin"
++export PATH
++
++# A .deb's shared objects are not in the loader's search path, so a binary
++# unpacked from one finds its libraries only if we say where they are.
++_ARCH_LIB="$PANTHEON_USER_PREFIX/opt/usr/lib/$(uname -m)-linux-gnu"
++export LD_LIBRARY_PATH="$_ARCH_LIB:$PANTHEON_USER_PREFIX/opt/usr/lib:$PANTHEON_USER_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
++export MANPATH="$PANTHEON_USER_PREFIX/opt/usr/share/man:${MANPATH:-}"
++unset _ARCH_LIB
++
++# ------------------------------------------------------------- conda-forge
++# The one thing the package managers above cannot do. Debian's
++# `install.packages()` builds R packages from source, so anything with a C
++# dependency needs headers that are not there — and the natural fix does not
++# work either:
++#
++#   install.packages("XML")   → installation had non-zero exit status
++#   apt install libxml2-dev   → unpacked into <prefix>/opt   (the shim works)
++#   install.packages("XML")   → STILL fails; R's configure does not look there
++#
++# conda-forge ships that same package already built. Measured here: 39 s and
++# `library(XML)` works, against "cannot be installed at all". Bioconda gets the
++# same treatment for command-line tools — samtools in 5 s, and a newer build
++# than Debian carries (1.24 vs 1.16.1).
++#
++# Envs live on the Volume, so they persist for the same reason everything else
++# here does.
++export MAMBA_ROOT_PREFIX="$PANTHEON_USER_PREFIX/micromamba"
++
++# The package cache stays on the Volume, unlike the pip/HF/torch caches the
++# entrypoint sends to ephemeral /root. Those are throwaway; this one is the
++# working set that makes a second env cheap to build, and micromamba copies
++# rather than hardlinks out of it (verified: nlink=1), so an env does not
++# depend on it afterwards. Point MAMBA_PKGS_DIRS elsewhere to change that.
++export MAMBA_PKGS_DIRS="${MAMBA_PKGS_DIRS:-$MAMBA_ROOT_PREFIX/pkgs}"
++
++# `micromamba activate` is a shell function, not the binary — without the hook
++# the terminal answers "run 'micromamba shell init' first" and the env cannot
++# be entered at all. Non-fatal on both counts: the binary may be missing (its
++# download in the Dockerfile is best-effort) and a bad eval must not take the
++# boot with it.
++if command -v micromamba >/dev/null 2>&1; then
++    eval "$(micromamba shell hook -s posix 2>/dev/null)" || true
++    # `conda` and `mamba` are the names in every tutorial and in muscle memory,
++    # and there is no second implementation here for them to be confused with.
++    # Functions rather than symlinks because `activate` has to run in the
++    # caller's shell; /usr/local/bin carries script shims for the rest.
++    conda() { micromamba "$@"; }
++    mamba() { micromamba "$@"; }
++fi
++
++# -------------------------------------------------------------------- python
++# /venv is the agent's runtime and stays that: what PantheonOS needs to run,
++# nothing else. Analysis packages go in a conda env on the Volume instead, so
++# that upgrading scanpy cannot take the sandbox down with it and two projects
++# with incompatible pins can have an env each. See pantheon-analysis-env.
++export PANTHEON_ANALYSIS_ENV="${PANTHEON_ANALYSIS_ENV:-analysis}"
++
++# The read-only stack in the image that the personal environment inherits from.
++# Its bin goes on PATH BEHIND the personal env's, so anything the user installs
++# shadows the baseline copy rather than the other way round.
++export PANTHEON_BASELINE_ENV="${PANTHEON_BASELINE_ENV:-/opt/pantheon/envs/analysis}"
++if [ -x "$PANTHEON_BASELINE_ENV/bin/python" ]; then
++    _pantheon_prepend_path "$PANTHEON_BASELINE_ENV/bin"
++    export PATH
++fi
++_ANALYSIS_DIR="$MAMBA_ROOT_PREFIX/envs/$PANTHEON_ANALYSIS_ENV"
++
++# The marker, not the presence of a python binary: an interrupted build leaves
++# an interpreter that cannot import `encodings` and dies on startup, and
++# putting that first on PATH would be worse than having no env. Only
++# pantheon-analysis-env writes it, and only after the env has proved it starts.
++if [ -f "$_ANALYSIS_DIR/.pantheon-ready" ] && [ -x "$_ANALYSIS_DIR/bin/python" ]; then
++    # `python` and `pip` mean the analysis env — for the person at the terminal
++    # and for anything the agent shells out to, which is the point: work lands
++    # where it persists and where it cannot reach the runtime.
++    _pantheon_prepend_path "$_ANALYSIS_DIR/bin"
++    export PATH
++
++    # Activate it properly, so `conda env list` marks it and the prompt says
++    # which env you are in — those read CONDA_PREFIX and CONDA_DEFAULT_ENV,
++    # which the PATH entry above does not set.
++    #
++    # ONCE, and inherited from there. Activation reads the env's metadata off
++    # the Volume, which is network-backed: measured at ~520 ms a time, and
++    # doing it per interactive shell put that on every terminal a person
++    # opened. The entrypoint sources this before the agent starts, so the
++    # agent, every pty and every `bash -c` inherit the result, and the guard
++    # below turns each of those into a no-op.
++    if [ "${CONDA_DEFAULT_ENV:-}" != "$PANTHEON_ANALYSIS_ENV" ] \
++       && command -v micromamba >/dev/null 2>&1; then
++        micromamba activate "$PANTHEON_ANALYSIS_ENV" 2>/dev/null || true
++    fi
++
++    # PIP_TARGET is deliberately NOT set in this case. The env is already on
++    # the Volume, so its own site-packages is the persistent place, and a
++    # --target pointing elsewhere would quietly divert every install out of the
++    # env the user just activated.
++else
++    # No env yet — first boot, or creation failed. `pip install X` still has to
++    # persist, so fall back to the flat prefix. --target rather than --user:
++    # the runtime is a virtualenv and a virtualenv disables --user outright
++    # ("User site-packages are not visible in this virtualenv").
++    export PIP_TARGET="$PANTHEON_USER_PREFIX/pylibs"
++
++    # Made importable with a .pth, NOT with PYTHONPATH. PYTHONPATH is searched
++    # BEFORE site-packages, so one `pip install --upgrade pydantic` would
++    # shadow the agent's own dependency with a version it was never tested
++    # against, inside the process that has to keep the sandbox alive. `site`
++    # processes a .pth by APPENDING, so the runtime still wins.
++    _SITE="$(python3 -c 'import site,sys; p=site.getsitepackages(); sys.stdout.write(p[0] if p else "")' 2>/dev/null)"
++    if [ -n "$_SITE" ] && [ -d "$_SITE" ]; then
++        # addsitedir() on a path that does not exist yet is a no-op, so this is
++        # written once and stays correct whether or not anything is installed.
++        printf 'import site; site.addsitedir(%s)\n' "\"$PANTHEON_USER_PREFIX/pylibs\"" \
++            > "$_SITE/zzz-pantheon-userspace.pth" 2>/dev/null || true
++    fi
++    unset _SITE
++fi
++unset _ANALYSIS_DIR
++
++# ----------------------------------------------------------------- node / npm
++export npm_config_prefix="$PANTHEON_USER_PREFIX"
++export NODE_PATH="$PANTHEON_USER_PREFIX/lib/node_modules${NODE_PATH:+:$NODE_PATH}"
++
++# ---------------------------------------------------------------------- R
++# Per-environment, NOT one shared library directory. Once the analysis env
++# provides R, `R` means conda's build, and a package compiled against Debian's
++# R will not load in it — sharing one R_LIBS_USER between the two is a silent
++# way to break packages that used to work. Kept outside the env so that
++# rebuilding the env does not take the installed R packages with it.
++if [ -n "${PANTHEON_ANALYSIS_PYTHON:-}" ]; then
++    export R_LIBS_USER="$PANTHEON_USER_PREFIX/Rlib/$PANTHEON_ANALYSIS_ENV"
++else
++    export R_LIBS_USER="$PANTHEON_USER_PREFIX/Rlib/system"
++fi
++mkdir -p "$R_LIBS_USER" 2>/dev/null
++
++# R's own search path has to reach the baseline too, or Seurat and the
++# Bioconductor packages in the image are invisible from the personal
++# environment — the same inheritance the .pth gives Python, for R.
++# R_LIBS is searched after R_LIBS_USER, so a package the user installs still
++# wins over the image's copy.
++if [ -d "$PANTHEON_BASELINE_ENV/lib/R/library" ]; then
++    export R_LIBS="$PANTHEON_BASELINE_ENV/lib/R/library${R_LIBS:+:$R_LIBS}"
++fi
++
++# ------------------------------------------------------------- rust / go
++# The binary persists; the build and module caches deliberately do not. They are
++# large, they are write-heavy, and the Volume is network-backed — the same
++# reason the entrypoint already sends pip/HF/torch caches to ephemeral /root.
++export CARGO_INSTALL_ROOT="$PANTHEON_USER_PREFIX"
++export GOBIN="$PANTHEON_USER_PREFIX/bin"
+diff --git a/executor/engine/job/process.py b/executor/engine/job/process.py
+index ef3973110..494c4f524 100644
+--- a/executor/engine/job/process.py
++++ b/executor/engine/job/process.py
+@@ -1,5 +1,8 @@
+ import asyncio
+ import functools
++import os
++import sys
++from contextlib import contextmanager
+ from inspect import iscoroutinefunction
+ 
+ import loky.process_executor
+@@ -13,6 +16,70 @@
+ )
+ 
+ 
++@contextmanager
++def _analysis_interpreter():
++    """Spawn workers from the analysis env rather than the agent's runtime.
++
++    The runtime venv is what keeps the agent alive; user analysis should not be
++    installing into it. PANTHEON_ANALYSIS_PYTHON names a conda env on the
++    persistent Volume to run the work in instead, so a package upgrade lands
++    somewhere it can only break the analysis, and two projects with
++    incompatible pins can have an env each.
++
++    It has to be done by moving `sys.executable`, because on POSIX loky builds
++    the child command line from it directly (`cmd_python = [sys.executable]` in
++    backend/popen_loky_posix.py) and consults neither its own
++    `spawn.get_executable()` nor any environment variable — patching that, the
++    documented-looking seam, changes nothing on Linux.
++
++    Held across pool creation only — see _spawn_executor for what "creation"
++    has to include — so the agent's own idea of its interpreter is restored
++    before any of its code runs with it. The env must be bridged back to the
++    runtime's site-packages (pantheon-analysis-env writes that .pth): loky
++    unpickles the job function in the child, so an interpreter that cannot
++    import `pantheon` cannot start.
++    """
++    exe = os.environ.get("PANTHEON_ANALYSIS_PYTHON")
++    # Unset is the ordinary case, and a stale path after an image change must
++    # not take every interpreter down with it — fall through to the runtime.
++    if not exe or not os.path.isfile(exe):
++        yield False
++        return
++    original = sys.executable
++    sys.executable = exe
++    try:
++        yield True
++    finally:
++        sys.executable = original
++
++
++def _spawn_executor(*args, **kwargs):
++    """Build a worker pool, in the analysis env when one is configured.
++
++    loky starts its workers LAZILY — the constructor allocates nothing, and the
++    first process is forked only when work arrives. Holding the interpreter
++    swap across the constructor alone therefore did nothing at all: by the time
++    a worker actually spawned, sys.executable had been put back, and the child
++    came up in the runtime venv. Measured both ways in a sandbox — patch across
++    the constructor gave `sys.prefix == /venv`, forcing the workers up inside
++    the same window gave the analysis env.
++
++    `_ensure_executor_running` is loky's private name for "start them now", so
++    it is called defensively: if a future version drops it, this degrades to
++    interpreters running in the runtime, which is what happens today anyway.
++    """
++    with _analysis_interpreter() as swapped:
++        executor = ProcessPoolExecutor(*args, **kwargs)
++        if swapped:
++            ensure = getattr(executor, "_ensure_executor_running", None)
++            if ensure is not None:
++                try:
++                    ensure()
++                except Exception:  # noqa: BLE001 - never fail a job over this
++                    pass
++    return executor
++
++
+ class ProcessJob(Job):
+     """Job that runs in a process."""""
+ 
+@@ -53,7 +120,7 @@ async def run_function(self):
+         func = functools.partial(self.func, *self.args, **self.kwargs)
+         if iscoroutinefunction(func):
+             func = functools.partial(run_async_func, func)
+-        self._executor = ProcessPoolExecutor(1)
++        self._executor = _spawn_executor(1)
+         loop = asyncio.get_running_loop()
+         fut = loop.run_in_executor(self._executor, func)
+         result = await fut
+@@ -62,7 +129,7 @@ async def run_function(self):
+     async def run_generator(self):
+         """Run job as a generator."""
+         func = functools.partial(self.func, *self.args, **self.kwargs)
+-        self._executor = ProcessPoolExecutor(
++        self._executor = _spawn_executor(
+             1, initializer=_gen_initializer, initargs=(func,))
+         result = create_generator_wrapper(self)
+         return result
+diff --git a/pantheon/toolsets/python/python_interpreter.py b/pantheon/toolsets/python/python_interpreter.py
+index d3efceed5..f592eec25 100644
+--- a/pantheon/toolsets/python/python_interpreter.py
++++ b/pantheon/toolsets/python/python_interpreter.py
+@@ -176,6 +176,10 @@ async def run_python_code(
+             }
+         # ─────────────────────────────────────────────────────────────────
+ 
++        # Defined for both branches: the crash-recovery path below has to know
++        # whether there is a session mapping to repair, and an explicit
++        # interpreter_id means there is not.
++        session_key = None
+         if interpreter_id:
+              p_id = interpreter_id
+         else:
+@@ -226,7 +230,7 @@ async def run_python_code(
+ 
+             if is_process_failure:
+                 logger.warning(
+-                    f"Python interpreter crashed (client_id: {client_id}), restarting..."
++                    f"Python interpreter crashed (session: {session_key}), restarting..."
+                 )
+                 logger.debug(f"Crash details: {error_type}: {error_str[:200]}")
+ 
+@@ -241,17 +245,18 @@ async def run_python_code(
+                                 del self.interpreters[p_id]
+                             if p_id in self.jobs:
+                                 del self.jobs[p_id]
+-                            # Clear the client mapping
+-                            if client_id in self.clientid_to_interpreterid:
+-                                del self.clientid_to_interpreterid[client_id]
++                            # Clear the session mapping
++                            if session_key in self.clientid_to_interpreterid:
++                                del self.clientid_to_interpreterid[session_key]
+                         except:
+                             pass  # Ignore cleanup errors
+ 
+                 # Create new interpreter and retry
+                 create_resp = await self.new_interpreter()
+                 p_id = create_resp["interpreter_id"]
+-                self.clientid_to_interpreterid[client_id] = p_id
+-                logger.info(f"Python interpreter restarted (client_id: {client_id})")
++                if session_key is not None:
++                    self.clientid_to_interpreterid[session_key] = p_id
++                logger.info(f"Python interpreter restarted (session: {session_key})")
+ 
+                 try:
+                     res = await self.run_code_in_interpreter(

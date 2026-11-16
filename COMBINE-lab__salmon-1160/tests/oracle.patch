@@ -1,0 +1,456 @@
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index f5d1e022e..6d724d44b 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -1485,15 +1485,13 @@ fn run_deterministic(
+         pct2,
+         res.num_eq_classes
+     );
+-    // `--skipQuant` estimates no abundances; aggregating the zero rows to
+-    // gene level would announce success over an empty result (#1140 — the
+-    // deterministic reads driver already skipped it, the others wrote
+-    // zeros silently).
+-    if map_opts.skip_quant && gene_map.is_some() {
+-        tracing::info!(
+-            "--skipQuant: gene-level aggregation (-g) skipped — no abundances were estimated"
+-        );
+-    } else if let Some(gm) = gene_map {
++    // No `--skipQuant` guard here, deliberately: this driver returns early for
++    // that case (see `stop_after_mapping` above), so reaching this point means
++    // phase 2 ran and produced real abundances. Guarding on
++    // `map_opts.skip_quant` instead — which phase 1 forces true regardless of
++    // what the user asked — made `-g` a silent no-op in the DEFAULT reads mode
++    // and printed a "--skipQuant" explanation on runs that never passed it.
++    if let Some(gm) = gene_map {
+         write_gene_level(
+             out_dir,
+             gm,
+@@ -1843,9 +1841,33 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     } else {
+         args.threads
+     };
+-    let _ = rayon::ThreadPoolBuilder::new()
++    // Clamp to what the machine can actually give. An unsatisfiable `-p` is an
++    // ordinary user error — an unset `$SLURM_CPUS_PER_TASK`, a typo'd digit —
++    // and rayon's failure for it is not a diagnosis: the thread pool aborts the
++    // process with a raw panic (exit 134) whose message asserts the global pool
++    // both was and was not initialized, and names neither `-p` nor the cause.
++    // The threshold scales with the machine, so a small node trips far below a
++    // big one. Say what happened and continue with a workable value.
++    let available = std::thread::available_parallelism()
++        .map(|n| n.get())
++        .unwrap_or(1);
++    let nthreads = if nthreads > available {
++        tracing::warn!(
++            "-p {nthreads} exceeds the {available} hardware thread(s) this machine reports; \
++             using {available}. (If this came from a scheduler variable, it was probably unset.)"
++        );
++        available
++    } else {
++        nthreads
++    };
++    // Propagate the failure rather than discarding it: a swallowed error here
++    // resurfaces much later as SIGABRT from an unrelated-looking place.
++    if let Err(e) = rayon::ThreadPoolBuilder::new()
+         .num_threads(nthreads)
+-        .build_global();
++        .build_global()
++    {
++        anyhow::bail!("could not create a thread pool of {nthreads} thread(s): {e}");
++    }
+     let out_dir = args.output.clone();
+     let gene_map = load_gene_map(args.gene_map.clone(), args.ignore_tx_version)?;
+ 
+diff --git a/crates/salmon-cli/tests/readiness_blockers.rs b/crates/salmon-cli/tests/readiness_blockers.rs
+new file mode 100644
+index 000000000..ee34433b8
+--- /dev/null
++++ b/crates/salmon-cli/tests/readiness_blockers.rs
+@@ -0,0 +1,226 @@
++//! Regressions for the four defects the pre-2.6.0 release-readiness sweep found
++//! on `develop` (#1140 follow-up). Three of them were introduced by the audit
++//! fixes themselves, which is why each is pinned end to end through the binary
++//! rather than at the unit level: every one of them type-checked, passed the
++//! existing suite, and still produced wrong or missing output.
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++const SALMON: &str = env!("CARGO_BIN_EXE_salmon");
++
++fn sequence(mut seed: u64, len: usize) -> String {
++    (0..len)
++        .map(|_| {
++            seed = seed
++                .wrapping_mul(6_364_136_223_846_793_005)
++                .wrapping_add(1_442_695_040_888_963_407);
++            "ACGT".as_bytes()[(seed >> 33) as usize & 3] as char
++        })
++        .collect()
++}
++
++fn rc(s: &str) -> String {
++    s.chars()
++        .rev()
++        .map(|c| match c {
++            'A' => 'T',
++            'C' => 'G',
++            'G' => 'C',
++            _ => 'A',
++        })
++        .collect()
++}
++
++/// Index over three transcripts, plus inward FR read pairs drawn from them.
++/// `mate1_len` shortens R1: below `k` it cannot seed, so R2 becomes the anchor
++/// and R1 has to be recovered — the case B3 got backwards.
++fn fixture(dir: &Path, mate1_len: usize) -> (PathBuf, PathBuf, PathBuf) {
++    let txs = [sequence(5, 3000), sequence(19, 3000), sequence(101, 2000)];
++    let fasta = dir.join("txome.fa");
++    std::fs::write(
++        &fasta,
++        format!(">txA\n{}\n>txB\n{}\n>txC\n{}\n", txs[0], txs[1], txs[2]),
++    )
++    .unwrap();
++    let index = dir.join("idx");
++    assert!(Command::new(SALMON)
++        .args(["index", "-t"])
++        .arg(&fasta)
++        .arg("-i")
++        .arg(&index)
++        .args(["-p", "2"])
++        .status()
++        .unwrap()
++        .success());
++
++    let (mut r1, mut r2) = (String::new(), String::new());
++    for i in 0..300 {
++        let s = &txs[i % 3];
++        let st = (i * 7) % (s.len() - 350);
++        // ISF by construction: mate 1 forward, mate 2 reverse-complement, inward.
++        r1.push_str(&format!(
++            "@x{i}\n{}\n+\n{}\n",
++            &s[st..st + mate1_len],
++            "I".repeat(mate1_len)
++        ));
++        r2.push_str(&format!(
++            "@x{i}\n{}\n+\n{}\n",
++            rc(&s[st + 200..st + 300]),
++            "I".repeat(100)
++        ));
++    }
++    let (p1, p2) = (dir.join("r1.fq"), dir.join("r2.fq"));
++    std::fs::write(&p1, r1).unwrap();
++    std::fs::write(&p2, r2).unwrap();
++    (index, p1, p2)
++}
++
++fn meta_number(out: &Path, key: &str) -> f64 {
++    let m = std::fs::read_to_string(out.join("aux_info").join("meta_info.json")).unwrap();
++    m.lines()
++        .find(|l| l.contains(&format!("\"{key}\"")))
++        .and_then(|l| l.rsplit(':').next())
++        .map(|v| v.trim().trim_end_matches(',').parse().unwrap())
++        .unwrap_or_else(|| panic!("{key} missing from meta_info.json:\n{m}"))
++}
++
++/// B1: `-g` produced no `quant.genes.sf` at all in the DEFAULT reads mode — the
++/// single most common salmon invocation — while `-a`, `--rad` and `--online`
++/// all wrote one. The gene-level guard tested `map_opts.skip_quant`, which
++/// phase 1 forces true regardless of what the user asked, so the write was dead
++/// code and the run explained itself with a `--skipQuant` message on a command
++/// line that never contained `--skipQuant`.
++#[test]
++fn gene_map_is_honoured_in_the_default_reads_mode() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, p1, p2) = fixture(dir.path(), 100);
++    let gmap = dir.path().join("t2g.tsv");
++    std::fs::write(&gmap, "txA\tgeneA\ntxB\tgeneB\ntxC\tgeneC\n").unwrap();
++
++    let out = dir.path().join("q");
++    let run = Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&index)
++        .args(["-l", "IU", "-1"])
++        .arg(&p1)
++        .arg("-2")
++        .arg(&p2)
++        .args(["-p", "2", "-g"])
++        .arg(&gmap)
++        .arg("-o")
++        .arg(&out)
++        .output()
++        .unwrap();
++    assert!(run.status.success());
++
++    let genes = out.join("quant.genes.sf");
++    assert!(
++        genes.exists(),
++        "-g must write quant.genes.sf on the default path; stderr:\n{}",
++        String::from_utf8_lossy(&run.stderr)
++    );
++    let body = std::fs::read_to_string(&genes).unwrap();
++    assert_eq!(body.lines().count(), 4, "header + 3 genes:\n{body}");
++
++    // The run must not claim --skipQuant on a command line that lacks it.
++    let err = String::from_utf8_lossy(&run.stderr);
++    assert!(
++        !err.contains("--skipQuant"),
++        "no --skipQuant explanation belongs here:\n{err}"
++    );
++}
++
++/// B3: `--recoverOrphans` took the fragment's orientation from the *anchor*
++/// rather than from mate 1, so whenever mate 2 was the anchor the recorded
++/// strand was inverted. A stranded library then judged every recovered pair
++/// backwards — mapping 0% under the correct `-l` and 100% under the wrong one.
++/// Latent until the audit made the recorded format actually drive the filter.
++#[test]
++fn recovered_pairs_keep_their_strand_when_mate_two_anchors() {
++    let dir = tempfile::tempdir().unwrap();
++    // Mate 1 is 25 bp: below k=31, so it cannot seed and mate 2 must anchor.
++    let (index, p1, p2) = fixture(dir.path(), 25);
++
++    let run = |lib: &str, out: &Path| {
++        assert!(Command::new(SALMON)
++            .args(["quant", "-i"])
++            .arg(&index)
++            .args(["-l", lib, "-1"])
++            .arg(&p1)
++            .arg("-2")
++            .arg(&p2)
++            .args(["--recoverOrphans", "-p", "2", "-o"])
++            .arg(out)
++            .status()
++            .unwrap()
++            .success());
++    };
++
++    let isf = dir.path().join("isf");
++    let isr = dir.path().join("isr");
++    run("ISF", &isf);
++    run("ISR", &isr);
++
++    // The fixture is ISF by construction, so ISF must keep the fragments and
++    // ISR must reject them. Inverted, this assertion reads exactly backwards.
++    assert!(
++        meta_number(&isf, "percent_mapped") > 90.0,
++        "ISF is the true library type and must map"
++    );
++    assert!(
++        meta_number(&isr, "percent_mapped") < 10.0,
++        "ISR is the wrong strand and must be rejected"
++    );
++
++    let counts = std::fs::read_to_string(isf.join("lib_format_counts.json")).unwrap();
++    let isf_obs = counts
++        .lines()
++        .find(|l| l.contains("\"ISF\""))
++        .expect("ISF key in lib_format_counts.json");
++    assert!(
++        !isf_obs.contains(": 0"),
++        "the observed format histogram must record ISF, not its opposite:\n{counts}"
++    );
++}
++
++/// B4: an unsatisfiable `-p` aborted the process with a raw rayon panic (exit
++/// 134) whose message named neither `-p` nor the cause. An unset
++/// `$SLURM_CPUS_PER_TASK` or a typo'd digit is an ordinary user error.
++#[test]
++fn an_unsatisfiable_thread_count_is_clamped_not_a_panic() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, p1, p2) = fixture(dir.path(), 100);
++    let out = dir.path().join("q");
++    let run = Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&index)
++        .args(["-l", "IU", "-1"])
++        .arg(&p1)
++        .arg("-2")
++        .arg(&p2)
++        .args(["-p", "999999", "-o"])
++        .arg(&out)
++        .output()
++        .unwrap();
++
++    assert!(
++        run.status.success(),
++        "an over-large -p must not abort the run; exit {:?}\n{}",
++        run.status.code(),
++        String::from_utf8_lossy(&run.stderr)
++    );
++    let err = String::from_utf8_lossy(&run.stderr);
++    assert!(
++        err.contains("-p 999999") && err.contains("hardware thread"),
++        "the warning must name the flag and the real limit:\n{err}"
++    );
++    assert!(
++        !err.contains("panicked"),
++        "no panic may reach the user:\n{err}"
++    );
++    assert!(
++        out.join("quant.sf").exists(),
++        "the run must still produce output"
++    );
++}
+diff --git a/crates/salmon-infer/src/uncertainty.rs b/crates/salmon-infer/src/uncertainty.rs
+index 91a38eb61..07aad4049 100644
+--- a/crates/salmon-infer/src/uncertainty.rs
++++ b/crates/salmon-infer/src/uncertainty.rs
+@@ -127,7 +127,13 @@ pub fn bootstrap(
+             // shapes the prior here exactly as it does the point estimate;
+             // passing `None` silently fell back to the flat prior, which made
+             // the flag a no-op inside every replicate (#1140, audit D13).
+-            let (alphas, _, _) = run_em_counts(p, &resampled, opts, false, 50, eff_lens, None);
++            //
++            // NOTE the argument order: `init_alphas` precedes `eff_lens` and
++            // both are `Option<&[f64]>`, so swapping them type-checks. The
++            // first attempt at this fix did exactly that — the prior stayed
++            // flat AND every replicate warm-started from the effective-length
++            // vector. Keep `None` explicit for the uniform start.
++            let (alphas, _, _) = run_em_counts(p, &resampled, opts, false, 50, None, eff_lens);
+             // Finalize like the point estimate: truncate the negligible
+             // abundances, then redistribute that mass to eq-class co-members via a
+             // masked final M-step over the *resampled* counts (no rescale-up). The
+@@ -138,7 +144,7 @@ pub fn bootstrap(
+             // spread interpretable: any systematic difference in post-processing
+             // would show up as bias, not variance.
+             let (alphas, _dropped) =
+-                crate::finalize_truncate_redistribute(p, &resampled, alphas, opts, None);
++                crate::finalize_truncate_redistribute(p, &resampled, alphas, opts, eff_lens);
+             alphas
+         })
+         .collect()
+@@ -517,3 +523,60 @@ mod tests {
+         assert_eq!(amb, vec![100, 100]);
+     }
+ }
++
++#[cfg(test)]
++mod per_nucleotide_prior_reaches_replicates {
++    use super::*;
++    use salmon_eqclass::{EquivalenceClassBuilder, TranscriptGroup};
++
++    /// `--perNucleotidePrior` must shape the prior inside every bootstrap
++    /// replicate, not only the point estimate.
++    ///
++    /// The bug this pins was invisible to the type system: `run_em_counts`
++    /// takes `init_alphas: Option<&[f64]>` immediately before
++    /// `eff_lens: Option<&[f64]>`, so passing the effective lengths one slot
++    /// early compiled, silently left the prior flat, AND warm-started every
++    /// replicate from the effective-length vector. The reported posterior
++    /// spread was then drawn under a different prior than the estimate it was
++    /// supposed to quantify.
++    ///
++    /// The transcripts differ in effective length, which is the only thing that
++    /// makes a per-nucleotide prior (`prior * effLen`) distinguishable from a
++    /// per-transcript one (`prior`), and the class is contested so the prior
++    /// actually moves the split.
++    #[test]
++    fn bootstrap_replicates_follow_the_per_nucleotide_prior() {
++        let eff_lens = [1000.0f64, 50.0];
++        let b = EquivalenceClassBuilder::new();
++        b.add_group(TranscriptGroup::new(vec![0, 1]), vec![1.0, 1.0], 800);
++        b.add_group(TranscriptGroup::new(vec![0]), vec![1.0], 200);
++        let mut eq = b.finish();
++        eq.update_eff_lengths(&eff_lens);
++        let packed = PackedEqClasses::from_collapsed(&eq, 2);
++
++        let mut opts = EmOptions {
++            use_vbem: true,
++            vb_prior: 10.0,
++            ..EmOptions::default()
++        };
++
++        opts.per_nucleotide_prior = false;
++        let flat = bootstrap(&packed, &opts, Some(&eff_lens), 16, 0xC0FFEE);
++        opts.per_nucleotide_prior = true;
++        let per_nt = bootstrap(&packed, &opts, Some(&eff_lens), 16, 0xC0FFEE);
++
++        assert_eq!(flat.len(), 16);
++        assert_eq!(per_nt.len(), 16);
++        let mean = |r: &[Vec<f64>], t: usize| -> f64 {
++            r.iter().map(|v| v[t]).sum::<f64>() / r.len() as f64
++        };
++        let (a, b) = (mean(&flat, 0), mean(&per_nt, 0));
++        // Same seed, same data, same resampling — only the prior differs, so
++        // any difference at all is the prior reaching the replicates.
++        assert!(
++            (a - b).abs() > 1e-6,
++            "--perNucleotidePrior must change the replicates: flat mean {a}, \
++             per-nucleotide mean {b}"
++        );
++    }
++}
+diff --git a/crates/salmon-map/src/mapper.rs b/crates/salmon-map/src/mapper.rs
+index 5acd9e7a9..e16d5f18f 100644
+--- a/crates/salmon-map/src/mapper.rs
++++ b/crates/salmon-map/src/mapper.rs
+@@ -576,17 +576,32 @@ fn push_orphan_or_recovered<R: RefProvider>(
+         if let Some((partner_score, frag_len)) =
+             recover_mate(partner_read, refseq, anchor, cfg, revcomp_buf)
+         {
++            // Which physical mate is which. `anchor_is_left` says the anchor is
++            // mate 1; otherwise the *rescued* read is mate 1. The rescue searches
++            // inward geometry, so the two mates are on opposite strands by
++            // construction. Every strand-bearing field below is stated in terms
++            // of these, matching the proper-pair convention built by
++            // `join_reads_and_filter` (`is_fw` = mate 1, `r2_fw` = mate 2) —
++            // taking them from the anchor instead inverted the fragment whenever
++            // mate 2 anchored, which a stranded `-l` then judged backwards.
++            let mate1_fw = if anchor_is_left {
++                anchor.is_fw
++            } else {
++                !anchor.is_fw
++            };
++            let mate2_fw = !mate1_fw;
+             raw.push(RawMapping {
+                 tid,
+-                is_fw: anchor.is_fw,
++                is_fw: mate1_fw,
+                 status: MateStatus::PairedEndPaired,
+                 score: anchor_aln.score + partner_score,
+                 fragment_len: frag_len,
+                 read_len: 0, // recovered proper pair: fragment_len carries the length signal
+                 is_decoy,
+                 ref_pos: anchor.chain.ref_start(),
+-                // orientation not re-derived for recovered pairs; attribute the
+-                // anchor's position to its own strand for positional bias.
++                // Positional bias attributes the anchor's coordinate to the
++                // anchor's own strand — that placement is directly observed,
++                // independently of which mate the anchor turned out to be.
+                 fw_pos: if anchor.is_fw {
+                     anchor.chain.ref_start()
+                 } else {
+@@ -599,16 +614,12 @@ fn push_orphan_or_recovered<R: RefProvider>(
+                 },
+                 // The recovered pair's orientation IS observed: the anchor's
+                 // strand is real evidence and the rescued mate is opposite by
+-                // construction (the rescue searches inward geometry). Filling
+-                // it lets the one-pass strand filter judge recovered pairs the
+-                // way the deterministic path always has — the RAD stores both
+-                // strand bits, so a requant judged these while one-pass waved
+-                // them through on `format: None` (#1140, the #1136 pattern
+-                // surviving on this one site).
+-                format: Some(salmon_core::observed_paired_format(
+-                    anchor.is_fw,
+-                    !anchor.is_fw,
+-                )),
++                // construction. Filling it lets the one-pass strand filter judge
++                // recovered pairs the way the deterministic path always has —
++                // the RAD stores both strand bits, so a requant judged these
++                // while one-pass waved them through on `format: None` (#1140,
++                // the #1136 pattern surviving on this one site).
++                format: Some(salmon_core::observed_paired_format(mate1_fw, mate2_fw)),
+                 // SAM: the partner's leftmost is estimated from the fragment length.
+                 r1_pos: if anchor_is_left {
+                     anchor.chain.ref_start()
+@@ -620,7 +631,7 @@ fn push_orphan_or_recovered<R: RefProvider>(
+                 } else {
+                     anchor.chain.ref_start()
+                 },
+-                r2_fw: !anchor.is_fw,
++                r2_fw: mate2_fw,
+                 r1_score: if anchor_is_left {
+                     anchor_aln.score
+                 } else {

@@ -1,0 +1,632 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d45664b..b787bf3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,16 @@
+ All notable changes to rctd-py are documented here.
+ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [Unreleased]
++
++### Changed
++
++- **Lower GPU memory use in full mode.** `run_rctd(..., mode="full", stream_gpu=True)` can now keep the complete spatial count matrix in host memory and transfer only the current batch to the GPU. The existing resident path remains the default. Doublet and multi mode still pre-stage the full spatial count matrix.
++- **Lower GPU memory use during sigma estimation.** Q/SQ likelihood tables are staged one sigma pair at a time instead of retaining all 126 pairs on the GPU simultaneously.
++- **Lower GPU residency during bulk platform-effect fitting.** Spatial counts and nUMI remain CPU-resident for the bulk reductions; only the reduced gene vector and scalar are moved to the compute device.
++- **Reduced temporary allocations in shared IRWLS.** Derivative workspaces are reused in place and released after their last use. Numerical output remains bit-identical to 0.4.0 for the tested full, doublet and multi workflows.
++- **Documented CUDA allocator fragmentation mitigation.** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` can reduce reserved CUDA memory on large workloads where allocator fragmentation is significant.
++
+ ## [0.4.0] — 2026-10-19
+ 
+ rctd-py 0.4.0 matches R spacexr: wherever both estimate the same sigma, every spot class and cell-type call is the same as R's. Getting there changed a few details of the fit (see Fixed), so **results can differ from 0.3.9**. On Visium about 15% of spots get a different dominant cell type, and on Visium HD and StrataMap 7-19% of spot classes. On imaging platforms (Xenium, CosMx, Atera) fewer than 1% of spot classes change, plus a few percent of first-type labels. Every difference we checked moves the call to R's. To reproduce 0.3.9 results exactly, pin `rctd-py==0.3.9`.
+diff --git a/docs/installation.md b/docs/installation.md
+index e9d6d51..d6d520d 100644
+--- a/docs/installation.md
++++ b/docs/installation.md
+@@ -67,15 +67,13 @@ version matters (`nvidia-smi`, top right).
+ 
+ ### GPU memory
+ 
+-Peak VRAM grows with `batch_size` and with the number of genes and cell types. It also grows with
+-the number of pixels, because rctd-py copies the whole count matrix (pixels x fitted genes) to the
+-GPU: for 557,300 Visium HD bins and 4,638 genes that matrix alone is 19 GiB in float64, and the run
+-peaked at 24-29 GiB whatever the mode. `batch_size` does not shrink that part; `dtype="float32"`
+-halves it. From Python, `run_rctd` defaults to `batch_size="auto"`, sized from the free GPU memory;
+-the CLI defaults to `--batch-size 10000`. At `batch_size=10000` in float64, the
+-{doc}`benchmarks <benchmarks>` peaked at 5.3-5.6 GiB on the small Xenium panels (242-376 genes) and
+-at 7-16 GiB on the other datasets (up to 714,535 pixels). Set it explicitly to fit a smaller card
+-or a shared GPU:
++Peak VRAM grows with `batch_size` and with the number of fitted genes and cell types. In the default resident path, the spatial count matrix is copied to the GPU: for 557,300 Visium HD bins and 4,638 fitted genes, that matrix alone is about 19 GiB in float64.
++
++For full mode, `run_rctd(..., mode="full", stream_gpu=True)` avoids keeping the complete spatial count matrix on the GPU. Instead, counts and nUMI values are transferred batch by batch, so the spatial-input component of GPU memory scales with `batch_size` rather than the total number of pixels. On a tested Visium HD dataset this reduced full-mode peak GPU memory from about 11 GB to about 1 GB at the same run time, with output bit-identical to the default path.
++
++`stream_gpu` currently applies only to full mode. Doublet and multi mode still pre-stage the complete spatial count matrix on the device. `dtype="float32"` approximately halves the storage required by floating-point count and workspace tensors.
++
++From Python, `run_rctd` defaults to `batch_size="auto"`, sized from the free GPU memory; the CLI defaults to `--batch-size 10000`. At `batch_size=10000` in float64, the {doc}`benchmarks <benchmarks>` peaked at 5.3-5.6 GiB on the small Xenium panels (242-376 genes) and at 7-16 GiB on the other datasets (up to 714,535 pixels). Set it explicitly to fit a smaller card or a shared GPU:
+ 
+ | Available VRAM | Recommended `batch_size` |
+ |---|---|
+@@ -86,6 +84,14 @@ or a shared GPU:
+ Peak host RAM ranged from 4 to 136 GiB on the benchmark datasets and is highest on large
+ whole-transcriptome data: 136 GiB for 557,300 Visium HD bins, 113 GiB for 714,535 Atera cells.
+ 
++PyTorch's CUDA caching allocator may reserve substantially more memory than is currently allocated by live tensors, especially on large workloads with changing allocation sizes. If reserved memory is much higher than allocated memory, setting
++
++```bash
++export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
++```
++
++can reduce allocator fragmentation. On the tested Visium HD doublet workload in float32, this reduced peak reserved memory from 6.6 GB to 4.6 GB without changing the output. This affects allocator reservation and fragmentation; it does not reduce the memory required by live tensors themselves.
++
+ ## Known issue: NVRTC missing on Blackwell + CUDA 13
+ 
+ On a Blackwell GPU with a CUDA 13 driver (580.x), a CUDA 12 build of PyTorch can fail in the
+diff --git a/src/rctd/_full.py b/src/rctd/_full.py
+index 7d346f9..365cc86 100644
+--- a/src/rctd/_full.py
++++ b/src/rctd/_full.py
+@@ -18,6 +18,7 @@ def run_full_mode(
+     batch_size: int = 10000,
+     device: str = "auto",
+     pixel_mask: np.ndarray | None = None,
++    stream_gpu: bool = False,
+ ) -> FullResult:
+     """Run full mode deconvolution across all spatial pixels.
+ 
+@@ -30,6 +31,7 @@ def run_full_mode(
+         sq_mat: Likelihood spline table for selected sigma
+         x_vals: Lambda grid points
+         batch_size: Number of pixels to process simultaneously on GPU
++        stream_gpu: If true, transfer only the current pixel batch to GPU
+ 
+     Returns:
+         FullResult object containing weights per pixel.
+@@ -38,13 +40,16 @@ def run_full_mode(
+     device = resolve_device(device)
+ 
+     P_gpu = torch.tensor(norm_profiles, device=device)
+-    Q_gpu = torch.tensor(q_mat, device=device)
+-    SQ_gpu = torch.tensor(sq_mat, device=device)
++    Q_gpu = torch.as_tensor(q_mat, device=device)
++    SQ_gpu = torch.as_tensor(sq_mat, device=device)
+     X_gpu = torch.tensor(x_vals, device=device)
+ 
+-    # Pre-transfer all spatial data to GPU at once (avoids per-batch numpy→CUDA copy)
+-    Y_gpu = torch.tensor(spatial_counts, device=device)
+-    nUMI_gpu = torch.tensor(spatial_numi, device=device)
++    # The default resident path avoids per-batch NumPy-to-device copies.
++    if stream_gpu:
++        Y_gpu = nUMI_gpu = None
++    else:
++        Y_gpu = torch.tensor(spatial_counts, device=device)
++        nUMI_gpu = torch.tensor(spatial_numi, device=device)
+ 
+     all_weights = []
+     all_converged = []
+@@ -52,14 +57,23 @@ def run_full_mode(
+     for start in range(0, N, batch_size):
+         end = min(start + batch_size, N)
+ 
++        if stream_gpu:
++            # Only current batch occupies GPU; no full spatial matrix allocation.
++            Y_batch = torch.as_tensor(spatial_counts[start:end], device=device)
++            nUMI_batch = torch.as_tensor(spatial_numi[start:end], device=device)
++        else:
++            assert Y_gpu is not None and nUMI_gpu is not None
++            Y_batch = Y_gpu[start:end]
++            nUMI_batch = nUMI_gpu[start:end]
++
+         # R's full-mode decomposition uses constrain=FALSE:
+         # - Full mode (fitPixels "full"): constrain=FALSE
+         # - Doublet mode initial full fit: constrain=FALSE
+         # Weights are NOT constrained to simplex; they can be negative.
+         weights, converged = solve_irwls_batch_shared(
+             P=P_gpu,
+-            Y_batch=Y_gpu[start:end],
+-            nUMI_batch=nUMI_gpu[start:end],
++            Y_batch=Y_batch,
++            nUMI_batch=nUMI_batch,
+             Q_mat=Q_gpu,
+             SQ_mat=SQ_gpu,
+             x_vals=X_gpu,
+@@ -71,6 +85,8 @@ def run_full_mode(
+ 
+         all_weights.append(weights.cpu().numpy())
+         all_converged.append(converged.cpu().numpy())
++        if stream_gpu:
++            del Y_batch, nUMI_batch, weights, converged
+ 
+     final_weights = np.vstack(all_weights)
+     final_converged = np.concatenate(all_converged)
+diff --git a/src/rctd/_irwls.py b/src/rctd/_irwls.py
+index 1862143..7ba2afc 100644
+--- a/src/rctd/_irwls.py
++++ b/src/rctd/_irwls.py
+@@ -841,22 +841,32 @@ def solve_irwls_batch_shared(
+         if bulk_mode:
+             d1_vec = -2.0 * (torch.log(prediction) - torch.log(Y_act + 1e-10)) / prediction
+             d2_vec = -2.0 * (1.0 - torch.log(prediction) + torch.log(Y_act + 1e-10)) / prediction**2
++            del prediction
+         else:
+             _, d1_flat, d2_flat = _q_fn(
+                 Y_act.reshape(-1), prediction.reshape(-1), Q_mat, SQ_mat, x_vals
+             )
++            del _, prediction
+             d1_vec = d1_flat.reshape(n_act, G)
++            del d1_flat
+             d2_vec = d2_flat.reshape(n_act, G)
++            del d2_flat
+ 
+         # Gradient: matmul replaces bmm
+         # grad = -(d1 @ S) = -(d1 * nUMI) @ P
+-        grad = -((d1_vec * nUMI_act.unsqueeze(1)) @ P)
++        d1_vec.mul_(nUMI_act.unsqueeze(1))
++
++        grad = d1_vec @ P
++        del d1_vec
++        grad.neg_()
+ 
+         # Hessian via P outer product: matmul replaces bmm
+         # H[n,i,j] = nUMI[n]^2 * sum_g (-d2[n,g]) * P[g,i] * P[g,j]
+-        d2_w = (-d2_vec) * (nUMI_act**2).unsqueeze(1)  # (n_act, G)
+-        hess = (d2_w @ P_outer).reshape(n_act, K, K)
+-        del d2_w, d1_vec, d2_vec, prediction  # free large intermediates
++        d2_vec.neg_()
++        d2_vec.mul_(nUMI_act.square().unsqueeze(1))
++        hess = (d2_vec @ P_outer).reshape(n_act, K, K)
++
++        del d2_vec
+ 
+         hess, norm_factor = _psd_batch(hess)
+         norm_factor = torch.clamp(norm_factor, min=1e-10)
+diff --git a/src/rctd/_normalize.py b/src/rctd/_normalize.py
+index c6807ae..968eac8 100644
+--- a/src/rctd/_normalize.py
++++ b/src/rctd/_normalize.py
+@@ -15,8 +15,11 @@ def _longdouble_sum(t: torch.Tensor, dim: int) -> torch.Tensor:
+     R and Python for large reductions (e.g. summing 135k spatial pixels).
+     """
+     arr = t.detach().cpu().numpy()
+-    result = arr.astype(np.longdouble).sum(axis=dim).astype(np.float64)
+-    return torch.tensor(result, dtype=t.dtype, device=t.device)
++    # Accumulate in longdouble without first materializing an entire
++    # longdouble copy of the input array.
++    result = np.sum(arr, axis=dim, dtype=np.longdouble).astype(np.float64)
++
++    return torch.as_tensor(result, dtype=t.dtype)
+ 
+ 
+ def fit_bulk(
+@@ -47,17 +50,16 @@ def fit_bulk(
+     device = cell_type_profiles.device
+     dtype = cell_type_profiles.dtype
+ 
+-    # Sum counts across all pixels (N, G) -> (G,)
+-    # Use longdouble accumulation to match R's long double precision,
+-    # eliminating BLAS-order-dependent divergence in platform effects.
+-    bulk_Y = _longdouble_sum(spatial_counts, dim=0)
++    # Reduce the complete spatial inputs on CPU, keeping their original dtype.
++    bulk_Y_cpu = _longdouble_sum(spatial_counts, dim=0)
++    bulk_nUMI_cpu = _longdouble_sum(spatial_nUMI, dim=0)
+ 
+-    # Total UMI across all pixels
+-    bulk_nUMI = _longdouble_sum(spatial_nUMI, dim=0)
++    # Transfer only the reduced gene vector and scalar to the compute device.
++    bulk_Y = bulk_Y_cpu.to(device=device)
++    bulk_nUMI = bulk_nUMI_cpu.to(device=device)
+ 
+-    # Scale reference profiles to bulk nUMI
++    # Scale reference profiles to bulk nUMI.
+     bulk_S = cell_type_profiles * bulk_nUMI
+-
+     # Note: in R's fitBulk, bulkData is fit using the gaussian approximation method (bulk_mode=True)
+     # and constrain=False. For bulk_mode=True, we don't need Q_mat etc.
+     # We pass zeros/dummy values for the likelihood tables since they are ignored in bulk_mode
+diff --git a/src/rctd/_rctd.py b/src/rctd/_rctd.py
+index 9b7a165..64ddcb5 100644
+--- a/src/rctd/_rctd.py
++++ b/src/rctd/_rctd.py
+@@ -223,12 +223,14 @@ def fit_platform_effects(self, sigma_override: int | None = None):
+         # R: fitBulk uses puck@counts (restricted to gene_list_bulk) and
+         #    puck@nUMI (total across ALL original genes, never recomputed)
+         print("Fitting bulk platform effects...")
++
+         bulk_profiles = self.reference.get_profiles_for_genes(gene_list_bulk)
+ 
+         bulk_weights, norm_prof_bulk = fit_bulk(
+-            cell_type_profiles=torch.tensor(bulk_profiles, device=device),
+-            spatial_counts=torch.tensor(bulk_counts, device=device),
+-            spatial_nUMI=torch.tensor(self.nUMI, device=device),
++            cell_type_profiles=torch.as_tensor(bulk_profiles, device=device),
++            # Keep full spatial data in CPU RAM.
++            spatial_counts=torch.as_tensor(bulk_counts),
++            spatial_nUMI=torch.as_tensor(self.nUMI),
+             min_change=self.config.MIN_CHANGE_BULK,
+         )
+ 
+@@ -313,6 +315,7 @@ def run_rctd(
+     config: RCTDConfig | None = None,
+     batch_size: int | str = "auto",
+     sigma_override: int | None = None,
++    stream_gpu: bool = False,
+ ) -> Union[FullResult, DoubletResult, MultiResult]:  # noqa: UP007
+     """Run RCTD pipeline on spatial data.
+ 
+@@ -326,12 +329,18 @@ def run_rctd(
+         sigma_override: Skip sigma estimation and use this value, as an integer
+             100 times sigma (63 means sigma 0.63). From an R run:
+             ``round(100 * myRCTD@internal_vars$sigma)``.
++        stream_gpu:
++            If True, keep full-mode spatial inputs CPU-resident and transfer
++            only the current batch to GPU. Currently supported only for
++            mode="full".
+ 
+     Returns:
+         Result object containing weights and predictions.
+     """
+     if mode not in ["full", "doublet", "multi"]:
+         raise ValueError(f"Unknown mode: {mode}")
++    if stream_gpu and mode != "full":
++        raise ValueError("stream_gpu currently supports only mode='full'")
+ 
+     rctd = RCTD(spatial, reference, config)
+     rctd.fit_platform_effects(sigma_override=sigma_override)
+@@ -341,7 +350,7 @@ def run_rctd(
+     dtype_bytes = 8 if rctd.config.dtype == "float64" else 4
+ 
+     if batch_size == "auto":
+-        batch_size = auto_batch_size(G, K, dtype_bytes)
++        batch_size = auto_batch_size(G, K, dtype_bytes=dtype_bytes)
+         print(f"Auto batch size: {batch_size}")
+ 
+     print(f"Running in {mode} mode...")
+@@ -360,7 +369,7 @@ def run_rctd(
+     }
+ 
+     if mode == "full":
+-        res = run_full_mode(**kwargs)
++        res = run_full_mode(**kwargs, stream_gpu=stream_gpu)
+     elif mode == "doublet":
+         res = run_doublet_mode(**kwargs, config=rctd.config)
+     elif mode == "multi":
+diff --git a/src/rctd/_sigma.py b/src/rctd/_sigma.py
+index ac2dd15..901b18b 100644
+--- a/src/rctd/_sigma.py
++++ b/src/rctd/_sigma.py
+@@ -72,21 +72,27 @@ def choose_sigma(
+     # ── Pre-convert arrays to torch tensors ──
+     x_j = torch.tensor(x_vals, device=device)
+     P_gpu = torch.tensor(norm_profiles, device=device)
+-    q_gpu = {k: torch.tensor(v, device=device) for k, v in q_matrices.items()}
+-    sq_gpu = {k: torch.tensor(v, device=device) for k, v in sq_matrices.items()}
+-    fit_counts = torch.tensor(spatial_counts[fit_idx], device=device)
+-    fit_numi = torch.tensor(spatial_numi[fit_idx], device=device)
++    fit_counts = torch.as_tensor(spatial_counts[fit_idx], device=device)
++    fit_numi = torch.as_tensor(spatial_numi[fit_idx], device=device)
+ 
+     sigma = sigma_init
+ 
++    def stage_sigma_tables(sigma):
++        # Keep only the current Q/SQ pair on the compute device.
++        key = str(sigma)
++
++        Q = torch.as_tensor(q_matrices[key], device=device)
++        SQ = torch.as_tensor(sq_matrices[key], device=device)
++
++        return Q, SQ
++
+     for epoch in range(n_epoch):
+         # ── Step 1: Fit weights at current sigma ──
+-        if str(sigma) not in q_gpu:
++        if str(sigma) not in q_matrices:
+             diffs = np.abs(SIGMA_ALL - sigma)
+             sigma = int(SIGMA_ALL[np.argmin(diffs)])
+ 
+-        Q_cur = q_gpu[str(sigma)]
+-        SQ_cur = sq_gpu[str(sigma)]
++        Q_cur, SQ_cur = stage_sigma_tables(sigma)
+ 
+         weights, _ = solve_irwls_batch_shared(
+             P=P_gpu,
+@@ -102,6 +108,7 @@ def choose_sigma(
+             _calc_q_fn=_calc_q_all_eager,
+         )
+         weights = torch.clamp(weights, min=0.0)
++        del Q_cur, SQ_cur
+ 
+         # ── Step 2: Fixed prediction ──
+         prediction = (weights @ P_gpu.T) * fit_numi[:, None]  # (n, G)
+@@ -133,21 +140,21 @@ def choose_sigma(
+         mult_fac_vec = torch.arange(8, 13, dtype=X.dtype, device=device) / 10.0
+ 
+         # Filter to available sigma candidates
+-        valid_cands = [s for s in sigma_cands if str(s) in q_gpu]
++        valid_cands = [s for s in sigma_cands if (str(s) in q_matrices and str(s) in sq_matrices)]
+         if not valid_cands:
+             break
+ 
+         # Evaluate each sigma candidate: pick best scale factor per sigma
+         scores = torch.zeros(len(valid_cands), device=device)
+         for sig_idx, s in enumerate(valid_cands):
+-            Q_s = q_gpu[str(s)]
+-            SQ_s = sq_gpu[str(s)]
++            Q_s, SQ_s = stage_sigma_tables(s)
+             fac_scores = torch.zeros(len(mult_fac_vec), device=device)
+             for fac_idx in range(len(mult_fac_vec)):
+                 X_fac = X * mult_fac_vec[fac_idx]
+                 d0, _, _ = _calc_q_all_eager(Y, X_fac, Q_s, SQ_s, x_j, k_val)
+                 fac_scores[fac_idx] = -torch.sum(d0)
+             scores[sig_idx] = fac_scores.min()
++            del Q_s, SQ_s
+ 
+         best_idx = int(torch.argmin(scores).item())
+         best_sigma = valid_cands[best_idx]
+diff --git a/tests/test_full_gpu_streaming.py b/tests/test_full_gpu_streaming.py
+new file mode 100644
+index 0000000..a2292c3
+--- /dev/null
++++ b/tests/test_full_gpu_streaming.py
+@@ -0,0 +1,173 @@
++"""Correctness and memory regression tests for full-mode batch transfers."""
++
++import numpy as np
++import pytest
++import torch
++
++from rctd import _full, _rctd
++from rctd._irwls import solve_irwls_batch_shared
++from rctd._likelihood import (
++    _calc_q_all_impl,
++    compute_spline_coefficients,
++    load_cached_q_matrices,
++)
++
++
++@pytest.mark.parametrize("device", ["cpu", "cuda"])
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++def test_stream_gpu_matches_resident_path(monkeypatch, device, dtype):
++    if device == "cuda" and not torch.cuda.is_available():
++        pytest.skip("CUDA unavailable")
++
++    # Stub ONLY the IRWLS solver to isolate the transfer/batching behavior.
++    def fake_solver(*, P, Y_batch, nUMI_batch, **_):
++        k = P.shape[1]
++        return (
++            Y_batch[:, :k] / nUMI_batch[:, None],
++            torch.ones(Y_batch.shape[0], device=Y_batch.device, dtype=torch.bool),
++        )
++
++    monkeypatch.setattr(_full, "solve_irwls_batch_shared", fake_solver)
++    rng = np.random.default_rng(123)
++    n, g, k = 19, 13, 3
++    Y = rng.integers(1, 9, size=(n, g)).astype(dtype)
++    u = Y.sum(axis=1)
++    P = rng.random((g, k)).astype(dtype)
++    args = dict(
++        spatial_counts=Y,
++        spatial_numi=u,
++        norm_profiles=P,
++        cell_type_names=["A", "B", "C"],
++        q_mat=np.zeros((3, 4), dtype=np.float64),
++        sq_mat=np.zeros((3, 4), dtype=np.float64),
++        x_vals=np.arange(4, dtype=dtype),
++        batch_size=7,
++        device=device,
++    )
++    baseline = _full.run_full_mode(**args, stream_gpu=False)
++    streamed = _full.run_full_mode(**args, stream_gpu=True)
++    np.testing.assert_array_equal(streamed.weights, baseline.weights)
++    np.testing.assert_array_equal(streamed.converged, baseline.converged)
++    assert streamed.weights.shape == (n, k)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
++def test_stream_gpu_avoids_full_counts_allocation(monkeypatch):
++    def fake_solver(*, P, Y_batch, nUMI_batch, **_):
++        k = P.shape[1]
++        return (
++            torch.zeros((Y_batch.shape[0], k), device=Y_batch.device, dtype=P.dtype),
++            torch.ones(Y_batch.shape[0], device=Y_batch.device, dtype=torch.bool),
++        )
++
++    monkeypatch.setattr(_full, "solve_irwls_batch_shared", fake_solver)
++    n, g, k = 8192, 512, 3
++    Y = np.ones((n, g), dtype=np.float64)
++    u = np.full(n, g, dtype=np.float64)
++    P = np.full((g, k), 1.0 / g, dtype=np.float64)
++    args = dict(
++        spatial_counts=Y,
++        spatial_numi=u,
++        norm_profiles=P,
++        cell_type_names=["A", "B", "C"],
++        q_mat=np.zeros((3, 4)),
++        sq_mat=np.zeros((3, 4)),
++        x_vals=np.arange(4, dtype=np.float64),
++        batch_size=256,
++        device="cuda",
++    )
++    peaks = {}
++    for stream in [False, True]:
++        torch.cuda.synchronize()
++        torch.cuda.reset_peak_memory_stats()
++        result = _full.run_full_mode(**args, stream_gpu=stream)
++        torch.cuda.synchronize()
++        peaks[stream] = torch.cuda.max_memory_allocated()
++        del result
++    # 8192 x 512 x 8 bytes = 32 MiB; streaming input is only 1 MiB.
++    assert peaks[False] - peaks[True] > 16 * 1024 * 1024, peaks
++
++
++@pytest.mark.parametrize("device", ["cpu", "cuda"])
++@pytest.mark.parametrize("dtype", [np.float32, np.float64])
++def test_stream_gpu_matches_resident_with_irwls(monkeypatch, device, dtype):
++    if device == "cuda" and not torch.cuda.is_available():
++        pytest.skip("CUDA unavailable")
++
++    def eager_solver(**kwargs):
++        return solve_irwls_batch_shared(**kwargs, _calc_q_fn=_calc_q_all_impl)
++
++    monkeypatch.setattr(_full, "solve_irwls_batch_shared", eager_solver)
++    cache = load_cached_q_matrices()
++    x_vals = cache["X_vals"]
++    q_mat = cache["Q_100"]
++    sq_mat = compute_spline_coefficients(q_mat, x_vals)
++    rng = np.random.default_rng(123)
++    n, g, k = 19, 13, 3
++    counts = rng.integers(1, 9, size=(n, g)).astype(dtype)
++    profiles = rng.random((g, k)).astype(dtype)
++    profiles /= profiles.sum(axis=0, keepdims=True)
++    args = dict(
++        spatial_counts=counts,
++        spatial_numi=counts.sum(axis=1),
++        norm_profiles=profiles,
++        cell_type_names=["A", "B", "C"],
++        q_mat=q_mat.astype(dtype),
++        sq_mat=sq_mat.astype(dtype),
++        x_vals=x_vals.astype(dtype),
++        batch_size=7,
++        device=device,
++        pixel_mask=np.ones(n, dtype=bool),
++    )
++    original_counts = counts.copy()
++    original_profiles = profiles.copy()
++    resident = _full.run_full_mode(**args)
++    streamed = _full.run_full_mode(**args, stream_gpu=True)
++    np.testing.assert_array_equal(streamed.weights, resident.weights)
++    np.testing.assert_array_equal(streamed.converged, resident.converged)
++    np.testing.assert_array_equal(streamed.pixel_mask, resident.pixel_mask)
++    np.testing.assert_array_equal(counts, original_counts)
++    np.testing.assert_array_equal(profiles, original_profiles)
++
++
++@pytest.mark.parametrize("stream_gpu", [False, True])
++def test_run_rctd_forwards_streaming_without_changing_auto_batch(monkeypatch, stream_gpu):
++    captured = {}
++
++    class FakeRCTD:
++        def __init__(self, *_):
++            self.config = type("Config", (), {"dtype": "float64", "device": "cpu"})()
++            self.reference = type("Reference", (), {"cell_type_names": ["A", "B"]})()
++            self.counts = np.ones((5, 3))
++            self.nUMI = np.ones(5)
++            self.norm_profiles = np.ones((3, 2))
++            self.q_mat = np.ones((4, 5))
++            self.sq_mat = np.ones((4, 5))
++            self.x_vals = np.arange(5.0)
++            self._pixel_mask = np.ones(5, dtype=bool)
++
++        def fit_platform_effects(self, sigma_override=None):
++            return None
++
++    def fake_auto_batch_size(G, K, dtype_bytes):
++        captured["auto_args"] = (G, K, dtype_bytes)
++        return 77
++
++    def fake_full(**kwargs):
++        captured.update(kwargs)
++        return "result"
++
++    monkeypatch.setattr(_rctd, "RCTD", FakeRCTD)
++    monkeypatch.setattr(_rctd, "auto_batch_size", fake_auto_batch_size)
++    monkeypatch.setattr(_rctd, "run_full_mode", fake_full)
++    result = _rctd.run_rctd(None, None, mode="full", batch_size="auto", stream_gpu=stream_gpu)
++    assert result == "result"
++    assert captured["auto_args"] == (3, 2, 8)
++    assert captured["batch_size"] == 77
++    assert captured["stream_gpu"] is stream_gpu
++
++
++@pytest.mark.parametrize("mode", ["doublet", "multi"])
++def test_run_rctd_rejects_streaming_in_other_modes(mode):
++    with pytest.raises(ValueError, match="stream_gpu currently supports only mode='full'"):
++        _rctd.run_rctd(None, None, mode=mode, stream_gpu=True)
+diff --git a/tests/test_sigma.py b/tests/test_sigma.py
+index 814ce0c..f435a65 100644
+--- a/tests/test_sigma.py
++++ b/tests/test_sigma.py
+@@ -1,5 +1,9 @@
++import weakref
++
+ import numpy as np
++import torch
+ 
++from rctd import _sigma
+ from rctd._likelihood import load_cached_q_matrices
+ from rctd._sigma import choose_sigma
+ 
+@@ -32,3 +36,75 @@ def test_choose_sigma_runs(synthetic_data):
+ 
+     assert isinstance(best_sigma, (int, np.integer))
+     assert best_sigma > 0
++
++
++def test_choose_sigma_stages_only_tables_in_the_candidate_window(monkeypatch):
++    """Stage only needed Q/SQ pairs, releasing each pair before loading the next."""
++    q_matrices = {str(s): np.full((4, 5), float(s)) for s in (10, 100, 102)}
++    sq_matrices = {str(s): np.full((4, 5), float(s + 1)) for s in (10, 100, 102)}
++    names = {
++        id(table): (kind, sigma)
++        for kind, tables in (("q", q_matrices), ("sq", sq_matrices))
++        for sigma, table in tables.items()
++    }
++    events = []
++    references = []
++    real_as_tensor = torch.as_tensor
++    real_tensor = torch.tensor
++
++    def track(converter, value, *args, **kwargs):
++        name = names.get(id(value))
++        if name is not None:
++            kind, sigma = name
++            assert sigma != "10", "A table outside the candidate window was staged"
++            live = sum(ref() is not None for ref in references)
++            assert live == (0 if kind == "q" else 1), "Previous Q/SQ pair is still live"
++        result = converter(value, *args, **kwargs)
++        if name is not None:
++            events.append(name)
++            references.append(weakref.ref(result))
++        return result
++
++    def tracking_as_tensor(value, *args, **kwargs):
++        return track(real_as_tensor, value, *args, **kwargs)
++
++    def tracking_tensor(value, *args, **kwargs):
++        return track(real_tensor, value, *args, **kwargs)
++
++    def fake_solver(*, P, Y_batch, **_):
++        return (
++            torch.ones((len(Y_batch), P.shape[1]), dtype=P.dtype, device=P.device),
++            torch.ones(len(Y_batch), dtype=torch.bool, device=P.device),
++        )
++
++    def fake_likelihood(Y, X, Q, *_):
++        # Smaller sigma wins, so the current sigma remains selected.
++        return -torch.ones_like(X) * Q[0, 0], torch.zeros_like(X), torch.zeros_like(X)
++
++    monkeypatch.setattr(_sigma.torch, "as_tensor", tracking_as_tensor)
++    monkeypatch.setattr(_sigma.torch, "tensor", tracking_tensor)
++    monkeypatch.setattr(_sigma, "solve_irwls_batch_shared", fake_solver)
++    monkeypatch.setattr(_sigma, "_calc_q_all_eager", fake_likelihood)
++    result = choose_sigma(
++        spatial_counts=np.ones((4, 2)),
++        spatial_numi=np.full(4, 100.0),
++        norm_profiles=np.full((2, 2), 0.5),
++        q_matrices=q_matrices,
++        sq_matrices=sq_matrices,
++        x_vals=np.arange(5.0),
++        sigma_init=100,
++        min_umi=0,
++        n_fit=2,
++        n_epoch=1,
++        device="cpu",
++    )
++    assert result == 100
++    assert events == [
++        ("q", "100"),
++        ("sq", "100"),
++        ("q", "100"),
++        ("sq", "100"),
++        ("q", "102"),
++        ("sq", "102"),
++    ]
++    assert all(ref() is None for ref in references)

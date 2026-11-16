@@ -1,0 +1,268 @@
+diff --git a/examples/parametric_umap_projection.md b/examples/parametric_umap_projection.md
+new file mode 100644
+index 000000000..eebdc6c0b
+--- /dev/null
++++ b/examples/parametric_umap_projection.md
+@@ -0,0 +1,88 @@
++# Parametric UMAP — project new data onto a reference embedding
++
++`ov.pp.umap(adata, method='pumap')` fits a **parametric UMAP**: besides the 2-D
++embedding, it learns the *mapping rule* (a small neural-network encoder) from
++the high-dimensional representation to the embedding. That rule can then be
++**reused to place new cells onto the same UMAP** — the atlas / reference-mapping
++use case.
++
++> When do you want this? Atlas building, or any workflow where new samples must
++> land in the **same** embedding as a reference. For a one-off pipeline (no new
++> data to add), the default non-parametric UMAP is simpler and faster — just use
++> `ov.pp.umap(adata)`.
++
++The key idea: the model maps a fixed input representation → 2-D. So new data
++must arrive in **exactly the representation the model was trained on** (same
++genes, same scaling, same PCA). The cleanest way to guarantee that is to keep a
++single PCA object fitted on the reference and reuse it for the query.
++
++## 1. Fit on the reference and keep the model
++
++```python
++import numpy as np
++import scanpy as sc
++from sklearn.decomposition import PCA
++import omicverse as ov
++
++# --- reference preprocessing ---
++ref = sc.datasets.pbmc3k()
++sc.pp.normalize_total(ref, target_sum=1e4); sc.pp.log1p(ref)
++sc.pp.highly_variable_genes(ref, n_top_genes=2000)
++ref = ref[:, ref.var.highly_variable].copy()
++sc.pp.scale(ref, max_value=10)
++
++# one PCA object fitted on the reference (its .transform reuses the
++# reference mean + components — that is what makes query projection correct)
++ref_pca = PCA(n_components=50, random_state=0).fit(np.asarray(ref.X))
++ref.obsm['X_pca'] = ref_pca.transform(np.asarray(ref.X)).astype('float32')
++
++ov.pp.neighbors(ref, n_neighbors=15, use_rep='X_pca')
++
++# fit parametric UMAP — RETURNS the model; ref.obsm['X_umap'] is also written
++model = ov.pp.umap(ref, method='pumap')
++```
++
++## 2. Bring new data into the **same feature space**
++
++Process the query identically, align it to the **reference genes**, scale it,
++then project with the **reference PCA** (do not refit PCA on the query):
++
++```python
++qry = sc.datasets.pbmc3k()                 # your new sample(s)
++sc.pp.normalize_total(qry, target_sum=1e4); sc.pp.log1p(qry)
++qry = qry[:, ref.var_names].copy()         # same genes, same order
++sc.pp.scale(qry, max_value=10)
++
++qry_pca = ref_pca.transform(np.asarray(qry.X)).astype('float32')  # reference PCA
++```
++
++## 3. Generate the new embedding through the model
++
++```python
++new_embedding = model.transform(qry_pca)   # (n_query, 2)
++qry.obsm['X_umap'] = new_embedding
++
++# the query now lies in the SAME embedding as the reference
++ov.pl.embedding(qry, basis='X_umap', color='your_label')
++```
++
++`model.transform` is deterministic — the same model + input always gives the
++same coordinates.
++
++## 4. Save / reuse the model
++
++```python
++model.save('pbmc_reference_pumap.pkl')
++model = ov.pp.load_pumap('pbmc_reference_pumap.pkl')
++emb = model.transform(another_query_pca.astype('float32'))
++```
++
++## Choosing the UMAP backend
++
++| call | backend | use it for |
++|---|---|---|
++| `ov.pp.umap(adata)` (mode `cpu`) | scanpy / umap-learn (CPU) | default, exact scanpy result |
++| `ov.pp.umap(adata)` (mode `cpu-gpu-mixed`) | non-parametric GPU UMAP | same result as scanpy, GPU-accelerated |
++| `ov.pp.umap(adata, method='pumap')` | **parametric UMAP** | atlas / projecting new data (this tutorial) |
++
++`method='pumap'` requires a GPU and `torch`.
+diff --git a/omicverse/pp/__init__.py b/omicverse/pp/__init__.py
+index 9e27eb833..829699425 100644
+--- a/omicverse/pp/__init__.py
++++ b/omicverse/pp/__init__.py
+@@ -70,6 +70,17 @@
+ from ._sude import sude
+ 
+ from ._qc import qc,qc_metrics,filter_cells,filter_genes
++
++
++def load_pumap(path):
++    """Load a parametric-UMAP model saved with ``model.save(path)``.
++
++    Companion to ``ov.pp.umap(adata, method='pumap')`` which returns the
++    fitted model. The heavy backend (``omicverse.external.umap_pytorch``) is
++    imported lazily here so it isn't pulled in on ``import omicverse.pp``.
++    """
++    from ..external.umap_pytorch import load_pumap as _load_pumap
++    return _load_pumap(path)
+ from ._recover import recover_counts,binary_search
+ from ._normalization import log1p,normalize_total
+ from ._scrublet import scrublet, scrublet_simulate_doublets
+@@ -111,6 +122,7 @@
+     'quantity_control',
+     'qc',
+     'qc_metrics',
++    'load_pumap',
+     'filter_cells',
+     'filter_genes',
+ 
+diff --git a/omicverse/pp/_preprocess.py b/omicverse/pp/_preprocess.py
+index 2e111307f..dcd515abd 100644
+--- a/omicverse/pp/_preprocess.py
++++ b/omicverse/pp/_preprocess.py
+@@ -1871,8 +1871,18 @@ def umap(
+     forward.update(kwargs)
+     kwargs = forward
+     print(f"{EMOJI['start']} [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Running UMAP in '{settings.mode}' mode...")
++    _pumap_model = None
+     try:
+-        if settings.mode == 'cpu':
++        # Honour an explicit method='pumap' in ANY mode: parametric UMAP is the
++        # atlas/projection use case. Returns the fitted model so new data can be
++        # projected with model.transform(new_X).
++        if kwargs.get('method') == 'pumap':
++            print(f"{EMOJI['gpu']} Using Parametric UMAP (pumap)...")
++            from ._umap import umap as _umap
++            _pumap_model = _umap(adata, **kwargs)
++            add_reference(adata, 'umap', 'UMAP with pumap (parametric)')
++            note(backend=f"omicverse({settings.mode}) · pumap")
++        elif settings.mode == 'cpu':
+             print(f"{EMOJI['cpu']} Using Scanpy CPU UMAP...")
+             from ._umap import umap as _umap
+             _umap(adata, **kwargs)
+@@ -1906,6 +1916,9 @@ def umap(
+     except Exception as e:
+         print(f"{EMOJI['error']} UMAP failed: {e}")
+         raise
++    # Parametric UMAP returns the fitted model (project new data with
++    # model.transform(new_X)); other backends write to adata in place.
++    return _pumap_model
+ 
+ @monitor
+ @register_function(
+diff --git a/omicverse/pp/_umap.py b/omicverse/pp/_umap.py
+index 9e7b517dd..4d9cbc82b 100644
+--- a/omicverse/pp/_umap.py
++++ b/omicverse/pp/_umap.py
+@@ -431,12 +431,16 @@ def umap(  # noqa: PLR0913, PLR0915
+ 
+         print(f"   {Colors.CYAN}💡 Using Parametric UMAP (PyTorch) on {device}{Colors.ENDC}")
+ 
+-        # Clean up
+-        del pumap, X_tensor
++        # Keep the fitted model so the caller can project NEW data through the
++        # same learned mapping: model.transform(new_X). Only free the input.
++        _pumap_model = pumap
++        del X_tensor
+         import gc
+         if torch.cuda.is_available():
+             torch.cuda.empty_cache()
+         gc.collect()
++        print(f"   {Colors.CYAN}💡 Returning the fitted parametric model — "
++              f"project new data with model.transform(new_X){Colors.ENDC}")
+ 
+     elif method == "rapids":
+         msg = (
+@@ -479,6 +483,10 @@ def umap(  # noqa: PLR0913, PLR0915
+     print(f"   {Colors.GREEN}✓ Results added to AnnData object:{Colors.ENDC}")
+     print(f"     {Colors.CYAN}• '{key_obsm}': {Colors.BOLD}UMAP coordinates{Colors.ENDC}{Colors.CYAN} (adata.obsm){Colors.ENDC}")
+     print(f"     {Colors.CYAN}• '{key_uns}': {Colors.BOLD}UMAP parameters{Colors.ENDC}{Colors.CYAN} (adata.uns){Colors.ENDC}")
++    # Parametric UMAP returns the fitted model (for projecting new data);
++    # all other backends keep the classic copy/in-place return contract.
++    if method == "pumap":
++        return _pumap_model
+     return adata if copy else None
+ 
+ 
+diff --git a/tests/pp/test_pumap_model.py b/tests/pp/test_pumap_model.py
+new file mode 100644
+index 000000000..51cc2f5e5
+--- /dev/null
++++ b/tests/pp/test_pumap_model.py
+@@ -0,0 +1,70 @@
++"""ov.pp.umap(method='pumap') returns a reusable model that projects new data."""
++import numpy as np
++import pytest
++
++
++def _ref_query():
++    import scanpy as sc
++    import omicverse as ov
++
++    ad = sc.datasets.pbmc3k()
++    sc.pp.filter_genes(ad, min_cells=3)
++    sc.pp.normalize_total(ad, target_sum=1e4)
++    sc.pp.log1p(ad)
++    sc.pp.highly_variable_genes(ad, n_top_genes=2000)
++    ad = ad[:, ad.var.highly_variable].copy()
++    ov.pp.scale(ad)
++    ov.pp.pca(ad, n_pcs=50, layer="scaled")
++    import scanpy as sc
++    sc.pp.neighbors(ad, use_rep="scaled|original|X_pca", random_state=0)
++    return ad[:2000].copy(), ad[2000:].copy()
++
++
++@pytest.mark.skipif(
++    not __import__("torch").cuda.is_available(),
++    reason="parametric UMAP (pumap) needs a GPU",
++)
++def test_pumap_returns_model_and_projects_new_data():
++    import contextlib
++    import io
++
++    import omicverse as ov
++
++    ref, qry = _ref_query()
++    ov.settings.mode = "cpu-gpu-mixed"
++    with contextlib.redirect_stdout(io.StringIO()):
++        model = ov.pp.umap(ref, method="pumap")
++
++    # model returned, reference embedding written
++    assert model is not None and hasattr(model, "transform")
++    assert ref.obsm["X_umap"].shape == (ref.n_obs, 2)
++
++    # project NEW data through the learned mapping (same PCA space)
++    qx = np.ascontiguousarray(qry.obsm["scaled|original|X_pca"], dtype=np.float32)
++    emb = model.transform(qx)
++    assert emb.shape == (qry.n_obs, 2) and np.isfinite(emb).all()
++    # deterministic for the same fitted model + input
++    assert np.allclose(emb, model.transform(qx))
++
++
++@pytest.mark.skipif(
++    not __import__("torch").cuda.is_available(),
++    reason="parametric UMAP (pumap) needs a GPU",
++)
++def test_pumap_save_load(tmp_path):
++    import contextlib
++    import io
++
++    import omicverse as ov
++
++    ref, qry = _ref_query()
++    ov.settings.mode = "cpu-gpu-mixed"
++    with contextlib.redirect_stdout(io.StringIO()):
++        model = ov.pp.umap(ref, method="pumap")
++    qx = np.ascontiguousarray(qry.obsm["scaled|original|X_pca"], dtype=np.float32)
++    emb = model.transform(qx)
++
++    p = str(tmp_path / "pumap.pkl")
++    model.save(p)
++    m2 = ov.pp.load_pumap(p)
++    assert np.allclose(m2.transform(qx), emb)

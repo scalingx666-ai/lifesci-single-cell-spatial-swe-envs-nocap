@@ -1,0 +1,262 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index 64136a477..0b74b4a05 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -117,6 +117,14 @@ jobs:
+     if: inputs.publish || inputs.pypi_only
+     runs-on: ubuntu-latest
+     timeout-minutes: 10
++    # GitHub shows a draft release only to a caller with push access. With the
++    # workflow-level `contents: read` token, `gh release view` answered
++    # "release not found" for the very draft this job exists to find: the
++    # first publish dispatch (v0.3.0, run 35087359578) stopped here. The job
++    # checks out nothing and runs only the gh/jq calls below, so the write
++    # scope reaches no repository code.
++    permissions:
++      contents: write
+     steps:
+       - name: The named tag must exist, in the state the chosen mode requires
+         env:
+@@ -154,6 +162,20 @@ jobs:
+               echo "::error::$TAG is already public; staging assets onto it is the half-published state this pipeline exists to prevent"
+               exit 1
+             fi
++            # Once PyPI has the version, staging again can only do harm. The
++            # build is not byte-reproducible, and `attach` uploads with
++            # --clobber, so a second dispatch would replace the draft's assets
++            # with bytes PyPI does not have. Then the pypi job fails on the
++            # reused filename and `--only publish` refuses the mismatch, which
++            # leaves the release stuck. Only a definite 404 lets staging start.
++            code=$(curl -sS -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/openai4s/${TAG#v}/json") || code=unreachable
++            if [ "$code" = "200" ]; then
++              echo "::error::openai4s ${TAG#v} is already on PyPI; do not dispatch again. Re-run the failed finalize job of the run that published it, or run release_pipeline.py --mode release --only publish against the untouched draft"
++              exit 1
++            elif [ "$code" != "404" ]; then
++              echo "::error::could not tell whether PyPI already has openai4s ${TAG#v} (HTTP $code); refusing to stage"
++              exit 1
++            fi
+           fi
+           if [ "$(jq -r .isPrerelease release.json)" = "true" ]; then
+             echo "::error::$TAG is marked as a prerelease; stable publication requires a non-prerelease draft"
+@@ -828,9 +850,13 @@ jobs:
+     # a public release with no matching package version.
+     #
+     # If this job fails after PyPI succeeded, the release stays a draft and
+-    # nothing needs rebuilding: re-run this workflow with the same tag, or run
+-    # `release_pipeline.py --only publish` by hand. Do not bump the version and
+-    # do not rebuild — the artifacts on the draft are the ones PyPI has.
++    # nothing needs rebuilding: use "Re-run failed jobs" on this same run (not
++    # "Re-run all jobs", which rebuilds), or run
++    # `release_pipeline.py --mode release --only publish` by hand. Never
++    # dispatch this tag again: the guard refuses once PyPI has the version,
++    # because a new build would clobber the draft with bytes PyPI does not
++    # have. Do not bump the version and do not rebuild -- the artifacts on the
++    # draft are the ones PyPI has.
+     if: inputs.publish
+     needs: [freeze, attach, pypi]
+     runs-on: ubuntu-latest
+diff --git a/docs/release-validation.md b/docs/release-validation.md
+index 9f7648255..30935372b 100644
+--- a/docs/release-validation.md
++++ b/docs/release-validation.md
+@@ -335,7 +335,14 @@ and `SHA256SUMS`, and no wheel, sdist, SBOM, provenance or evidence bundle.
+ 
+ A version number can be uploaded to PyPI only once. If `finalize` fails after
+ the PyPI job has succeeded, re-run the failed job instead of dispatching a new
+-build.
++build. A new `publish=true` dispatch is refused by the guard once PyPI has the
++version: the rebuild is not byte-identical, and staging it would overwrite the
++draft's assets with files PyPI does not have.
++
++The guard job holds `contents: write` although it only reads. GitHub shows a
++draft release only to a caller with push access, so with the workflow's
++read-only token the guard reported an existing draft as missing. That is how
++v0.3.0's first publish dispatch stopped.
+ 
+ The workflow uses GitHub/PyPI OIDC and does not accept a long-lived PyPI token.
+ Its PyPI job also creates PyPI's default provenance attestations through the
+diff --git a/scripts/release_pipeline.py b/scripts/release_pipeline.py
+index 5d7304c2e..54a8a9430 100644
+--- a/scripts/release_pipeline.py
++++ b/scripts/release_pipeline.py
+@@ -1519,7 +1519,7 @@ def step_evidence(self) -> StepResult:
+         """
+         if self.dry_run:
+             return StepResult("evidence", True, "would seal the evidence bundle")
+-        payload = self.report(planned=STEPS, sealing=True)
++        payload = self.report(planned=self.planned_steps(), sealing=True)
+         carried = [
+             path
+             for path in (
+@@ -2297,6 +2297,15 @@ def report(
+             "steps": [result.public() for result in self.results],
+         }
+         if sealing:
++            # A seal is a snapshot, taken before `checksums`, `draft`, `upload`
++            # and `publish` have run. The end-of-run verdict above does not
++            # exist yet: sealed as-is, the bundle said `ok: true` and
++            # `published: true` for a run that had uploaded nothing, and it
++            # stayed that way in the 90-day artifact of a run that later
++            # failed at PyPI.
++            document["ok"] = None
++            document["published"] = False
++            document["sealed_at"] = "evidence"
+             # Only when sealing: `_frozen_sha` runs git and can raise, and the
+             # ordinary report is also built on the failure path where raising
+             # would replace the real reason with a git error.
+diff --git a/tests/test_release_gates.py b/tests/test_release_gates.py
+index 5116e7b7c..119843a94 100644
+--- a/tests/test_release_gates.py
++++ b/tests/test_release_gates.py
+@@ -877,6 +877,111 @@ def test_publishing_requires_an_existing_draft_before_anything_runs():
+         assert "guard" in block, f"{job.strip()} may run without the draft check"
+ 
+ 
++def test_every_job_that_reads_the_draft_can_see_it():
++    """A draft release is visible only to a caller with push access.
++
++    The workflow-level token is `contents: read`, and under it `gh release view`
++    answers "release not found" for an existing draft. The guard inherited that
++    token, so the first real publish dispatch (v0.3.0, run 35087359578)
++    refused a correct draft. The draft-first design was never reachable. Every
++    job that looks the draft up needs `contents: write`. The guard gets it
++    only because it runs no repository code, which is held here too.
++    """
++    yaml = pytest.importorskip("yaml")
++    workflow = yaml.safe_load(
++        (ROOT / ".github" / "workflows" / "release.yml").read_text("utf-8")
++    )
++    assert workflow["permissions"] == {"contents": "read"}
++    readers = {
++        name: job
++        for name, job in workflow["jobs"].items()
++        if any(
++            "gh release" in str(step.get("run") or "")
++            or "release_pipeline.py" in str(step.get("run") or "")
++            for step in job.get("steps") or []
++        )
++    }
++    assert {"guard", "attach", "finalize"} <= set(readers), sorted(readers)
++    for name, job in readers.items():
++        assert (job.get("permissions") or {}).get(
++            "contents"
++        ) == "write", f"{name} reads the draft with a token that cannot see it"
++    guard_steps = workflow["jobs"]["guard"]["steps"]
++    assert all("uses" not in step for step in guard_steps), (
++        "the guard holds contents: write, so it must not check out or run "
++        "repository code"
++    )
++
++
++def _run_guard(tmp_path, *, publish, pypi, draft=True):
++    """Execute the guard's own shell step against a fake `gh` and `curl`."""
++    yaml = pytest.importorskip("yaml")
++    if shutil.which("jq") is None or shutil.which("bash") is None:
++        pytest.skip("the guard step needs bash and jq")
++    workflow = yaml.safe_load(
++        (ROOT / ".github" / "workflows" / "release.yml").read_text("utf-8")
++    )
++    (step,) = workflow["jobs"]["guard"]["steps"]
++    bin_dir = tmp_path / "bin"
++    bin_dir.mkdir(parents=True)
++    release = json.dumps({"isDraft": draft, "isPrerelease": False})
++    (bin_dir / "gh").write_text(f"#!/bin/sh\necho '{release}'\n", encoding="utf-8")
++    curl = "exit 7" if pypi == "unreachable" else f"printf '%s' '{pypi}'"
++    (bin_dir / "curl").write_text(
++        f'#!/bin/sh\necho "$@" >> "{tmp_path}/curl.args"\n{curl}\n', encoding="utf-8"
++    )
++    for tool in ("gh", "curl"):
++        (bin_dir / tool).chmod(0o755)
++    env = {
++        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
++        "TAG": "v9.8.7",
++        "PUBLISH": "true" if publish else "false",
++        "PYPI_ONLY": "false" if publish else "true",
++        "GH_TOKEN": "unused",
++        "GH_REPO": "owner/repo",
++    }
++    return subprocess.run(
++        ["bash", "-e", "-c", step["run"]],
++        cwd=tmp_path,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=60,
++    )
++
++
++def test_the_guard_refuses_to_stage_a_version_pypi_already_has(tmp_path):
++    """A second dispatch would clobber the draft with bytes PyPI lacks.
++
++    The build is not byte-reproducible and `attach` uploads with `--clobber`.
++    Once PyPI has the version, the pypi job then fails on the reused filename
++    and `--only publish` refuses the mismatch, leaving a release no retry can
++    finish. Only a definite 404 may let staging start.
++    """
++    fresh = _run_guard(tmp_path / "fresh", publish=True, pypi="404")
++    assert fresh.returncode == 0, fresh.stdout + fresh.stderr
++    assert "pypi.org/pypi/openai4s/9.8.7/json" in (
++        tmp_path / "fresh" / "curl.args"
++    ).read_text("utf-8")
++
++    for case, answer in (
++        ("taken", "200"),
++        ("broken", "503"),
++        ("offline", "unreachable"),
++    ):
++        refused = _run_guard(tmp_path / case, publish=True, pypi=answer)
++        assert refused.returncode != 0, (case, refused.stdout)
++    taken = _run_guard(tmp_path / "taken2", publish=True, pypi="200")
++    assert "already on PyPI" in taken.stdout
++    assert "Re-run the failed finalize job" in taken.stdout
++
++    # `pypi_only` exists for a public release whose PyPI upload never
++    # happened; it is not asked, and PyPI answers for it at upload time.
++    recovery = _run_guard(tmp_path / "recovery", publish=False, pypi="200", draft=False)
++    assert recovery.returncode == 0, recovery.stdout + recovery.stderr
++    assert not (tmp_path / "recovery" / "curl.args").exists()
++
++
+ def test_publishing_refuses_a_prerelease_draft():
+     """A stable tag must not publish a GitHub Release still marked prerelease.
+ 
+diff --git a/tests/test_release_pipeline.py b/tests/test_release_pipeline.py
+index 99efda93a..2d078de19 100644
+--- a/tests/test_release_pipeline.py
++++ b/tests/test_release_pipeline.py
+@@ -1735,6 +1735,35 @@ def gh(argv):
+     assert calls[-1][-1] == "--draft=false", "publishing is the final act"
+ 
+ 
++def test_the_sealed_report_is_a_snapshot_not_a_verdict(assets):
++    """`evidence` runs before `checksums`, `draft`, `upload` and `publish`.
++
++    The staging job's bundle recorded the end-of-run verdict anyway, with
++    `ok: true` and `published: true` and all thirteen steps planned, for a run
++    that had uploaded nothing yet. That record is attached to the release and
++    kept for 90 days even when the run later fails at PyPI. The stdout
++    report was right all along, so this reads the zip.
++    """
++    import zipfile
++
++    _signed_dmg(assets)
++    staged = _pipeline(
++        assets, mode="release", stop_after="reverify", gh=_gh_for(assets)
++    ).run()
++    assert staged["ok"] is True and staged["published"] is False, staged
++
++    with zipfile.ZipFile(assets / "openai4s-0.2.0-evidence.zip") as archive:
++        sealed = json.loads(archive.read("release-report.json"))
++    assert sealed["ok"] is None
++    assert sealed["published"] is False
++    assert sealed["sealed_at"] == "evidence"
++    assert sealed["stopped_at"] is None
++    assert sealed["planned"] == list(STEPS[: STEPS.index("reverify") + 1])
++    assert [step["step"] for step in sealed["steps"]] == list(
++        STEPS[: STEPS.index("evidence")]
++    )
++
++
+ def _write_checksums(assets: Path) -> None:
+     """A SHA256SUMS covering the uploaded assets, as step_checksums writes it.
+ 

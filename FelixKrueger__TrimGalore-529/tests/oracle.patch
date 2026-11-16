@@ -1,0 +1,1747 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index e8c194c..00f76d0 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -74,4 +74,4 @@ Single binary (`src/main.rs` is the only `[[bin]]`); the rest is a library crate
+ - **Output-collision pre-flight.** Don't bypass it — it catches issue #216 (case-only aliases on APFS/NTFS silently overwriting).
+ - **Em-dashes in user-facing strings.** `--version` provenance uses literal em-dashes; CI grep is content-targeted on that character.
+ - **uBAM input is auto-detected by content** (`format::detect_input_format`), NOT filename — `bgzip x.fq` and `samtools import`-produced `.bam` files both look BGZF-framed at the gzip-header layer, so the discriminator is `BAM\1` in the decompressed payload. Output stays FASTQ; BAM aux tags fold into the FASTQ header only when explicitly requested via `--preserve-tags TAG1,TAG2,…` (samtools `-T`-compatible, tab-separated). Aligned BAM is rejected per-record (not just at sanity-check time) so mixed-aligned inputs cannot silently produce wrong output. Paired-uBAM expects a single interleaved file (`samtools sort -n` / `collate` / Picard / fgbio all emit mate-adjacent); the de-interleaver bounds per-side buffering at `MAX_SLACK = 1024` and errors with a `samtools collate` remediation hint on grouped input.
+-- **uBAM output is opt-in via `--output-format ubam`.** Always single-threaded in v1 (`--cores N` is silently ignored on this path); paired output is **ONE interleaved BAM** (`<stem>_val.bam`) matching samtools/Picard/fgbio convention. The `@PG ID:trim_galore VN:<version> CL:<cmdline>` line is appended on every run — uBAM-in → uBAM-out preserves the input `@HD`/`@PG` chain plus our line, so output is NOT byte-identical to input (provenance is preserved by adding to history). Routine version bumps shift the `VN:` tag; CI golden fixtures use `assert_ubam_eq` which ignores `@PG`. Aux-tag round-trip supports A/Z/i/f scalars only; B (array) and H (hex) tags are rejected (the FASTQ intermediate's textual encoding can't carry them). The dispatch entry point is `main.rs::run_ubam_output`; trimmer entry points are `trimmer::run_{single,paired}_end_to_bam`. Most multi-output features (`--demux`, `--passthrough`, `--retain_unpaired`) and FASTQ-header-encoding specialty modes (`--clock`, `--implicon`, `--clumpify`) are rejected at the CLI layer in v1 — see `cli.rs::Cli::validate` §3.4a for the full list.
++- **uBAM output is opt-in via `--output-format ubam`.** Output uses `--cores N` (workers trim and encode batches, a BGZF pool compresses them; `parallel::run_{paired,single}_end_parallel_to_bam`); paired output is **ONE interleaved BAM** (`<stem>_val.bam`) matching samtools/Picard/fgbio convention. The `@PG ID:trim_galore VN:<version> CL:<cmdline>` line is appended on every run — uBAM-in → uBAM-out preserves the input `@HD`/`@PG` chain plus our line, so output is NOT byte-identical to input (provenance is preserved by adding to history). Routine version bumps shift the `VN:` tag; CI golden fixtures use `assert_ubam_eq` which ignores `@PG`. Aux-tag round-trip supports A/Z/i/f scalars only; B (array) and H (hex) tags are rejected (the FASTQ intermediate's textual encoding can't carry them). The dispatch entry point is `main.rs::run_ubam_output`; trimmer entry points are `trimmer::run_{single,paired}_end_to_bam`. Most multi-output features (`--demux`, `--passthrough`, `--retain_unpaired`) and FASTQ-header-encoding specialty modes (`--clock`, `--implicon`, `--clumpify`) are rejected at the CLI layer in v1 — see `cli.rs::Cli::validate` §3.4a for the full list.
+diff --git a/README.md b/README.md
+index f9c6f60..d645c85 100644
+--- a/README.md
++++ b/README.md
+@@ -127,7 +127,7 @@ trim_galore --paired interleaved.bam
+ # `-T`-compatible, tab-separated). Ignored for FASTQ input.
+ trim_galore --preserve-tags CB,UB sample.bam
+ 
+-# uBAM output — emit unaligned BAM instead of FASTQ. Single-threaded; the
++# uBAM output — emit unaligned BAM instead of FASTQ. Uses --cores; the
+ # input `@HD`/`@PG` chain is propagated and a trim_galore `@PG` line is
+ # appended. Paired output is ONE interleaved BAM (`<stem>_val.bam`) with
+ # FREAD1/FREAD2 flag bits per record (samtools/Picard/fgbio convention).
+diff --git a/src/bam.rs b/src/bam.rs
+index 26e1f4f..8e8b8bf 100644
+--- a/src/bam.rs
++++ b/src/bam.rs
+@@ -47,10 +47,10 @@ const BAM_READER_CHANNEL_BATCHES: usize = 4;
+ /// per-side buffer at ~1 MB, not unbounded.
+ ///
+ /// See `plans/06252026_ubam-input-support/spikes/SPIKE_paired_ordering.md`.
+-const MAX_SLACK: usize = 1024;
++pub(crate) const MAX_SLACK: usize = 1024;
+ 
+ /// Suggested remediation text when the de-interleaver detects grouped input.
+-const GROUPED_INPUT_ERR: &str = "Paired uBAM input has non-adjacent mates (one side queue exceeded MAX_SLACK = 1024 \
++pub(crate) const GROUPED_INPUT_ERR: &str = "Paired uBAM input has non-adjacent mates (one side queue exceeded MAX_SLACK = 1024 \
+      records without seeing a matching mate). TrimGalore's paired-uBAM reader requires \
+      mate-adjacent ordering to stream without unbounded buffering. \
+      Re-interleave the input first: \
+@@ -95,6 +95,226 @@ enum BamReaderSource {
+     },
+ }
+ 
++/// A mate pair of raw (not yet converted) BAM records, with the 1-based record numbers for error
++/// messages.
++pub struct RawPair {
++    pub r1: bam::Record,
++    pub r2: bam::Record,
++    pub idx1: usize,
++    pub idx2: usize,
++}
++
++/// Reads an interleaved paired uBAM and hands on batches of raw mate pairs (`batch_size` pairs
++/// each) through `emit`, which returns `false` to stop. The pairing and the errors are those of
++/// [`BamReader::open_paired_interleaved_with_tags`]; the conversion of the records is left to
++/// the caller (so that worker threads can do it instead of this one).
++pub fn read_raw_pairs(
++    path: &Path,
++    batch_size: usize,
++    mut emit: impl FnMut(Vec<RawPair>) -> bool,
++) -> Result<()> {
++    const FREAD1: u16 = 0x40;
++    const FREAD2: u16 = 0x80;
++    let (mut inner, _header) = open_inner(path)?;
++    let mut q1: std::collections::VecDeque<(usize, bam::Record)> =
++        std::collections::VecDeque::new();
++    let mut q2: std::collections::VecDeque<(usize, bam::Record)> =
++        std::collections::VecDeque::new();
++    let mut batch: Vec<RawPair> = Vec::with_capacity(batch_size);
++    let mut record_idx: usize = 0;
++    loop {
++        let mut rec = bam::Record::default();
++        let n = inner.read_record(&mut rec).map_err(|e| {
++            anyhow::anyhow!(
++                "{}: failed to read BAM record {}: {}",
++                path.display(),
++                record_idx + 1,
++                e
++            )
++        })?;
++        if n == 0 {
++            break;
++        }
++        record_idx += 1;
++        let flags = rec.flags().bits();
++        let (is_r1, is_r2) = (flags & FREAD1 != 0, flags & FREAD2 != 0);
++        if is_r1 == is_r2 {
++            bail!(
++                "Paired uBAM '{}': record {} has invalid flag bits (FREAD1={}, FREAD2={}, raw=0x{:04X}). Each record must have exactly one of READ1 (0x40) / READ2 (0x80) set.",
++                path.display(),
++                record_idx,
++                is_r1,
++                is_r2,
++                flags
++            );
++        }
++        if is_r1 {
++            q1.push_back((record_idx, rec));
++        } else {
++            q2.push_back((record_idx, rec));
++        }
++        if !q1.is_empty() && !q2.is_empty() {
++            let (idx1, r1) = q1.pop_front().expect("checked");
++            let (idx2, r2) = q2.pop_front().expect("checked");
++            batch.push(RawPair { r1, r2, idx1, idx2 });
++            if batch.len() >= batch_size {
++                let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
++                if !emit(full) {
++                    return Ok(());
++                }
++            }
++        }
++        if q1.len() > MAX_SLACK || q2.len() > MAX_SLACK {
++            bail!("{GROUPED_INPUT_ERR}");
++        }
++    }
++    if !batch.is_empty() && !emit(batch) {
++        return Ok(());
++    }
++    if !q1.is_empty() || !q2.is_empty() {
++        bail!(
++            "Paired uBAM '{}' ended with {} unmatched R1 and {} unmatched R2 records (orphans). Consider --retain_unpaired or re-interleave with `samtools collate`.",
++            path.display(),
++            q1.len(),
++            q2.len()
++        );
++    }
++    Ok(())
++}
++
++/// Reads a uBAM and hands on batches of raw (not yet converted) records, each with its 1-based
++/// record number for error messages, through `emit`, which returns `false` to stop. Single-end
++/// counterpart of [`read_raw_pairs`].
++pub fn read_raw_records(
++    path: &Path,
++    batch_size: usize,
++    mut emit: impl FnMut(Vec<(usize, bam::Record)>) -> bool,
++) -> Result<()> {
++    let (mut inner, _header) = open_inner(path)?;
++    let mut batch: Vec<(usize, bam::Record)> = Vec::with_capacity(batch_size);
++    let mut record_idx: usize = 0;
++    loop {
++        let mut rec = bam::Record::default();
++        let n = inner.read_record(&mut rec).map_err(|e| {
++            anyhow::anyhow!(
++                "{}: failed to read BAM record {}: {}",
++                path.display(),
++                record_idx + 1,
++                e
++            )
++        })?;
++        if n == 0 {
++            break;
++        }
++        record_idx += 1;
++        batch.push((record_idx, rec));
++        if batch.len() >= batch_size {
++            let full = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
++            if !emit(full) {
++                return Ok(());
++            }
++        }
++    }
++    if !batch.is_empty() {
++        emit(batch);
++    }
++    Ok(())
++}
++
++/// What the reading thread of a conversion pool hands to the merger, in input order.
++enum PoolMsg<OB> {
++    Batch(OB),
++    /// End of input.
++    End,
++    /// Reading failed (or a worker failed to convert a batch).
++    Fail(anyhow::Error),
++}
++
++/// A pool that converts raw batches on `workers` threads and passes the results on in input order.
++///
++/// `produce` runs on its own thread and calls the function it is given for every raw batch
++/// (which returns `false` once nobody listens any more). The batches go round-robin to the
++/// workers; `convert` turns one raw batch into one result; a merger thread puts the results back
++/// in order and calls `deliver` with each one: `Ok(Some(batch))` for a batch, `Ok(None)` at the
++/// end of the input, `Err` for the first error (nothing follows it). `deliver` returns `false`
++/// to stop. All threads are detached; they end when the input ends, on an error, or when
++/// `deliver` stops.
++fn spawn_conversion_pool<RB, OB>(
++    workers: usize,
++    produce: impl FnOnce(&mut dyn FnMut(RB) -> bool) -> Result<()> + Send + 'static,
++    convert: impl Fn(RB) -> Result<OB> + Send + Sync + 'static,
++    mut deliver: impl FnMut(Result<Option<OB>>) -> bool + Send + 'static,
++) where
++    RB: Send + 'static,
++    OB: Send + 'static,
++{
++    let workers = workers.max(1);
++    let convert = std::sync::Arc::new(convert);
++    let (merge_tx, merge_rx) = mpsc::sync_channel::<(u64, PoolMsg<OB>)>(workers * 2);
++
++    let mut work_txs = Vec::with_capacity(workers);
++    for _ in 0..workers {
++        let (tx, rx) = mpsc::sync_channel::<(u64, RB)>(2);
++        work_txs.push(tx);
++        let convert = convert.clone();
++        let merge_tx = merge_tx.clone();
++        std::thread::spawn(move || {
++            while let Ok((seq, raw)) = rx.recv() {
++                let msg = match convert(raw) {
++                    Ok(out) => PoolMsg::Batch(out),
++                    Err(e) => PoolMsg::Fail(e),
++                };
++                if merge_tx.send((seq, msg)).is_err() {
++                    break;
++                }
++            }
++        });
++    }
++
++    // the reading thread: raw batches out, then the end (or the error) as the last message
++    std::thread::spawn(move || {
++        let mut seq: u64 = 0;
++        let res = produce(&mut |raw: RB| {
++            let idx = (seq as usize) % work_txs.len();
++            seq += 1;
++            work_txs[idx].send((seq - 1, raw)).is_ok()
++        });
++        let last = match res {
++            Ok(()) => PoolMsg::End,
++            Err(e) => PoolMsg::Fail(e),
++        };
++        let _ = merge_tx.send((seq, last));
++        // dropping `work_txs` ends the workers
++    });
++
++    std::thread::spawn(move || {
++        let mut expected: u64 = 0;
++        let mut pending: std::collections::BTreeMap<u64, PoolMsg<OB>> =
++            std::collections::BTreeMap::new();
++        while let Ok((seq, msg)) = merge_rx.recv() {
++            pending.insert(seq, msg);
++            while let Some(m) = pending.remove(&expected) {
++                expected += 1;
++                match m {
++                    PoolMsg::Batch(b) => {
++                        if !deliver(Ok(Some(b))) {
++                            return;
++                        }
++                    }
++                    PoolMsg::End => {
++                        deliver(Ok(None));
++                        return;
++                    }
++                    PoolMsg::Fail(e) => {
++                        deliver(Err(e));
++                        return;
++                    }
++                }
++            }
++        }
++    });
++}
++
+ /// uBAM reader. Yields `FastqRecord`s via `next_record()`, mirroring the
+ /// `FastqReader` shape so the worker pool can dispatch through the
+ /// `RecordSource` trait object.
+@@ -141,6 +361,130 @@ impl BamReader {
+         Self::open_threaded_inner(path, preserve_tags.to_vec())
+     }
+ 
++    /// Like [`BamReader::open_threaded_with_tags`], but the records are converted on `workers`
++    /// threads (the reading thread only reads them). `workers <= 1` is the plain threaded reader.
++    pub fn open_threaded_pooled<P: AsRef<Path>>(
++        path: P,
++        preserve_tags: &[String],
++        workers: usize,
++    ) -> Result<Self> {
++        if workers <= 1 {
++            return Self::open_threaded_with_tags(path, preserve_tags);
++        }
++        let path = path.as_ref().to_path_buf();
++        if !path.exists() {
++            bail!("Input file not found: {}", path.display());
++        }
++        let (tx, rx) = mpsc::sync_channel(BAM_READER_CHANNEL_BATCHES);
++        let tags = preserve_tags.to_vec();
++        let (read_path, convert_path) = (path.clone(), path);
++        spawn_conversion_pool(
++            workers,
++            move |emit: &mut dyn FnMut(Vec<(usize, bam::Record)>) -> bool| {
++                read_raw_records(&read_path, BAM_READER_BATCH_SIZE, emit)
++            },
++            move |batch: Vec<(usize, bam::Record)>| {
++                batch
++                    .iter()
++                    .map(|(idx, rec)| {
++                        bam_record_to_fastq(rec, &tags).map_err(|e| {
++                            e.context(format!("{}: BAM record {}", convert_path.display(), idx))
++                        })
++                    })
++                    .collect::<Result<Vec<FastqRecord>>>()
++            },
++            move |item| match item {
++                Ok(Some(batch)) => tx.send(Ok(batch)).is_ok(),
++                Ok(None) => {
++                    let _ = tx.send(Ok(Vec::new()));
++                    false
++                }
++                Err(e) => {
++                    let _ = tx.send(Err(e));
++                    false
++                }
++            },
++        );
++        Ok(Self {
++            source: BamReaderSource::Threaded {
++                rx,
++                buffer: Vec::new(),
++                buf_pos: 0,
++                eof: false,
++                _handle: spawn_noop_joinhandle(),
++            },
++            preserved_tags: preserve_tags.to_vec(),
++        })
++    }
++
++    /// Like [`BamReader::open_paired_interleaved_with_tags`], but the records are converted on
++    /// `workers` threads (the reading thread only reads them and pairs the mates). `workers <= 1`
++    /// is the plain reader.
++    pub fn open_paired_interleaved_pooled<P: AsRef<Path>>(
++        path: P,
++        preserve_tags: &[String],
++        workers: usize,
++    ) -> Result<(Self, Self)> {
++        if workers <= 1 {
++            return Self::open_paired_interleaved_with_tags(path, preserve_tags);
++        }
++        let path = path.as_ref().to_path_buf();
++        if !path.exists() {
++            bail!("Input file not found: {}", path.display());
++        }
++        let (tx_r1, rx_r1) = mpsc::sync_channel(BAM_READER_CHANNEL_BATCHES);
++        let (tx_r2, rx_r2) = mpsc::sync_channel(BAM_READER_CHANNEL_BATCHES);
++        let tags = preserve_tags.to_vec();
++        let (read_path, convert_path) = (path.clone(), path);
++        spawn_conversion_pool(
++            workers,
++            move |emit: &mut dyn FnMut(Vec<RawPair>) -> bool| {
++                read_raw_pairs(&read_path, BAM_READER_BATCH_SIZE, emit)
++            },
++            move |batch: Vec<RawPair>| {
++                let convert = |rec: &bam::Record, idx: usize| {
++                    bam_record_to_fastq(rec, &tags).map_err(|e| {
++                        anyhow::anyhow!("{}: BAM record {}: {:#}", convert_path.display(), idx, e)
++                    })
++                };
++                let (mut r1s, mut r2s) = (
++                    Vec::with_capacity(batch.len()),
++                    Vec::with_capacity(batch.len()),
++                );
++                for pair in &batch {
++                    r1s.push(convert(&pair.r1, pair.idx1)?);
++                    r2s.push(convert(&pair.r2, pair.idx2)?);
++                }
++                Ok((r1s, r2s))
++            },
++            move |item| match item {
++                Ok(Some((r1s, r2s))) => tx_r1.send(Ok(r1s)).is_ok() && tx_r2.send(Ok(r2s)).is_ok(),
++                Ok(None) => {
++                    let _ = tx_r1.send(Ok(Vec::new()));
++                    let _ = tx_r2.send(Ok(Vec::new()));
++                    false
++                }
++                Err(e) => {
++                    let msg = format!("{e:#}");
++                    let _ = tx_r1.send(Err(anyhow::anyhow!("{msg}")));
++                    let _ = tx_r2.send(Err(anyhow::anyhow!("{msg}")));
++                    false
++                }
++            },
++        );
++        let side = |rx| Self {
++            source: BamReaderSource::Threaded {
++                rx,
++                buffer: Vec::new(),
++                buf_pos: 0,
++                eof: false,
++                _handle: spawn_noop_joinhandle(),
++            },
++            preserved_tags: preserve_tags.to_vec(),
++        };
++        Ok((side(rx_r1), side(rx_r2)))
++    }
++
+     /// Open a paired uBAM and de-interleave on the fly.
+     ///
+     /// Returns two `BamReader`s, both in `Threaded` mode, fed from a single
+@@ -624,80 +968,10 @@ impl BamWriter {
+     /// PLAN §3.6 — only A / Z / i / f scalar types are accepted; B / H
+     /// arrays or malformed shape errors.
+     pub fn write_record(&mut self, record: &FastqRecord, paired_side: Option<u8>) -> Result<()> {
+-        let (name, data) = parse_name_and_data(&record.id)
+-            .with_context(|| format!("malformed FastqRecord.id: {:?}", record.id))?;
+-        let flags = match paired_side {
+-            None => Flags::UNMAPPED,
+-            Some(1) => {
+-                Flags::SEGMENTED | Flags::UNMAPPED | Flags::MATE_UNMAPPED | Flags::FIRST_SEGMENT
+-            }
+-            Some(2) => {
+-                Flags::SEGMENTED | Flags::UNMAPPED | Flags::MATE_UNMAPPED | Flags::LAST_SEGMENT
+-            }
+-            Some(other) => bail!(
+-                "BamWriter::write_record: paired_side must be 1 or 2, got {}",
+-                other
+-            ),
+-        };
+-        // Sequence — validate per PLAN §3.3 step 3 (ACGTN-only, reject `=`,
+-        // coerce IUPAC degenerate to N). Mirrors the read-side
+-        // `bam_record_to_fastq` logic for symmetry. Code-review B-M1 fix.
+-        let normalized_seq = validate_and_normalize_seq_for_write(record.seq.as_bytes())
+-            .with_context(|| format!("while writing BAM record {:?}", record.id))?;
+-        // BAM stores raw Phred bytes; `FastqRecord.qual` is ASCII at the
+-        // input's declared offset — 33, or 64 under `--phred64`. Hardcoding 33
+-        // here was issue #358: Phred+64 input was under-subtracted by 31 and
+-        // stored as inflated-but-SAM-legal quality, so nothing errored.
+-        //
+-        // `saturating_sub` is load-bearing, not merely defensive: nothing in
+-        // `fastq.rs` validates the quality range (`FastqReader::sanity_check`
+-        // only checks the `@` prefix and rejects colorspace; the record path
+-        // only detects truncation), so a malformed sub-offset byte can reach
+-        // here and must floor to 0 rather than wrap.
+-        let raw_qual: Vec<u8> = record
+-            .qual
+-            .bytes()
+-            .map(|b| b.saturating_sub(self.input_phred_offset))
+-            .collect();
+-        debug_assert_eq!(
+-            raw_qual.len(),
+-            normalized_seq.len(),
+-            "FastqRecord seq/qual length mismatch reached BamWriter"
+-        );
+-        let rec = RecordBuf::builder()
+-            .set_name(name)
+-            .set_flags(flags)
+-            .set_sequence(Sequence::from(normalized_seq))
+-            .set_quality_scores(QualityScores::from(raw_qual))
+-            .set_data(data)
+-            .build();
+-        // `record.id`, not `name` — that moved into `set_name` above. Shown under the
+-        // 60-char cap the tag notices use, with the byte count when it bites, because
+-        // a FASTQ id has no length limit and one rejection here is over-long. The
+-        // QNAME rule is appended only for `InvalidInput`, so a full disk or a closed
+-        // pipe is not relabelled as a read-name problem.
++        let rec = build_record_buf(record, paired_side, self.input_phred_offset)?;
+         self.inner
+             .write_alignment_record(&self.header, &rec)
+-            .map_err(|e| {
+-                let shown = if record.id.chars().count() > 60 {
+-                    format!(
+-                        "{}… ({} bytes)",
+-                        record.id.chars().take(60).collect::<String>(),
+-                        record.id.len()
+-                    )
+-                } else {
+-                    record.id.clone()
+-                };
+-                let mut msg = format!("while writing BAM record \"{}\"", shown.escape_debug());
+-                if e.kind() == std::io::ErrorKind::InvalidInput {
+-                    msg.push_str(
+-                        " — BAM rejected it. A SAM read name must be 1-254 bytes of \
+-                         printable ASCII other than `@` and space. Rename the reads \
+-                         before trimming, or write FASTQ output, which accepts them.",
+-                    );
+-                }
+-                anyhow::Error::new(e).context(msg)
+-            })?;
++            .map_err(|e| write_error_context(&record.id, e))?;
+         Ok(())
+     }
+ 
+@@ -719,6 +993,181 @@ impl BamWriter {
+     }
+ }
+ 
++/// Context for a failed BAM record write (shared by the serial writer and the parallel
++/// encoder). Shows `id` under the 60-char cap the tag notices use, with the byte count when it
++/// bites, because a FASTQ id has no length limit and one rejection here is over-long. The
++/// QNAME rule is appended only for `InvalidInput`, so a full disk or a closed pipe is not
++/// relabelled as a read-name problem.
++fn write_error_context(id: &str, e: std::io::Error) -> anyhow::Error {
++    let shown = if id.chars().count() > 60 {
++        format!(
++            "{}… ({} bytes)",
++            id.chars().take(60).collect::<String>(),
++            id.len()
++        )
++    } else {
++        id.to_string()
++    };
++    let mut msg = format!("while writing BAM record \"{}\"", shown.escape_debug());
++    if e.kind() == std::io::ErrorKind::InvalidInput {
++        msg.push_str(
++            " — BAM rejected it. A SAM read name must be 1-254 bytes of \
++             printable ASCII other than `@` and space. Rename the reads \
++             before trimming, or write FASTQ output, which accepts them.",
++        );
++    }
++    anyhow::Error::new(e).context(msg)
++}
++
++/// Build the BAM record for one `FastqRecord` (shared by the serial writer and the parallel
++/// encoder). See `BamWriter::write_record` for the flag and tag rules. `input_phred_offset` is
++/// the ASCII offset of `record.qual` (33, or 64 under `--phred64`).
++fn build_record_buf(
++    record: &FastqRecord,
++    paired_side: Option<u8>,
++    input_phred_offset: u8,
++) -> Result<RecordBuf> {
++    let (name, data) = parse_name_and_data(&record.id)
++        .with_context(|| format!("malformed FastqRecord.id: {:?}", record.id))?;
++    let flags = match paired_side {
++        None => Flags::UNMAPPED,
++        Some(1) => Flags::SEGMENTED | Flags::UNMAPPED | Flags::MATE_UNMAPPED | Flags::FIRST_SEGMENT,
++        Some(2) => Flags::SEGMENTED | Flags::UNMAPPED | Flags::MATE_UNMAPPED | Flags::LAST_SEGMENT,
++        Some(other) => bail!(
++            "BamWriter::write_record: paired_side must be 1 or 2, got {}",
++            other
++        ),
++    };
++    // Sequence — validate per PLAN §3.3 step 3 (ACGTN-only, reject `=`,
++    // coerce IUPAC degenerate to N). Mirrors the read-side
++    // `bam_record_to_fastq` logic for symmetry. Code-review B-M1 fix.
++    let normalized_seq = validate_and_normalize_seq_for_write(record.seq.as_bytes())
++        .with_context(|| format!("while writing BAM record {:?}", record.id))?;
++    // BAM stores raw Phred bytes; `FastqRecord.qual` is ASCII at the input's declared
++    // offset — 33, or 64 under `--phred64`. Hardcoding 33 here was issue #358: Phred+64
++    // input was under-subtracted by 31 and stored as inflated-but-SAM-legal quality, so
++    // nothing errored.
++    //
++    // `saturating_sub` is load-bearing, not merely defensive: nothing in `fastq.rs`
++    // validates the quality range (`FastqReader::sanity_check` only checks the `@` prefix
++    // and rejects colorspace; the record path only detects truncation), so a malformed
++    // sub-offset byte can reach here and must floor to 0 rather than wrap.
++    let raw_qual: Vec<u8> = record
++        .qual
++        .bytes()
++        .map(|b| b.saturating_sub(input_phred_offset))
++        .collect();
++    debug_assert_eq!(
++        raw_qual.len(),
++        normalized_seq.len(),
++        "FastqRecord seq/qual length mismatch reached BamWriter"
++    );
++    Ok(RecordBuf::builder()
++        .set_name(name)
++        .set_flags(flags)
++        .set_sequence(Sequence::from(normalized_seq))
++        .set_quality_scores(QualityScores::from(raw_qual))
++        .set_data(data)
++        .build())
++}
++
++/// Encodes the records of one batch into uncompressed BAM bytes, so that a worker thread can
++/// do the record building and encoding and leave only the BGZF framing to the sink.
++pub struct BatchEncoder {
++    inner: bam::io::Writer<Vec<u8>>,
++    /// ASCII offset of the incoming `FastqRecord.qual`, as for [`BamWriter::create`].
++    input_phred_offset: u8,
++}
++
++impl BatchEncoder {
++    pub fn with_capacity(bytes: usize, input_phred_offset: u8) -> Self {
++        Self {
++            inner: bam::io::Writer::from(Vec::with_capacity(bytes)),
++            input_phred_offset,
++        }
++    }
++
++    /// Append one record (`paired_side` as in `BamWriter::write_record`).
++    pub fn push(
++        &mut self,
++        header: &Header,
++        record: &FastqRecord,
++        paired_side: Option<u8>,
++    ) -> Result<()> {
++        let rec = build_record_buf(record, paired_side, self.input_phred_offset)?;
++        self.inner
++            .write_alignment_record(header, &rec)
++            .map_err(|e| write_error_context(&record.id, e))?;
++        Ok(())
++    }
++
++    pub fn into_bytes(self) -> Vec<u8> {
++        self.inner.into_inner()
++    }
++}
++
++/// uBAM sink for the multithreaded path: batches of already-encoded BAM records are written in
++/// order and compressed to BGZF by a pool of threads (`noodles` multithreaded writer).
++pub struct ParallelBamSink {
++    /// Declared before `pending` so the BGZF stream is closed before the
++    /// temporary is removed on the abandon path.
++    inner: bgzf::MultithreadedWriter<BufWriter<File>>,
++    pending: Option<crate::io::PendingOutput>,
++    header: Header,
++}
++
++impl ParallelBamSink {
++    /// Same header rules as [`BamWriter::create`]; `workers` is the number of compression threads.
++    pub fn create<P: AsRef<Path>>(
++        path: P,
++        source_header: Option<&Header>,
++        command_line: &str,
++        workers: usize,
++    ) -> Result<Self> {
++        let path = path.as_ref();
++        let header = build_output_header(source_header, command_line)?;
++        let (pending, file) = crate::io::PendingOutput::create(path)?;
++        let workers = std::num::NonZeroUsize::new(workers.max(1)).expect("at least one");
++        let mut inner = bgzf::multithreaded_writer::Builder::default()
++            .set_worker_count(workers)
++            .build_from_writer(BufWriter::new(file));
++        // the header, written through a plain (uncompressed) BAM writer into the BGZF stream
++        let mut head = bam::io::Writer::from(Vec::new());
++        head.write_header(&header)
++            .with_context(|| format!("Failed to write BAM header to {}", path.display()))?;
++        std::io::Write::write_all(&mut inner, &head.into_inner())
++            .with_context(|| format!("Failed to write BAM header to {}", path.display()))?;
++        Ok(Self {
++            inner,
++            pending: Some(pending),
++            header,
++        })
++    }
++
++    pub fn header(&self) -> &Header {
++        &self.header
++    }
++
++    /// Append encoded BAM records (the bytes of a [`BatchEncoder`]).
++    pub fn write_encoded(&mut self, bytes: &[u8]) -> Result<()> {
++        std::io::Write::write_all(&mut self.inner, bytes).context("failed to write BAM records")
++    }
++
++    /// Flush, stop the compression threads, write the BGZF EOF block and
++    /// publish the file under its final name.
++    pub fn finish(mut self) -> Result<()> {
++        self.inner
++            .finish()
++            .context("failed to finalise uBAM output (BGZF EOF marker)")?;
++        let pending = self.pending.take();
++        drop(self);
++        match pending {
++            Some(p) => p.commit(),
++            None => Ok(()),
++        }
++    }
++}
++
+ /// Build the output header — either propagate `source` + append our `@PG`
+ /// via noodles' [`Programs::add`] (which auto-handles `PP:` chain linkage
+ /// AND ID disambiguation when the prefix collides), or synthesise a
+@@ -932,7 +1381,9 @@ fn spawn_noop_joinhandle() -> JoinHandle<()> {
+ /// Open a BAM file, read its header, return both the reader and the parsed
+ /// header. The header is needed by `BamWriter` to propagate `@HD`/`@PG`/`@CO`
+ /// lines through uBAM-in → uBAM-out (PLAN §3.5).
+-fn open_inner(path: &Path) -> Result<(bam::io::Reader<bgzf::Reader<BufReader<File>>>, Header)> {
++pub(crate) fn open_inner(
++    path: &Path,
++) -> Result<(bam::io::Reader<bgzf::Reader<BufReader<File>>>, Header)> {
+     let file = File::open(path)
+         .with_context(|| format!("Failed to open uBAM input: {}", path.display()))?;
+     let mut inner = bam::io::Reader::new(BufReader::new(file));
+@@ -1003,7 +1454,7 @@ fn reject_framing_in_tag_value(text: &str) -> Result<()> {
+ /// - Must NOT be reverse-complemented / secondary / supplementary.
+ /// - Sequence may be empty (`SEQ = *`); IUPAC codes coerced to N on read, `=` rejected.
+ /// - Qual length must match seq length (or be all-`0xFF` / empty — missing).
+-fn bam_record_to_fastq(rec: &bam::Record, tags: &[String]) -> Result<FastqRecord> {
++pub(crate) fn bam_record_to_fastq(rec: &bam::Record, tags: &[String]) -> Result<FastqRecord> {
+     let flags = rec.flags();
+     if !flags.is_unmapped() {
+         bail!(
+@@ -1035,25 +1486,40 @@ fn bam_record_to_fastq(rec: &bam::Record, tags: &[String]) -> Result<FastqRecord
+ 
+     // Tag preservation — append `\tTAG:TYPE:VALUE` in user-specified order.
+     // Missing tags from a specific record are silently skipped (per-record).
++    //
++    // One pass over the record's aux fields (looking each tag up separately
++    // re-scans the fields once per requested tag, which made this the
++    // dominant cost of reading a uBAM). The first occurrence of a tag wins,
++    // as with `Data::get`.
+     if !tags.is_empty() {
+-        let data = rec.data();
+-        for tag_name in tags {
+-            let bytes = tag_name.as_bytes();
+-            debug_assert_eq!(
+-                bytes.len(),
+-                2,
+-                "CLI parser must enforce 2-char SAM tag names"
+-            );
+-            let tag = Tag::new(bytes[0], bytes[1]);
+-            if let Some(value_result) = data.get(&tag) {
+-                let value = value_result.with_context(|| {
+-                    format!("failed to read tag '{}' from BAM record", tag_name)
+-                })?;
++        let want: Vec<[u8; 2]> = tags
++            .iter()
++            .map(|t| {
++                let b = t.as_bytes();
++                debug_assert_eq!(b.len(), 2, "CLI parser must enforce 2-char SAM tag names");
++                [b[0], b[1]]
++            })
++            .collect();
++        let mut text = String::new();
++        let mut spans: Vec<Option<(usize, usize)>> = vec![None; tags.len()];
++        for field in rec.data().iter() {
++            let (tag, value) = field.context("failed to read an aux field from BAM record")?;
++            let tag_bytes: &[u8; 2] = tag.as_ref();
++            for (i, w) in want.iter().enumerate() {
++                if w == tag_bytes && spans[i].is_none() {
++                    let start = text.len();
++                    append_tag_type_and_value(&mut text, &value)
++                        .with_context(|| format!("aux tag '{}'", tags[i]))?;
++                    spans[i] = Some((start, text.len()));
++                }
++            }
++        }
++        for (name, span) in tags.iter().zip(&spans) {
++            if let Some((start, end)) = *span {
+                 id.push('\t');
+-                id.push_str(tag_name);
++                id.push_str(name);
+                 id.push(':');
+-                append_tag_type_and_value(&mut id, &value)
+-                    .with_context(|| format!("aux tag '{}'", tag_name))?;
++                id.push_str(&text[start..end]);
+             }
+         }
+     }
+@@ -1357,6 +1823,139 @@ mod tests {
+         Ok(())
+     }
+ 
++    /// Writes `n` records (`pairs`: as mate-adjacent R1/R2 pairs) with tags to a uBAM.
++    fn write_tagged_ubam(path: &Path, n: usize, pairs: bool) -> Result<()> {
++        let mut w = BamWriter::create(path, None, &[], "pooled reader test", 33)?;
++        for i in 0..n {
++            let rec = |side: &str| FastqRecord {
++                id: format!("@read_{i}\tCB:Z:AAAA{}\tUB:Z:CC{}", i % 7, i % 5),
++                seq: format!("ACGTACGTACGT{}", &"ACGT"[i % 4..i % 4 + 1]),
++                qual: format!("IIIIIIIIIIII{}", if side == "1" { "I" } else { "5" }),
++            };
++            if pairs {
++                w.write_record(&rec("1"), Some(1))?;
++                w.write_record(&rec("2"), Some(2))?;
++            } else {
++                w.write_record(&rec("1"), None)?;
++            }
++        }
++        w.finish()
++    }
++
++    fn drain(mut r: BamReader) -> Result<Vec<(String, String, String)>> {
++        let mut v = Vec::new();
++        while let Some(x) = r.next_record()? {
++            v.push((x.id, x.seq, x.qual));
++        }
++        Ok(v)
++    }
++
++    /// The readers that convert on a pool of threads must give the same records, in the same
++    /// order, as the plain ones, over several batches (> 4,096 records per side).
++    #[test]
++    fn pooled_readers_match_plain_readers() -> Result<()> {
++        let dir = tempfile::tempdir()?;
++        let tags = vec!["CB".to_string(), "UB".to_string()];
++
++        let se = dir.path().join("se.bam");
++        write_tagged_ubam(&se, 10_000, false)?;
++        let plain = drain(BamReader::open_threaded_with_tags(&se, &tags)?)?;
++        let pooled = drain(BamReader::open_threaded_pooled(&se, &tags, 4)?)?;
++        assert_eq!(plain.len(), 10_000);
++        assert_eq!(plain, pooled, "single-end records differ");
++
++        let pe = dir.path().join("pe.bam");
++        write_tagged_ubam(&pe, 10_000, true)?;
++        let (p1, p2) = BamReader::open_paired_interleaved_with_tags(&pe, &tags)?;
++        let (q1, q2) = BamReader::open_paired_interleaved_pooled(&pe, &tags, 4)?;
++        assert_eq!(drain(p1)?, drain(q1)?, "R1 records differ");
++        assert_eq!(drain(p2)?, drain(q2)?, "R2 records differ");
++        Ok(())
++    }
++
++    /// The errors of the pooled readers are those of the plain ones, and nothing before the
++    /// error is lost or reordered.
++    #[test]
++    fn pooled_readers_report_the_same_errors() -> Result<()> {
++        let dir = tempfile::tempdir()?;
++        let tags: Vec<String> = Vec::new();
++
++        // mates not adjacent: all R1 first, then all R2
++        let grouped = dir.path().join("grouped.bam");
++        {
++            let mut w = BamWriter::create(&grouped, None, &[], "grouped", 33)?;
++            let rec = |i: usize| FastqRecord {
++                id: format!("@read_{i}"),
++                seq: "ACGTACGTACGT".to_string(),
++                qual: "IIIIIIIIIIII".to_string(),
++            };
++            for i in 0..2_000 {
++                w.write_record(&rec(i), Some(1))?;
++            }
++            for i in 0..2_000 {
++                w.write_record(&rec(i), Some(2))?;
++            }
++            w.finish()?;
++        }
++        let (r1, _r2) = BamReader::open_paired_interleaved_pooled(&grouped, &tags, 3)?;
++        let err = drain(r1).expect_err("grouped input must fail");
++        assert!(format!("{err:#}").contains("non-adjacent mates"), "{err:#}");
++
++        // a record that cannot be converted: the error names its number, and the records
++        // before it come out first
++        let bad = dir.path().join("bad.bam");
++        {
++            let mut w = BamWriter::create(&bad, None, &[], "bad", 33)?;
++            for i in 0..5_000usize {
++                let rec = FastqRecord {
++                    id: format!("@read_{i}"),
++                    seq: "ACGTACGTACGT".to_string(),
++                    qual: "IIIIIIIIIIII".to_string(),
++                };
++                w.write_record(&rec, None)?;
++            }
++            w.finish()?;
++        }
++        // flip record 4,500 to an aligned record (flag 0x4 cleared) by rewriting the file
++        let mut r = bam::io::Reader::new(File::open(&bad)?);
++        let header = r.read_header()?;
++        let mut records: Vec<bam::Record> = Vec::new();
++        loop {
++            let mut rec = bam::Record::default();
++            if r.read_record(&mut rec)? == 0 {
++                break;
++            }
++            records.push(rec);
++        }
++        let aligned = dir.path().join("aligned.bam");
++        {
++            let mut w = bam::io::Writer::new(File::create(&aligned)?);
++            w.write_header(&header)?;
++            for (i, rec) in records.iter().enumerate() {
++                if i + 1 == 4_500 {
++                    let mut buf = RecordBuf::try_from_alignment_record(&header, rec)?;
++                    *buf.flags_mut() = Flags::empty();
++                    w.write_alignment_record(&header, &buf)?;
++                } else {
++                    w.write_record(&header, rec)?;
++                }
++            }
++            w.try_finish()?;
++        }
++        let mut r = BamReader::open_threaded_pooled(&aligned, &tags, 3)?;
++        let mut n = 0;
++        let err = loop {
++            match r.next_record() {
++                Ok(Some(_)) => n += 1,
++                Ok(None) => panic!("the aligned record must fail"),
++                Err(e) => break e,
++            }
++        };
++        assert_eq!(n, 4_096, "the first batch comes out before the error");
++        assert!(format!("{err:#}").contains("BAM record 4500"), "{err:#}");
++        Ok(())
++    }
++
+     #[test]
+     fn threaded_reads_match_direct() -> Result<()> {
+         let mut direct = BamReader::open("test_files/ubam_test.bam")?;
+@@ -2119,6 +2718,37 @@ mod tests {
+         Ok(())
+     }
+ 
++    /// Issue #358 for the multithreaded path: `BatchEncoder` must subtract the input's
++    /// offset too, and store the same QUAL bytes as the serial `BamWriter`.
++    #[test]
++    fn batch_encoder_subtracts_input_phred_offset() -> Result<()> {
++        fn stored_qual(qual: &str, input_phred_offset: u8, name: &str) -> Result<Vec<u8>> {
++            let dir = tempfile::tempdir()?;
++            let out = dir.path().join(format!("{name}.bam"));
++            let rec = FastqRecord {
++                id: format!("@{name}"),
++                seq: "ACGT".to_string(),
++                qual: qual.to_string(),
++            };
++            let mut sink = ParallelBamSink::create(&out, None, "trim_galore offset test", 2)?;
++            let mut enc = BatchEncoder::with_capacity(256, input_phred_offset);
++            enc.push(sink.header(), &rec, None)?;
++            sink.write_encoded(&enc.into_bytes())?;
++            sink.finish()?;
++
++            let file = File::open(&out)?;
++            let mut reader = bam::io::Reader::new(BufReader::new(file));
++            let _h = reader.read_header()?;
++            let mut bam_rec = bam::Record::default();
++            assert!(reader.read_record(&mut bam_rec)? > 0, "no record written");
++            Ok(bam_rec.quality_scores().as_ref().to_vec())
++        }
++
++        assert_eq!(stored_qual("hhhh", 64, "p64")?, vec![40u8; 4]);
++        assert_eq!(stored_qual("IIII", 33, "p33")?, vec![40u8; 4]);
++        Ok(())
++    }
++
+     #[test]
+     fn validate_seq_accepts_acgtn_upper() -> Result<()> {
+         let out = validate_and_normalize_seq_for_write(b"ACGTN")?;
+diff --git a/src/cli.rs b/src/cli.rs
+index c05c74a..32c31b4 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -14,9 +14,9 @@ pub enum OutputFormat {
+     /// FASTQ output, mirroring input compression (default).
+     #[default]
+     Fastq,
+-    /// Unaligned BAM output. Always single-threaded; --clumpify,
+-    /// --passthrough, --clock, --implicon, --demux, --retain_unpaired and
+-    /// --dont_gzip are rejected at validation.
++    /// Unaligned BAM output; uses --cores. --clumpify, --passthrough, --clock,
++    /// --implicon, --demux, --retain_unpaired and --dont_gzip are rejected at
++    /// validation.
+     #[clap(name = "ubam")]
+     UBam,
+ }
+@@ -266,8 +266,8 @@ pub struct Cli {
+     /// Output container format. Default `fastq` keeps existing behaviour
+     /// (input-compression-mirroring FASTQ); `ubam` emits unaligned BAM with
+     /// aux tags propagated from uBAM inputs (when `--preserve-tags` is set).
+-    /// uBAM output is always single-threaded; some flag combinations are
+-    /// rejected (see `--help` and the startup diagnostics for details).
++    /// uBAM output uses --cores; some flag combinations are rejected (see
++    /// `--help` and the startup diagnostics for details).
+     /// From FASTQ input, record bodies are preserved but not byte-identically:
+     /// header text after the first space is dropped (BAM read names cannot
+     /// contain whitespace), bases are uppercased, and IUPAC codes become `N`.
+diff --git a/src/format.rs b/src/format.rs
+index 654a256..dd7239f 100644
+--- a/src/format.rs
++++ b/src/format.rs
+@@ -409,19 +409,23 @@ pub fn open_sync_reader(
+ 
+ /// Open a threaded (background-decompression) reader for `path`, dispatching
+ /// by detected format. `preserve_tags` is honoured for BAM input; silently
+-/// ignored for FASTQ.
++/// ignored for FASTQ. `workers` is the number of threads that convert the
++/// records of a BAM input (one reads, `workers` convert); with 1 the plain
++/// threaded reader is used. FASTQ input ignores it.
+ pub fn open_threaded_reader(
+     path: &Path,
+     preserve_tags: &[String],
++    workers: usize,
+ ) -> Result<Box<dyn crate::fastq::RecordSource>> {
+     match detect_input_format(path)? {
+         // Detected format wins over the filename; see `open_sync_reader`.
+         fmt @ (InputFormat::FastqPlain | InputFormat::FastqGz) => Ok(Box::new(
+             crate::fastq::FastqReader::open_threaded_with(path, fmt == InputFormat::FastqGz)?,
+         )),
+-        InputFormat::UnalignedBam => Ok(Box::new(crate::bam::BamReader::open_threaded_with_tags(
++        InputFormat::UnalignedBam => Ok(Box::new(crate::bam::BamReader::open_threaded_pooled(
+             path,
+             preserve_tags,
++            workers,
+         )?)),
+     }
+ }
+@@ -467,7 +471,7 @@ mod tests {
+             enc.finish()?;
+         }
+ 
+-        let mut reader = open_threaded_reader(&p, &[])?;
++        let mut reader = open_threaded_reader(&p, &[], 1)?;
+         assert_eq!(reader.next_record()?.expect("one record").id, "@r1");
+         assert!(reader.next_record()?.is_none());
+         Ok(())
+diff --git a/src/main.rs b/src/main.rs
+index c73e43e..b629e7e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -582,15 +582,6 @@ fn main() -> Result<()> {
+     }
+ 
+     if matches!(cli.output_format, trim_galore::cli::OutputFormat::UBam) {
+-        if cli.cores > 1 {
+-            eprintln!(
+-                "NOTE: --output-format ubam uses single-threaded compression in v1; \
+-                 --cores {} is ignored for BAM writing (FastQC, if requested, still \
+-                 uses it). For high-throughput uBAM output, run multiple invocations \
+-                 in parallel.",
+-                cli.cores
+-            );
+-        }
+         if any_bam {
+             // PLAN §3.3 step 4 — uBAM-in → uBAM-out cannot carry the BAM
+             // missing-qual sentinel (0xFF) through the FASTQ intermediate.
+@@ -1524,7 +1515,7 @@ fn run_single_file(
+     let stats = if cli.cores > 1 || cli.clumpify {
+         // Worker-pool parallel path: N workers each handle trim + compress.
+         // `--clumpify` always routes here (validation enforces cores >= 2).
+-        let reader = open_threaded_reader(input, &cli.preserve_tags)?;
++        let reader = open_threaded_reader(input, &cli.preserve_tags, cli.cores)?;
+         let clump_layout = resolve_clump_layout(cli)?;
+         parallel::run_single_end_parallel(
+             reader,
+@@ -1751,8 +1742,8 @@ fn run_paired(
+     let (stats_r1, stats_r2, pair_stats) = if cli.cores > 1 || cli.clumpify {
+         // Worker-pool parallel path: N workers each handle trim + compress.
+         // `--clumpify` always routes here (validation enforces cores >= 2).
+-        let reader_r1 = open_threaded_reader(input_r1, &cli.preserve_tags)?;
+-        let reader_r2 = open_threaded_reader(input_r2, &cli.preserve_tags)?;
++        let reader_r1 = open_threaded_reader(input_r1, &cli.preserve_tags, cli.cores)?;
++        let reader_r2 = open_threaded_reader(input_r2, &cli.preserve_tags, cli.cores)?;
+         let reader_passthrough: Option<Box<dyn RecordSource>> = match passthrough_input {
+             Some(p) => Some(Box::new(FastqReader::open_threaded(p)?)),
+             None => None,
+@@ -2045,7 +2036,8 @@ fn run_paired_ubam_single_file(
+     };
+ 
+     let (stats_r1, stats_r2, pair_stats) = if cli.cores > 1 || cli.clumpify {
+-        let (r1, r2) = BamReader::open_paired_interleaved_with_tags(input, &cli.preserve_tags)?;
++        let (r1, r2) =
++            BamReader::open_paired_interleaved_pooled(input, &cli.preserve_tags, cli.cores)?;
+         let clump_layout = resolve_clump_layout(cli)?;
+         parallel::run_paired_end_parallel(
+             Box::new(r1),
+@@ -2363,16 +2355,30 @@ fn run_ubam_output_single(
+         eprintln!("NOTE: input is FASTQ; output uBAM records will have no aux fields.");
+     }
+ 
+-    let mut reader = open_sync_reader(input, &cli.preserve_tags)?;
+-    let mut writer = trim_galore::bam::BamWriter::create(
+-        &output_path,
+-        source_header.as_ref(),
+-        &cli.preserve_tags,
+-        command_line,
+-        cli.phred_offset(),
+-    )?;
+-    let stats = trimmer::run_single_end_to_bam(reader.as_mut(), &mut writer, config)?;
+-    writer.finish()?;
++    let stats = if cli.cores > 1 {
++        let reader = open_threaded_reader(input, &cli.preserve_tags, cli.cores)?;
++        let mut sink = trim_galore::bam::ParallelBamSink::create(
++            &output_path,
++            source_header.as_ref(),
++            command_line,
++            cli.cores,
++        )?;
++        let out = parallel::run_single_end_parallel_to_bam(reader, &mut sink, config, cli.cores)?;
++        sink.finish()?;
++        out
++    } else {
++        let mut reader = open_sync_reader(input, &cli.preserve_tags)?;
++        let mut writer = trim_galore::bam::BamWriter::create(
++            &output_path,
++            source_header.as_ref(),
++            &cli.preserve_tags,
++            command_line,
++            cli.phred_offset(),
++        )?;
++        let out = trimmer::run_single_end_to_bam(reader.as_mut(), &mut writer, config)?;
++        writer.finish()?;
++        out
++    };
+ 
+     // Summary (shape mirrors `run_single_file`).
+     eprintln!("\n=== Summary ===\n");
+@@ -2523,22 +2529,39 @@ fn run_ubam_output_paired_two_files(
+         InputFormat::FastqPlain | InputFormat::FastqGz => None,
+     };
+ 
+-    let mut reader_r1 = open_sync_reader(input_r1, &cli.preserve_tags)?;
+-    let mut reader_r2 = open_sync_reader(input_r2, &cli.preserve_tags)?;
+-    let mut writer = trim_galore::bam::BamWriter::create(
+-        &output_path,
+-        source_header.as_ref(),
+-        &cli.preserve_tags,
+-        command_line,
+-        cli.phred_offset(),
+-    )?;
+-    let (stats_r1, stats_r2, pair_stats) = trimmer::run_paired_end_to_bam(
+-        reader_r1.as_mut(),
+-        reader_r2.as_mut(),
+-        &mut writer,
+-        config,
+-    )?;
+-    writer.finish()?;
++    let (stats_r1, stats_r2, pair_stats) = if cli.cores > 1 {
++        let reader_r1 = open_threaded_reader(input_r1, &cli.preserve_tags, cli.cores)?;
++        let reader_r2 = open_threaded_reader(input_r2, &cli.preserve_tags, cli.cores)?;
++        let mut sink = trim_galore::bam::ParallelBamSink::create(
++            &output_path,
++            source_header.as_ref(),
++            command_line,
++            cli.cores,
++        )?;
++        let out = parallel::run_paired_end_parallel_to_bam(
++            reader_r1, reader_r2, &mut sink, config, cli.cores,
++        )?;
++        sink.finish()?;
++        out
++    } else {
++        let mut reader_r1 = open_sync_reader(input_r1, &cli.preserve_tags)?;
++        let mut reader_r2 = open_sync_reader(input_r2, &cli.preserve_tags)?;
++        let mut writer = trim_galore::bam::BamWriter::create(
++            &output_path,
++            source_header.as_ref(),
++            &cli.preserve_tags,
++            command_line,
++            cli.phred_offset(),
++        )?;
++        let out = trimmer::run_paired_end_to_bam(
++            reader_r1.as_mut(),
++            reader_r2.as_mut(),
++            &mut writer,
++            config,
++        )?;
++        writer.finish()?;
++        out
++    };
+ 
+     // Summaries.
+     eprintln!("\n=== Summary (Read 1) ===\n");
+@@ -2652,17 +2675,39 @@ fn run_ubam_output_paired_single_file(
+     eprintln!("  Output: {}", output_path.display());
+ 
+     let source_header = trim_galore::bam::peek_header(input)?;
+-    let (mut r1, mut r2) = BamReader::open_paired_interleaved_with_tags(input, &cli.preserve_tags)?;
+-    let mut writer = trim_galore::bam::BamWriter::create(
+-        &output_path,
+-        Some(&source_header),
+-        &cli.preserve_tags,
+-        command_line,
+-        cli.phred_offset(),
+-    )?;
+-    let (stats_r1, stats_r2, pair_stats) =
+-        trimmer::run_paired_end_to_bam(&mut r1, &mut r2, &mut writer, config)?;
+-    writer.finish()?;
++    let (stats_r1, stats_r2, pair_stats) = if cli.cores > 1 {
++        // N threads convert the input records, N workers trim and encode, N threads compress
++        let (r1, r2) =
++            BamReader::open_paired_interleaved_pooled(input, &cli.preserve_tags, cli.cores)?;
++        let mut sink = trim_galore::bam::ParallelBamSink::create(
++            &output_path,
++            Some(&source_header),
++            command_line,
++            cli.cores,
++        )?;
++        let out = parallel::run_paired_end_parallel_to_bam(
++            Box::new(r1),
++            Box::new(r2),
++            &mut sink,
++            config,
++            cli.cores,
++        )?;
++        sink.finish()?;
++        out
++    } else {
++        let (mut r1, mut r2) =
++            BamReader::open_paired_interleaved_with_tags(input, &cli.preserve_tags)?;
++        let mut writer = trim_galore::bam::BamWriter::create(
++            &output_path,
++            Some(&source_header),
++            &cli.preserve_tags,
++            command_line,
++            cli.phred_offset(),
++        )?;
++        let out = trimmer::run_paired_end_to_bam(&mut r1, &mut r2, &mut writer, config)?;
++        writer.finish()?;
++        out
++    };
+ 
+     // Summaries (mirror `run_paired_ubam_single_file`).
+     eprintln!("\n=== Summary (Read 1) ===\n");
+diff --git a/src/parallel.rs b/src/parallel.rs
+index eb37882..3def524 100644
+--- a/src/parallel.rs
++++ b/src/parallel.rs
+@@ -334,6 +334,284 @@ pub fn run_paired_end_parallel(
+         Ok((total_r1, total_r2, total_pair))
+     })
+ }
++// ─────────────────────── Paired-end, uBAM output ───────────────────────
++
++/// Result of one batch for the uBAM path: the encoded (uncompressed) BAM records of the pairs
++/// that passed, and the batch statistics.
++struct BamBatchResult {
++    seq: u64,
++    bytes: Vec<u8>,
++    stats_r1: TrimStats,
++    stats_r2: TrimStats,
++    pair_stats: PairValidationStats,
++}
++
++/// Paired-end trimming with uBAM output on `cores` worker threads.
++///
++/// The workers trim, filter and encode the records of a batch into uncompressed BAM bytes. The
++/// main thread hands the batches to the sink in input order; the sink compresses them to BGZF
++/// on its own pool of `cores` threads. The output has the same records, in the same order, as the
++/// serial `trimmer::run_paired_end_to_bam`.
++pub fn run_paired_end_parallel_to_bam(
++    reader_r1: Box<dyn RecordSource>,
++    reader_r2: Box<dyn RecordSource>,
++    sink: &mut crate::bam::ParallelBamSink,
++    config: &TrimConfig,
++    cores: usize,
++) -> Result<(TrimStats, TrimStats, PairValidationStats)> {
++    let cores = cores.max(1);
++    let header = sink.header().clone();
++    let header = &header;
++
++    let mut work_txs: Vec<mpsc::SyncSender<PairedWork>> = Vec::with_capacity(cores);
++    let mut work_rxs: Vec<mpsc::Receiver<PairedWork>> = Vec::with_capacity(cores);
++    for _ in 0..cores {
++        let (tx, rx) = mpsc::sync_channel::<PairedWork>(2);
++        work_txs.push(tx);
++        work_rxs.push(rx);
++    }
++    let (result_tx, result_rx) = mpsc::sync_channel::<Result<BamBatchResult>>(cores * 2);
++
++    std::thread::scope(|s| -> Result<(TrimStats, TrimStats, PairValidationStats)> {
++        for rx in work_rxs.drain(..) {
++            let rtx = result_tx.clone();
++            s.spawn(move || {
++                while let Ok(Some((seq, mut r1s, mut r2s, _))) = rx.recv() {
++                    match process_paired_batch_bam(seq, &mut r1s, &mut r2s, config, header) {
++                        Ok(batch) => {
++                            if rtx.send(Ok(batch)).is_err() {
++                                break;
++                            }
++                        }
++                        Err(e) => {
++                            let _ = rtx.send(Err(e));
++                            break;
++                        }
++                    }
++                }
++            });
++        }
++        let result_tx_for_reader = result_tx.clone();
++        drop(result_tx);
++
++        let txs = std::mem::take(&mut work_txs);
++        let reader_handle = s.spawn(move || -> Result<()> {
++            let res = read_pairs_round_robin(reader_r1, reader_r2, None, &txs);
++            if res.is_err() {
++                let _ = result_tx_for_reader.send(Err(anyhow::anyhow!(
++                    "reader thread errored; full error follows via reader_handle.join()"
++                )));
++            }
++            res
++        });
++
++        let mut expected: u64 = 0;
++        let mut pending: BTreeMap<u64, BamBatchResult> = BTreeMap::new();
++        let mut total_r1 = TrimStats::with_adapter_count(config.adapters.len());
++        let mut total_r2 = TrimStats::with_adapter_count(config.r2_adapter_count());
++        let mut total_pair = PairValidationStats::default();
++        let mut first_error: Option<anyhow::Error> = None;
++
++        'outer: while let Ok(result) = result_rx.recv() {
++            match result {
++                Ok(batch) => {
++                    pending.insert(batch.seq, batch);
++                    while let Some(r) = pending.remove(&expected) {
++                        if let Err(e) = sink.write_encoded(&r.bytes) {
++                            first_error = Some(e);
++                            break 'outer;
++                        }
++                        total_r1.merge(&r.stats_r1);
++                        total_r2.merge(&r.stats_r2);
++                        total_pair.merge(&r.pair_stats);
++                        expected += 1;
++                    }
++                }
++                Err(e) => {
++                    first_error = Some(e);
++                    break 'outer;
++                }
++            }
++        }
++        // see run_paired_end_parallel: unblock the workers and the reader before joining
++        drop(result_rx);
++
++        let reader_join_err = match reader_handle.join() {
++            Ok(Ok(())) => None,
++            Ok(Err(e)) => Some(e),
++            Err(_) => Some(anyhow::anyhow!("Reader thread panicked")),
++        };
++        if let Some(e) = reader_join_err.or(first_error) {
++            return Err(e);
++        }
++        Ok((total_r1, total_r2, total_pair))
++    })
++}
++
++/// Result of one batch of single-end reads for the uBAM path.
++struct SingleBamBatchResult {
++    seq: u64,
++    bytes: Vec<u8>,
++    stats: TrimStats,
++}
++
++/// Single-end trimming with uBAM output on `cores` worker threads. Same design as
++/// [`run_paired_end_parallel_to_bam`]: the workers trim, filter and encode the batches, the main
++/// thread hands them to the sink in input order, and the sink compresses on `cores` threads.
++pub fn run_single_end_parallel_to_bam(
++    reader: Box<dyn RecordSource>,
++    sink: &mut crate::bam::ParallelBamSink,
++    config: &TrimConfig,
++    cores: usize,
++) -> Result<TrimStats> {
++    let cores = cores.max(1);
++    let header = sink.header().clone();
++    let header = &header;
++
++    let mut work_txs: Vec<mpsc::SyncSender<SingleWork>> = Vec::with_capacity(cores);
++    let mut work_rxs: Vec<mpsc::Receiver<SingleWork>> = Vec::with_capacity(cores);
++    for _ in 0..cores {
++        let (tx, rx) = mpsc::sync_channel::<SingleWork>(2);
++        work_txs.push(tx);
++        work_rxs.push(rx);
++    }
++    let (result_tx, result_rx) = mpsc::sync_channel::<Result<SingleBamBatchResult>>(cores * 2);
++
++    std::thread::scope(|s| -> Result<TrimStats> {
++        for rx in work_rxs.drain(..) {
++            let rtx = result_tx.clone();
++            s.spawn(move || {
++                while let Ok(Some((seq, mut reads))) = rx.recv() {
++                    match process_single_batch_bam(seq, &mut reads, config, header) {
++                        Ok(batch) => {
++                            if rtx.send(Ok(batch)).is_err() {
++                                break;
++                            }
++                        }
++                        Err(e) => {
++                            let _ = rtx.send(Err(e));
++                            break;
++                        }
++                    }
++                }
++            });
++        }
++        let result_tx_for_reader = result_tx.clone();
++        drop(result_tx);
++
++        let txs = std::mem::take(&mut work_txs);
++        let reader_handle = s.spawn(move || -> Result<()> {
++            let res = read_single_round_robin(reader, &txs);
++            if res.is_err() {
++                let _ = result_tx_for_reader.send(Err(anyhow::anyhow!(
++                    "reader thread errored; full error follows via reader_handle.join()"
++                )));
++            }
++            res
++        });
++
++        let mut expected: u64 = 0;
++        let mut pending: BTreeMap<u64, SingleBamBatchResult> = BTreeMap::new();
++        let mut total = TrimStats::with_adapter_count(config.adapters.len());
++        let mut first_error: Option<anyhow::Error> = None;
++
++        'outer: while let Ok(result) = result_rx.recv() {
++            match result {
++                Ok(batch) => {
++                    pending.insert(batch.seq, batch);
++                    while let Some(r) = pending.remove(&expected) {
++                        if let Err(e) = sink.write_encoded(&r.bytes) {
++                            first_error = Some(e);
++                            break 'outer;
++                        }
++                        total.merge(&r.stats);
++                        expected += 1;
++                    }
++                }
++                Err(e) => {
++                    first_error = Some(e);
++                    break 'outer;
++                }
++            }
++        }
++        drop(result_rx);
++
++        let reader_join_err = match reader_handle.join() {
++            Ok(Ok(())) => None,
++            Ok(Err(e)) => Some(e),
++            Err(_) => Some(anyhow::anyhow!("Reader thread panicked")),
++        };
++        if let Some(e) = reader_join_err.or(first_error) {
++            return Err(e);
++        }
++        Ok(total)
++    })
++}
++
++/// Worker body for the single-end uBAM path.
++fn process_single_batch_bam(
++    batch_seq: u64,
++    reads: &mut [FastqRecord],
++    config: &TrimConfig,
++    header: &noodles::sam::Header,
++) -> Result<SingleBamBatchResult> {
++    let mut stats = TrimStats::with_adapter_count(config.adapters.len());
++    let mut enc = crate::bam::BatchEncoder::with_capacity(reads.len() * 400, config.phred_offset);
++    for record in reads.iter_mut() {
++        if let SingleOutcome::Pass = classify_single(record, config, &mut stats) {
++            enc.push(header, record, None)?;
++        }
++    }
++    Ok(SingleBamBatchResult {
++        seq: batch_seq,
++        bytes: enc.into_bytes(),
++        stats,
++    })
++}
++
++/// Worker body for the uBAM path: trim + filter every pair of a batch and encode the passing ones.
++fn process_paired_batch_bam(
++    batch_seq: u64,
++    reads_r1: &mut [FastqRecord],
++    reads_r2: &mut [FastqRecord],
++    config: &TrimConfig,
++    header: &noodles::sam::Header,
++) -> Result<BamBatchResult> {
++    let mut stats_r1 = TrimStats::with_adapter_count(config.adapters.len());
++    let mut stats_r2 = TrimStats::with_adapter_count(config.r2_adapter_count());
++    let mut pair_stats = PairValidationStats::default();
++    // `--retain_unpaired` is rejected for uBAM output, so the rescue lengths are never used.
++    let unpaired = UnpairedLengths { r1: 0, r2: 0 };
++
++    let mut enc =
++        crate::bam::BatchEncoder::with_capacity(reads_r1.len() * 2 * 400, config.phred_offset);
++    for (r1, r2) in reads_r1.iter_mut().zip(reads_r2.iter_mut()) {
++        if let PairOutcome::Pass = classify_paired(
++            r1,
++            r2,
++            config,
++            &mut stats_r1,
++            &mut stats_r2,
++            &mut pair_stats,
++            unpaired,
++        ) {
++            enc.push(header, r1, Some(1))?;
++            enc.push(header, r2, Some(2))?;
++        }
++    }
++    // the serial uBAM path never counts rescued reads
++    pair_stats.r1_unpaired = 0;
++    pair_stats.r2_unpaired = 0;
++
++    Ok(BamBatchResult {
++        seq: batch_seq,
++        bytes: enc.into_bytes(),
++        stats_r1,
++        stats_r2,
++        pair_stats,
++    })
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn process_paired_batch(
+     batch_seq: u64,
+@@ -2907,4 +3185,156 @@ mod tests {
+         fs::remove_dir_all(&dir).ok();
+         Ok(())
+     }
++
++    /// uBAM output: the worker-pool path must write the same records, in the same order, with
++    /// the same header and the same statistics as the serial `run_paired_end_to_bam`. 10,000 pairs
++    /// fill two and a half batches (4,096 each), which is what tests the ordered merge;
++    /// the reads have adapters, are too short or N-rich, so the filters drop some pairs.
++    #[test]
++    fn test_parallel_ubam_output_matches_serial() -> Result<()> {
++        use std::io::Read;
++        let dir = fresh_tmpdir("tg_parallel_ubam_parity");
++        let (in1, in2) = (dir.join("r1.fq"), dir.join("r2.fq"));
++        let (mut c1, mut c2) = (String::new(), String::new());
++        for i in 0..10_000usize {
++            let core = match i % 4 {
++                0 => "ACGTACGTACGTACGTACGTACGTACGTACAGATCGGAAGAGC".to_string(), // adapter
++                1 => "ACGTACGTACGTACGTACGTACGTACGTACGTAC".to_string(),          // clean
++                2 => "ACGTAC".to_string(),                                      // too short
++                _ => "NNNNNNNNNNNNNNNNNNNNACGTACGTACGTACGT".to_string(),        // N-rich
++            };
++            for (buf, seq) in [(&mut c1, &core), (&mut c2, &core)] {
++                let qual = "I".repeat(seq.len());
++                // a BAM-style tag tail in the header, as `--preserve-tags` produces
++                buf.push_str(&format!(
++                    "@read_{i}\tCB:Z:AAAA{}\tUB:Z:CC{}\n{seq}\n+\n{qual}\n",
++                    i % 7,
++                    i % 5
++                ));
++            }
++        }
++        fs::write(&in1, c1)?;
++        fs::write(&in2, c2)?;
++        let config = TrimConfig {
++            length_cutoff: 20,
++            max_n: Some(crate::filters::MaxNFilter::Count(5)),
++            is_paired: true,
++            ..parity_test_config()
++        };
++        let cmd = "trim_galore --paired test";
++
++        let serial_out = dir.join("serial.bam");
++        let (s1, s2, sp) = {
++            let mut r1 = FastqReader::open(&in1)?;
++            let mut r2 = FastqReader::open(&in2)?;
++            let mut w =
++                crate::bam::BamWriter::create(&serial_out, None, &[], cmd, config.phred_offset)?;
++            let out = crate::trimmer::run_paired_end_to_bam(&mut r1, &mut r2, &mut w, &config)?;
++            w.finish()?;
++            out
++        };
++
++        let par_out = dir.join("parallel.bam");
++        let (p1, p2, pp) = {
++            let mut sink = crate::bam::ParallelBamSink::create(&par_out, None, cmd, 4)?;
++            let out = run_paired_end_parallel_to_bam(
++                open_fq(&in1),
++                open_fq(&in2),
++                &mut sink,
++                &config,
++                4,
++            )?;
++            sink.finish()?;
++            out
++        };
++
++        assert_eq!(s1, p1, "R1 stats differ between serial and parallel");
++        assert_eq!(s2, p2, "R2 stats differ between serial and parallel");
++        assert_eq!(sp, pp, "pair stats differ between serial and parallel");
++        assert!(
++            s1.reads_written > 0 && sp.pairs_removed > 0,
++            "fixture must pass and drop pairs"
++        );
++
++        // the BGZF framing may differ; the decompressed BAM stream must not
++        let inflate = |path: &std::path::Path| -> Result<Vec<u8>> {
++            let mut r = noodles::bgzf::Reader::new(fs::File::open(path)?);
++            let mut v = Vec::new();
++            r.read_to_end(&mut v)?;
++            Ok(v)
++        };
++        let (a, b) = (inflate(&serial_out)?, inflate(&par_out)?);
++        assert_eq!(a.len(), b.len(), "decompressed sizes differ");
++        assert!(a == b, "decompressed BAM streams differ");
++
++        fs::remove_dir_all(&dir).ok();
++        Ok(())
++    }
++
++    /// Single-end uBAM output: the worker-pool path must write the same records, header and
++    /// statistics as the serial `run_single_end_to_bam`.
++    #[test]
++    fn test_parallel_single_end_ubam_output_matches_serial() -> Result<()> {
++        use std::io::Read;
++        let dir = fresh_tmpdir("tg_parallel_se_ubam_parity");
++        let input = dir.join("r.fq");
++        let mut content = String::new();
++        for i in 0..10_000usize {
++            let seq = match i % 4 {
++                0 => "ACGTACGTACGTACGTACGTACGTACGTACAGATCGGAAGAGC",
++                1 => "ACGTACGTACGTACGTACGTACGTACGTACGTAC",
++                2 => "ACGTAC",
++                _ => "NNNNNNNNNNNNNNNNNNNNACGTACGTACGTACGT",
++            };
++            let qual = "I".repeat(seq.len());
++            content.push_str(&format!(
++                "@read_{i}\tCB:Z:AAAA{}\n{seq}\n+\n{qual}\n",
++                i % 7
++            ));
++        }
++        fs::write(&input, content)?;
++        let config = TrimConfig {
++            length_cutoff: 20,
++            max_n: Some(crate::filters::MaxNFilter::Count(5)),
++            ..parity_test_config()
++        };
++        let cmd = "trim_galore single-end test";
++
++        let serial_out = dir.join("serial.bam");
++        let s_stats = {
++            let mut r = FastqReader::open(&input)?;
++            let mut w =
++                crate::bam::BamWriter::create(&serial_out, None, &[], cmd, config.phred_offset)?;
++            let out = crate::trimmer::run_single_end_to_bam(&mut r, &mut w, &config)?;
++            w.finish()?;
++            out
++        };
++
++        let par_out = dir.join("parallel.bam");
++        let p_stats = {
++            let mut sink = crate::bam::ParallelBamSink::create(&par_out, None, cmd, 4)?;
++            let out = run_single_end_parallel_to_bam(open_fq(&input), &mut sink, &config, 4)?;
++            sink.finish()?;
++            out
++        };
++
++        assert_eq!(s_stats, p_stats, "stats differ between serial and parallel");
++        assert!(
++            s_stats.reads_written > 0 && s_stats.too_short > 0,
++            "fixture must pass and drop reads"
++        );
++
++        let inflate = |path: &std::path::Path| -> Result<Vec<u8>> {
++            let mut r = noodles::bgzf::Reader::new(fs::File::open(path)?);
++            let mut v = Vec::new();
++            r.read_to_end(&mut v)?;
++            Ok(v)
++        };
++        assert!(
++            inflate(&serial_out)? == inflate(&par_out)?,
++            "decompressed BAM streams differ"
++        );
++        fs::remove_dir_all(&dir).ok();
++        Ok(())
++    }
+ }
+diff --git a/tests/integration_ubam_out.rs b/tests/integration_ubam_out.rs
+index 4d9e334..9c1ec81 100644
+--- a/tests/integration_ubam_out.rs
++++ b/tests/integration_ubam_out.rs
+@@ -105,6 +105,23 @@ fn header_minus_pg(path: &Path) -> String {
+ ///
+ /// Fixture regen: see `test_files/README.md` "uBAM output reference
+ /// fixtures" section.
++/// `count` reads named `@r<N>`, 40 bp and adapter-free so they pass the filters
++/// unchanged. `long_name` makes the read at that index carry a name of the given
++/// byte length instead.
++fn write_numbered_fastq(path: &Path, count: usize, long_name: Option<(usize, usize)>) {
++    use std::fmt::Write as _;
++    const SEQ: &str = "GCTAAAGACAATTACATAACATACACGTCAGCACGAAACT";
++    let mut text = String::with_capacity(count * 96);
++    for i in 0..count {
++        let name = match long_name {
++            Some((idx, len)) if idx == i => "n".repeat(len),
++            _ => format!("r{i}"),
++        };
++        writeln!(text, "@{name}\n{SEQ}\n+\n{}", "I".repeat(SEQ.len())).unwrap();
++    }
++    std::fs::write(path, text).unwrap();
++}
++
+ fn assert_ubam_eq(actual: &Path, expected: &Path) {
+     let actual_hdr = header_minus_pg(actual);
+     let expected_hdr = header_minus_pg(expected);
+@@ -308,31 +325,73 @@ fn ubam_out_hardtrim5_writes_bam() {
+ }
+ 
+ #[test]
+-fn ubam_out_cores_gt_1_warns_and_proceeds() {
+-    // PLAN §9 row: `--cores N>1` + uBAM-out must warn ("ignored") and
+-    // STILL PRODUCE a valid output BAM. Code-review AGREE-2 row.
++fn ubam_out_cores_gt_1_matches_single_core_across_batches() {
++    // The reader batches at 4096 records, so a fixture has to exceed that
++    // several times over before the worker pool has any order to get wrong.
+     let dir = fresh_tmpdir("tg_int_ubam_out_cores");
++    let input = dir.join("many.fq");
++    write_numbered_fastq(&input, 12_000, None);
++
++    let mut outs = Vec::new();
++    for cores in ["1", "4"] {
++        let out_dir = dir.join(format!("c{cores}"));
++        std::fs::create_dir_all(&out_dir).unwrap();
++        let output = Command::new(binary())
++            .args(["--cores", cores, "--output-format", "ubam", "--no_poly_g"])
++            .arg(&input)
++            .arg("-o")
++            .arg(&out_dir)
++            .output()
++            .expect("trim_galore failed to run");
++        let stderr = String::from_utf8_lossy(&output.stderr);
++        assert!(output.status.success(), "--cores {cores}: stderr={stderr}");
++        assert!(
++            !stderr.contains("ignored"),
++            "--cores {cores} must not be reported as ignored: {stderr}"
++        );
++        outs.push(out_dir.join("many_trimmed.bam"));
++    }
++
++    // Same records, same order. A pool that published batches out of order,
++    // dropped one or duplicated one fails here rather than on a count.
++    assert_ubam_eq(&outs[1], &outs[0]);
++    assert_eq!(
++        bam_tuples(&outs[1]).len(),
++        12_000,
++        "every record must survive the pool"
++    );
++}
++
++/// A run that fails part-way at `--cores > 1` must publish nothing: the sink
++/// writes to a temporary and renames only on success, so a file already at the
++/// output name is still there afterwards.
++#[test]
++fn ubam_out_cores_gt_1_failure_leaves_existing_output_untouched() {
++    let dir = fresh_tmpdir("tg_int_ubam_out_cores_fail");
++    let input = dir.join("many.fq");
++    // A 300-byte read name in the second batch: BAM allows 1-254, so the
++    // encoder rejects it once ~4096 records have already been written.
++    write_numbered_fastq(&input, 8_000, Some((5_000, 300)));
++
++    let out = dir.join("many_trimmed.bam");
++    std::fs::write(&out, b"not a bam, but it was here first").unwrap();
++
+     let output = Command::new(binary())
+-        .args(["--cores", "4", "--output-format", "ubam"])
+-        .arg("test_files/ubam_test.bam")
++        .args(["--cores", "4", "--output-format", "ubam", "--no_poly_g"])
++        .arg(&input)
+         .arg("-o")
+         .arg(&dir)
+         .output()
+         .expect("trim_galore failed to run");
+-    assert!(
+-        output.status.success(),
+-        "--cores 4 + uBAM should succeed (with warning); stderr={}",
+-        String::from_utf8_lossy(&output.stderr)
+-    );
+     let stderr = String::from_utf8_lossy(&output.stderr);
+     assert!(
+-        stderr.contains("ignored"),
+-        "expected '--cores ignored' note in stderr, got: {}",
+-        stderr
++        !output.status.success(),
++        "the over-long read name must fail the run; stderr={stderr}"
+     );
+-    assert!(
+-        dir.join("ubam_test_trimmed.bam").exists(),
+-        "expected output BAM to still be produced"
++    assert_eq!(
++        std::fs::read(&out).unwrap(),
++        b"not a bam, but it was here first",
++        "a failed run must leave the file that was already there: {stderr}"
+     );
+ }
+ 

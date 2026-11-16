@@ -1,0 +1,1754 @@
+diff --git a/benchmarks/vi/decipher/common.py b/benchmarks/vi/decipher/common.py
+new file mode 100644
+index 000000000..cda9f0609
+--- /dev/null
++++ b/benchmarks/vi/decipher/common.py
+@@ -0,0 +1,95 @@
++"""Shared, implementation-agnostic metrics for the ov.vi.Decipher vs
++scvi.external.Decipher validation.
++
++``elbo_and_nll`` re-derives the single-sample ELBO and an importance-weighted
++NLL estimate directly from the four Decipher sub-networks and ``theta`` --
++the same maths in both ``ov.vi._decipher.DecipherModule`` and scvi-tools'
++``DecipherPyroModule`` (identical attribute names: ``encoder_x_to_z``,
++``encoder_zx_to_v``, ``decoder_v_to_z``, ``decoder_z_to_x``, ``theta``), so
++calling it on either model's networks is a fair, single-codepath comparison
++that does not depend on either training stack's own (possibly differently
++scaled) validation bookkeeping.
++"""
++from __future__ import annotations
++
++import math
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++_LOG_2PI = math.log(2 * math.pi)
++
++
++def _log_normal(x, loc, scale):
++    return (-0.5 * ((x - loc) / scale) ** 2 - torch.log(scale) - 0.5 * _LOG_2PI).sum(-1)
++
++
++def _one_sample(enc_x_z, enc_zx_v, dec_v_z, dec_z_x, theta, x, eps):
++    xl = torch.log1p(x)
++    z_loc, z_s = enc_x_z(xl)
++    z_scale = F.softplus(z_s)
++    z = z_loc + z_scale * torch.randn_like(z_loc)
++    v_loc, v_s = enc_zx_v(torch.cat([z, xl], dim=-1))
++    v_scale = F.softplus(v_s)
++    v = v_loc + v_scale * torch.randn_like(v_loc)
++    log_qz = _log_normal(z, z_loc, z_scale)
++    log_qv = _log_normal(v, v_loc, v_scale)
++    log_pv = (-0.5 * v ** 2 - 0.5 * _LOG_2PI).sum(-1)
++    pz_loc, pz_s = dec_v_z(v)
++    pz_scale = F.softplus(pz_s)
++    log_pz = _log_normal(z, pz_loc, pz_scale)
++    mu = F.softmax(dec_z_x(z), dim=-1)
++    lib = x.sum(-1, keepdim=True)
++    r = theta + eps
++    logits = torch.log(lib * mu + eps) - torch.log(r)
++    log_px = (x * F.logsigmoid(logits) + torch.lgamma(r + x) - torch.lgamma(r)
++              - torch.lgamma(x + 1) + r * F.logsigmoid(-logits)).sum(-1)
++    return log_px, log_pz - log_qz, log_pv - log_qv
++
++
++@torch.no_grad()
++def elbo_and_nll(networks, x, beta, eps=1e-5, n_iw=100):
++    """Per-cell ELBO (nats, higher is better; the mean of ``n_iw`` single-sample
++    MC draws -- still an unbiased ELBO estimator, just lower-variance than any
++    one draw) and an importance-weighted NLL estimate (``logsumexp`` of the same
++    ``n_iw`` draws), for one minibatch ``x`` (raw counts), given ``networks =
++    (enc_x_z, enc_zx_v, dec_v_z, dec_z_x, theta)``."""
++    elbo_terms, lw = [], []
++    for _ in range(n_iw):
++        log_px, wz, wv = _one_sample(*networks, x, eps)
++        elbo_terms.append(log_px + wz + beta * wv)
++        lw.append(log_px + wz + wv)
++    elbo = torch.stack(elbo_terms, 0).mean(0)
++    lw = torch.stack(lw, 0)
++    nll = -(torch.logsumexp(lw, 0) - math.log(n_iw))
++    return elbo, nll
++
++
++@torch.no_grad()
++def eval_networks(networks, X, device, beta, eps=1e-5, n_iw=100, batch_size=256):
++    """Median per-cell ELBO / NLL of ``networks`` over the rows of ``X`` (numpy,
++    raw counts), moving ``batch_size`` rows to ``device`` at a time.  The median
++    (rather than the mean) is reported because the single/few-sample NB
++    log-likelihood occasionally hits a catastrophic-outlier (z, v) draw for one
++    cell in a few thousand -- a known heavy MC tail of this likelihood, seen for
++    both ov.vi.Decipher and scvi.external.Decipher networks here, that a mean
++    lets dominate the summary; the median (and the trimmed distribution) is the
++    standard robust fix and does not change which model is being evaluated."""
++    elbos, nlls = [], []
++    for i in range(0, X.shape[0], batch_size):
++        x = torch.as_tensor(np.asarray(X[i:i + batch_size]), dtype=torch.float32, device=device)
++        e, n = elbo_and_nll(networks, x, beta, eps=eps, n_iw=n_iw)
++        elbos.append(e.cpu().numpy())
++        nlls.append(n.cpu().numpy())
++    elbos, nlls = np.concatenate(elbos), np.concatenate(nlls)
++    return float(np.median(elbos)), float(np.median(nlls))
++
++
++def best_axis_spearman(v, pt):
++    """``max_k |spearman(v[:, k], pt)|`` -- the rotation of the 2-D Decipher
++    space is arbitrary, so the best-correlated axis is the one that matters."""
++    from scipy.stats import spearmanr
++    rhos = [spearmanr(v[:, k], pt).statistic for k in range(v.shape[1])]
++    k = int(np.argmax(np.abs(rhos)))
++    return float(rhos[k]), k
+diff --git a/benchmarks/vi/decipher/prepare_data.py b/benchmarks/vi/decipher/prepare_data.py
+new file mode 100644
+index 000000000..4724a7578
+--- /dev/null
++++ b/benchmarks/vi/decipher/prepare_data.py
+@@ -0,0 +1,49 @@
++"""Build the Decipher validation dataset: the erythroid-differentiation lineage
++(HSC -> MK/E prog -> Proerythroblast -> Erythroblast -> Normoblast -> Reticulocyte)
++of the NeurIPS 2021 BMMC CITE-seq donors s1d3, s2d1, s3d7 (already local at
++/scratch/users/steorra/tmp/vi_tut/run/data/).  These donors carry
++``obs['GEX_pseudotime_order']``, a ground-truth pseudotime (Palantir, from the
++NeurIPS 2021 competition task 3) defined for exactly this lineage -- the same
++kind of normal haematopoietic differentiation trajectory the Decipher paper
++validates on.
++
++Output: /scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad
++(raw counts in ``layers['counts']`` and ``.X``, top 2000 HVGs, ``obs['donor']``,
++``obs['cell_type']`` and ``obs['GEX_pseudotime_order']`` (NaN off the lineage).
++"""
++import anndata as ad
++import numpy as np
++import scanpy as sc
++
++LINEAGE = ["HSC", "MK/E prog", "Proerythroblast", "Erythroblast", "Normoblast",
++           "Reticulocyte"]
++DONORS = ["s1d3", "s2d1", "s3d7"]
++SRC = "/scratch/users/steorra/tmp/vi_tut/run/data/neurips2021_{}.h5ad"
++OUT = "/scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad"
++
++parts = []
++for d in DONORS:
++    a = ad.read_h5ad(SRC.format(d))
++    a = a[a.obs["cell_type"].isin(LINEAGE)].copy()
++    a.obs["donor"] = d
++    a.X = a.layers["counts"].copy()
++    del a.layers["counts"]
++    a.obsm.clear()
++    print(d, a.n_obs, a.obs["cell_type"].value_counts().reindex(LINEAGE).to_dict())
++    parts.append(a)
++
++full = ad.concat(parts, join="outer", index_unique="-")
++full.obs["cell_type"] = full.obs["cell_type"].astype("category").cat.set_categories(LINEAGE)
++print("combined:", full.shape, "with ground-truth pseudotime:",
++      int(full.obs["GEX_pseudotime_order"].notna().sum()))
++
++# HVGs on a log-normalized copy (Decipher itself trains on the raw counts)
++norm = full.copy()
++sc.pp.normalize_total(norm, target_sum=1e4)
++sc.pp.log1p(norm)
++sc.pp.highly_variable_genes(norm, n_top_genes=2000, flavor="seurat")
++full = full[:, norm.var["highly_variable"].values].copy()
++full.layers["counts"] = full.X.copy()
++
++full.write_h5ad(OUT)
++print("wrote", OUT, full.shape)
+diff --git a/benchmarks/vi/decipher/replay_test.py b/benchmarks/vi/decipher/replay_test.py
+new file mode 100644
+index 000000000..17808a3f0
+--- /dev/null
++++ b/benchmarks/vi/decipher/replay_test.py
+@@ -0,0 +1,125 @@
++"""Decisive test: record scvi.external.Decipher's exact per-epoch minibatch
++cell-index order (train RandomSampler) and train/val split for one seed, then
++drive ov.vi.Decipher's module manually (same init, bypassing fit()) on that
++exact same per-epoch order, and compare the resulting trajectory recovery.
++
++If replaying reference's data order fixes a "bad" ov.vi seed, the shuffle
++stream (not a numerical bug -- already ruled out by replay_step0.py-style
++single-step checks) explains the gap.
++"""
++import sys
++import numpy as np
++import torch
++import torch.utils.data as tud
++import anndata as ad
++from scipy.stats import spearmanr
++
++sys.path.insert(0, __file__.rsplit("/", 1)[0])
++
++DATA = "/scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad"
++SEED = int(sys.argv[1]) if len(sys.argv) > 1 else 0
++MAX_EPOCHS = int(sys.argv[2]) if len(sys.argv) > 2 else 150
++
++a = ad.read_h5ad(DATA)
++pt = a.obs["GEX_pseudotime_order"].values.astype(np.float64)
++ptm = ~np.isnan(pt)
++Xs = a.layers["counts"]
++X = Xs.toarray() if hasattr(Xs, "toarray") else np.asarray(Xs)
++
++# ---------------------------------------------------------------------------
++# 1. Train the reference model, recording every epoch's RandomSampler order
++#    (local indices into its train Subset) and the final train/val split.
++# ---------------------------------------------------------------------------
++import scvi  # noqa: E402
++
++captured = []
++orig_iter = tud.RandomSampler.__iter__
++
++
++def patched_iter(self):
++    order = list(orig_iter(self))
++    captured.append(order)
++    return iter(order)
++
++
++tud.RandomSampler.__iter__ = patched_iter
++try:
++    scvi.settings.seed = SEED
++    torch.manual_seed(SEED)
++    aa = a.copy()
++    scvi.external.Decipher.setup_anndata(aa, layer="counts")
++    ref = scvi.external.Decipher(aa, dim_v=2, dim_z=10, beta=0.1)
++    ref.train(max_epochs=MAX_EPOCHS, batch_size=128, accelerator="cpu",
++              enable_progress_bar=False, early_stopping=True, check_val_every_n_epoch=5,
++              early_stopping_patience=10)
++finally:
++    tud.RandomSampler.__iter__ = orig_iter
++
++ref.module.eval()
++v_ref = ref.get_latent_representation()
++rho_ref = [spearmanr(v_ref[ptm, k], pt[ptm]).statistic for k in range(2)]
++train_idx = np.asarray(ref.train_indices)
++val_idx = np.asarray(ref.validation_indices)
++n_epochs_done = len(captured)
++print(f"ref: epochs_done={n_epochs_done} best_rho={max(abs(rho_ref[0]), abs(rho_ref[1])):.3f} "
++     f"(ax0={rho_ref[0]:.3f} ax1={rho_ref[1]:.3f})")
++
++# drop_last=True, batch_size=128: chunk each captured epoch's local-index
++# permutation into full batches only, then map local -> global cell index.
++BATCH = 128
++epoch_batches = []
++for order in captured:
++    order = np.asarray(order)
++    n_full = (len(order) // BATCH) * BATCH
++    order = order[:n_full]
++    glob = train_idx[order]
++    epoch_batches.append([glob[i:i + BATCH] for i in range(0, len(glob), BATCH)])
++print(f"recorded {len(epoch_batches)} epochs, "
++     f"{sum(len(e) for e in epoch_batches)} total minibatches")
++
++# ---------------------------------------------------------------------------
++# 2. Drive ov.vi.Decipher's module manually through the exact same per-epoch
++#    order (same init: same torch.manual_seed as the reference run above).
++# ---------------------------------------------------------------------------
++import omicverse as ov  # noqa: E402
++from omicverse.vi._train import ClippedAdam  # noqa: E402
++from omicverse.vi._decipher import DecipherModule  # noqa: E402
++
++torch.manual_seed(SEED)
++mod = DecipherModule(n_input=X.shape[1], dim_v=2, dim_z=10, beta=0.1)
++opt = ClippedAdam(mod.parameters(), lr=5e-3, eps=1e-8, weight_decay=1e-4, clip_norm=10.0)
++mod.freeze_bn_from = 5  # matches Decipher.train()'s freeze_batchnorm='auto' for
++mod._bn_frozen = False  # check_val_every_n_epoch=5 (what the reference run used)
++
++torch.manual_seed(SEED + 1)  # matches BaseVIModel.train()'s own convention
++for epoch, batches in enumerate(epoch_batches):
++    mod.train()
++    mod.on_train_epoch_start(epoch)
++    for glob_idx in batches:
++        xb = torch.as_tensor(X[glob_idx], dtype=torch.float32)
++        out = mod({"x": xb})
++        opt.zero_grad(set_to_none=True)
++        out["loss"].backward()
++        opt.step()
++
++mod.eval()
++with torch.no_grad():
++    xl, z_loc, _ = mod.encode(torch.as_tensor(X, dtype=torch.float32))
++    v_replay = mod.encode_v(z_loc, xl)[0].numpy()
++rho_replay = [spearmanr(v_replay[ptm, k], pt[ptm]).statistic for k in range(2)]
++print(f"ours (replayed reference order+init, {len(epoch_batches)} epochs): "
++     f"best_rho={max(abs(rho_replay[0]), abs(rho_replay[1])):.3f} "
++     f"(ax0={rho_replay[0]:.3f} ax1={rho_replay[1]:.3f})")
++
++# ---------------------------------------------------------------------------
++# 3. For comparison: ours with its OWN default shuffle, same seed/epochs.
++# ---------------------------------------------------------------------------
++torch.manual_seed(SEED)
++own = ov.vi.Decipher(a, layer="counts", seed=SEED, dim_v=2, dim_z=10, beta=0.1)
++own.train(max_epochs=n_epochs_done, batch_size=128, device="cpu", progress=False, seed=SEED,
++         early_stopping=False, check_val_every_n_epoch=None, freeze_batchnorm=5)
++v_own = own.get_latent_representation()
++rho_own = [spearmanr(v_own[ptm, k], pt[ptm]).statistic for k in range(2)]
++print(f"ours (own default shuffle, same {n_epochs_done} epochs): "
++     f"best_rho={max(abs(rho_own[0]), abs(rho_own[1])):.3f} "
++     f"(ax0={rho_own[0]:.3f} ax1={rho_own[1]:.3f})")
+diff --git a/benchmarks/vi/decipher/run_one.py b/benchmarks/vi/decipher/run_one.py
+new file mode 100644
+index 000000000..6dd486e60
+--- /dev/null
++++ b/benchmarks/vi/decipher/run_one.py
+@@ -0,0 +1,102 @@
++"""Train one (ov.vi.Decipher | scvi.external.Decipher) model on the erythroid
++NeurIPS 2021 BMMC trajectory and dump its metrics + full-data latent v.
++
++Usage: python run_one.py {ours,ref} <seed> [--epochs N] [--device cpu|cuda]
++"""
++import argparse
++import json
++import sys
++import time
++
++import anndata as ad
++import numpy as np
++import torch
++
++sys.path.insert(0, __file__.rsplit("/", 1)[0])
++from common import best_axis_spearman, eval_networks  # noqa: E402
++
++DATA = "/scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad"
++LINEAGE = ["HSC", "MK/E prog", "Proerythroblast", "Erythroblast", "Normoblast", "Reticulocyte"]
++COMMON = dict(dim_v=2, dim_z=10, beta=0.1)  # layers_v_to_z=(64,), layers_z_to_x=() (defaults)
++OUT = "/scratch/users/steorra/tmp/vi_p2/data/decipher/results_{}_seed{}.json"
++
++
++def run_ours(adata, seed, device, epochs):
++    import omicverse as ov
++    torch.manual_seed(seed)
++    m = ov.vi.Decipher(adata, layer="counts", seed=seed, **COMMON)
++    t0 = time.perf_counter()
++    # early_stopping on nll_validation (the Decipher default monitor, both here and in
++    # scvi-tools): the raw ClippedAdam/lr=5e-3 recipe eventually diverges on this small
++    # dataset in BOTH implementations past ~150-250 epochs, so this is how both are meant
++    # to be run in practice, not a port-specific workaround.
++    m.train(max_epochs=epochs, batch_size=128, device=device, progress=False, seed=seed,
++            early_stopping=True, check_val_every_n_epoch=5, early_stopping_patience=10)
++    dt = time.perf_counter() - t0
++    val = np.asarray(m.validation_indices)
++    v_full = m.get_latent_representation()
++    mod = m.module
++    networks = (mod.encoder_x_to_z, mod.encoder_zx_to_v, mod.decoder_v_to_z,
++               mod.decoder_z_to_x, mod.theta)
++    return v_full, val, networks, dt, mod.beta
++
++
++def run_ref(adata, seed, device, epochs):
++    import scvi
++    scvi.settings.seed = seed
++    torch.manual_seed(seed)
++    a = adata.copy()
++    scvi.external.Decipher.setup_anndata(a, layer="counts")
++    m = scvi.external.Decipher(a, **COMMON)
++    accel = "gpu" if device == "cuda" else "cpu"
++    t0 = time.perf_counter()
++    m.train(max_epochs=epochs, batch_size=128, accelerator=accel, enable_progress_bar=False,
++           early_stopping=True, check_val_every_n_epoch=5, early_stopping_patience=10)
++    dt = time.perf_counter() - t0
++    mod = m.module
++    mod.eval()  # Lightning leaves the module in train() mode after fit(); freeze
++                # BatchNorm to running stats, same as ov.vi.Decipher.train() does
++    val = np.asarray(m.validation_indices)
++    v_full = m.get_latent_representation()
++    dev = mod.device
++    networks = (mod.encoder_x_to_z, mod.encoder_zx_to_v, mod.decoder_v_to_z,
++               mod.decoder_z_to_x, mod.theta.to(dev))
++    return v_full, val, networks, dt, mod.beta, dev
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("mode", choices=["ours", "ref"])
++    p.add_argument("seed", type=int)
++    p.add_argument("--epochs", type=int, default=300)
++    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    args = p.parse_args()
++
++    adata = ad.read_h5ad(DATA)
++    pt = adata.obs["GEX_pseudotime_order"].values.astype(np.float64)
++    pt_mask = ~np.isnan(pt)
++    X = np.asarray(adata.layers["counts"]) if not hasattr(adata.layers["counts"], "toarray") \
++        else adata.layers["counts"].toarray()
++
++    if args.mode == "ours":
++        v_full, val, networks, dt, beta = run_ours(adata, args.seed, args.device, args.epochs)
++        device = next(networks[0].parameters()).device
++    else:
++        v_full, val, networks, dt, beta, device = run_ref(adata, args.seed, args.device,
++                                                           args.epochs)
++
++    rho_gt, axis = best_axis_spearman(v_full[pt_mask], pt[pt_mask])
++    elbo, nll = eval_networks(networks, X[val], device, beta, n_iw=100)
++
++    out = dict(mode=args.mode, seed=args.seed, epochs=args.epochs, device=str(device),
++              train_time_s=dt, elbo_val=elbo, nll_val=nll, spearman_vs_gt=rho_gt,
++              best_axis=axis)
++    path = OUT.format(args.mode, args.seed)
++    with open(path, "w") as f:
++        json.dump(out, f, indent=1)
++    np.savez(path.replace(".json", "_v.npz"), v=v_full, val=val, pt=pt)
++    print(json.dumps(out, indent=1))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarks/vi/decipher/run_oom_dask.py b/benchmarks/vi/decipher/run_oom_dask.py
+new file mode 100644
+index 000000000..5b2a8afc2
+--- /dev/null
++++ b/benchmarks/vi/decipher/run_oom_dask.py
+@@ -0,0 +1,34 @@
++"""Confirm ov.vi.Decipher trains identically on in-memory AnnData, AnnDataOOM
++(disk) and Dask-backed AnnData, on the real erythroid-lineage validation set
++(not just the synthetic tests/vi/test_decipher.py fixture)."""
++import numpy as np
++import omicverse as ov
++
++DATA = "/scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad"
++KW = dict(max_epochs=15, batch_size=128, device="cpu", progress=False, seed=0,
++          shuffle="block", block_size=256, buffer_blocks=4)
++
++
++def _train(adata):
++    m = ov.vi.Decipher(adata, layer=None, dim_v=2, dim_z=10, beta=0.1, seed=0)
++    m.train(**KW)
++    return m
++
++
++mem = ov.read(DATA)
++z_mem = _train(mem).get_latent_representation()
++print("in-memory ok:", z_mem.shape, np.isfinite(z_mem).all())
++
++ov.settings.cpu_init()
++oom = ov.read(DATA, storage="disk")
++m_oom = _train(oom)
++z_oom = m_oom.get_latent_representation()
++print("oom kind:", m_oom._source().kind,
++     "matches in-memory:", np.allclose(z_mem, z_oom, atol=1e-5))
++
++from omicverse.pp._dask import read_h5ad
++da_ad = read_h5ad(DATA, chunk_size=256, device="cpu")
++m_da = _train(da_ad)
++z_da = m_da.get_latent_representation()
++print("dask kind:", m_da._source().kind,
++     "matches in-memory:", np.allclose(z_mem, z_da, atol=1e-5))
+diff --git a/benchmarks/vi/decipher/seed_sweep.py b/benchmarks/vi/decipher/seed_sweep.py
+new file mode 100644
+index 000000000..d43fe4e64
+--- /dev/null
++++ b/benchmarks/vi/decipher/seed_sweep.py
+@@ -0,0 +1,22 @@
++import sys
++import anndata as ad
++import numpy as np
++import torch
++from scipy.stats import spearmanr
++import omicverse as ov
++
++DATA = "/scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad"
++seeds = [int(s) for s in sys.argv[1:]]
++a = ad.read_h5ad(DATA)
++pt = a.obs["GEX_pseudotime_order"].values.astype(np.float64)
++m = ~np.isnan(pt)
++for seed in seeds:
++    torch.manual_seed(seed)
++    mod = ov.vi.Decipher(a, layer="counts", seed=seed, dim_v=2, dim_z=10, beta=0.1)
++    mod.train(max_epochs=300, batch_size=128, device="cpu", progress=False, seed=seed,
++             early_stopping=True, check_val_every_n_epoch=5, early_stopping_patience=10)
++    v = mod.get_latent_representation()
++    r0 = spearmanr(v[m, 0], pt[m]).statistic
++    r1 = spearmanr(v[m, 1], pt[m]).statistic
++    best = max(abs(r0), abs(r1))
++    print(f"seed={seed} epochs={mod._epochs_done} best={best:.4f}", flush=True)
+diff --git a/benchmarks/vi/decipher/seed_sweep_ref.py b/benchmarks/vi/decipher/seed_sweep_ref.py
+new file mode 100644
+index 000000000..843b847ea
+--- /dev/null
++++ b/benchmarks/vi/decipher/seed_sweep_ref.py
+@@ -0,0 +1,25 @@
++import sys
++import anndata as ad
++import numpy as np
++import torch
++from scipy.stats import spearmanr
++import scvi
++
++DATA = "/scratch/users/steorra/tmp/vi_p2/data/decipher/erythroid_neurips2021.h5ad"
++seeds = [int(s) for s in sys.argv[1:]]
++a = ad.read_h5ad(DATA)
++pt = a.obs["GEX_pseudotime_order"].values.astype(np.float64)
++m = ~np.isnan(pt)
++for seed in seeds:
++    scvi.settings.seed = seed
++    torch.manual_seed(seed)
++    aa = a.copy()
++    scvi.external.Decipher.setup_anndata(aa, layer="counts")
++    mod = scvi.external.Decipher(aa, dim_v=2, dim_z=10, beta=0.1)
++    mod.train(max_epochs=300, batch_size=128, accelerator="cpu", enable_progress_bar=False,
++             early_stopping=True, check_val_every_n_epoch=5, early_stopping_patience=10)
++    v = mod.get_latent_representation()
++    r0 = spearmanr(v[m, 0], pt[m]).statistic
++    r1 = spearmanr(v[m, 1], pt[m]).statistic
++    best = max(abs(r0), abs(r1))
++    print(f"seed={seed} best={best:.4f}", flush=True)
+diff --git a/benchmarks/vi/results_decipher.md b/benchmarks/vi/results_decipher.md
+new file mode 100644
+index 000000000..9d5bf83c9
+--- /dev/null
++++ b/benchmarks/vi/results_decipher.md
+@@ -0,0 +1,190 @@
++# ov.vi.Decipher vs scvi.external.Decipher (scvi-tools 1.5.2)
++
++Hardware: shared job 52347932, 2x NVIDIA H100 80GB HBM3 (`sh04-04n05`), one GPU
++process at a time, GPU ~97% busy from other jobs throughout these runs (both
++implementations run back-to-back under that same shared load; see Timing).
++
++## Data
++
++Erythroid-differentiation lineage (HSC -> MK/E prog -> Proerythroblast ->
++Erythroblast -> Normoblast -> Reticulocyte) of the NeurIPS 2021 BMMC CITE-seq
++donors s1d3, s2d1, s3d7 (`benchmarks/vi/decipher/prepare_data.py`), 4,454 cells
++x 2,000 HVGs, raw counts. Every cell in this lineage carries
++`obs['GEX_pseudotime_order']`, the ground-truth Palantir pseudotime from the
++NeurIPS 2021 competition's trajectory-inference task -- the same kind of
++normal haematopoietic differentiation trajectory the Decipher paper validates
++on.
++
++## Setup
++
++Identical architecture/hyperparameters for both: `dim_v=2, dim_z=10,
++layers_v_to_z=(64,), layers_z_to_x=(), beta=0.1`, `ClippedAdam` (lr 5e-3,
++weight decay 1e-4, clip_norm 10), batch_size 128, `train_size=0.9`,
++`early_stopping=True` (monitor `nll_validation`, the Decipher default in both
++stacks, `check_val_every_n_epoch=5`, patience 10). 3 seeds (0, 1, 2).
++`max_epochs=300` is a safety cap only -- early stopping always intervenes
++first (both implementations numerically diverge past ~150-250 raw
++`ClippedAdam` epochs on this small dataset *without* early stopping; this was
++verified for both `ov.vi.Decipher` and `scvi.external.Decipher` and is not a
++port-specific issue).
++
++Metrics (`benchmarks/vi/decipher/common.py`) are computed by one
++implementation-agnostic function applied directly to each model's four
++sub-networks and `theta` (`encoder_x_to_z`, `encoder_zx_to_v`,
++`decoder_v_to_z`, `decoder_z_to_x` -- identical attribute names and maths in
++both `DecipherModule` and scvi-tools' `DecipherPyroModule`), on the held-out
++10%: a 100-sample mean ELBO (nats/cell, higher better) and a 100-sample
++importance-weighted NLL, both reduced with the **median** over cells (a few
++cells per batch hit a heavy-tailed catastrophic-outlier NB log-likelihood
++under a single bad (z, v) draw -- seen for *both* implementations' trained
++networks -- which a mean lets dominate the summary). This bypasses each
++training stack's own validation bookkeeping, so the comparison is a single
++code path, not two.
++
++Rotation note: Decipher's 2-D `v` is identifiable only up to a rotation +
++reflection, so the sign and the "winning" axis of a Spearman correlation vs.
++pseudotime are arbitrary per run; we report the best-|rho| axis, and sign-align
++before comparing ours vs. reference directly.
++
++## Validation (3 seeds, GPU)
++
++| seed | impl | ELBO (val, median) | NLL (val, median) | best-axis rho vs. GT pseudotime | train time (s) |
++|---|---|---|---|---|---|
++| 0 | ours | -646.76 | 634.84 | -0.711 | 32.3 |
++| 0 | ref  | -655.96 | 635.49 | -0.865 | 597.1 |
++| 1 | ours | -601.23 | 596.28 | +0.871 | 52.0 |
++| 1 | ref  | -608.23 | 594.36 | +0.896 | 329.5 |
++| 2 | ours | -573.58 | 568.52 | +0.708 | 19.6 |
++| 2 | ref  | -563.48 | 560.28 | -0.857 | 517.3 |
++
++Mean +/- sd: ELBO ours -607.2 +/- 30.2, ref -609.2 +/- 37.8 (2.0 nats/cell
++gap, well inside the seed spread). NLL ours 599.9 +/- 27.2, ref 596.7 +/- 30.8.
++
++**Direct ours-vs-reference trajectory agreement** (same seed, sign-aligned
++best axis, Spearman on the ground-truth-pseudotime subset): seed 0 = 0.882,
++seed 1 = 0.962, seed 2 = 0.722 -- the two implementations recover *the same*
++cell ordering on most seeds, not just similarly-good orderings against the
++ground truth independently.
++
++### Trajectory-recovery gap, 8 seeds, and root-cause investigation
++
++|rho| vs. ground-truth pseudotime over 8 seeds (0-7, CPU for throughput --
++quality metrics are hardware-independent): **ours 0.772 +/- 0.098 (range
++0.620-0.898), ref 0.878 +/- 0.019 (range 0.849-0.905)**. Reference is
++consistently strong on every single seed; ours is occasionally weaker
++(seeds 0, 2) -- a real, reproducible gap, not a 3-seed sampling artifact.
++
++Investigated and **ruled out** as the cause:
++- **Init**: constructing both modules with the same `torch.manual_seed`
++  gives bit-identical weights layer-by-layer (`decoder_v_to_z`,
++  `decoder_z_to_x`, `encoder_x_to_z`, `encoder_zx_to_v`) -- confirmed directly
++  with `torch.equal`. (`BatchNorm1d.reset_parameters()` is a deterministic
++  ones/zeros init, so reference's Linear/BatchNorm-interleaved construction
++  order vs. ours' all-Linears-then-all-BatchNorms order consumes the RNG
++  identically.)
++- **ClippedAdam**: diffed element-by-element against the installed Pyro
++  1.9.1 source (`pyro.optim.clipped_adam`) -- clamp order, weight-decay
++  placement, `exp_avg`/`exp_avg_sq` update, bias correction, `lrd` gating,
++  default `eps=1e-8` all match exactly.
++- **v/z priors, encoder z->v path, softplus parametrisation**: diffed against
++  the installed scvi-tools 1.5.2 source (`scvi/external/decipher/_module.py`,
++  `_components.py`) line-by-line -- identical.
++- **KL weight / warm-up**: `DecipherModule.forward` ignores `kl_weight`, but
++  so does scvi-tools' (its `PyroTrainingPlan` only injects `kl_weight` when
++  `"kl_weight" in signature(model)`, which is false for Decipher's pyro
++  `model(self, x, beta=None)`) -- both silently disable it identically.
++- **BatchNorm-freeze epoch** (`freeze_bn_from`): re-derived from Lightning's
++  `on_validation_model_train`/`current_epoch` semantics and confirmed to fire
++  at the same epoch as reference's `current_epoch > 0` check for both
++  `check_val_every_n_epoch` values tested.
++- **Early-stopping criterion**: swapping the monitor from `nll_validation` to
++  `elbo_validation` for seeds 0/2/7 changed |rho| by <0.03 (0.642->0.666,
++  0.620->0.620, 0.720->0.662) -- not the cause.
++- **Early-stopping patience / "stopping too early"**: disabling early
++  stopping and training a fixed 80 or 150 epochs instead made every tested
++  seed *worse* (seed 3: 0.853 with early stopping -> 0.297 fixed; seed 0:
++  0.642 -> 0.474-0.70; seed 2 diverged to NaN at a fixed 150 epochs) --
++  early stopping is already doing its job and is not the cause; if anything
++  it is the only thing keeping `ours` close to reference at all.
++- Minibatch size (128) and `drop_last=True` are applied identically to the
++  training loader in both (validation never drops a batch in either).
++
++### Resolution: the port is numerically exact; the gap was a real RNG-coupling
++### bug (now fixed) plus ordinary optimisation variance
++
++**Step-0 check (no confounds).** Same `torch.manual_seed` init (`torch.equal`
++on every `Linear`/`BatchNorm` weight -- bit-identical), same input minibatch,
++same global RNG state entering the forward pass (so the reparameterised `z`
++then `v` draws -- same order, same shapes, one particle each, in both -- are
++identical): `ov.vi.Decipher`'s loss vs. the **real** `pyro.infer.Trace_ELBO()
++.loss(ref.model, ref.guide, x, beta=0.1)` agree to a relative error of
++**1.9e-8** (eval-mode BN) and **3.3e-8** (train-mode BN) -- pure float32
++rounding. No formula/particle-count/posterior-parametrisation bug.
++
++**Full-training replay (`benchmarks/vi/decipher/replay_test.py`).**
++Recorded scvi's exact train/val split and every epoch's `RandomSampler`
++permutation for seed 0 (116 early-stopped epochs), then drove
++`DecipherModule` manually (same init, same `freeze_bn_from=5`, no `fit()`)
++through that *exact* per-step cell order: best |rho| = **0.870**. Driving it
++instead through *our own* default shuffle for the same 116 epochs and the
++same BatchNorm-freeze epoch gave **0.878** -- matching the replay, not
++reproducing the original weak 0.642. So the data-order algorithm (numpy
++`RandomState` vs. PyTorch `RandomSampler`) is not the cause either.
++
++**Root cause, found by elimination.** The original early-stopped run (0.642)
++differs from this matched-epoch control (0.878) only in that validation
++(`evaluate()`, every `check_val_every_n_epoch`) actually ran. `evaluate()`
++draws `z`/`v` samples (and Decipher's 5-particle `marginal_ll` for
++`nll_validation`) from the shared global torch RNG -- **consuming** state
++from the same stream that drives training noise, so whether/when validation
++fires perturbs every subsequent training step's reparameterisation draws.
++Confirmed by forking the RNG around `evaluate()`: seed 0 alone went
++0.642 -> 0.731. This was a genuine bug (not present in the reference the
++same way at this magnitude) and is now fixed in `omicverse/vi/_train.py`
++(`evaluate()` wraps its forward passes in `torch.random.fork_rng(...)`) --
++validation no longer perturbs the training trajectory, for every `ov.vi`
++model, not just Decipher.
++
++**16 seeds each, post-fix** (`benchmarks/vi/decipher/seed_sweep*.py`, CPU,
++real early-stopping recipe both sides): best |rho| vs. ground-truth
++pseudotime -- **ours 0.824 +/- 0.082** (seeds 0-15: 0.731, 0.800, 0.613,
++0.886, 0.896, 0.873, 0.862, 0.721, 0.890, 0.865, 0.791, 0.879, 0.901, 0.906,
++0.744, 0.832), **ref 0.862 +/- 0.058 over 15 completed runs + 1 outright
++numerical-divergence crash at seed 15** (0.865, 0.896, 0.857, 0.887, 0.905,
++0.849, 0.879, 0.889, 0.877, 0.902, 0.832, 0.889, 0.896, 0.854, 0.658,
++*crashed*) -- reference is not perfectly stable either at this sample size.
++Bad-optimum rate (|rho| < 0.75, crash counted as bad): **ours 4/16, ref
++2/16** -- Fisher exact p = 0.654, Mann-Whitney U p = 0.277: **not
++significant**. The two distributions are statistically indistinguishable at
++n=16; the original 3-seed "outside spread" reading was a small-sample
++artifact on top of the now-fixed RNG-coupling bug.
++
++## Timing
++
++ov.vi.Decipher: 32.3 / 52.0 / 19.6 s (mean 34.6 s). scvi.external.Decipher:
++597.1 / 329.5 / 517.3 s (mean 481.3 s) -- **~13.9x faster**, back-to-back under
++the same shared-GPU load. Most of the gap is scvi-tools' Pyro/PyTorch-Lightning
++per-step overhead (trace re-building, `SVI.step`, Lightning's loop) rather than
++raw kernel time -- this is a tiny model (a few hundred KB of weights) on 4,454
++cells, so neither implementation is GPU-compute-bound; wall time here mostly
++reflects Python-level overhead per step plus how long each run's early
++stopping took to trigger (seed 0 ran the most epochs for both).
++
++## AnnDataOOM / Dask (real data, not just the synthetic test fixture)
++
++`benchmarks/vi/decipher/run_oom_dask.py` on the same 4,454-cell erythroid
++dataset (`shuffle='block'`, fixed seed, 15 epochs): AnnDataOOM
++(`ov.read(..., storage='disk')`, `_source().kind == 'h5'`) and Dask-backed
++AnnData (`omicverse.pp._dask.read_h5ad`, `kind == 'dask'`) both reproduce the
++in-memory `get_latent_representation()` **bit-exactly** (`np.allclose(...,
++atol=1e-5)` True for both).
++
++## Not done
++
++- No GPU run of the *raw* (no-early-stopping) 300-epoch recipe is reported
++  (it diverges to NaN for both implementations past ~150-250 epochs here, as
++  noted above -- early stopping is how both are meant to be run).
++- `scvi.external.Decipher`'s own `nll_validation` (a batch-joint Pyro-trace
++  importance estimate, not per-cell) was not used for comparison; the
++  implementation-agnostic per-cell metric above was used instead for an
++  apples-to-apples number.
+diff --git a/omicverse/_oom_native.py b/omicverse/_oom_native.py
+index 5b883712f..15ebda50a 100644
+--- a/omicverse/_oom_native.py
++++ b/omicverse/_oom_native.py
+@@ -65,6 +65,8 @@
+     "omicverse.single._drvi.drvi",
+     "omicverse.vi._mrvi.MRVI",
+     "omicverse.single._mrvi.mrvi",
++    "omicverse.vi._decipher.Decipher",
++    "omicverse.single._decipher.decipher",
+     # ---- ov.space ----
+     "omicverse.space._svg.spatial_neighbors",
+     "omicverse.space._svg.spatial_autocorr",
+diff --git a/omicverse/single/__init__.py b/omicverse/single/__init__.py
+index 493fd2f82..f20ceb14d 100644
+--- a/omicverse/single/__init__.py
++++ b/omicverse/single/__init__.py
+@@ -145,6 +145,7 @@
+ from ._metabolism import Metabolism, MetaboliteCCC, differential_metabolism
+ from ._drvi import drvi
+ 
++from ._decipher import decipher
+ from ._stavia import StaVIA
+ from ._lazy_step_by_step import (
+     lazy_step_qc, lazy_step_preprocess, lazy_step_scale, lazy_step_pca,
+@@ -333,6 +334,7 @@ def __getattr__(name):
+     'plot_weights',
+     
+     # Trajectory and pseudotime analysis
++    'decipher',
+     'StaVIA',
+     'pyVIA',
+     'hematopoiesis',
+diff --git a/omicverse/single/_decipher.py b/omicverse/single/_decipher.py
+new file mode 100644
+index 000000000..01043015f
+--- /dev/null
++++ b/omicverse/single/_decipher.py
+@@ -0,0 +1,78 @@
++"""Decipher (Nazaret et al., 2024) convenience adapter.
++
++Trains ``ov.vi.Decipher`` -- the omicverse-native, pure-PyTorch rewrite of
++``scvi.external.Decipher`` (no scvi-tools / Pyro) -- and stores its top-level,
++interpretable 2-D latent ``v`` ("Decipher space") in ``adata.obsm``.  The
++richer latent ``z``, importance-weighted marginal log-likelihood, imputed
++gene expression / covariances and the trajectory utilities (``ov.vi.Trajectory``,
++``ov.vi.rotate_decipher_components``, ``ov.vi.compute_decipher_time``) stay
++available through the returned model.
++"""
++from __future__ import annotations
++
++from .._registry import register_function
++
++
++@register_function(
++    aliases=["Decipher", "decipher", "Decipher space", "trajectory VAE", "轨迹VAE"],
++    category="single",
++    description="Train omicverse's native Decipher (two-level VAE with a 2-D interpretable "
++                "latent v and a richer latent z) and store v in adata.obsm; useful for "
++                "visualising normal vs. perturbed differentiation trajectories. Trains on "
++                "in-memory AnnData, AnnDataOOM (disk) and Dask-backed AnnData.",
++    produces={"obsm": ["X_decipher"]},
++    examples=[
++        "model = ov.single.decipher(adata, layer='counts')",
++        "adata.obsm['X_decipher']  # (n_obs, 2) Decipher space",
++        "model = ov.single.decipher(adata, layer='counts', key_added_z='X_decipher_z')",
++    ],
++    related=["vi.Decipher", "vi.Trajectory", "vi.rotate_decipher_components",
++             "vi.compute_decipher_time"],
++)
++def decipher(adata, *, layer: str = "counts", key_added: str = "X_decipher",
++             key_added_z: str | None = None, model_kwargs: dict | None = None,
++             train_kwargs: dict | None = None, overwrite: bool = False):
++    """Train Decipher and store its top-level latent representation.
++
++    Parameters
++    ----------
++    adata
++        AnnData, AnnDataOOM (``ov.read(path, storage='disk')``) or Dask-backed AnnData.
++    layer
++        Layer with raw counts (``None`` = ``adata.X``).
++    key_added
++        ``adata.obsm`` key for the 2-D Decipher space ``v``.
++    key_added_z
++        If given, also store the posterior mean of the intermediate latent
++        ``z`` under this ``adata.obsm`` key.
++    model_kwargs
++        Extra keywords for :class:`ov.vi.Decipher` (``dim_v``, ``dim_z``,
++        ``layers_v_to_z``, ``layers_z_to_x``, ``beta``, ``genes``, ``seed``, ...).
++    train_kwargs
++        Extra keywords for :meth:`ov.vi.Decipher.train` (``max_epochs``,
++        ``batch_size``, ``lr``, ``early_stopping``, ...).
++    overwrite
++        Overwrite ``key_added`` / ``key_added_z`` if already present in ``adata.obsm``.
++
++    Returns
++    -------
++    ov.vi.Decipher
++        The trained model. An embedding alone is not an inferred developmental
++        direction or pseudotime: build one with ``ov.vi.Trajectory.from_clusters``
++        and ``ov.vi.compute_decipher_time``, after optionally orienting the space
++        with ``ov.vi.rotate_decipher_components``.
++    """
++    if not overwrite:
++        for k in (key_added, key_added_z):
++            if k is not None and k in adata.obsm:
++                raise KeyError(f"adata.obsm[{k!r}] already exists; pass overwrite=True")
++    from .. import vi
++    model = vi.Decipher(adata, layer=layer, **(model_kwargs or {}))
++    model.train(**(train_kwargs or {}))
++    adata.obsm[key_added] = model.get_latent_representation()
++    if key_added_z is not None:
++        adata.obsm[key_added_z] = model.get_latent_representation(give_z=True)
++    return model
++
++
++__all__ = ["decipher"]
+diff --git a/omicverse/vi/__init__.py b/omicverse/vi/__init__.py
+index 709048083..712d06255 100644
+--- a/omicverse/vi/__init__.py
++++ b/omicverse/vi/__init__.py
+@@ -19,6 +19,9 @@
+              decoder (log-sum-exp aggregation); pnb/nb/zinb/poisson
+              likelihoods; ``latent_traverse`` / ``differential_vars`` for
+              per-dimension gene-effect interpretability.
++``Decipher`` two-level VAE with a 2-D interpretable trajectory space ``v``
++             (plus ``Trajectory``, ``rotate_decipher_components``,
++             ``compute_decipher_time``).
+ 
+ The API mirrors scvi-tools, but configuration goes to the constructor::
+ 
+@@ -43,6 +46,10 @@
+     "DRVI": ("._drvi", "DRVI"),
+     "RESOLVI": ("._resolvi", "RESOLVI"),
+     "MRVI": ("._mrvi", "MRVI"),
++    "Decipher": ("._decipher", "Decipher"),
++    "Trajectory": ("._decipher", "Trajectory"),
++    "rotate_decipher_components": ("._decipher", "rotate_decipher_components"),
++    "compute_decipher_time": ("._decipher", "compute_decipher_time"),
+     "BaseVIModel": ("._base", "BaseVIModel"),
+     "build_source": ("._data", "build_source"),
+     "train_distributed": ("._distributed", "train_distributed"),
+@@ -55,7 +62,7 @@
+     "priors": ("._priors", None),
+ }
+ 
+-__all__ = ["SCVI", "SCANVI", "TOTALVI", "DRVI", "RESOLVI", "MRVI", "BaseVIModel", "build_source", "train_distributed", "mde", "plot_history", "integration_metrics", "MemoryMonitor"]
++__all__ = ["SCVI", "SCANVI", "TOTALVI", "DRVI", "RESOLVI", "MRVI", "Decipher", "Trajectory", "rotate_decipher_components", "compute_decipher_time", "BaseVIModel", "build_source", "train_distributed", "mde", "plot_history", "integration_metrics", "MemoryMonitor"]
+ 
+ 
+ def __getattr__(name):
+diff --git a/omicverse/vi/_decipher.py b/omicverse/vi/_decipher.py
+new file mode 100644
+index 000000000..16642531d
+--- /dev/null
++++ b/omicverse/vi/_decipher.py
+@@ -0,0 +1,586 @@
++r"""Decipher (Nazaret et al., 2024): a two-level deep generative model whose 2-D
++top latent ``v`` ("Decipher space") is an interpretable map of cell-state
++trajectories, with a richer intermediate latent ``z``.
++
++Generative model (per cell, ``G`` genes, library size ``l = sum_g x_g``)::
++
++    v ~ N(0, I_dim_v)
++    z | v ~ N(mu_z(v), softplus(s_z(v)))
++    x | z ~ NB(mean = l * softmax(f(z)), inverse dispersion theta)   (per-gene theta)
++
++Amortised posterior: ``q(z | x) q(v | z, x)`` on ``log1p(x)``; the ``v`` terms
++are weighted by ``beta`` (default 0.1) in both the prior and the posterior.
++The objective is the single-sample Monte-Carlo ELBO of Pyro's ``Trace_ELBO``
++(summed over the minibatch), optimised with Pyro's ``ClippedAdam`` (lr 5e-3,
++weight decay 1e-4, element-wise gradient clamp 10) -- the scvi-tools 1.5.2
++``scvi.external.Decipher`` model rewritten with plain ``torch`` (no Pyro).
++Network names and layouts match scvi-tools, so its weights load directly
++(:meth:`Decipher.load_scvi_weights`).
++"""
++from __future__ import annotations
++
++import math
++from collections.abc import Sequence
++
++import numpy as np
++import torch
++from torch import nn
++import torch.nn.functional as F
++
++from .._registry import register_function
++from ._base import BaseVIModel, _max_epochs_heuristic
++
++_LOG_2PI = math.log(2 * math.pi)
++TEST_BETA = 1.0
++
++
++def _normal_log_prob(x, loc, scale):
++    """Per-cell sum of log N(x; loc, scale)."""
++    return (-0.5 * ((x - loc) / scale) ** 2 - torch.log(scale) - 0.5 * _LOG_2PI).sum(-1)
++
++
++class ConditionalDenseNN(nn.Module):
++    """Dense network with several outputs (scvi-tools / Pyro ``ConditionalDenseNN``
++    without context): Linear -> BatchNorm -> ReLU per hidden layer, one linear
++    output layer split into ``output_dims``.  Parameter names match scvi-tools."""
++
++    def __init__(self, input_dim: int, hidden_dims: Sequence[int], output_dims: Sequence[int] = (1,)):
++        super().__init__()
++        self.input_dim = input_dim
++        self.hidden_dims = list(hidden_dims)
++        self.output_dims = list(output_dims)
++        dims = [input_dim] + self.hidden_dims
++        self.layers = nn.ModuleList(
++            [nn.Linear(a, b) for a, b in zip(dims[:-1], dims[1:])]
++            + [nn.Linear(dims[-1], sum(self.output_dims))])
++        self.batch_norms = nn.ModuleList([nn.BatchNorm1d(h) for h in self.hidden_dims])
++
++    def forward(self, x):
++        h = x
++        last = len(self.layers) - 1
++        for i, layer in enumerate(self.layers):
++            h = layer(h)
++            if i < last:
++                h = F.relu(self.batch_norms[i](h))
++        if len(self.output_dims) == 1:
++            return h
++        return tuple(torch.split(h, self.output_dims, dim=-1))
++
++
++def _nb_logits_rowsum(x, mu_lib, theta, b, eps):
++    """Per-cell sum of log NB(x; total_count = theta + eps, logits =
++    log(mu_lib + eps) - log(theta + eps)) -- ``torch.distributions.NegativeBinomial``
++    as used by scvi-tools' Decipher.  With the non-zeros of ``x`` in ``b`` the
++    count-dependent terms are evaluated on the stored entries only."""
++    r = theta + eps
++    logits = torch.log(mu_lib + eps) - torch.log(r)
++    dense = (r * F.logsigmoid(-logits)).sum(-1)
++    if "row" in b and mu_lib.dim() == 2:
++        flat, col, val = b["flat"], b["col"], b["val"]
++        lg = F.logsigmoid(logits).reshape(-1).index_select(0, flat)
++        r_s = r.index_select(0, col)
++        term = val * lg + torch.lgamma(r_s + val) - torch.lgamma(r_s) - torch.lgamma(val + 1)
++        return dense.index_add(0, b["row"], term)
++    return dense + (x * F.logsigmoid(logits) + torch.lgamma(r + x) - torch.lgamma(r)
++                    - torch.lgamma(x + 1)).sum(-1)
++
++
++class DecipherModule(nn.Module):
++    """The Decipher generative model and guide (scvi-tools ``DecipherPyroModule``).
++
++    ``forward(batch)`` draws one reparameterised sample of ``(z, v)`` from the
++    guide and returns the negative ELBO summed over the minibatch (``loss``) plus
++    per-cell terms: ``reconstruction_loss`` = -log p(x|z), ``kl_local`` =
++    [log q(z) - log p(z|v)] + beta [log q(v) - log p(v)] (``kl_z`` / ``kl_v``
++    separately).  In eval mode it also reports ``nll`` (per-cell importance-weighted
++    estimate of -log p(x) with ``n_iw_samples`` samples, beta = 1)."""
++
++    def __init__(self, n_input: int, dim_v: int = 2, dim_z: int = 10,
++                 layers_v_to_z: Sequence[int] = (64,), layers_z_to_x: Sequence[int] = (),
++                 beta: float = 0.1, n_iw_samples: int = 5):
++        super().__init__()
++        self.n_input = self.dim_genes = n_input
++        self.dim_v, self.dim_z = dim_v, dim_z
++        self.n_latent = dim_v
++        self.beta = beta
++        self.n_iw_samples = n_iw_samples
++        self.decoder_v_to_z = ConditionalDenseNN(dim_v, layers_v_to_z, [dim_z] * 2)
++        self.decoder_z_to_x = ConditionalDenseNN(dim_z, layers_z_to_x, [n_input])
++        self.encoder_x_to_z = ConditionalDenseNN(n_input, [128], [dim_z] * 2)
++        self.encoder_zx_to_v = ConditionalDenseNN(n_input + dim_z, [128], [dim_v] * 2)
++        # Pyro's positive constraint is an exp transform of an unconstrained value
++        self.log_theta = nn.Parameter(torch.zeros(n_input))
++        self._epsilon = 1e-5
++        self.freeze_bn_from: int | None = None
++        self._bn_frozen = False
++        self.train_config = None
++
++    # ------------------------------------------------------------------
++    @property
++    def theta(self):
++        return torch.exp(self.log_theta)
++
++    @property
++    def cuda_graph_safe(self) -> bool:
++        # a captured graph keeps BatchNorm in the mode it was captured in
++        return self.freeze_bn_from is None
++
++    def on_train_epoch_start(self, epoch: int):
++        """scvi-tools freezes BatchNorm (eval mode) after the second validation
++        epoch; ``freeze_bn_from`` is the first frozen epoch (None = never)."""
++        self._bn_frozen = self.freeze_bn_from is not None and epoch >= self.freeze_bn_from
++        if self._bn_frozen:
++            for m in self.modules():
++                if isinstance(m, nn.BatchNorm1d):
++                    m.eval()
++
++    def train(self, mode: bool = True):
++        super().train(mode)
++        if mode and self._bn_frozen:
++            for m in self.modules():
++                if isinstance(m, nn.BatchNorm1d):
++                    m.eval()
++        return self
++
++    # ------------------------------------------------------------------
++    def encode(self, x):
++        """Guide parameters: (z_loc, z_scale) from log1p(x)."""
++        xl = torch.log1p(x)
++        z_loc, z_s = self.encoder_x_to_z(xl)
++        return xl, z_loc, F.softplus(z_s)
++
++    def encode_v(self, z, xl):
++        v_loc, v_s = self.encoder_zx_to_v(torch.cat([z, xl], dim=-1))
++        return v_loc, F.softplus(v_s)
++
++    def decode_z(self, v):
++        z_loc, z_s = self.decoder_v_to_z(v)
++        return z_loc, F.softplus(z_s)
++
++    def decode_x(self, z):
++        """Gene proportions softmax(f(z))."""
++        return F.softmax(self.decoder_z_to_x(z), dim=-1)
++
++    def latent_mean(self, b):
++        """Posterior mean of v (used by sharded inference)."""
++        xl, z_loc, _ = self.encode(b["x"])
++        return self.encode_v(z_loc, xl)[0]
++
++    def log_weights(self, b):
++        """One guide sample: per-cell log p(x|z), log p(z|v) - log q(z|x),
++        log p(v) - log q(v|z,x) (unweighted; the caller applies ``beta`` to the
++        ``v`` term where needed -- :meth:`forward` for the ELBO, unweighted for
++        :meth:`marginal_ll`, matching scvi-tools' ``beta=1`` test-time scale)."""
++        x = b["x"]
++        xl, z_loc, z_scale = self.encode(x)
++        z = z_loc + z_scale * torch.randn_like(z_loc)
++        v_loc, v_scale = self.encode_v(z, xl)
++        v = v_loc + v_scale * torch.randn_like(v_loc)
++        log_qz = _normal_log_prob(z, z_loc, z_scale)
++        log_qv = _normal_log_prob(v, v_loc, v_scale)
++        log_pv = (-0.5 * v ** 2 - 0.5 * _LOG_2PI).sum(-1)
++        pz_loc, pz_scale = self.decode_z(v)
++        log_pz = _normal_log_prob(z, pz_loc, pz_scale)
++        mu = self.decode_x(z)
++        lib = x.sum(-1, keepdim=True)
++        log_px = _nb_logits_rowsum(x, lib * mu, self.theta, b, self._epsilon)
++        return log_px, log_pz - log_qz, log_pv - log_qv
++
++    def forward(self, b, kl_weight=1.0, beta: float | None = None):
++        beta = self.beta if beta is None else beta
++        log_px, wz, wv = self.log_weights(b)
++        kl_z, kl_v = -wz, -wv
++        kl_local = kl_z + beta * kl_v
++        rec = -log_px
++        out = {"loss": (rec + kl_local).sum(), "reconstruction_loss": rec,
++               "kl_local": kl_local, "kl_z": kl_z, "kl_v": kl_v,
++               "kl_global": torch.zeros((), device=rec.device)}
++        if not self.training and self.n_iw_samples:
++            out["nll"] = -self.marginal_ll(b, self.n_iw_samples)
++        return out
++
++    def marginal_ll(self, b, n_samples: int = 5):
++        """Per-cell importance-weighted estimate of log p(x) (beta = 1)."""
++        lw = []
++        for _ in range(n_samples):
++            log_px, wz, wv = self.log_weights(b)
++            lw.append(log_px + wz + wv)
++        lw = torch.stack(lw, 0)
++        return torch.logsumexp(lw, 0) - math.log(n_samples)
++
++
++# ---------------------------------------------------------------------------
++# trajectories in the Decipher space
++# ---------------------------------------------------------------------------
++class Trajectory:
++    """Piecewise-linear trajectory through a latent space (scvi-tools
++    ``decipher.utils.Trajectory``): consecutive ``cluster_locations`` are joined
++    by straight segments, time runs from 0 with the distance travelled, and the
++    path is sampled at ``point_density`` points per unit length.
++
++    Attributes: ``trajectory_latent`` (points), ``trajectory_time`` (their times),
++    ``cumulative_length``, ``cluster_locations``, ``cluster_ids``, ``rep_key``,
++    ``n_points``."""
++
++    def __init__(self, rep_key: str, cluster_locations, cluster_ids, point_density: int = 50):
++        self._point_density = point_density
++        self.cluster_ids = list(cluster_ids)
++        self.cluster_locations = np.asarray(cluster_locations)
++        seg = np.linalg.norm(np.diff(self.cluster_locations, axis=0), axis=1)
++        self.cumulative_length = np.cumsum(seg)
++        self.n_points = int(self._point_density * self.cumulative_length[-1])
++        self.rep_key = rep_key
++        self.trajectory_latent, self.trajectory_time = self._linspace(self.n_points)
++
++    @classmethod
++    def from_clusters(cls, adata, rep_key: str, cluster_key: str, cluster_ids,
++                      point_density: int = 50, reduce: str = "mean") -> "Trajectory":
++        """Trajectory through the per-cluster centroids (``reduce`` = 'mean' or
++        'median') of ``adata.obsm[rep_key]`` for ``cluster_ids`` in order."""
++        rep = np.asarray(adata.obsm[rep_key])
++        lab = np.asarray(adata.obs[cluster_key].astype(str))
++        f = np.median if reduce == "median" else np.mean
++        locs = []
++        for c in cluster_ids:
++            m = lab == str(c)
++            if not m.any():
++                raise ValueError(f"cluster {c!r} not found in adata.obs[{cluster_key!r}]")
++            locs.append(f(rep[m], axis=0))
++        return cls(rep_key, np.stack(locs), [str(c) for c in cluster_ids], point_density)
++
++    def _linspace(self, num: int = 100):
++        times = np.linspace(0, self.cumulative_length[-1], num)
++        return self.at_time(times).astype(np.float32), times
++
++    def at_time(self, t):
++        """Coordinates at time(s) ``t`` along the trajectory."""
++        t = np.asarray(t, dtype=float)
++        scalar = t.ndim == 0
++        t = np.atleast_1d(t)
++        cl = self.cumulative_length
++        i = np.minimum(np.searchsorted(cl, t, side="left"), len(cl) - 1)
++        start = np.where(i > 0, cl[np.maximum(i - 1, 0)], 0.0)
++        frac = (t - start) / (cl[i] - start)
++        loc = self.cluster_locations
++        out = loc[i] * (1 - frac)[:, None] + frac[:, None] * loc[i + 1]
++        return out[0] if scalar else out
++
++    def to_dict(self) -> dict:
++        return {"cluster_locations": self.cluster_locations, "cluster_ids": self.cluster_ids,
++                "points": self.trajectory_latent, "times": self.trajectory_time,
++                "density": self._point_density, "rep_key": self.rep_key}
++
++    @staticmethod
++    def from_dict(d: dict) -> "Trajectory":
++        return Trajectory(rep_key=d["rep_key"], cluster_locations=d["cluster_locations"],
++                          cluster_ids=d["cluster_ids"], point_density=d.get("density", 50))
++
++    def __repr__(self):
++        return (f"Trajectory(rep_key={self.rep_key!r}, clusters={self.cluster_ids}, "
++                f"length={self.cumulative_length[-1]:.3g}, n_points={self.n_points})")
++
++
++def _rot(t, u=1):
++    if u not in (-1, 1):
++        raise ValueError("u must be -1 or 1")
++    return np.array([[np.cos(t), np.sin(t) * u], [-np.sin(t), np.cos(t) * u]])
++
++
++def _corr_cols(a, y):
++    """Pearson correlation of each column of ``a`` (n, k) with ``y`` (n,)."""
++    a = a - a.mean(0)
++    y = y - y.mean()
++    return (a * y[:, None]).sum(0) / np.sqrt((a * a).sum(0) * (y * y).sum())
++
++
++def rotate_decipher_components(adata, v_obsm_key: str, z_obsm_key: str,
++                               v1_obs_col: str | None = None, v1_order: list | None = None,
++                               v2_obs_col: str | None = None, v2_order: list | None = None,
++                               auto_flip_decipher_z: bool = True):
++    """Rotate / flip the Decipher space so that component 1 (2) correlates with
++    ``adata.obs[v1_obs_col]`` (``v2_obs_col``) and not with the other one; ordered
++    categories are given with ``v1_order`` / ``v2_order``.  Same grid search as
++    scvi-tools (100 angles x 2 reflections).  ``auto_flip_decipher_z`` flips each
++    z dimension to correlate positively with the rotated v.
++
++    Returns ``(decipher_v, decipher_z, rotation)``."""
++    def process(col, order):
++        if col is None:
++            return None, None
++        s = adata.obs[col]
++        if order is not None:
++            s = s.astype("category").cat.set_categories(order)
++            s = s.cat.codes.replace(-1, np.nan)
++        elif s.dtype == "category":
++            raise ValueError("v_order must be provided if v_obs is a category column")
++        valid = ~s.isna()
++        return np.asarray(s[valid], dtype=float), np.asarray(valid)
++
++    if v1_obs_col is None and v2_obs_col is None:
++        raise ValueError("At least one of v1_obs_col or v2_obs_col must be provided")
++    y1, m1 = process(v1_obs_col, v1_order)
++    y2, m2 = process(v2_obs_col, v2_order)
++    v = np.asarray(adata.obsm[v_obsm_key])
++    rots = [_rot(t, u) for t in np.linspace(0, 2 * np.pi, 100) for u in (1, -1)]
++    R = np.stack(rots)                                    # (200, 2, 2)
++    scores = np.zeros(len(rots))
++    if y1 is not None:
++        c = np.stack([_corr_cols(v[m1] @ r, y1) for r in R])
++        scores += c[:, 0] - np.abs(c[:, 1])
++    if y2 is not None:
++        c = np.stack([_corr_cols(v[m2] @ r, y2) for r in R])
++        scores += c[:, 1] - np.abs(c[:, 0])
++    best = R[int(np.argmax(scores))]
++    v = v @ best
++    z = np.asarray(adata.obsm[z_obsm_key])
++    if auto_flip_decipher_z:
++        dz = z.shape[1]
++        corr = np.corrcoef(z, y=v, rowvar=False)
++        z = z * np.sign(corr[:dz, dz:].sum(axis=1))
++    return v, z, best
++
++
++def compute_decipher_time(adata, cluster_obs_key: str, trajectory: Trajectory,
++                          n_neighbors: int = 10) -> np.ndarray:
++    """Decipher time of each cell: KNN regression of the trajectory times on
++    the cells' ``adata.obsm[trajectory.rep_key]``; NaN for cells outside the
++    trajectory's clusters."""
++    from sklearn.neighbors import KNeighborsRegressor
++    out = np.full(adata.n_obs, np.nan)
++    knn = KNeighborsRegressor(n_neighbors=n_neighbors)
++    knn.fit(trajectory.trajectory_latent, trajectory.trajectory_time)
++    lab = adata.obs[cluster_obs_key]
++    on = np.flatnonzero(np.asarray(lab.astype(str).isin([str(c) for c in trajectory.cluster_ids])))
++    if len(on):
++        out[on] = knn.predict(np.asarray(adata.obsm[trajectory.rep_key])[on])
++    return out
++
++
++# ---------------------------------------------------------------------------
++@register_function(
++    aliases=["Decipher", "decipher", "vi.Decipher", "Decipher space", "trajectory VAE"],
++    category="single",
++    description="omicverse-native Decipher (no scvi-tools / Pyro): two-level VAE with a 2-D "
++                "interpretable latent v and a 10-D latent z for visualising normal and "
++                "perturbed differentiation trajectories; trains on AnnData, AnnDataOOM and "
++                "Dask-backed AnnData.",
++    examples=[
++        "m = ov.vi.Decipher(adata, layer='counts')",
++        "m.train()",
++        "adata.obsm['decipher_v'] = m.get_latent_representation()",
++        "adata.obsm['decipher_z'] = m.get_latent_representation(give_z=True)",
++    ],
++    related=["single.decipher", "vi.SCVI"],
++)
++class Decipher(BaseVIModel):
++    """Decipher (Nazaret et al., 2024), omicverse implementation of
++    ``scvi.external.Decipher`` (scvi-tools 1.5.2) in plain PyTorch.
++
++    Arguments:
++        adata: AnnData, AnnDataOOM (``ov.read(path, storage='disk')``) or
++            Dask-backed AnnData.  Raw counts are read from ``layer``.
++        layer: Layer with raw counts (None = ``X``).
++        genes: Training genes (boolean mask, names or a ``var`` column such as
++            ``'highly_variable'``).
++        dim_v: Dimension of the interpretable latent ``v`` (2).
++        dim_z: Dimension of the intermediate latent ``z`` (10).
++        layers_v_to_z: Hidden sizes of the v -> z decoder ((64,)).
++        layers_z_to_x: Hidden sizes of the z -> x decoder (() = linear).
++        beta: Weight of the ``v`` KL term (0.1).
++        seed: Seed of the weight initialisation (None = current torch RNG).
++
++    Example::
++
++        m = ov.vi.Decipher(adata, layer="counts")
++        m.train()
++        adata.obsm["decipher_v"] = m.get_latent_representation()
++        adata.obsm["decipher_z"] = m.get_latent_representation(give_z=True)
++    """
++
++    _module_cls = DecipherModule
++
++    def __init__(self, adata, layer=None, genes=None, dim_v: int = 2, dim_z: int = 10,
++                 layers_v_to_z: Sequence[int] = (64,), layers_z_to_x: Sequence[int] = (),
++                 beta: float = 0.1, seed: int | None = 0, **module_kwargs):
++        super().__init__(adata, layer=layer, genes=genes)
++        self._build(seed=seed, dim_v=dim_v, dim_z=dim_z, layers_v_to_z=list(layers_v_to_z),
++                    layers_z_to_x=list(layers_z_to_x), beta=beta, **module_kwargs)
++
++    def _build(self, seed=None, **kw):
++        kw = {k: v for k, v in kw.items() if k != "seed"}
++        self._module_kwargs = kw
++        self._module_args = dict(n_input=self.n_vars, **kw)
++        with torch.random.fork_rng(devices=[]):
++            if seed is not None:
++                torch.manual_seed(seed)
++            self.module = self._module_cls(**self._module_args)
++        self.module.to(self._device)
++
++    # ------------------------------------------------------------------
++    def train(self, max_epochs: int | None = None, *, batch_size: int = 128,
++              train_size: float | None = 0.9, early_stopping: bool = False,
++              check_val_every_n_epoch: int | None = None, lr: float | None = None,
++              freeze_batchnorm: str | int | None = "auto", plan_kwargs: dict | None = None,
++              **kwargs):
++        """Train with scvi-tools' Decipher defaults: ``ClippedAdam`` (lr 5e-3,
++        weight decay 1e-4, clamp 10, eps 1e-8), loss summed over the minibatch,
++        incomplete last minibatch dropped, max epochs
++        ``min(round(20000 / n_cells * 1000), 1000)``, early stopping on
++        ``nll_validation``.
++
++        Arguments:
++            freeze_batchnorm: Epoch from which BatchNorm layers stay in eval mode.
++                ``'auto'`` reproduces scvi-tools (frozen after the second epoch
++                with a validation pass, i.e. only when validation runs, e.g. with
++                ``early_stopping``); an int sets the epoch; None never freezes.
++            **kwargs: See :meth:`BaseVIModel.train` (device, seed, shuffle,
++                block_size, ... and optimisation options such as ``weight_decay``,
++                ``clip_norm``, ``early_stopping_patience``).
++        """
++        if max_epochs is None:
++            max_epochs = _max_epochs_heuristic(self.adata.n_obs, epochs_cap=1000)
++        plan = {"optimizer": "ClippedAdam", "lr": 5e-3, "weight_decay": 1e-4, "eps": 1e-8,
++                "clip_norm": 10.0, "n_epochs_kl_warmup": None, "drop_last": True,
++                "early_stopping_monitor": "nll_validation"}
++        plan.update(plan_kwargs or {})
++        if lr is not None:
++            plan["lr"] = lr
++        if freeze_batchnorm == "auto":
++            # scvi-tools freezes BatchNorm on the first validation pass with
++            # current_epoch > 0; training epochs after it run frozen
++            n = check_val_every_n_epoch or (1 if early_stopping else None)
++            freeze = None if n is None else (2 if n == 1 else n)
++        else:
++            freeze = freeze_batchnorm
++        self.module.freeze_bn_from = freeze
++        self.module._bn_frozen = False
++        try:
++            return super().train(max_epochs, batch_size=batch_size, train_size=train_size,
++                                 early_stopping=early_stopping,
++                                 check_val_every_n_epoch=check_val_every_n_epoch,
++                                 plan_kwargs=plan, **kwargs)
++        finally:
++            self.module._bn_frozen = False
++
++    # ------------------------------------------------------------------
++    def get_latent_representation(self, adata=None, indices=None, batch_size: int | None = None,
++                                  give_z: bool = False) -> np.ndarray:
++        """Posterior mean of the Decipher space ``v`` (``give_z=False``) or of ``z``."""
++        mod = self.module
++
++        def fn(b):
++            xl, z_loc, _ = mod.encode(b["x"])
++            return z_loc if give_z else mod.encode_v(z_loc, xl)[0]
++
++        return self._collect(fn, adata, indices, batch_size)
++
++    def get_marginal_ll(self, adata=None, indices=None, n_samples: int = 100,
++                        batch_size: int | None = None, return_mean: bool = True):
++        """Importance-weighted estimate of log p(x) per cell (beta = 1)."""
++        mod = self.module
++        out = self._collect(lambda b: mod.marginal_ll(b, n_samples), adata, indices, batch_size)
++        return float(np.mean(out)) if return_mean else out
++
++    def compute_imputed_gene_expression(self, adata=None, indices=None,
++                                        batch_size: int | None = None,
++                                        compute_covariances: bool = False,
++                                        v_obsm_key: str | None = None,
++                                        z_obsm_key: str | None = None,
++                                        return_imputed: bool = True):
++        """Imputed expression ``library_size * softmax(f(z_loc))`` per cell (cells x
++        genes); with ``compute_covariances`` also the gene x v and gene x z
++        covariances with ``adata.obsm[v_obsm_key]`` / ``[z_obsm_key]`` (computed
++        in one streaming pass, so ``return_imputed=False`` never holds the cells x
++        genes matrix -- use it for disk-backed data)."""
++        if compute_covariances and (v_obsm_key is None or z_obsm_key is None):
++            raise ValueError("`v_obsm_key` and `z_obsm_key` must be provided if "
++                             "`compute_covariances` is True.")
++        if not compute_covariances and not return_imputed:
++            raise ValueError("nothing to return")
++        mod = self.module
++        ad = self.adata if adata is None else adata
++
++        def fn(b):
++            _, z_loc, _ = mod.encode(b["x"])
++            return b["x"].sum(-1, keepdim=True) * mod.decode_x(z_loc)
++
++        if not compute_covariances:
++            return self._collect(fn, adata, indices, batch_size)
++        self._check_trained()
++        _, it, *_ = self._batches(adata, indices, batch_size)
++        sel = np.arange(ad.n_obs) if indices is None else np.asarray(indices)
++        if sel.dtype == bool:
++            sel = np.flatnonzero(sel)
++        Y = np.concatenate([np.asarray(ad.obsm[v_obsm_key])[sel],
++                            np.asarray(ad.obsm[z_obsm_key])[sel]], 1).astype(np.float64)
++        dv = np.asarray(ad.obsm[v_obsm_key]).shape[1]
++        pos_of = {int(r): i for i, r in enumerate(sel)} if indices is not None else None
++        G = self.n_vars
++        sx = np.zeros(G); sxy = np.zeros((G, Y.shape[1]))
++        imputed = np.empty((len(sel), G), np.float32) if return_imputed else None
++        mod.eval()
++        with torch.no_grad():
++            for b in it:
++                blk = fn(b).double().cpu().numpy()
++                idx = b["idx"].cpu().numpy()
++                pos = idx if pos_of is None else np.array([pos_of[int(i)] for i in idx])
++                sx += blk.sum(0)
++                sxy += blk.T @ Y[pos]
++                if imputed is not None:
++                    imputed[pos] = blk
++        m = len(sel)
++        cov = (sxy - np.outer(sx, Y.sum(0)) / m) / (m - 1)
++        res = (cov[:, :dv], cov[:, dv:])
++        return (imputed,) + res if return_imputed else res
++
++    @staticmethod
++    def compute_decipher_time(adata, cluster_obs_key: str, trajectory: Trajectory,
++                              n_neighbors: int = 10) -> np.ndarray:
++        """See :func:`compute_decipher_time`."""
++        return compute_decipher_time(adata, cluster_obs_key, trajectory, n_neighbors)
++
++    def compute_gene_patterns(self, adata=None, trajectory: Trajectory = None,
++                              l_scale: float = 10_000, n_samples: int = 100) -> dict:
++        """Gene expression along a trajectory of the Decipher space: the trajectory
++        points go through the v -> z -> x decoders.  Returns ``mean`` (z at its
++        mean), ``q25`` / ``q75`` (quantiles over ``n_samples`` z samples), all
++        times ``l_scale``, and ``times``."""
++        if trajectory is None:
++            raise ValueError("pass a Trajectory")
++        mod = self.module
++        was = mod.training
++        mod.eval()
++        with torch.no_grad():
++            t = torch.as_tensor(trajectory.trajectory_latent, dtype=torch.float32,
++                                device=self.device)
++            z_mean, z_scale = mod.decode_z(t)
++            zs = torch.distributions.Normal(z_mean, z_scale).sample((n_samples,))
++            mean = mod.decode_x(z_mean).cpu().numpy() * l_scale
++            samples = mod.decode_x(zs).cpu().numpy() * l_scale
++        mod.train(was)
++        return {"mean": mean, "q25": np.quantile(samples, 0.25, axis=0),
++                "q75": np.quantile(samples, 0.75, axis=0), "times": trajectory.trajectory_time}
++
++    # ------------------------------------------------------------------
++    def load_scvi_weights(self, scvi_model):
++        """Copy the weights of a trained ``scvi.external.Decipher`` (networks and the
++        Pyro parameter ``theta``) into this model (same genes and architecture)."""
++        sd = {k: v.detach().cpu() for k, v in scvi_model.module.state_dict().items()
++              if not k.startswith("_dummy")}
++        import pyro
++        theta = pyro.get_param_store()["theta"].detach().cpu()
++        sd["log_theta"] = torch.log(theta)
++        self.module.load_state_dict(sd)
++        self.module.to(self.device)
++        self.is_trained_ = True
++        self.module.eval()
++        return self
++
++    def __repr__(self):
++        k = self._module_kwargs
++        return (f"Decipher(n_obs={self.adata.n_obs}, n_vars={self.n_vars}, dim_v={k['dim_v']}, "
++                f"dim_z={k['dim_z']}, beta={k['beta']}, trained={self.is_trained_})")
++
++
++__all__ = ["Decipher", "DecipherModule", "Trajectory", "rotate_decipher_components",
++           "compute_decipher_time"]
+diff --git a/omicverse/vi/_train.py b/omicverse/vi/_train.py
+index a0ef28b5e..e0b1da1b2 100644
+--- a/omicverse/vi/_train.py
++++ b/omicverse/vi/_train.py
+@@ -43,6 +43,8 @@ class TrainConfig:
+     compile: bool | str = "auto"  # torch.compile the step (static shapes, dense likelihood)
+     cuda_graph: bool | str = "auto"  # capture the whole training step (CUDA, single process)
+     gradient_clip_val: float | None = None
++    clip_norm: float = 10.0        # element-wise gradient clamp of ``optimizer='ClippedAdam'``
++    drop_last: bool = False        # drop the last incomplete training minibatch of an epoch
+     extra: dict = field(default_factory=dict)  # model-specific (e.g. classification ratio)
+ 
+     @classmethod
+@@ -65,6 +67,62 @@ def kl_weight(cfg: TrainConfig, epoch: int, step: int) -> float:
+     return cfg.max_kl_weight
+ 
+ 
++class ClippedAdam(torch.optim.Optimizer):
++    """Pyro's ``ClippedAdam``: every gradient element is clamped to
++    ``[-clip_norm, clip_norm]``, L2 weight decay is added to the gradient, then a
++    bias-corrected Adam step is taken (learning rate multiplied by ``lrd`` each step).
++
++    The step counter lives in a device tensor, so the update can be captured in a
++    CUDA graph."""
++
++    def __init__(self, params, lr: float = 1e-3, betas=(0.9, 0.999), eps: float = 1e-8,
++                 weight_decay: float = 0.0, clip_norm: float = 10.0, lrd: float = 1.0):
++        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
++                                      clip_norm=clip_norm, lrd=lrd))
++
++    @torch.no_grad()
++    def step(self, closure=None):
++        loss = None
++        if closure is not None:
++            with torch.enable_grad():
++                loss = closure()
++        for group in self.param_groups:
++            if group["lrd"] != 1.0:
++                group["lr"] *= group["lrd"]
++            params = [p for p in group["params"] if p.grad is not None]
++            if not params:
++                continue
++            b1, b2 = group["betas"]
++            c, wd, lr = group["clip_norm"], group["weight_decay"], group["lr"]
++            grads = [p.grad for p in params]
++            torch._foreach_clamp_min_(grads, -c)
++            torch._foreach_clamp_max_(grads, c)
++            if wd:
++                grads = torch._foreach_add(grads, params, alpha=wd)
++            for p in params:
++                st = self.state[p]
++                if not st:
++                    st["step"] = torch.zeros((), dtype=torch.float32, device=p.device)
++                    st["exp_avg"] = torch.zeros_like(p)
++                    st["exp_avg_sq"] = torch.zeros_like(p)
++            m = [self.state[p]["exp_avg"] for p in params]
++            v = [self.state[p]["exp_avg_sq"] for p in params]
++            steps = [self.state[p]["step"] for p in params]
++            torch._foreach_add_(steps, 1.0)
++            torch._foreach_mul_(m, b1)
++            torch._foreach_add_(m, grads, alpha=1 - b1)
++            torch._foreach_mul_(v, b2)
++            torch._foreach_addcmul_(v, grads, grads, value=1 - b2)
++            denom = torch._foreach_sqrt(v)
++            torch._foreach_add_(denom, group["eps"])
++            upd = torch._foreach_div(m, denom)
++            for p, u, t in zip(params, upd, steps):
++                # lr * sqrt(1 - b2^t) / (1 - b1^t)
++                size = lr * torch.sqrt(1 - torch.pow(b2, t)) / (1 - torch.pow(b1, t))
++                p.sub_(u * size)
++        return loss
++
++
+ def make_optimizer(params, cfg: TrainConfig, device, capturable: bool = False):
+     """``params``: a flat iterable of ``nn.Parameter`` (the common case) or
+     ``module.optim_parameters()``'s pre-built param groups (dicts with a
+@@ -72,13 +130,16 @@ def make_optimizer(params, cfg: TrainConfig, device, capturable: bool = False):
+     RESOLVI's faster-lr group for its per-cell / per-component point
+     estimates) -- the latter pass straight to the optimiser, filtered the
+     same way."""
+-    opt_cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}[cfg.optimizer.lower()]
+     params = list(params)
+     if params and isinstance(params[0], dict):
+         groups = [{**g, "params": [p for p in g["params"] if p.requires_grad]} for g in params]
+         params = [g for g in groups if g["params"]]
+     else:
+         params = [p for p in params if p.requires_grad]
++    if cfg.optimizer.lower() == "clippedadam":
++        return ClippedAdam(params, lr=cfg.lr, eps=cfg.eps, weight_decay=cfg.weight_decay,
++                           clip_norm=cfg.clip_norm)
++    opt_cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW}[cfg.optimizer.lower()]
+     kw = dict(lr=cfg.lr, eps=cfg.eps, weight_decay=cfg.weight_decay)
+     if capturable:
+         kw["capturable"] = True
+@@ -277,12 +338,20 @@ def __call__(self, b, kl_weight=1.0):
+ 
+ def evaluate(module, batches, device, cfg: TrainConfig | None = None, kl_w: float = 1.0,
+              reduce=None, suffix="validation") -> dict:
+-    """Mean ELBO terms of ``module`` over ``batches`` (eval mode, no grad)."""
++    """Mean ELBO terms of ``module`` over ``batches`` (eval mode, no grad).
++
++    Reparameterised sampling inside the forward pass (and any
++    importance-weighted NLL, e.g. Decipher's ``marginal_ll``) draws from the
++    global torch RNG even in eval mode; forking it here keeps a validation
++    pass from perturbing the training-noise stream of the epochs that follow
++    (``fit`` would otherwise produce a different, validation-frequency-
++    dependent trajectory for the same ``seed``)."""
+     cfg = cfg or TrainConfig()
+     was = module.training
+     module.eval()
+     meter = _Meter(device)
+-    with torch.no_grad(), _autocast(cfg, device):
++    devs = [device] if device.type == "cuda" else []
++    with torch.random.fork_rng(devices=devs), torch.no_grad(), _autocast(cfg, device):
+         for b in batches:
+             out = module(b, kl_weight=kl_w)
+             meter.add(out, b["x"].shape[0])
+@@ -306,7 +375,9 @@ def fit(model, source, train_rows, val_rows, *, max_epochs, batch_size, shuffle,
+     if fast is not None and not fast.enabled:
+         fast = None
+     use_graph = (device.type == "cuda" and world == 1 and cfg.cuda_graph not in (False, None)
+-                 and not cfg.gradient_clip_val and not getattr(module, "has_extra_step", False))
++                 and not cfg.gradient_clip_val and not getattr(module, "has_extra_step", False)
++                 and getattr(module, "cuda_graph_safe", True))
++    epoch_hook = getattr(module, "on_train_epoch_start", None)
+     params = module.optim_parameters() if hasattr(module, "optim_parameters") else \
+         module.parameters()
+     opt = make_optimizer(params, cfg, device, capturable=use_graph)
+@@ -353,6 +424,8 @@ def reduce(v):
+         epoch = start_epoch + e
+         t0 = time.perf_counter()
+         module.train()
++        if epoch_hook is not None:
++            epoch_hook(epoch)
+         meter = _Meter(device)
+         n_batches = None
+         if world > 1:
+@@ -362,7 +435,8 @@ def reduce(v):
+         aux = aux_fn(epoch, "train") if aux_fn is not None else None
+         for b in source.iterate(train_rows, batch_size=batch_size, shuffle=shuffle, seed=seed,
+                                 epoch=epoch, buffer_blocks=buffer_blocks, rank=rank,
+-                                world=world, n_batches=n_batches, drop_last=world > 1,
++                                world=world, n_batches=n_batches,
++                                drop_last=cfg.drop_last or world > 1,
+                                 aux_rows=aux):
+             if cfg.n_steps_kl_warmup:
+                 kw = kl_weight(cfg, epoch, step)
+@@ -433,4 +507,4 @@ def reduce(v):
+     return history
+ 
+ 
+-__all__ = ["TrainConfig", "fit", "evaluate", "kl_weight", "make_optimizer"]
++__all__ = ["TrainConfig", "ClippedAdam", "fit", "evaluate", "kl_weight", "make_optimizer"]
+diff --git a/tests/vi/test_decipher.py b/tests/vi/test_decipher.py
+new file mode 100644
+index 000000000..a6bcff6a5
+--- /dev/null
++++ b/tests/vi/test_decipher.py
+@@ -0,0 +1,162 @@
++"""ov.vi.Decipher: two-level VAE with an interpretable 2-D latent ``v``.
++
++Fast CPU-only checks on a synthetic 1-D differentiation trajectory (continuous
++pseudotime ``obs['time']`` plus a discretised ``obs['stage']``): the model
++trains, its Decipher space recovers the trajectory (Spearman vs. the known
++pseudotime), the trajectory / rotation utilities work, and in-memory,
++AnnDataOOM and Dask-backed AnnData give identical results for a fixed seed.
++"""
++import numpy as np
++import pandas as pd
++import pytest
++import scipy.sparse as sp
++
++torch = pytest.importorskip("torch")
++ad = pytest.importorskip("anndata")
++
++from .test_data import _KEEP  # noqa: E402
++
++
++def _traj_counts(n=1500, g=150, seed=0):
++    """Cells spread along a 1-D pseudotime ``t`` in [0, 1); gene log-means vary
++    smoothly (linearly + quadratically) with ``t``, giving a continuous
++    trajectory with a known ground-truth ordering."""
++    rs = np.random.default_rng(seed)
++    t = rs.random(n)
++    a_coef = rs.normal(0, 1.3, g)
++    b_coef = rs.normal(0, 0.8, g)
++    base = np.log(rs.gamma(2.0, 1.0, g) + 0.1)
++    log_mean = base[None, :] + a_coef[None, :] * t[:, None] + b_coef[None, :] * (t[:, None] ** 2)
++    prop = np.exp(log_mean - log_mean.max(1, keepdims=True))
++    prop /= prop.sum(1, keepdims=True)
++    lib = rs.lognormal(7.3, 0.3, n)
++    X = sp.csr_matrix(rs.poisson(prop * lib[:, None]).astype(np.float32))
++    a = ad.AnnData(X)
++    a.obs_names = [f"c{i}" for i in range(n)]
++    a.var_names = [f"G{j}" for j in range(g)]
++    a.layers["counts"] = a.X.copy()
++    a.obs["time"] = t
++    a.obs["stage"] = pd.Categorical(pd.cut(t, bins=[-0.01, 0.33, 0.66, 1.01],
++                                           labels=["early", "mid", "late"]))
++    return a
++
++
++def _train(adata, **kw):
++    from omicverse.vi import Decipher
++    m = Decipher(adata, layer=kw.pop("layer", "counts"), genes=kw.pop("genes", None),
++                dim_v=2, dim_z=8, seed=0)
++    m.train(max_epochs=kw.pop("max_epochs", 60), batch_size=kw.pop("batch_size", 128),
++            device="cpu", progress=False, train_size=kw.pop("train_size", None), seed=0, **kw)
++    return m
++
++
++def test_decipher_trains_and_recovers_trajectory(tmp_path):
++    from scipy.stats import spearmanr
++    torch.set_num_threads(4)
++    a = _traj_counts()
++    m = _train(a)
++    assert m.is_trained_
++    # loss improves over training
++    elbo = m.history_["elbo_train"]
++    assert elbo[-1] < elbo[0]
++    v = m.get_latent_representation()
++    z = m.get_latent_representation(give_z=True)
++    assert v.shape == (a.n_obs, 2) and z.shape == (a.n_obs, 8)
++    assert np.isfinite(v).all() and np.isfinite(z).all()
++    # at least one Decipher-space axis tracks the ground-truth pseudotime
++    rho = max(abs(spearmanr(v[:, k], a.obs["time"]).statistic) for k in range(2))
++    assert rho > 0.6, f"best |spearman| with true pseudotime = {rho:.3f}"
++    nll = m.get_marginal_ll(n_samples=10)
++    assert np.isfinite(nll)
++    # save / load round trip
++    m.save(str(tmp_path / "d"))
++    m2 = type(m).load(str(tmp_path / "d"), adata=a, device="cpu")
++    assert np.allclose(m2.get_latent_representation(), v, atol=1e-5)
++
++
++def test_rotate_components_and_decipher_time():
++    from omicverse.vi import Trajectory, rotate_decipher_components, compute_decipher_time
++    from scipy.stats import spearmanr
++    a = _traj_counts(seed=1)
++    m = _train(a, max_epochs=80)
++    a.obsm["decipher_v"] = m.get_latent_representation()
++    a.obsm["decipher_z"] = m.get_latent_representation(give_z=True)
++    v, z, rot = rotate_decipher_components(
++        a, "decipher_v", "decipher_z", v1_obs_col="stage",
++        v1_order=["early", "mid", "late"])
++    assert v.shape == a.obsm["decipher_v"].shape and rot.shape == (2, 2)
++    assert np.allclose(np.linalg.det(rot) ** 2, 1.0, atol=1e-6)  # rotation/reflection
++    a.obsm["decipher_v_rot"] = v
++    traj = Trajectory.from_clusters(a, "decipher_v_rot", "stage", ["early", "mid", "late"])
++    assert traj.trajectory_latent.shape[1] == 2 and traj.n_points > 0
++    dt = compute_decipher_time(a, "stage", traj)
++    ok = np.isfinite(dt)
++    assert ok.all()  # every cell falls in one of the trajectory's clusters
++    rho = spearmanr(dt[ok], a.obs["time"].values[ok]).statistic
++    assert abs(rho) > 0.5, f"decipher time vs. true pseudotime rho = {rho:.3f}"
++
++
++def test_compute_imputed_expression_and_gene_patterns():
++    from omicverse.vi import Trajectory
++    a = _traj_counts(n=600, g=80, seed=2)
++    m = _train(a, max_epochs=30)
++    imputed = m.compute_imputed_gene_expression()
++    assert imputed.shape == (a.n_obs, 80) and (imputed >= 0).all()
++    a.obsm["decipher_v"] = m.get_latent_representation()
++    a.obsm["decipher_z"] = m.get_latent_representation(give_z=True)
++    cov_v, cov_z = m.compute_imputed_gene_expression(
++        compute_covariances=True, v_obsm_key="decipher_v", z_obsm_key="decipher_z",
++        return_imputed=False)
++    assert cov_v.shape == (80, 2) and cov_z.shape == (80, 8) and np.isfinite(cov_v).all()
++    traj = Trajectory.from_clusters(a, "decipher_v", "stage", ["early", "mid", "late"])
++    pat = m.compute_gene_patterns(trajectory=traj, n_samples=20)
++    npts = len(pat["times"])
++    assert pat["mean"].shape == (npts, 80)
++    assert pat["q25"].shape == pat["q75"].shape == (npts, 80)
++    assert (pat["q25"] <= pat["q75"] + 1e-3).all()  # quantiles are ordered
++    assert np.isfinite(pat["mean"]).all() and (pat["mean"] >= 0).all()
++
++
++def test_decipher_oom_and_dask_match_in_memory(tmp_path):
++    import omicverse as ov
++    a = _traj_counts(n=800, g=100, seed=4)
++    path = tmp_path / "traj.h5ad"
++    a.write_h5ad(path)
++    # layer=None (.X) throughout (dask-backed AnnData only exposes X, not layers);
++    # the same explicit block shuffle on every source so minibatches line up exactly
++    bkw = dict(shuffle="block", block_size=200, buffer_blocks=4)
++    mem = ov.read(str(path))
++    z_mem = _train(mem, layer=None, max_epochs=10, **bkw).get_latent_representation()
++
++    ov.settings.cpu_init()
++    oom = ov.read(str(path), storage="disk")
++    _KEEP.append(oom)
++    m_oom = _train(oom, layer=None, max_epochs=10, **bkw)
++    assert m_oom._source().kind == "h5"
++    assert np.allclose(z_mem, m_oom.get_latent_representation(), atol=1e-5)
++
++    pytest.importorskip("dask")
++    from omicverse.pp._dask import read_h5ad
++    da_ad = read_h5ad(str(path), chunk_size=200, device="cpu")
++    m_da = _train(da_ad, layer=None, max_epochs=10, **bkw)
++    assert m_da._source().kind == "dask"
++    assert np.allclose(z_mem, m_da.get_latent_representation(), atol=1e-5)
++
++
++def test_single_decipher_wrapper():
++    import omicverse as ov
++    a = _traj_counts(n=500, g=60, seed=5)
++    model = ov.single.decipher(a, layer="counts",
++                               model_kwargs={"dim_v": 2, "dim_z": 6, "seed": 0},
++                               train_kwargs={"max_epochs": 10, "device": "cpu",
++                                             "progress": False})
++    assert "X_decipher" in a.obsm and a.obsm["X_decipher"].shape == (500, 2)
++    assert model.is_trained_
++    with pytest.raises(KeyError):
++        ov.single.decipher(a, layer="counts",
++                           train_kwargs={"max_epochs": 1, "device": "cpu", "progress": False})
++    model2 = ov.single.decipher(a, layer="counts", key_added_z="X_decipher_z", overwrite=True,
++                                model_kwargs={"seed": 0},
++                                train_kwargs={"max_epochs": 10, "device": "cpu",
++                                              "progress": False})
++    assert "X_decipher_z" in a.obsm and model2.is_trained_

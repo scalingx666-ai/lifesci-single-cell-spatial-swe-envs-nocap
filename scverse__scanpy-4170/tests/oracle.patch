@@ -1,0 +1,599 @@
+diff --git a/docs/release-notes/4170.feat.md b/docs/release-notes/4170.feat.md
+new file mode 100644
+index 0000000000..529090f188
+--- /dev/null
++++ b/docs/release-notes/4170.feat.md
+@@ -0,0 +1 @@
++Add `flavor="networkit"` to {func}`~scanpy.tl.leiden` for parallel Leiden clustering via NetworKit (install `scanpy[networkit]`) {smaller}`amalia-k510`
+diff --git a/pyproject.toml b/pyproject.toml
+index 8568ac01c9..5e88094e05 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -88,6 +88,7 @@ dask = [ "anndata[dask]", "dask[array]>=2024.10" ]
+ # PCA acceleration
+ dask-ml = [ "dask-ml", "scanpy[dask]" ]
+ leiden = [ "igraph>=1", "leidenalg>=0.11" ]
++networkit = [ "networkit>=11.3" ]
+ louvain = [ "igraph", "louvain>=0.8.2", "setuptools" ]
+ magic = [ "magic-impute>=2.0.4" ]
+ paga = [ "igraph" ]
+@@ -117,6 +118,7 @@ test = [
+     "scanpy[dask]",
+     "scanpy[illico]",
+     "scanpy[leiden]",
++    "scanpy[networkit]",
+     "scanpy[plotting]",
+     "scanpy[scrublet]",
+     "scanpy[skmisc]",
+@@ -287,8 +289,8 @@ filterwarnings = [
+     "default::numba.core.errors.NumbaPerformanceWarning",
+     # we should set init=obsm["X_pca"] or so
+     "default:.*TSNE.*random.*to.*pca:FutureWarning",
+-    # igraph vs leidenalg warning
+-    "ignore:The `igraph` implementation of leiden clustering:UserWarning",
++    # igraph/networkit vs leidenalg warning
++    "ignore:The `igraph` and `networkit` implementations of leiden clustering:UserWarning",
+     # everybody uses this zarr 3 feature, including us, XArray, lots of data out there …
+     "ignore:Consolidated metadata is currently not part:UserWarning",
+     # joblib fallback to serial mode in restricted multiprocessing environments
+diff --git a/src/scanpy/_settings/presets.py b/src/scanpy/_settings/presets.py
+index fe1902b04f..0091dfe8bf 100644
+--- a/src/scanpy/_settings/presets.py
++++ b/src/scanpy/_settings/presets.py
+@@ -40,7 +40,7 @@
+     "logreg", "t-test", "wilcoxon", "wilcoxon_illico", "t-test_overestim_var"
+ ]
+ type HVGFlavor = Literal["seurat", "cell_ranger", "seurat_v3", "seurat_v3_paper"]
+-type LeidenFlavor = Literal["leidenalg", "igraph"]
++type LeidenFlavor = Literal["leidenalg", "igraph", "networkit"]
+ 
+ 
+ @dataclass
+@@ -113,7 +113,8 @@ class ScoreGenesPreset(NamedTuple):
+ 
+ class LeidenPreset(NamedTuple):
+     flavor: LeidenFlavor
+-    directed: bool | None
++    directed: bool | frozenset[LeidenFlavor] | None
++    """A set means “directed for these flavors”."""
+ 
+ 
+ preset_postprocessors: list[Callable[[], None]] = []
+@@ -293,7 +294,9 @@ def leiden() -> Mapping[Preset, LeidenPreset]:
+         """Settings for :func:`~scanpy.tl.leiden`."""  # noqa: D401
+         return {
+             Preset.ScanpyV1: LeidenPreset(flavor="leidenalg", directed=None),
+-            Preset.ScanpyV2Preview: LeidenPreset(flavor="igraph", directed=True),
++            Preset.ScanpyV2Preview: LeidenPreset(
++                flavor="igraph", directed=frozenset({"igraph", "leidenalg"})
++            ),
+         }
+ 
+     @contextmanager
+diff --git a/src/scanpy/_utils/__init__.py b/src/scanpy/_utils/__init__.py
+index e36e491197..2a7cc6d68d 100644
+--- a/src/scanpy/_utils/__init__.py
++++ b/src/scanpy/_utils/__init__.py
+@@ -75,6 +75,7 @@
+     "expose_dispatch",
+     "get_igraph_from_adjacency",
+     "get_literal_vals",
++    "get_networkit_from_adjacency",
+     "indent",
+     "is_backed_type",
+     "own_deprecations",
+@@ -101,6 +102,17 @@ def ensure_igraph() -> None:
+     raise ImportError(msg)
+ 
+ 
++def ensure_networkit() -> None:
++    if importlib.util.find_spec("networkit"):
++        return
++    msg = (
++        "Please install the networkit package: "
++        "`conda install conda-forge::networkit` or "
++        "`pip install networkit`."
++    )
++    raise ImportError(msg)
++
++
+ def _getdoc(c_or_f: Callable | type) -> str | None:
+     if getattr(c_or_f, "__doc__", None) is None:
+         return None
+@@ -307,6 +319,19 @@ def get_igraph_from_adjacency(adjacency: CSBase, *, directed: bool) -> Graph:
+     return g
+ 
+ 
++def get_networkit_from_adjacency(adjacency: CSBase, *, weighted: bool = True):
++    """Get a NetworKit graph from an adjacency matrix.
++
++    Used func:`networkit.GraphFromCsr` (networkit/networkit#1422)
++    """
++    import networkit as nk
++    import scipy.sparse as sps
++
++    assert adjacency.shape is not None
++    upper = sps.triu(adjacency, k=1).tocsr()
++    return nk.GraphFromCsr(upper, directed=False, weighted=weighted)
++
++
+ # --------------------------------------------------------------------------------
+ # Group stuff
+ # --------------------------------------------------------------------------------
+diff --git a/src/scanpy/tools/_leiden.py b/src/scanpy/tools/_leiden.py
+index 53e3f67073..bf1d13246c 100644
+--- a/src/scanpy/tools/_leiden.py
++++ b/src/scanpy/tools/_leiden.py
+@@ -1,5 +1,9 @@
+ from __future__ import annotations
+ 
++import importlib.util
++import os
++from collections.abc import Sequence
++from types import SimpleNamespace
+ from typing import TYPE_CHECKING, cast
+ 
+ import numpy as np
+@@ -18,8 +22,7 @@
+     doc_out_key,
+     doc_rng,
+ )
+-from .._settings import Default
+-from .._settings.presets import LeidenPreset
++from .._settings import Default, settings
+ from .._utils import _doc_params
+ from .._utils.random import _accepts_legacy_random_state, _LegacyRng, _set_igraph_rng
+ from ..get._out import _out_key, deprecated_copy
+@@ -35,10 +38,8 @@
+ from ._utils_clustering import rename_groups, restrict_adjacency
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Sequence
+-
+     from anndata import AnnData
+-    from igraph import Graph
++    from igraph import Graph, VertexClustering
+ 
+     from .._compat import CSBase
+     from .._settings.presets import LeidenFlavor
+@@ -86,11 +87,14 @@ def leiden(  # noqa: PLR0913
+     *,
+     restrict_to: tuple[str, Sequence[str]] | None = None,
+     rng: SeedLike | RNGLike | None = None,
+-    directed: bool | Default | None = Default(preset=("leiden", "directed")),
++    directed: bool | Default | None = Default(
++        repr="None (in 2.0: True for 'igraph' and 'leidenalg')"
++    ),
+     use_weights: bool = True,
+     n_iterations: int = -1,
+     partition_type: type[MutableVertexPartition] | None = None,
+     flavor: LeidenFlavor | Default = Default(preset=("leiden", "flavor")),
++    n_jobs: int | None = None,
+     use: GraphAcc | str | None = None,
+     out: VecRef | bool = False,
+     # deprecated
+@@ -124,7 +128,8 @@ def leiden(  # noqa: PLR0913
+     {restrict_to}
+     directed
+         Whether to treat the graph as directed or undirected.
+-        `None` means directed for `flavor='leidenalg'` and undirected for `flavor='igraph'`.
++        `None` means directed for `flavor='leidenalg'` and undirected otherwise.
++        `flavor='networkit'` only supports undirected graphs.
+     use_weights
+         If `True`, edge weights from the graph are used in the computation
+         (placing more emphasis on stronger edges).
+@@ -140,6 +145,12 @@ def leiden(  # noqa: PLR0913
+         :func:`~leidenalg.find_partition`.
+     flavor
+         Which package's implementation to use.
++        `'networkit'` runs in parallel (see `n_jobs`).
++    n_jobs
++        Number of threads for `flavor='networkit'` (`-1` means all cores).
++        With multiple threads, results for the same `rng` are similar but not identical,
++        so `None` means :attr:`scanpy.settings.n_jobs` if `rng=None` is passed
++        and `1` otherwise, for exact reproducibility.
+     {use}
+     {out}
+     {adjacency}
+@@ -176,6 +187,9 @@ def leiden(  # noqa: PLR0913
+     )
+     _utils.ensure_igraph()
+     clustering_args = dict(clustering_args)
++    if n_jobs is None:
++        # unseeded runs needn’t be reproducible, so they can be parallel
++        n_jobs = settings.n_jobs if rng is None else 1
+     rng = np.random.default_rng(rng)
+     meta_random_state = (
+         dict(random_state=rng.arg) if isinstance(rng, _LegacyRng) else {}
+@@ -224,23 +238,24 @@ def leiden(  # noqa: PLR0913
+             "MutableVertexPartition",
+             leidenalg.find_partition(g, partition_type, seed=seed, **clustering_args),
+         )
++    elif flavor == "networkit":
++        part = _leiden_networkit(
++            adjacency,
++            rng=rng,
++            n_jobs=n_jobs,
++            use_weights=use_weights,
++            n_iterations=n_iterations,
++            resolution=resolution,
++        )
+     else:
+-        g = _utils.get_igraph_from_adjacency(adjacency, directed=directed)
+-        if use_weights:
+-            clustering_args["weights"] = "weight"
+-        if resolution is not None:
+-            clustering_args["resolution"] = resolution
+-        clustering_args.setdefault("objective_function", "modularity")
+-        if (
+-            directed
+-            and clustering_args["objective_function"] == "modularity"
+-            and clustering_args.keys().isdisjoint({"node_weights", "node_in_weights"})
+-        ):
+-            clustering_args |= _directed_node_weights(
+-                g, weights=clustering_args.get("weights")
+-            )
+-        with _set_igraph_rng(rng):
+-            part = g.community_leiden(**clustering_args)
++        part = _leiden_igraph(
++            adjacency,
++            rng=rng,
++            directed=directed,
++            use_weights=use_weights,
++            resolution=resolution,
++            clustering_args=clustering_args,
++        )
+     # store output into adata.obs
+     groups = np.array(part.membership)
+     if restrict_to is not None:
+@@ -276,6 +291,81 @@ def leiden(  # noqa: PLR0913
+     return None
+ 
+ 
++def _leiden_networkit(
++    adjacency: CSBase,
++    *,
++    rng: np.random.Generator,
++    n_jobs: int,
++    use_weights: bool,
++    n_iterations: int,
++    resolution: float | None,
++) -> SimpleNamespace:
++    _utils.ensure_networkit()
++    import networkit
++
++    # Seeding controls which nodes are tried and in what order, but not
++    # which thread wins when two move neighboring nodes simultaneously.
++    # So runs are statistically reproducible, but only bit-for-bit identical
++    # when single-threaded (a fixed thread count > 1 is not enough).
++    seed = int(rng.integers(np.iinfo(np.int64).max))
++    networkit.setSeed(seed, useThreadId=True)
++
++    # only undirected for Parallel Leiden
++    g = _utils.get_networkit_from_adjacency(adjacency, weighted=use_weights)
++    # NetworKit's `iterations` caps Leiden passes (stops early on convergence; default is 3).
++    # We map scanpy's `n_iterations=-1` ("run until done") to this default,
++    # while any positive value explicitly overrides it.
++    iterations = n_iterations if n_iterations > 0 else 3
++    gamma = 1.0 if resolution is None else resolution
++    # randomization was removed as an option, so it is randomize = True
++    algorithm = networkit.community.ParallelLeiden(
++        g, iterations=iterations, gamma=gamma
++    )
++    prev_n_threads = networkit.getCurrentNumberOfThreads()
++    networkit.setNumberOfThreads(n_jobs if n_jobs > 0 else os.process_cpu_count() or 1)
++    try:
++        algorithm.run()
++    finally:
++        networkit.setNumberOfThreads(prev_n_threads)
++    nk_part = algorithm.getPartition()
++    # NetworKit's Partition exposes getVector() for the labels and a
++    # separate Modularity measure, rather than .membership / .modularity.
++    return SimpleNamespace(
++        membership=np.asarray(nk_part.getVector()),
++        modularity=networkit.community.Modularity().getQuality(nk_part, g),
++    )
++
++
++def _leiden_igraph(
++    adjacency: CSBase,
++    *,
++    rng: np.random.Generator,
++    directed: bool,
++    use_weights: bool,
++    resolution: float | None,
++    clustering_args: dict[str, object],
++) -> VertexClustering:
++    g = _utils.get_igraph_from_adjacency(adjacency, directed=directed)
++    _maybe_suggest_networkit(g)
++    if use_weights:
++        clustering_args["weights"] = "weight"
++    if resolution is not None:
++        clustering_args["resolution"] = resolution
++    clustering_args.setdefault("objective_function", "modularity")
++    if (
++        directed
++        and clustering_args["objective_function"] == "modularity"
++        and clustering_args.keys().isdisjoint({"node_weights", "node_in_weights"})
++    ):
++        weights = clustering_args.get("weights")
++        if not (weights is None or isinstance(weights, str | Sequence)):
++            msg = f"`weights` must be a str or sequence, got {type(weights).__name__}."
++            raise TypeError(msg)
++        clustering_args |= _directed_node_weights(g, weights=weights)
++    with _set_igraph_rng(rng):
++        return g.community_leiden(**clustering_args)
++
++
+ def _directed_node_weights(
+     g: Graph, *, weights: str | Sequence[float] | None
+ ) -> dict[str, list[float]]:
+@@ -291,22 +381,28 @@ def _validate_flavor(
+     *,
+     partition_type: object | None,
+     directed: bool | Default | None,
+-) -> LeidenPreset:
++) -> tuple[LeidenFlavor, bool]:
+     from scanpy import settings
+ 
+     if was_default := (flavor is None or isinstance(flavor, Default)):
+         flavor = settings.preset.leiden.flavor
+-    if isinstance(directed, Default):
+-        directed = settings.preset.leiden.directed
++    is_directed = _resolve_directed(directed, flavor=flavor)
+     match flavor:
+         case "igraph":
+             if partition_type is not None:
+                 msg = "Do not pass in partition_type argument when using igraph."
+                 raise ValueError(msg)
++        case "networkit":
++            if is_directed:
++                msg = "Cannot use NetworKit's leiden implementation with a directed graph."
++                raise ValueError(msg)
++            if partition_type is not None:
++                msg = "Do not pass in partition_type argument when using networkit."
++                raise ValueError(msg)
+         case "leidenalg":
+             msg = (
+-                "The `igraph` implementation of leiden clustering is *orders of magnitude faster*. "
+-                "Set the flavor argument to (and install if needed) 'igraph' to use it."
++                "The `igraph` and `networkit` implementations of leiden clustering are *orders of magnitude faster*. "
++                "Set the flavor argument to (and install if needed) 'igraph' or 'networkit' to use them."
+             )
+             if was_default:
+                 msg += (
+@@ -322,8 +418,31 @@ def _validate_flavor(
+                 )
+                 raise
+         case _:
+-            msg = f"flavor must be either 'igraph' or 'leidenalg', but {flavor!r} was passed."
++            msg = f"flavor must be either 'igraph', 'leidenalg', or 'networkit', but {flavor!r} was passed."
+             raise ValueError(msg)
+-    if directed is None:
+-        directed = flavor == "leidenalg"
+-    return LeidenPreset(flavor, directed)
++    return flavor, is_directed
++
++
++def _resolve_directed(directed: bool | Default | None, *, flavor: str) -> bool:  # noqa: FBT001
++    from scanpy import settings
++
++    resolved = (
++        settings.preset.leiden.directed if isinstance(directed, Default) else directed
++    )
++    if isinstance(resolved, frozenset):
++        return flavor in resolved
++    return flavor == "leidenalg" if resolved is None else resolved
++
++
++def _maybe_suggest_networkit(g: Graph) -> None:
++    """Encourage users toward the parallel NetworKit backend on large graphs."""
++    _networkit_edge_heuristic = 500000
++    if g.ecount() < _networkit_edge_heuristic:
++        return
++    if importlib.util.find_spec("networkit") is None:
++        return
++    logg.hint(
++        f"Graph has {g.ecount():,} edges; NetworKit's parallel Leiden "
++        f"(`flavor='networkit'`) is typically several times faster than "
++        f"igraph's serial implementation."
++    )
+diff --git a/src/testing/scanpy/_pytest/marks.py b/src/testing/scanpy/_pytest/marks.py
+index 629d4e1766..060aecde09 100644
+--- a/src/testing/scanpy/_pytest/marks.py
++++ b/src/testing/scanpy/_pytest/marks.py
+@@ -71,6 +71,7 @@ def _generate_next_value_(
+     gprofiler = "gprofiler-official"
+     leidenalg = auto()
+     louvain = auto()
++    networkit = auto()
+     openpyxl = auto()
+     igraph = auto()
+     pybiomart = auto()
+diff --git a/tests/test_clustering.py b/tests/test_clustering.py
+index 6f5b6f11f7..846e00df56 100644
+--- a/tests/test_clustering.py
++++ b/tests/test_clustering.py
+@@ -17,6 +17,8 @@
+ if TYPE_CHECKING:
+     from typing import Literal
+ 
++    from pytest_mock import MockerFixture
++
+ 
+ @pytest.fixture
+ def adata_neighbors() -> AnnData:
+@@ -33,9 +35,12 @@ def _leiden_copy(adata: AnnData, **kwargs) -> AnnData:
+     params=[
+         pytest.param("igraph", marks=needs.igraph),
+         pytest.param("leidenalg", marks=needs.leidenalg),
++        pytest.param("networkit", marks=needs.networkit),
+     ]
+ )
+-def flavor(request: pytest.FixtureRequest) -> Literal["igraph", "leidenalg"]:
++def flavor(
++    request: pytest.FixtureRequest,
++) -> Literal["igraph", "leidenalg", "networkit"]:
+     return request.param
+ 
+ 
+@@ -45,15 +50,16 @@ def flavor(request: pytest.FixtureRequest) -> Literal["igraph", "leidenalg"]:
+ @pytest.mark.parametrize("n_iterations", [-1, 3])
+ def test_leiden_basic(
+     adata_neighbors: AnnData,
+-    flavor: Literal["igraph", "leidenalg"],
++    flavor: Literal["igraph", "leidenalg", "networkit"],
+     resolution: float,
+     n_iterations: int,
+ ) -> None:
+     with (
+         nullcontext()
+-        if flavor == "igraph"
++        if flavor in {"igraph", "networkit"}
+         else pytest.warns(
+-            UserWarning, match=r"The `igraph` implementation of leiden clustering"
++            UserWarning,
++            match=r"The `igraph` and `networkit` implementations of leiden clustering",
+         )
+     ):
+         sc.tl.leiden(
+@@ -74,7 +80,7 @@ def test_leiden_basic(
+ def test_leiden_random_state(
+     subtests: pytest.Subtests,
+     adata_neighbors: AnnData,
+-    flavor: Literal["igraph", "leidenalg"],
++    flavor: Literal["igraph", "leidenalg", "networkit"],
+     rng_arg: Literal["rng", "random_state"],
+ ) -> None:
+     is_leiden_alg = flavor == "leidenalg"
+@@ -87,7 +93,8 @@ def test_leiden_random_state(
+             n_iterations=n_iterations,
+             **{rng_arg: seed},
+         )
+-        for seed in (1, 1, 42)
++        # some seeds give the same partition as 1 for some flavor, 8 differs for all
++        for seed in (1, 1, 8)
+     )
+     with subtests.test("reproducible"):
+         pd.testing.assert_series_equal(
+@@ -128,6 +135,59 @@ def test_leiden_igraph_directed():
+     assert normalized_mutual_info_score(igraph, leidenalg) == 1
+ 
+ 
++@needs.networkit
++@pytest.mark.parametrize(
++    ("kwargs", "expected"),
++    [
++        pytest.param({}, 1, id="default"),
++        pytest.param({"rng": 0}, 1, id="seeded"),
++        pytest.param({"rng": None}, 3, id="unseeded"),
++        pytest.param({"rng": 0, "n_jobs": 2}, 2, id="explicit"),
++    ],
++)
++def test_leiden_networkit_n_jobs(
++    mocker: MockerFixture,
++    adata_neighbors: AnnData,
++    kwargs: dict[str, int | None],
++    expected: int,
++) -> None:
++    import networkit
++
++    sc.settings.n_jobs = 3
++    spy = mocker.spy(networkit, "setNumberOfThreads")
++    sc.tl.leiden(adata_neighbors, flavor="networkit", **kwargs)
++    assert spy.call_args_list[0].args == (expected,)
++
++
++@needs.networkit
++def test_leiden_networkit_directed(adata_neighbors):
++    with pytest.raises(ValueError, match=r"Cannot use NetworKit's leiden.*directed"):
++        sc.tl.leiden(adata_neighbors, flavor="networkit", directed=True)
++
++
++@pytest.mark.parametrize("flavor", ["igraph", "leidenalg", "networkit"])
++@pytest.mark.parametrize(
++    ("preset", "directed_flavors"),
++    [
++        pytest.param(sc.Preset.ScanpyV1, {"leidenalg"}, id="v1"),
++        pytest.param(
++            sc.Preset.ScanpyV2Preview,
++            {"igraph", "leidenalg"},
++            marks=needs.scanpy2,
++            id="v2",
++        ),
++    ],
++)
++def test_leiden_directed_default(
++    preset: sc.Preset, directed_flavors: set[str], flavor: str
++) -> None:
++    from scanpy._settings import Default
++    from scanpy.tools._leiden import _resolve_directed
++
++    sc.settings.preset = preset
++    assert _resolve_directed(Default(), flavor=flavor) is (flavor in directed_flavors)
++
++
+ @needs.igraph
+ def test_leiden_wrong_flavor(adata_neighbors):
+     with pytest.raises(ValueError, match=r"flavor must be.*'igraph'.*'leidenalg'.*but"):
+@@ -147,37 +207,49 @@ def test_leiden_igraph_partition_type(adata_neighbors):
+         )
+ 
+ 
++@pytest.fixture(
++    params=[
++        pytest.param("igraph", marks=needs.igraph),
++        pytest.param("networkit", marks=needs.networkit),
++    ]
++)
++def fast_flavor(request: pytest.FixtureRequest) -> Literal["igraph", "networkit"]:
++    return request.param
++
++
+ @needs.leidenalg
+-@needs.igraph
+-def test_leiden_equal_defaults_same_args(adata_neighbors):
+-    """Ensure the two implementations are the same for the same args."""
++def test_leiden_equal_defaults_same_args(
++    adata_neighbors: AnnData, fast_flavor: Literal["igraph", "networkit"]
++) -> None:
++    """Ensure the implementations are the same for the same args."""
+     leiden_alg_clustered = _leiden_copy(
+         adata_neighbors, flavor="leidenalg", n_iterations=2
+     )
+-    igraph_clustered = _leiden_copy(
+-        adata_neighbors, flavor="igraph", directed=False, n_iterations=2
++    fast_clustered = _leiden_copy(
++        adata_neighbors, flavor=fast_flavor, directed=False, n_iterations=2
+     )
+     assert (
+         normalized_mutual_info_score(
+-            leiden_alg_clustered.obs["leiden"], igraph_clustered.obs["leiden"]
++            leiden_alg_clustered.obs["leiden"], fast_clustered.obs["leiden"]
+         )
+         > 0.9
+     )
+ 
+ 
+ @needs.leidenalg
+-@needs.igraph
+-def test_leiden_equal_defaults(adata_neighbors):
++def test_leiden_equal_defaults(
++    adata_neighbors: AnnData, fast_flavor: Literal["igraph", "networkit"]
++) -> None:
+     """Ensure that the old leidenalg defaults are close enough to the current default outputs."""
+     leiden_alg_clustered = _leiden_copy(
+         adata_neighbors, flavor="leidenalg", directed=True
+     )
+-    igraph_clustered = _leiden_copy(
+-        adata_neighbors, flavor="igraph", n_iterations=2, directed=False
++    fast_clustered = _leiden_copy(
++        adata_neighbors, flavor=fast_flavor, n_iterations=2, directed=False
+     )
+     assert (
+         normalized_mutual_info_score(
+-            leiden_alg_clustered.obs["leiden"], igraph_clustered.obs["leiden"]
++            leiden_alg_clustered.obs["leiden"], fast_clustered.obs["leiden"]
+         )
+         > 0.9
+     )

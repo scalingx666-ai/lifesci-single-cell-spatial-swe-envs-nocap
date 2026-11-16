@@ -1,0 +1,698 @@
+diff --git a/cell2location/distributions/AutoAmortisedNormalMessenger.py b/cell2location/distributions/AutoAmortisedNormalMessenger.py
+new file mode 100755
+index 00000000..9dde61a7
+--- /dev/null
++++ b/cell2location/distributions/AutoAmortisedNormalMessenger.py
+@@ -0,0 +1,350 @@
++from copy import deepcopy
++from typing import Callable, Optional, Union
++
++import numpy as np
++import pyro.distributions as dist
++import torch
++from pyro.distributions.distribution import Distribution
++from pyro.distributions.transforms import SoftplusTransform
++from pyro.infer.autoguide import AutoHierarchicalNormalMessenger
++from pyro.infer.autoguide.utils import (
++    deep_getattr,
++    deep_setattr,
++    helpful_support_errors,
++)
++from pyro.nn.module import PyroModule, PyroParam, to_pyro_module_
++from scvi._compat import Literal
++from scvi.nn import FCLayers
++from torch.distributions import biject_to, constraints
++
++
++class FCLayersPyro(FCLayers, PyroModule):
++    pass
++
++
++class AutoAmortisedHierarchicalNormalMessenger(AutoHierarchicalNormalMessenger):
++    """
++    EXPERIMENTAL Automatic :class:`~pyro.infer.effect_elbo.GuideMessenger` ,
++    intended for use with :class:`~pyro.infer.effect_elbo.Effect_ELBO` or
++    similar. Amortise specific sites
++
++    The mean-field posterior at any site is a transformed normal distribution,
++    the mean of which depends on the value of that site given its dependencies in the model:
++
++        loc = loc + transform.inv(prior.mean) * weight
++
++    Where the value of `prior.mean` is conditional on upstream sites in the model.
++    This approach doesn't work for distributions that don't have the mean.
++
++    loc, scales and element-specific weight are amortised for each site specified in `amortised_plate_sites`.
++
++    Derived classes may override particular sites and use this simply as a
++    default, see AutoNormalMessenger documentation for example.
++
++    :param callable model: A Pyro model.
++    :param dict amortised_plate_sites: Dictionary with amortised plate details:
++        the name of observation/minibatch plate,
++        indexes of model args to provide to encoder,
++        variable names that belong to the observation plate
++        and the number of dimensions in non-plate axis of each variable - such as:
++        {
++            "name": "obs_plate",
++            "input": [0],  # expression data + (optional) batch index ([0, 2])
++            "input_transform": [torch.log1p], # how to transform input data before passing to NN
++            "sites": {
++                "n_s": 1,
++                "y_s": 1,
++                "z_sr": R,
++                "w_sf": F,
++            }
++        }
++    :param int n_in: Number of input dimensions (for encoder_class).
++    :param int n_hidden: Number of hidden nodes in each layer, one of 3 options:
++        1. Integer denoting the number of hidden nodes
++        2. Dictionary with {"single": 200, "multiple": 200} denoting the number of hidden nodes for each `encoder_mode` (See below)
++        3. Allowing different number of hidden nodes for each model site. Dictionary with the number of hidden nodes for single encode mode and each model site:
++        {
++            "single": 200
++            "n_s": 5,
++            "y_s": 5,
++            "z_sr": 128,
++            "w_sf": 200,
++        }
++    :param float init_param_scale: How to scale/normalise initial values for weights converting hidden layers to loc and scales.
++    :param float scales_offset: offset between the output of the NN and scales.
++    :param Callable encoder_class: Class that defines encoder network.
++    :param dict encoder_kwargs: Keyword arguments for encoder class.
++    :param dict multi_encoder_kwargs: Optional separate keyword arguments for encoder_class,
++        useful when encoder_mode == "single-multiple".
++    :param Callable encoder_instance: Encoder network instance, overrides class input and the input instance is copied with deepcopy.
++    :param str encoder_mode: Use single encoder for all variables ("single"), one encoder per variable ("multiple")
++        or a single encoder in the first step and multiple encoders in the second step ("single-multiple").
++    :param list hierarchical_sites: List of latent variables (model sites)
++        that have hierarchical dependencies.
++        If None, all sites are assumed to have hierarchical dependencies. If None, for the sites
++        that don't have upstream sites, the guide is representing/learning deviation from the prior.
++    """
++
++    # 'element-wise' or 'scalar'
++    weight_type = "element-wise"
++
++    def __init__(
++        self,
++        model: Callable,
++        *,
++        amortised_plate_sites: dict,
++        n_in: int,
++        n_hidden: dict = None,
++        init_param_scale: float = 1 / 50,
++        init_scale: float = 0.1,
++        init_weight: float = 1.0,
++        encoder_class=FCLayersPyro,
++        encoder_kwargs=None,
++        multi_encoder_kwargs=None,
++        encoder_instance: torch.nn.Module = None,
++        encoder_mode: Literal["single", "multiple", "single-multiple"] = "single",
++        hierarchical_sites: Optional[list] = None,
++    ):
++        if not isinstance(init_scale, float) or not (init_scale > 0):
++            raise ValueError("Expected init_scale > 0. but got {}".format(init_scale))
++        super().__init__(model)
++        self._init_scale = init_scale
++        self._init_weight = init_weight
++        self._hierarchical_sites = hierarchical_sites
++        self.amortised_plate_sites = amortised_plate_sites
++        self.encoder_mode = encoder_mode
++        self._computing_median = False
++
++        self.softplus = SoftplusTransform()
++
++        # default n_hidden values and checking input
++        if n_hidden is None:
++            n_hidden = {"single": 200, "multiple": 200}
++        else:
++            if isinstance(n_hidden, int):
++                n_hidden = {"single": n_hidden, "multiple": n_hidden}
++            elif not isinstance(n_hidden, dict):
++                raise ValueError("n_hidden must be either int or dict")
++        # process encoder kwargs, add n_hidden, create argument for multiple encoders
++        encoder_kwargs = deepcopy(encoder_kwargs) if isinstance(encoder_kwargs, dict) else dict()
++        encoder_kwargs["n_hidden"] = n_hidden["single"]
++        if multi_encoder_kwargs is None:
++            multi_encoder_kwargs = deepcopy(encoder_kwargs)
++
++        # save encoder parameters
++        self.encoder_kwargs = encoder_kwargs
++        self.multi_encoder_kwargs = multi_encoder_kwargs
++        self.single_n_in = n_in
++        self.multiple_n_in = n_in
++        self.n_hidden = n_hidden
++        if ("single" in encoder_mode) and ("multiple" in encoder_mode):
++            # if single network precedes multiple networks
++            self.multiple_n_in = self.n_hidden["single"]
++        self.encoder_class = encoder_class
++        self.encoder_instance = encoder_instance
++        self.init_param_scale = init_param_scale
++
++    def get_posterior(
++        self,
++        name: str,
++        prior: Distribution,
++    ) -> Union[Distribution, torch.Tensor]:
++        if self._computing_median:
++            return self._get_posterior_median(name, prior)
++
++        with helpful_support_errors({"name": name, "fn": prior}):
++            transform = biject_to(prior.support)
++        # If hierarchical_sites not specified all sites are assumed to be hierarchical
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            loc, scale, weight = self._get_params(name, prior)
++            loc = loc + transform.inv(prior.mean) * weight
++            posterior = dist.TransformedDistribution(
++                dist.Normal(loc, scale).to_event(transform.domain.event_dim),
++                transform.with_cache(),
++            )
++            return posterior
++        else:
++            # Fall back to mean field when hierarchical_sites list is not empty and site not in the list.
++            loc, scale = self._get_params(name, prior)
++            posterior = dist.TransformedDistribution(
++                dist.Normal(loc, scale).to_event(transform.domain.event_dim),
++                transform.with_cache(),
++            )
++            return posterior
++
++    def encode(self, name: str, prior: Distribution):
++        """
++        Apply encoder network to input data to obtain hidden layer encoding.
++        Parameters
++        ----------
++        args
++            Pyro model args
++        kwargs
++            Pyro model kwargs
++        -------
++
++        """
++        try:
++            args, kwargs = self.args_kwargs  # stored as a tuple of (tuple, dict)
++            # get the data for NN from
++            in_names = self.amortised_plate_sites["input"]
++            x_in = [kwargs[i] if i in kwargs.keys() else args[i] for i in in_names]
++            # apply data transform before passing to NN
++            in_transforms = self.amortised_plate_sites["input_transform"]
++            x_in = [in_transforms[i](x) for i, x in enumerate(x_in)]
++            if "single" in self.encoder_mode:
++                # encode with a single encoder
++                res = deep_getattr(self, "one_encoder")(*x_in)
++                if "multiple" in self.encoder_mode:
++                    # when there is a second layer of multiple encoders fetch encoders and encode data
++                    x_in[0] = res
++                    res = deep_getattr(self.multiple_encoders, name)(*x_in)
++            else:
++                # when there are multiple encoders fetch encoders and encode data
++                res = deep_getattr(self.multiple_encoders, name)(*x_in)
++            return res
++        except AttributeError:
++            pass
++
++        # Initialize.
++        # create single encoder NN
++        if "single" in self.encoder_mode:
++            if self.encoder_instance is not None:
++                # copy provided encoder instance
++                one_encoder = deepcopy(self.encoder_instance).to(prior.mean.device)
++                # convert to pyro module
++                to_pyro_module_(one_encoder)
++                deep_setattr(self, "one_encoder", one_encoder)
++            else:
++                # create encoder instance from encoder class
++                deep_setattr(
++                    self,
++                    "one_encoder",
++                    self.encoder_class(n_in=self.single_n_in, n_out=self.n_hidden["single"], **self.encoder_kwargs).to(
++                        prior.mean.device
++                    ),
++                )
++        if "multiple" in self.encoder_mode:
++            # determine the number of hidden layers
++            if name in self.n_hidden.keys():
++                n_hidden = self.n_hidden[name]
++            else:
++                n_hidden = self.n_hidden["multiple"]
++            multi_encoder_kwargs = deepcopy(self.multi_encoder_kwargs)
++            multi_encoder_kwargs["n_hidden"] = n_hidden
++
++            # create multiple encoders
++            if self.encoder_instance is not None:
++                # copy instances
++                encoder_ = deepcopy(self.encoder_instance).to(prior.mean.device)
++                # convert to pyro module
++                to_pyro_module_(encoder_)
++                deep_setattr(
++                    self,
++                    "multiple_encoders." + name,
++                    encoder_,
++                )
++            else:
++                # create instances
++                deep_setattr(
++                    self,
++                    "multiple_encoders." + name,
++                    self.encoder_class(n_in=self.multiple_n_in, n_out=n_hidden, **multi_encoder_kwargs).to(
++                        prior.mean.device
++                    ),
++                )
++        return self.encode(name, prior)
++
++    def _get_params(self, name: str, prior: Distribution):
++        if name not in self.amortised_plate_sites["sites"].keys():
++            # don't use amortisation unless requested (site in the list)
++            return super()._get_params(name, prior)
++
++        args, kwargs = self.args_kwargs  # stored as a tuple of (tuple, dict)
++        hidden = self.encode(name, prior)
++        try:
++            linear_loc = deep_getattr(self.hidden2locs, name)
++            bias_loc = deep_getattr(self.bias4locs, name)
++            loc = hidden @ linear_loc + bias_loc
++            linear_scale = deep_getattr(self.hidden2scales, name)
++            bias_scale = deep_getattr(self.bias4scales, name)
++            scale = self.softplus((hidden @ linear_scale) + bias_scale - self._init_scale_unconstrained)
++            if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++                if self.weight_type == "element-wise":
++                    # weight is element-wise
++                    linear_weight = deep_getattr(self.hidden2weights, name)
++                    bias_weight = deep_getattr(self.bias4weights, name)
++                    weight = self.softplus((hidden @ linear_weight) + bias_weight - self._init_weight_unconstrained)
++                if self.weight_type == "scalar":
++                    # weight is a single value parameter
++                    weight = deep_getattr(self.weights, name)
++                return loc, scale, weight
++            else:
++                return loc, scale
++        except AttributeError:
++            pass
++
++        # Initialize.
++        with torch.no_grad():
++            init_scale = torch.full((), self._init_scale)
++            self._init_scale_unconstrained = self.softplus.inv(init_scale)
++            init_weight = torch.full((), self._init_weight)
++            self._init_weight_unconstrained = self.softplus.inv(init_weight)
++
++            # determine the number of hidden layers
++            if "multiple" in self.encoder_mode:
++                if name in self.n_hidden.keys():
++                    n_hidden = self.n_hidden[name]
++                else:
++                    n_hidden = self.n_hidden["multiple"]
++            elif "single" in self.encoder_mode:
++                n_hidden = self.n_hidden["single"]
++            # determine parameter dimensions
++            param_dim = (n_hidden, self.amortised_plate_sites["sites"][name])
++            bias_dim = (1, self.amortised_plate_sites["sites"][name])
++            # generate initial value for linear parameters
++            init_param = torch.normal(
++                torch.full(size=param_dim, fill_value=0.0, device=prior.mean.device),
++                torch.full(
++                    size=param_dim, fill_value=(1 * self.init_param_scale) / np.sqrt(n_hidden), device=prior.mean.device
++                ),
++            )
++        deep_setattr(self, "hidden2locs." + name, PyroParam(init_param.clone().detach().requires_grad_(True)))
++        deep_setattr(self, "hidden2scales." + name, PyroParam(init_param.clone().detach().requires_grad_(True)))
++        deep_setattr(
++            self, "bias4locs." + name, PyroParam(torch.full(size=bias_dim, fill_value=0.0, device=prior.mean.device))
++        )
++        deep_setattr(
++            self, "bias4scales." + name, PyroParam(torch.full(size=bias_dim, fill_value=0.0, device=prior.mean.device))
++        )
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            if self.weight_type == "scalar":
++                # weight is a single value parameter
++                deep_setattr(self, "weights." + name, PyroParam(init_weight, constraint=constraints.positive))
++            if self.weight_type == "element-wise":
++                # weight is element-wise
++                deep_setattr(
++                    self, "hidden2weights." + name, PyroParam(init_param.clone().detach().requires_grad_(True))
++                )
++                deep_setattr(
++                    self,
++                    "bias4weights." + name,
++                    PyroParam(torch.full(size=bias_dim, fill_value=0.0, device=prior.mean.device)),
++                )
++        return self._get_params(name, prior)
++
++    def median(self, *args, **kwargs):
++        self._computing_median = True
++        try:
++            return self(*args, **kwargs)
++        finally:
++            self._computing_median = False
++
++    def _get_posterior_median(self, name, prior):
++        transform = biject_to(prior.support)
++        if (self._hierarchical_sites is None) or (name in self._hierarchical_sites):
++            loc, scale, weight = self._get_params(name, prior)
++            loc = loc + transform.inv(prior.mean) * weight
++        else:
++            loc, scale = self._get_params(name, prior)
++        return transform(loc)
+diff --git a/cell2location/distributions/AutoNormalEncoder.py b/cell2location/distributions/AutoNormalEncoder.py
+index 325c06d9..821b5393 100755
+--- a/cell2location/distributions/AutoNormalEncoder.py
++++ b/cell2location/distributions/AutoNormalEncoder.py
+@@ -9,7 +9,7 @@
+ from pyro.distributions.util import sum_rightmost
+ from pyro.infer.autoguide import AutoGuide
+ from pyro.infer.autoguide import AutoGuideList as PyroAutoGuideList
+-from pyro.infer.autoguide.guides import _deep_getattr, _deep_setattr
++from pyro.infer.autoguide.guides import deep_getattr, deep_setattr
+ from pyro.infer.autoguide.utils import helpful_support_errors
+ from pyro.nn import PyroModule, PyroParam
+ from pyro.nn.module import to_pyro_module_
+@@ -218,7 +218,7 @@ def _setup_prototype(self, *args, **kwargs):
+                 np.zeros(param_dim),
+                 (np.ones(param_dim) * self.init_param_scale) / np.sqrt(n_hidden),
+             ).astype("float32")
+-            _deep_setattr(
++            deep_setattr(
+                 self.hidden2locs,
+                 name,
+                 PyroParam(torch.tensor(init_param, device=site["value"].device, requires_grad=True)),
+@@ -228,7 +228,7 @@ def _setup_prototype(self, *args, **kwargs):
+                 np.zeros(param_dim),
+                 (np.ones(param_dim) * self.init_param_scale) / np.sqrt(n_hidden),
+             ).astype("float32")
+-            _deep_setattr(
++            deep_setattr(
+                 self.hidden2scales,
+                 name,
+                 PyroParam(torch.tensor(init_param, device=site["value"].device, requires_grad=True)),
+@@ -241,14 +241,14 @@ def _setup_prototype(self, *args, **kwargs):
+                     encoder_ = deepcopy(self.encoder_instance).to(site["value"].device)
+                     # convert to pyro module
+                     to_pyro_module_(encoder_)
+-                    _deep_setattr(
++                    deep_setattr(
+                         self.multiple_encoders,
+                         name,
+                         encoder_,
+                     )
+                 else:
+                     # create instances
+-                    _deep_setattr(
++                    deep_setattr(
+                         self.multiple_encoders,
+                         name,
+                         self.encoder_class(n_in=self.multiple_n_in, n_out=n_hidden, **self.multi_encoder_kwargs).to(
+@@ -269,8 +269,8 @@ def _get_loc_and_scale(self, name, encoded_hidden):
+ 
+         """
+ 
+-        linear_locs = _deep_getattr(self.hidden2locs, name)
+-        linear_scales = _deep_getattr(self.hidden2scales, name)
++        linear_locs = deep_getattr(self.hidden2locs, name)
++        linear_scales = deep_getattr(self.hidden2scales, name)
+ 
+         if "multiple" in self.encoder_mode:
+             # when using multiple encoders extract hidden layer for this parameter
+@@ -305,13 +305,13 @@ def encode(self, *args, **kwargs):
+                 # when there is a second layer of multiple encoders fetch encoders and encode data
+                 x_in[0] = res
+                 res = {
+-                    name: _deep_getattr(self.multiple_encoders, name)(*x_in)
++                    name: deep_getattr(self.multiple_encoders, name)(*x_in)
+                     for name, site in self.prototype_trace.iter_stochastic_nodes()
+                 }
+         else:
+             # when there are multiple encoders fetch encoders and encode data
+             res = {
+-                name: _deep_getattr(self.multiple_encoders, name)(*x_in)
++                name: deep_getattr(self.multiple_encoders, name)(*x_in)
+                 for name, site in self.prototype_trace.iter_stochastic_nodes()
+             }
+         return res
+diff --git a/cell2location/models/_cell2location_model.py b/cell2location/models/_cell2location_model.py
+index 1a34fdd2..e63b775e 100755
+--- a/cell2location/models/_cell2location_model.py
++++ b/cell2location/models/_cell2location_model.py
+@@ -1,4 +1,3 @@
+-from copy import deepcopy
+ from typing import List, Optional
+ 
+ import matplotlib.pyplot as plt
+@@ -8,7 +7,9 @@
+ import scvi
+ from anndata import AnnData
+ from pyro import clear_param_store
++from pyro.infer import Trace_ELBO
+ from pyro.nn import PyroModule
++from pyro.poutine.messenger import Messenger
+ from scvi import _CONSTANTS
+ from scvi.data._anndata import _setup_anndata, get_from_registry
+ from scvi.model.base import BaseModelClass, PyroSampleMixin, PyroSviTrainMixin
+@@ -115,7 +116,7 @@ def __init__(
+             **model_kwargs,
+         )
+         self._model_summary_string = f'cell2location model with the following params: \nn_factors: {self.n_factors_} \nn_batch: {self.summary_stats["n_batch"]} '
+-        self.init_params_ = self._get_init_params(deepcopy(locals()))
++        self.init_params_ = self._get_init_params(locals())
+ 
+     @staticmethod
+     @setup_anndata_dsp.dedent
+@@ -154,7 +155,13 @@ def setup_anndata(
+         )
+ 
+     def train(
+-        self, max_epochs: int = 30000, batch_size: int = None, train_size: float = 1, lr: float = 0.002, **kwargs
++        self,
++        max_epochs: int = 30000,
++        batch_size: int = None,
++        train_size: float = 1,
++        lr: float = 0.002,
++        num_particles: int = 1,
++        **kwargs,
+     ):
+         """Train the model with useful defaults
+ 
+@@ -180,6 +187,9 @@ def train(
+         kwargs["batch_size"] = batch_size
+         kwargs["train_size"] = train_size
+         kwargs["lr"] = lr
++        # if guide is of new type
++        if isinstance(self.module.guide, Messenger):
++            kwargs["plan_kwargs"] = {"loss_fn": Trace_ELBO(num_particles=num_particles)}
+ 
+         super().train(**kwargs)
+ 
+diff --git a/cell2location/models/base/_pyro_base_loc_module.py b/cell2location/models/base/_pyro_base_loc_module.py
+index 4a4f996a..871071e0 100755
+--- a/cell2location/models/base/_pyro_base_loc_module.py
++++ b/cell2location/models/base/_pyro_base_loc_module.py
+@@ -1,3 +1,5 @@
++from typing import Optional
++
+ from scvi._compat import Literal
+ from scvi.module.base import PyroBaseModuleClass
+ 
+@@ -10,8 +12,9 @@ def __init__(
+         model,
+         amortised: bool = False,
+         encoder_mode: Literal["single", "multiple", "single-multiple"] = "single",
+-        encoder_kwargs=None,
++        encoder_kwargs: Optional[dict] = None,
+         data_transform="log1p",
++        create_autoguide_kwargs: Optional[dict] = None,
+         **kwargs,
+     ):
+         """
+@@ -34,6 +37,8 @@ def __init__(
+ 
+         self._model = model(**kwargs)
+         self._amortised = amortised
++        if create_autoguide_kwargs is None:
++            create_autoguide_kwargs = dict()
+ 
+         self._guide = self._create_autoguide(
+             model=self.model,
+@@ -43,6 +48,7 @@ def __init__(
+             encoder_mode=encoder_mode,
+             init_loc_fn=self.init_to_value,
+             n_cat_list=[kwargs["n_batch"]],
++            **create_autoguide_kwargs,
+         )
+ 
+         self._get_fn_args_from_batch = self._model._get_fn_args_from_batch
+diff --git a/cell2location/models/base/_pyro_mixin.py b/cell2location/models/base/_pyro_mixin.py
+index 39e1731c..bd3f0a77 100755
+--- a/cell2location/models/base/_pyro_mixin.py
++++ b/cell2location/models/base/_pyro_mixin.py
+@@ -1,21 +1,23 @@
+ from datetime import date
+ from functools import partial
++from typing import Optional
+ 
+ import matplotlib
+ import matplotlib.pyplot as plt
+ import numpy as np
+ import pandas as pd
+-import pyro
+ import torch
+ from pyro import poutine
+-from pyro.infer.autoguide import AutoNormal, init_to_mean
++from pyro.infer.autoguide import AutoNormalMessenger, init_to_feasible, init_to_mean
+ from scipy.sparse import issparse
+ from scvi import _CONSTANTS
+ from scvi.data._anndata import get_from_registry
+ from scvi.dataloaders import AnnDataLoader
+ from scvi.model._utils import parse_use_gpu_arg
+ 
+-from ...distributions.AutoNormalEncoder import AutoGuideList, AutoNormalEncoder
++from ...distributions.AutoAmortisedNormalMessenger import (
++    AutoAmortisedHierarchicalNormalMessenger,
++)
+ 
+ 
+ def init_to_value(site=None, values={}):
+@@ -24,7 +26,7 @@ def init_to_value(site=None, values={}):
+     if site["name"] in values:
+         return values[site["name"]]
+     else:
+-        return init_to_mean(site)
++        return init_to_mean(site, fallback=init_to_feasible)
+ 
+ 
+ class AutoGuideMixinModule:
+@@ -44,39 +46,29 @@ def _create_autoguide(
+         encoder_kwargs,
+         data_transform,
+         encoder_mode,
+-        init_loc_fn=init_to_mean,
++        init_loc_fn=init_to_mean(fallback=init_to_feasible),
+         n_cat_list: list = [],
+         encoder_instance=None,
++        guide_class=AutoNormalMessenger,
++        guide_kwargs: Optional[dict] = None,
+     ):
+ 
++        if guide_kwargs is None:
++            guide_kwargs = dict()
++
+         if not amortised:
+-            _guide = AutoNormal(
++            if getattr(model, "discrete_variables", None) is not None:
++                model = poutine.block(model, hide=model.discrete_variables)
++            _guide = guide_class(
+                 model,
+                 init_loc_fn=init_loc_fn,
+-                create_plates=model.create_plates,
++                **guide_kwargs
++                # create_plates=model.create_plates,
+             )
+         else:
+             encoder_kwargs = encoder_kwargs if isinstance(encoder_kwargs, dict) else dict()
+             n_hidden = encoder_kwargs["n_hidden"] if "n_hidden" in encoder_kwargs.keys() else 200
+-            init_param_scale = (
+-                encoder_kwargs["init_param_scale"] if "init_param_scale" in encoder_kwargs.keys() else 1 / 50
+-            )
+-            if "init_param_scale" in encoder_kwargs.keys():
+-                del encoder_kwargs["init_param_scale"]
+-            amortised_vars = self.list_obs_plate_vars
+-            _guide = AutoGuideList(model, create_plates=model.create_plates)
+-            _guide.append(
+-                AutoNormal(
+-                    pyro.poutine.block(model, hide=list(amortised_vars["sites"].keys())),
+-                    init_loc_fn=init_loc_fn,
+-                )
+-            )
+-            if isinstance(data_transform, np.ndarray):
+-                # add extra info about gene clusters to the network
+-                self.register_buffer("gene_clusters", torch.tensor(data_transform.astype("float32")))
+-                n_in = model.n_vars + data_transform.shape[1]
+-                data_transform = self.data_transform_clusters()
+-            elif data_transform == "log1p":
++            if data_transform == "log1p":
+                 # use simple log1p transform
+                 data_transform = torch.log1p
+                 n_in = self.model.n_vars
+@@ -100,30 +92,24 @@ def _create_autoguide(
+                 # use custom data transform
+                 data_transform = data_transform
+                 n_in = model.n_vars
+-
++            amortised_vars = model.list_obs_plate_vars()
+             if len(amortised_vars["input"]) >= 2:
+                 encoder_kwargs["n_cat_list"] = n_cat_list
+             amortised_vars["input_transform"][0] = data_transform
+-            _guide.append(
+-                AutoNormalEncoder(
+-                    pyro.poutine.block(model, expose=list(amortised_vars["sites"].keys())),
+-                    amortised_plate_sites=amortised_vars,
+-                    n_in=n_in,
+-                    n_hidden=n_hidden,
+-                    init_param_scale=init_param_scale,
+-                    encoder_kwargs=encoder_kwargs,
+-                    encoder_mode=encoder_mode,
+-                    encoder_instance=encoder_instance,
+-                )
++            if getattr(model, "discrete_variables", None) is not None:
++                model = poutine.block(model, hide=model.discrete_variables)
++            _guide = AutoAmortisedHierarchicalNormalMessenger(
++                model,
++                amortised_plate_sites=amortised_vars,
++                n_in=n_in,
++                n_hidden=n_hidden,
++                encoder_kwargs=encoder_kwargs,
++                encoder_mode=encoder_mode,
++                encoder_instance=encoder_instance,
++                **guide_kwargs,
+             )
+         return _guide
+ 
+-    def _data_transform_clusters(self):
+-        def _data_transform(x):
+-            return torch.log1p(torch.cat([x, x @ self.gene_clusters], dim=1))
+-
+-        return _data_transform
+-
+     def _data_transform_scale(self):
+         def _data_transform(x):
+             # return (x - self.var_mean) / self.var_std
+diff --git a/setup.cfg b/setup.cfg
+index 9faf4831..91046914 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -14,7 +14,7 @@ author_email = vitalii.kleshchevnikov@sanger.ac.uk
+ include_package_data = True
+ packages = find:
+ install_requires =
+-    pyro-ppl>=1.7.0
++    pyro-ppl @ git+https://github.com/pyro-ppl/pyro.git@dev
+     scvi-tools>=0.14.3<0.15.0
+     torch>=1.9.0
+     pymc3>=3.8<3.10
+@@ -25,7 +25,6 @@ install_requires =
+     plotnine
+     opencv-python
+ 
+-
+ [options.extras_require]
+ dev =
+     black>=21.4b0
+diff --git a/tests/test_cell2location.py b/tests/test_cell2location.py
+index 02e4f587..7db9119f 100644
+--- a/tests/test_cell2location.py
++++ b/tests/test_cell2location.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++from pyro import poutine
+ from scvi.data import synthetic_iid
+ 
+ from cell2location import run_colocation
+@@ -62,7 +63,8 @@ def test_cell2location():
+     # minibatches of locations
+     dataset = st_model.export_posterior(dataset, sample_kwargs={"num_samples": 10, "batch_size": 50})
+     # test computing any quantile of the posterior distribution
+-    st_model.posterior_quantile(q=0.5)
++    if not isinstance(st_model.module.guide, poutine.messenger.Messenger):
++        st_model.posterior_quantile(q=0.5)
+     # test computing expected expression per cell type
+     st_model.module.model.compute_expected_per_cell_type(st_model.samples["post_sample_q05"], st_model.adata)
+     ### test amortised inference with default cell2location model ###

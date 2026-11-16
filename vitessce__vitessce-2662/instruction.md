@@ -1,0 +1,25 @@
+# Issue
+
+**Title:** Fix check makestyles command in gh action
+
+## Description
+
+<!-- Credit (as a starting template): https://github.com/visgl/deck.gl/blob/master/.github/pull_request_template.md -->
+<!-- For feature, feature enhancement or bug fix, create an issue first and finish To Do List there -->
+<!-- Anything doesn't work as expected is a bug, including code, doc and test -->
+Follow-up from #2592 
+
+Motivated by https://github.com/vitessce/vitessce/actions/runs/38445906082/job/115464119073
+<!-- For other PRs without open issue -->
+#### Background
+<!-- For all the PRs -->
+#### Change List
+-
+#### Checklist
+ - [ ] Have tested PR with one or more demo configurations
+ - [ ] Documentation added, updated, or not applicable
+ - [ ] New subpackage(s) manually published to NPM and trusted publishing enabled, or not applicable
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `2efa317bbb90`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

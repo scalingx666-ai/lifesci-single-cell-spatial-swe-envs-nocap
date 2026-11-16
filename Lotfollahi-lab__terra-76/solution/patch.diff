@@ -1,0 +1,1355 @@
+diff --git a/main.py b/main.py
+index babec026..810e0d8d 100644
+--- a/main.py
++++ b/main.py
+@@ -10,6 +10,7 @@
+ import multiprocessing as mp
+ import os
+ import pprint
++import random
+ import yaml
+ from datetime import datetime
+ 
+@@ -33,9 +34,9 @@ def parse_arguments():
+                         help='Name of the config file to load.')
+     parser.add_argument('--devices', type=str, nargs='+', default=['cuda:0'],
+                         help='Devices to use on the local machine.')
+-    parser.add_argument('--do_sweep', action='store_true',
++    parser.add_argument('--do_sweep', action='store_true', default=False,
+                         help='Enable or disable parameter sweeping.')
+-    parser.add_argument('--test', action='store_true',
++    parser.add_argument('--test', action='store_true', default=False,
+                         help='Run in test mode.')
+     return parser.parse_args()
+ 
+@@ -49,6 +50,7 @@ def process_main(rank, args, params, world_size, devices, logger, folder_path, i
+     world_size, rank = init_distributed(
+         rank_and_world_size=(rank, world_size), port=40003)
+     logger.info(f'Running... (rank: {rank}/{world_size})')
++    logger.info(f'Training mode: {is_training}')
+ 
+     # Execute training or evaluation
+     if is_training:
+@@ -112,6 +114,7 @@ def sweep_func(args):
+     if args.test:
+         process_main(0, args, params, num_gpus, args.devices, logger, folder_path)
+     else:
++
+         for rank in range(num_gpus):
+             p = mp.Process(target=process_main,
+                            args=(rank, args, params, num_gpus, args.devices, logger, folder_path))
+diff --git a/pyproject.toml b/pyproject.toml
+index d24ec685..a6c679e6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -25,6 +25,7 @@ dependencies = [
+     "anndata",
+     "squidpy",
+     "scikit-misc",
++    "transformers",
+     "datasets",
+     # for debug logging (referenced from the issue template)
+     "session-info",
+diff --git a/src/nichejepa/datasets/cell_datasets.py b/src/nichejepa/datasets/cell_datasets.py
+index 3380df6e..fd548af4 100644
+--- a/src/nichejepa/datasets/cell_datasets.py
++++ b/src/nichejepa/datasets/cell_datasets.py
+@@ -8,25 +8,23 @@
+ 
+ class CellBaseDataset(Dataset):
+     def __init__(self,
++                 gt_type: Literal['rank', 'counts'],
+                  dataset: datasets.Dataset,
+                  vocab_size: int,
+                  seq_len_cell: int,
+                  seq_len_neighborhood: int,
+-                 max_cls_tokens: int,
+                  max_special_tokens: int,
+-                 tokenizer_type: Literal['cell_neighborhood', 'cell_graph'],
+-                 gt_type: Literal['rank', 'counts'],
+                  special_tokens: List=[
+                     'cls_cell',
+-                    'cls_neighborhood',
++                    'cls_neigh',
+                     'assay',
+                     'species',
+                     'tissue',
+                     'gene_panel',
+                     'batch'],
+                  sampling_strategy: Optional[
+-                    Literal['norm_count_rank_sampling',
+-                            'norm_count_rank_sampling_rep',
++                    Literal['norm_value_rank_sampling',
++                            'norm_value_rank_sampling_rep',
+                             'rand_sampling',
+                             'rand_sampling_rep']]=None,
+                  ):
+@@ -35,141 +33,166 @@ def __init__(self,
+ 
+         Parameters
+         -----------
++        gt_type:
++            Gene transformer type.
+         dataset:
+-            Hugging Face dataset with sequences of gene tokens and special
+-            tokens.
++            Hugging Face dataset with tokenized data.
+         vocab_size:
+-            Size of the vocabulary.
++            Size of the token vocabulary.
+         seq_len_cell:
+             Sequence length of the (index) cell tokens.
+         seq_len_neighborhood:
+             Sequence length of the neighborhood tokens.
+-        max_cls_tokens:
+         max_special_tokens:
+-        tokenizer_type;
+-        gt_type:
+-            Gene transformer type.
++            Maximum number of special tokens (if all special tokens are
++            included; used to determine the first cell segment).
+         special_tokens:
+-            Special tokens to be included in the sequence processed by the
+-            model.
++            Special tokens to be included in the token sequences.
+         sampling_strategy:
+             Token sampling strategy.
+         """
+         if gt_type not in ['rank', 'counts']:
+             raise ValueError(f'Invalid "gt_type": {gt_type}.')
+-
++        
++        self.gt_type = gt_type
+         self.dataset = dataset
+         self.len = len(self.dataset)
+-        self.n_nonzero_tokens = self.dataset['n_nonzero_tokens']
+         self.vocab_size = vocab_size
+         self.seq_len_cell = seq_len_cell
+         self.seq_len_neighborhood = seq_len_neighborhood
+         self.max_special_tokens = max_special_tokens
+-        self.gt_type = gt_type
++        self.special_tokens = special_tokens
+         self.n_special_tokens = len(special_tokens)
+         self.seq_len = (seq_len_cell +
+                         seq_len_neighborhood +
+                         self.n_special_tokens)
+-        self.special_tokens = special_tokens
+         self.sampling_strategy = sampling_strategy
+ 
++        self.n_nz_tokens = self.dataset['n_nonzero_tokens']
++
+     def __len__(self) -> int:
+         return self.len
+ 
+-    def _add_special_tokens_to_seq(self,
+-                                   tokens: List,
+-                                   segments: List,
+-                                   positions: List,
+-                                   gene_expr: List,
+-                                   item: int,
+-                                   ) -> Tuple[List[int], List[int]]:
++    def _add_special_seq(self,
++                         item: int,
++                         tokens: List[int],
++                         segments: List[int],
++                         positions: Optional[List[int]]=None,
++                         values: Optional[List[float]]=None,
++                         ) -> Union[Tuple[List[int],
++                                          List[int],
++                                          List[int]],
++                                    Tuple[List[int],
++                                          List[int],
++                                          List[float]]]:
+         """
+-        Add special tokens to sequence and update segment and positions tokens.
++        Add special tokens to sequence and update positions/values and segments.
+ 
+         Parameters
+         -----------
++        item:
++            Index of the cell in the Hugging Face dataset.
+         tokens:
+             Token sequence including all segments.
+         segments:
+-            Segment tokens including all segments.
++            Segment labels including all segments.
+         positions:
+-            Position tokens including all segments.
+-        gene_expr:
+-            Gene expression values including all segments.
+-        item:
+-            Index of the cell in the Hugging Face dataset.
++            Positions including all segments.
++        values:
++            Values including all segments.
+ 
+         Returns
+         -----------
+         tokens:
+             Sequence of tokens with special tokens included at sequence start.
+         segments:
+-            Segment labels with 0s for special tokens at sequence start.
++            Segment labels with extra segments for special tokens at sequence
++            start.
++        positions:
++            Positions with extra positions for special tokens at sequence start.
++        values:
++            Values with special values corresponding to special tokens.
+         """
+         if 'batch' in self.special_tokens:
+             if self.gt_type == 'rank':
+                 tokens = item["batch_value_token"] + tokens
+             elif self.gt_type == 'counts':
+                 tokens = item["batch_token"] + tokens
+-            gene_expr = item["batch_value"] + gene_expr
++                values = item["batch_value"] + values
+         if 'gene_panel' in self.special_tokens:
+             if self.gt_type == 'rank':
+                 tokens = item["gene_panel_value_token"] + tokens
+             elif self.gt_type == 'counts':
+                 tokens = item["gene_panel_token"] + tokens
+-            gene_expr = item["gene_panel_value"] + gene_expr
++                values = item["gene_panel_value"] + values
+         if 'tissue' in self.special_tokens:
+             if self.gt_type == 'rank':
+                 tokens = item["tissue_value_token"] + tokens
+             elif self.gt_type == 'counts':
+                 tokens = item["tissue_token"] + tokens
+-            gene_expr = item["tissue_value"] + gene_expr
++                values = item["tissue_value"] + values
+         if 'species' in self.special_tokens:
+             if self.gt_type == 'rank':
+                 tokens = item["species_value_token"] + tokens
+             elif self.gt_type == 'counts':
+                 tokens = item["species_token"] + tokens
+-            gene_expr = item["species_value"] + gene_expr
++                values = item["species_value"] + values
+         if 'assay' in self.special_tokens:
+             if self.gt_type == 'rank':
+                 tokens = item["assay_value_token"] + tokens
+             elif self.gt_type == 'counts':
+                 tokens = item["assay_token"] + tokens
+-            gene_expr = item["assay_value"] + gene_expr
++                values = item["assay_value"] + values
+             
+-        n_cls_tokens = len(item["cls_tokens"])
+-        n_nz_cls_tokens = sum(
+-            1 for token in item["cls_tokens"] if token != 0)
+-        n_zero_cls_tokens = n_cls_tokens - n_nz_cls_tokens
+-        tokens = item["cls_tokens"] + tokens
+-        gene_expr = list(
+-            range(2, 2 + n_nz_cls_tokens)) + [0] * n_zero_cls_tokens + gene_expr
+-
+-        segments = list(
+-            range(1, 1 + n_nz_cls_tokens)) + [0] * n_zero_cls_tokens + list(
+-            range(1 + n_nz_cls_tokens,  1 + n_nz_cls_tokens + (self.n_special_tokens - n_cls_tokens))) + segments
+-        positions = list(
+-            range(1, 1 + n_nz_cls_tokens)) + [0] * n_zero_cls_tokens + list(
+-            range(1 + n_nz_cls_tokens, 1 + n_nz_cls_tokens + (self.n_special_tokens - n_cls_tokens))) + positions
+-
+-        return tokens, segments, positions, gene_expr
+-
+-    def _create_sampled_token_and_count_seq(self,
+-                                            tokens: List,
+-                                            counts: List,
+-                                            n_nonzero_tokens: int,
+-                                            size: int,
+-                                            ) -> List[int]:
++        if any('cls' in token for token in self.special_tokens):
++            n_cls_tokens = sum('cls' in token for token in self.special_tokens)
++            cls_tokens = item["cls_tokens"][:n_cls_tokens]
++            n_nz_cls_tokens = sum(1 for token in cls_tokens if token != 0)
++            n_zero_cls_tokens = n_cls_tokens - n_nz_cls_tokens
++            tokens = cls_tokens + tokens
++            segments = list(range(1, 1 + n_nz_cls_tokens)) \
++                + [0] * n_zero_cls_tokens \
++                + list(range(1 + n_nz_cls_tokens, 1 + n_nz_cls_tokens + (
++                    self.n_special_tokens - n_cls_tokens))) \
++                + segments
++            if self.gt_type == 'counts':
++                values = list(range(2, 2 + n_nz_cls_tokens)) \
++                    + [0] * n_zero_cls_tokens \
++                    + values
++            elif self.gt_type == 'rank':
++                positions = list(range(1, 1 + n_nz_cls_tokens)) \
++                    + [0] * n_zero_cls_tokens \
++                    + list(range(1 + n_nz_cls_tokens, 1 + n_nz_cls_tokens + (
++                        self.n_special_tokens - n_cls_tokens))) \
++                    + positions
++        else:
++            segments = list(range(1, 1 + self.n_special_tokens)) + segments
++            if self.gt_type == 'rank':
++                positions = list(
++                    range(1, 1 + self.n_special_tokens)) + positions
++
++        if self.gt_type == 'rank':
++            return tokens, segments, positions
++        elif self.gt_type == 'counts':
++            return tokens, segments, values
++
++    def _sample_seq(self,
++                    tokens: List[int],
++                    values: Optional[List],
++                    n_nz_tokens: int,
++                    size: int,
++                    ) -> Tuple[List[int], List[int]]:
+         """
+-        Sample a subset of tokens based on a sampling strategy.
++        Sample a subset of gene tokens and corresponding values based on a
++        sampling strategy.
+ 
+         Parameters
+         -----------
+         tokens:
+             List of tokens.
+-        counts:
+-            List of counts.
+-        n_nonzero_tokens:
++        values:
++            List of values.
++        n_nz_tokens:
+             Number of nonzero tokens in `tokens`.
+         size:
+             Size of the sampled subset.
+@@ -178,54 +201,56 @@ def _create_sampled_token_and_count_seq(self,
+         --------
+         sampled_tokens:
+             List of sampled tokens.
+-        sampled_counts:
+-            List of (corresponding) sampled counts.
++        sampled_values:
++            List of (corresponding) sampled values.
+         """
+-        if 'norm_count_rank_sampling' in self.sampling_strategy:
++        if 'norm_value_rank_sampling' in self.sampling_strategy:
+             # Calculate weights based on rank and number of nonzero tokens:
+             # the higher the rank, the higher the weight
+             # seq = [4, 1, 3, 2, 5, 0, 0, 0]
+-            # n_nonzero_tokens = 5  
++            # n_nz_tokens = 5  
+             # sum_rank = 5 * (5 + 1) / 2.0 = 15.0
+-            # weights = [(n_nonzero_tokens - i)/sum_rank for i in range(
+-            #     n_nonzero_tokens)] 
++            # weights = [(n_nz_tokens - i)/sum_rank for i in range(
++            #     n_nz_tokens)] 
+             # = [0.333, 0.266, 0.2, 0.133, 0.066]
+             # np.sum(weights) = 1.0
+-            sum_rank = (
+-                n_nonzero_tokens * (n_nonzero_tokens + 1) / 2.0) + 1e-9
+-            weights = [(n_nonzero_tokens - i)/sum_rank for i in range(
+-                n_nonzero_tokens)]
++            sum_rank = (n_nz_tokens * (n_nz_tokens + 1) / 2.0) + 1e-9
++            weights = [(n_nz_tokens - i)/sum_rank for i in range(n_nz_tokens)]
+             assert np.isclose(np.sum(weights), 1.0)
+         elif 'rand_sampling' in self.sampling_strategy:
+-            weights = np.ones(n_nonzero_tokens) / n_nonzero_tokens
++            weights = np.ones(n_nz_tokens) / n_nz_tokens
+         else:
+             raise ValueError(f"'{self.sampling_strategy}' is invalid.")
+             
+         # Sample token indices based on weights
+         sampled_indices = np.random.choice(
+-            np.arange(n_nonzero_tokens),
+-            size=min(size, n_nonzero_tokens),
++            np.arange(n_nz_tokens),
++            size=min(size, n_nz_tokens),
+             p=weights,
+             replace=(True if 'rep' in self.sampling_strategy else False))
+             
+         # Sort sampled indices to preserve rank order
+         sampled_indices = np.sort(sampled_indices)
+         sampled_tokens = [tokens[i] for i in sampled_indices]
+-        sampled_counts = [counts[i] for i in sampled_indices]
++        if self.gt_type == 'counts':
++            sampled_values = [values[i] for i in sampled_indices]
++        else:
++            sampled_values = None
+ 
+-        if size > n_nonzero_tokens:
++        if size > n_nz_tokens:
+             sampled_tokens.extend([0] * (size - len(sampled_tokens)))
+-            sampled_counts.extend([0.0] * (size - len(sampled_counts)))
++            if self.gt_type == 'counts':
++                sampled_values.extend([0.0] * (size - len(sampled_values)))
+ 
+-        return sampled_tokens, sampled_counts
++        return sampled_tokens, sampled_values
+          
+-    def _get_gene_tokens_and_counts_for_segment(self, 
+-                                                item: int,
+-                                                segment: int,
+-                                                segment_seq_len: int,
+-                                                ) -> List[int]:
++    def _get_segment_seq(self, 
++                         item: int,
++                         segment: int,
++                         segment_seq_len: int,
++                         ) -> Tuple[List[int], List[int]]:
+             """
+-            Get gene tokens and counts for a given segment based on a sampling
++            Get gene tokens and values for a given segment based on a sampling
+             strategy.
+ 
+             Parameters
+@@ -239,32 +264,32 @@ def _get_gene_tokens_and_counts_for_segment(self,
+ 
+             Returns
+             --------
+-            segment_gene_tokens:
++            segment_tokens:
+                 List of tokens for a given segment.
++            segment_values:
++                List of values for a given segment.
+             """
+-            # Only keep gene tokens and gene expr in specified segment
+-            segment_start_idx = item["seg_tokens"].index(segment)
+-            if segment + 1 in item["seg_tokens"]:
+-                segment_end_idx = item["seg_tokens"].index(segment+1)
++            # Only keep gene tokens and values in specified segment
++            segment_start_idx = item['seg_tokens'].index(segment)
++            if segment + 1 in item['seg_tokens']:
++                segment_end_idx = item['seg_tokens'].index(segment+1)
+             else:
+-                segment_end_idx = len(item["seg_tokens"])
++                segment_end_idx = len(item['seg_tokens'])
+             
+-            segment_gene_tokens = item["gene_tokens"][
+-                segment_start_idx: segment_end_idx]
+-            segment_gene_expr = item["gene_expr"][
++            segment_tokens = item['gene_tokens'][
+                 segment_start_idx: segment_end_idx]
++            if self.gt_type == 'counts':
++                segment_values = item['gene_expr'][
++                    segment_start_idx: segment_end_idx]
++            else:
++                segment_values = None
+ 
+             # Validate that segment sequence length is specified correctly
+             if (self.sampling_strategy is not None and 'rep' in
+             self.sampling_strategy):
+                 pass
+             else:
+-                if segment_seq_len > len(segment_gene_tokens):
+-                    print(segment_seq_len)
+-                    print(len(segment_gene_tokens))
+-                    print(segment)
+-                    print(segment_gene_tokens)
+-                    print(item["seg_tokens"])
++                if segment_seq_len > len(segment_tokens):
+                     raise ValueError(
+                         'Sequence length for a given segment cannot be larger '
+                         'than segment size when not sampling with replacement.')
+@@ -272,21 +297,22 @@ def _get_gene_tokens_and_counts_for_segment(self,
+             # If no sampling strategy is specified, use all tokens up to
+             # specified length
+             if self.sampling_strategy is None:
+-                segment_gene_tokens = segment_gene_tokens[:segment_seq_len]
+-                segment_gene_expr = segment_gene_expr[:segment_seq_len]
++                segment_tokens = segment_tokens[:segment_seq_len]
++                if self.gt_type == 'counts':
++                    segment_values = segment_values[:segment_seq_len]
+             # Otherwise, sample a subset of tokens based on the sampling
+             # strategy
+             else:
+-                segment_n_nonzero_tokens = sum(
+-                    1 for token in segment_gene_tokens if token != 0)
++                segment_n_nz_tokens = sum(
++                    1 for token in segment_tokens if token != 0)
+ 
+-                segment_gene_tokens, segment_gene_expr = self._create_sampled_token_and_count_seq(
+-                    tokens=segment_gene_tokens,
+-                    counts=segment_gene_expr,
+-                    n_nonzero_tokens=segment_n_nonzero_tokens,
++                segment_tokens, segment_values = self._sample_seq(
++                    tokens=segment_tokens,
++                    values=segment_values,
++                    n_nz_tokens=segment_n_nz_tokens,
+                     size=segment_seq_len)       
+                     
+-            return segment_gene_tokens, segment_gene_expr
++            return segment_tokens, segment_values
+ 
+ 
+ class CellGraphDataset(CellBaseDataset):
+@@ -302,67 +328,94 @@ def __init__(self,
+             Keyword arguments for the initialization of the CellBaseDataset.
+         """
+         super().__init__(**base_dataset_kwargs)
+-         
++
+     def __getitem__(self,
+                     item: int
+                     ) -> Tuple[torch.Tensor,
+                                torch.Tensor,
+                                torch.Tensor,
+                                List[int]]:
+-        # Retrieve Huggingface item once
++        # Retrieve Hugging Face item once
+         item = self.dataset[item]
+ 
+-        # Get (sampled) gene tokens and counts
+-        gene_tokens_cell, gene_expr_cell = self._get_gene_tokens_and_counts_for_segment(
++        # Get (sampled) gene tokens and values/positions for index cell segment
++        tokens, values = self._get_segment_seq(
+             item=item,
+-            segment=self.max_special_tokens, # index cell seg
++            segment=self.max_special_tokens, # index cell segment
+             segment_seq_len=self.seq_len_cell)
+-        segments = [self.max_special_tokens if gene_token != 0 else 0 for
+-                    gene_token in gene_tokens_cell]
+-        positions = list(range(1, len(gene_tokens_cell) + 1))
+-        gene_tokens_neighborhood = []
+-        gene_expr_neighborhood = []
++        if self.gt_type == 'rank':
++            positions = [position if tokens[i] != 0 else 0 for i, position in 
++                enumerate(list(range(1, len(tokens) + 1)))] 
++        elif self.gt_type == 'counts':
++            positions = None
++
++        # Get non-padded segments for index cell segment
++        segments = [self.max_special_tokens if token != 0 else 0 for
++            token in tokens]
++
++        # Get (sampled) gene tokens, values/positions and non-padded segments
++        # for neighbor cell segments
+         for segment in np.unique(item["seg_tokens"]):
+             if segment > self.max_special_tokens: # neighbor cell segments
+-                segment_gene_tokens, segment_gene_expr = self._get_gene_tokens_and_counts_for_segment(
++                segment_tokens, segment_values = self._get_segment_seq(
+                     item=item,
+-                    segment=segment, # neighbor cell segs
++                    segment=segment,
+                     segment_seq_len=self.seq_len_cell)
+-                gene_tokens_neighborhood.extend(segment_gene_tokens)
+-                gene_expr_neighborhood.extend(segment_gene_expr)
+-                segments.extend([segment if gene_token != 0 else 0 for
+-                                 gene_token in segment_gene_tokens])
+-                positions.extend(list(range(1, len(segment_gene_tokens) + 1)))
+-        tokens = gene_tokens_cell + gene_tokens_neighborhood
+-        positions = [position if tokens[i] != 0 else 0 for i, position in 
+-                     enumerate(positions)]
+-        gene_expr = gene_expr_cell + gene_expr_neighborhood
++                if self.gt_type == 'rank':   
++                    positions.extend([position if segment_tokens[i] != 0 else 0
++                        for i, position in enumerate(
++                            list(range(1, len(segment_tokens) + 1)))])
++                elif self.gt_type == 'counts':
++                    values.extend(segment_values)
++                tokens.extend(segment_tokens)
++                segments.extend([segment if token != 0 else 0 for
++                    token in segment_tokens])
+ 
+         if len(tokens) > (self.seq_len_cell + self.seq_len_neighborhood):
+             tokens = tokens[:self.seq_len_cell + self.seq_len_neighborhood]
+             segments = segments[:self.seq_len_cell + self.seq_len_neighborhood]
+-            positions = positions[:self.seq_len_cell + self.seq_len_neighborhood]
+-            gene_expr = gene_expr[:self.seq_len_cell + self.seq_len_neighborhood]
++            if self.gt_type == 'rank':
++                positions = positions[
++                    :self.seq_len_cell + self.seq_len_neighborhood]
++            elif self.gt_type == 'counts':
++                values = values[:self.seq_len_cell + self.seq_len_neighborhood]
++
+         elif len(tokens) < (self.seq_len_cell + self.seq_len_neighborhood):
+-            tokens += [0] * ((self.seq_len_cell + self.seq_len_neighborhood) - len(tokens))
+-            segments += [0] * ((self.seq_len_cell + self.seq_len_neighborhood) - len(segments))
+-            positions += [0] * ((self.seq_len_cell + self.seq_len_neighborhood) - len(positions))
+-            gene_expr += [0.0] * ((self.seq_len_cell + self.seq_len_neighborhood) - len(gene_expr))
++            tokens += [0] * (
++                (self.seq_len_cell + self.seq_len_neighborhood) - len(tokens))
++            segments += [0] * (
++                (self.seq_len_cell + self.seq_len_neighborhood) - len(segments))
++            if self.gt_type == 'rank':
++                positions += [0] * (
++                    (self.seq_len_cell + self.seq_len_neighborhood) -
++                    len(positions))
++            elif self.gt_type == 'counts':
++                values += [0.0] * (
++                    (self.seq_len_cell + self.seq_len_neighborhood) -
++                    len(values))
+ 
+         # Add special tokens
+-        tokens, segments, positions, gene_expr = self._add_special_tokens_to_seq(
+-            tokens=tokens,
+-            segments=segments,
+-            positions=positions,
+-            gene_expr=gene_expr,
+-            item=item)
++        if self.gt_type == 'rank':
++            tokens, segments, positions = self._add_special_seq(
++                item=item,
++                tokens=tokens,
++                segments=segments,
++                positions=positions)            
++        elif self.gt_type == 'counts':
++            tokens, segments, values = self._add_special_seq(
++                item=item,
++                tokens=tokens,
++                segments=segments,
++                values=values)
+ 
+         tokens = torch.tensor(tokens)
+         segments = torch.tensor(segments)
+-        positions = torch.tensor(positions)
+-        gene_expr = torch.tensor(gene_expr)
+-
+-        return tokens, segments, positions, gene_expr, item["cell_id"]
++        if self.gt_type == 'rank':
++            positions = torch.tensor(positions)
++            return tokens, segments, positions, item["cell_id"]
++        elif self.gt_type == 'counts':
++            values = torch.tensor(values)
++            return tokens, segments, values, item["cell_id"]
+ 
+ 
+ class CellNeighborhoodDataset(CellBaseDataset):
+@@ -385,50 +438,59 @@ def __getitem__(self,
+                                torch.Tensor,
+                                torch.Tensor,
+                                List[int]]:
+-        # Retrieve Huggingface item once
++        # Retrieve Hugging Face item once
+         item = self.dataset[item]
+ 
+-        # Get (sampled) gene tokens and counts
+-        gene_tokens_cell, gene_expr_cell = self._get_gene_tokens_and_counts_for_segment(
++        # Get (sampled) gene tokens, values/positions and non-padded segments
++        gene_tokens_cell, values_cell = self._get_segment_seq(
+             item=item,
+             segment=self.max_special_tokens, # cell seg
+             segment_seq_len=self.seq_len_cell)
+-        gene_tokens_neighborhood, gene_expr_neighborhood = self._get_gene_tokens_and_counts_for_segment(
++        gene_tokens_neigh, values_neigh = self._get_segment_seq(
+             item=item,
+-            segment=self.max_special_tokens + 1, # neighborhood seg
++            segment=self.max_special_tokens + 1, # neigh seg
+             segment_seq_len=self.seq_len_neighborhood)
+-
+-        tokens = gene_tokens_cell + gene_tokens_neighborhood
+-        gene_expr = gene_expr_cell + gene_expr_neighborhood
++        tokens = gene_tokens_cell + gene_tokens_neigh
+         segments = [
+             self.max_special_tokens if gene_token != 0 else 0 for gene_token
+             in gene_tokens_cell
+             ] + [
+             self.max_special_tokens + 1 if gene_token != 0 else 0 for
+-            gene_token in gene_tokens_neighborhood]
+-        positions = list(range(1, len(gene_tokens_cell) + 1)) + list(
+-            range(1, len(gene_tokens_neighborhood) + 1))
+-        positions = [position if tokens[i] != 0 else 0 for i, position in 
+-                     enumerate(positions)]
++            gene_token in gene_tokens_neigh]
++        if self.gt_type == 'rank':
++            positions = list(range(1, len(gene_tokens_cell) + 1)) + list(
++                range(1, len(gene_tokens_neigh) + 1))
++            positions = [position if tokens[i] != 0 else 0 for i, position in 
++                        enumerate(positions)]
++        elif self.gt_type == 'counts':
++            values = values_cell + values_neigh
+ 
+         # Add special tokens
+-        tokens, segments, positions, gene_expr = self._add_special_tokens_to_seq(
+-            tokens=tokens,
+-            segments=segments,
+-            positions=positions,
+-            gene_expr=gene_expr,
+-            item=item)
++        if self.gt_type == 'rank':
++            tokens, segments, positions = self._add_special_seq(
++                item=item,
++                tokens=tokens,
++                segments=segments,
++                positions=positions)            
++        elif self.gt_type == 'counts':
++            tokens, segments, values = self._add_special_seq(
++                item=item,
++                tokens=tokens,
++                segments=segments,
++                values=values)
+ 
+         tokens = torch.tensor(tokens)
+         segments = torch.tensor(segments)
+-        positions = torch.tensor(positions)
+-        gene_expr = torch.tensor(gene_expr)
+-
+-        return tokens, segments, positions, gene_expr, item["cell_id"]
++        if self.gt_type == 'rank':
++            positions = torch.tensor(positions)
++            return tokens, segments, positions, item["cell_id"]
++        elif self.gt_type == 'counts':
++            values = torch.tensor(values)
++            return tokens, segments, values, item["cell_id"]
+ 
+ 
+ def make_cell_dataset(tokenizer_type: Literal['cell_graph',
+-                                              'cell_neighborhood'],
++                                              'cell_neigh'],
+                       **cell_dataset_kwargs
+                       ) -> Union[CellGraphDataset,
+                                  CellNeighborhoodDataset]:
+@@ -436,10 +498,8 @@ def make_cell_dataset(tokenizer_type: Literal['cell_graph',
+     Based on tokenizer type, return CellGraphDataset or CellNeighborhoodDataset.
+     """
+     if tokenizer_type == 'cell_graph':
+-        cell_dataset = CellGraphDataset(tokenizer_type=tokenizer_type,
+-                                        **cell_dataset_kwargs)
+-    elif tokenizer_type  == 'cell_neighborhood':
+-        cell_dataset = CellNeighborhoodDataset(tokenizer_type=tokenizer_type,
+-                                               **cell_dataset_kwargs)
++        cell_dataset = CellGraphDataset(**cell_dataset_kwargs)
++    elif tokenizer_type  == 'cell_neigh':
++        cell_dataset = CellNeighborhoodDataset(**cell_dataset_kwargs)
+ 
+     return cell_dataset
+diff --git a/src/nichejepa/datasets/dataloaders.py b/src/nichejepa/datasets/dataloaders.py
+index f6c95d89..f12e2ab5 100644
+--- a/src/nichejepa/datasets/dataloaders.py
++++ b/src/nichejepa/datasets/dataloaders.py
+@@ -75,7 +75,7 @@ def __init__(self,
+                 len(self.cell_dataset) / self.num_replicas)
+         self.total_size = self.num_samples * self.num_replicas
+         self.seed = seed
+-        self.lengths = self.cell_dataset.n_nonzero_tokens
++        self.lengths = self.cell_dataset.n_nz_tokens
+ 
+     def __iter__(self) -> Iterator:
+         # Deterministically shuffle based on epoch and seed
+diff --git a/src/nichejepa/datasets/utils.py b/src/nichejepa/datasets/utils.py
+index 6d7c973b..9329abb8 100644
+--- a/src/nichejepa/datasets/utils.py
++++ b/src/nichejepa/datasets/utils.py
+@@ -112,8 +112,9 @@ def prepare_dataset(args: dict,
+     elif args['data']['test_batch_ids']:
+         cell_ids = dataset['cell_id']
+         test_batch_mask = [
+-            any(batch_id in cell_id for batch_id in args['data'][
+-                'test_batch_ids']) for cell_id in cell_ids]
++            any(batch_id == f"{cell_id.split('_')[0]}_{cell_id.split('_')[1]}"
++                for batch_id in args['data']['test_batch_ids'])
++            for cell_id in cell_ids]
+         train_indices = [
+             index for index, value in enumerate(test_batch_mask) if not value]
+         test_indices = [
+diff --git a/src/nichejepa/infer.py b/src/nichejepa/infer.py
+index ee21a374..3123ebd7 100644
+--- a/src/nichejepa/infer.py
++++ b/src/nichejepa/infer.py
+@@ -1,6 +1,7 @@
+ import copy
+ import logging
+ import os
++import pickle
+ import sys
+ import yaml
+ from collections import defaultdict
+@@ -93,6 +94,7 @@ def infer(args: dict,
+         torch.cuda.set_device(device)
+ 
+     # Load params from config file
++    add_cls = args['meta']['add_cls']
+     gt_type = args['meta']['gt_type']
+     enc_depth = args['meta']['enc_depth']
+     enc_emb_dim = args['meta']['enc_emb_dim']
+@@ -105,13 +107,12 @@ def infer(args: dict,
+     use_flash_attention = args['meta']['use_flash_attention']
+ 
+     dataset_name = args['data']['dataset_name']
++    token_dict_folder_path = args['data']['token_dict_folder_path']
+     raw_data_folder_path = args['data']['raw_data_folder_path']
+     batch_size = args['data']['batch_size']
+-    vocab_size = args['data']['vocab_size']
+     pin_memory = args['data']['pin_memory']
+     num_workers = args['data']['num_workers']
+     tokenizer_type = args['data']['tokenizer_type']
+-    n_special_values = args['data']['n_special_values']
+     seq_len_cell = args['data']['seq_len_cell']
+     seq_len_neighborhood = args['data']['seq_len_neighborhood']
+     n_segments = args['data']['n_segments']
+@@ -126,34 +127,35 @@ def infer(args: dict,
+         controlled_attention_pattern = torch.tensor(args['mask']['controlled_attention_pattern'])
+     else:
+         controlled_attention_pattern = args['mask']['controlled_attention_pattern']
++    controlled_attention_type = args['mask']['controlled_attention_type']
+     restrict_special_attention = args['mask']['restrict_special_attention']
+ 
+     r_file = args['state']['read_checkpoint']
+     tag = args['state']['write_tag']
+     
++    # Load token dict and get token dict-specfic params
++    with open(token_dict_folder_path, 'rb') as file:
++        token_dict = pickle.load(file)
++    vocab_size = len(token_dict)
++    n_special_values = sum(1 for key in token_dict if "spv" in key)
++    max_special_tokens = sum(1 for key in token_dict if "cls" in key) + sum(
++        1 for key in token_dict if "spt" in key)
++
+     # Define tokenizer-specific params
+     if tokenizer_type == 'cell_neighborhood':
+-        max_special_tokens = 7
+-        max_cls_tokens = 2
+-        special_tokens = ['cls_cell', 'cls_neighborhood'] + special_tokens
++        if add_cls:
++            special_tokens = ['cls_cell', 'cls_neighborhood'] + special_tokens  
+     elif tokenizer_type == 'cell_graph':
+-        max_special_tokens = 105
+-        max_cls_tokens = 100
+-        special_tokens = [
+-            f'cls_{i}' for i in range(max_cls_tokens)] + special_tokens
++        if add_cls:
++            special_tokens = [
++                f'cls_{i}' for i in range(n_segments)] + special_tokens
++
++    max_cls_tokens = sum('cls' in token for token in special_tokens)
+ 
+     # Get token sequence length and number of special tokens
+     n_special_tokens = len(special_tokens)
+     seq_len = seq_len_cell + seq_len_neighborhood + n_special_tokens
+ 
+-    # Define tokenizer-specific params
+-    if tokenizer_type == 'cell_neighborhood':
+-        max_special_tokens = 7
+-        max_cls_tokens = 2
+-    elif tokenizer_type == 'cell_graph':
+-        max_special_tokens = 105
+-        max_cls_tokens = 100
+-
+     # Set the folder for saving extracted features
+     save_folder = f"{load_folder_path}/extracted_features"
+     feature_path = f"{save_folder}/"
+@@ -200,6 +202,7 @@ def infer(args: dict,
+        mask_collator = BlockMaskCollator(
+             n_targets=n_targets,
+             n_contexts=n_contexts,
++            n_segments=n_segments,
+             seq_len_cell=seq_len_cell,
+             seq_len_neighborhood=seq_len_neighborhood,
+             max_special_tokens=max_special_tokens,
+@@ -207,6 +210,7 @@ def infer(args: dict,
+             max_cls_tokens=max_cls_tokens,
+             per_block_mask_ratio=per_block_mask_ratio,
+             controlled_attention_pattern=controlled_attention_pattern,
++            controlled_attention_type=controlled_attention_type,
+             restrict_special_attention=restrict_special_attention)
+     else:
+         mask_collator = RandomMaskCollator(
+@@ -224,7 +228,6 @@ def infer(args: dict,
+         vocab_size=vocab_size,
+         seq_len_cell=seq_len_cell,
+         seq_len_neighborhood=seq_len_neighborhood,
+-        max_cls_tokens=max_cls_tokens,
+         max_special_tokens=max_special_tokens,
+         tokenizer_type=tokenizer_type,
+         gt_type=gt_type,
+@@ -265,8 +268,10 @@ def infer(args: dict,
+         # Load gene tokens and segmentation label to the specified device
+         tokens = udata[0].to(device, non_blocking=True)
+         segments = udata[1].to(device, non_blocking=True)
+-        positions = udata[2].to(device, non_blocking=True)
+-        counts = udata[3].to(device, non_blocking=True)
++        if gt_type == 'rank':
++            positions = udata[2].to(device, non_blocking=True)
++        elif gt_type == 'counts':
++            counts = udata[2].to(device, non_blocking=True)
+         masks_attention = masks_attention.to(device, non_blocking=True)
+ 
+         # Collect cell IDs to join metadata
+@@ -419,6 +424,7 @@ def infer(args: dict,
+     adata_metadata = collect_adata_from_folder(raw_data_folder_path)
+     adata_metadata_subset = adata_metadata[
+         adata_metadata.obs['cell_id'].isin(adata.obs['cell_id'])]
++
+     merged_obs = pd.merge(adata.obs,
+                           adata_metadata_subset.obs,
+                           on='cell_id')
+diff --git a/src/nichejepa/masks/block_masking.py b/src/nichejepa/masks/block_masking.py
+index 08f2841f..62836d95 100644
+--- a/src/nichejepa/masks/block_masking.py
++++ b/src/nichejepa/masks/block_masking.py
+@@ -27,6 +27,8 @@ class BlockMaskCollator:
+     n_targets:
+         Number of target masks to sample for each token sequence.
+     n_contexts:
++    n_segments:
++        Number of segments
+     seq_len_cell:
+         The length of the token sequence representing the cell segment.
+     seq_len_neighborhood:
+@@ -44,12 +46,14 @@ class BlockMaskCollator:
+         max will be sampled for each batch.
+     controlled_attention_pattern:
+         The pattern that the model uses to generate the attention matrix.
++    controlled_attention_type:
+     restrict_special_attention:
+         If 'True', restrict attention of special tokens to themselves
+     """
+     def __init__(self,
+                  n_targets: int,
+                  n_contexts: int,
++                 n_segments: int,
+                  seq_len_cell: int,
+                  seq_len_neighborhood: int,
+                  max_special_tokens: int,
+@@ -57,9 +61,11 @@ def __init__(self,
+                  max_cls_tokens: int,
+                  per_block_mask_ratio: float=0.5,
+                  controlled_attention_pattern: Optional[torch.Tensor]=None,
++                 controlled_attention_type: Literal['enc', 'pred', 'enc_pred']='enc_pred',
+                  restrict_special_attention: bool=False):
+         self.n_targets = n_targets
+         self.n_contexts = n_contexts
++        self.n_segments = n_segments
+         self.seq_len_cell = seq_len_cell
+         self.seq_len_neighborhood = seq_len_neighborhood
+         self.seq_len_genes = self.seq_len_cell + self.seq_len_neighborhood
+@@ -68,6 +74,7 @@ def __init__(self,
+         self.max_cls_tokens = max_cls_tokens
+         self.per_block_mask_ratio = per_block_mask_ratio
+         self.controlled_attention_pattern = controlled_attention_pattern
++        self.controlled_attention_type = controlled_attention_type
+         self.restrict_special_attention = restrict_special_attention
+ 
+     def _sample_gene_mask(self,
+@@ -291,16 +298,23 @@ def __call__(self,
+                     i,
+                     (i+1):] = 0
+ 
+-        # Create predictor attention mask (without controlled attention)
+-        if (self.controlled_attention_pattern is not None) or (self.max_cls_tokens > 2):
+-            collated_masks_attention_pred = create_controlled_mask_context_target(
+-                collated_masks_attention,
+-                n_special_tokens=self.n_special_tokens,
+-                max_cls_tokens=self.max_cls_tokens,
+-                target_masks=collated_target_masks,
+-                context_masks=collated_context_masks)
+-        else:
+-            collated_masks_attention_pred = None
++        collated_masks_attention_pred = None
++        collated_masks_attention_enc = None
++
++        if 'pred' not in self.controlled_attention_type:
++            # Create predictor attention mask (without controlled attention)
++            if (self.controlled_attention_pattern is not None) or (self.max_cls_tokens > 2):
++                collated_masks_attention_pred = create_controlled_mask_context_target(
++                    collated_masks_attention,
++                    n_special_tokens=self.n_special_tokens,
++                    target_masks=collated_target_masks,
++                    context_masks=collated_context_masks)
++        if 'enc' not in self.controlled_attention_type:
++            # Create encoder attention mask (without controlled attention)
++            if (self.controlled_attention_pattern is not None) or (self.max_cls_tokens > 2):
++                collated_masks_attention_enc = create_controlled_mask_context_target(
++                    collated_masks_attention,
++                    context_masks=collated_context_masks)         
+ 
+         # Apply controlled attention
+         if self.controlled_attention_pattern is not None:
+@@ -310,14 +324,22 @@ def __call__(self,
+                     collated_masks_attention,
+                     self.seq_len_cell,
+                     self.n_special_tokens,
+-                    self.max_cls_tokens)
++                    self.max_cls_tokens,
++                    self.n_segments)
+ 
+-        # Create encoder attention mask (with controlled attention)
+-        if (self.controlled_attention_pattern is not None) or (self.max_cls_tokens > 2):
+-            collated_masks_attention_enc = create_controlled_mask_context_target(
+-                collated_masks_attention,
+-                context_masks=collated_context_masks)
+-        else:
+-            collated_masks_attention_enc = None
++        if 'pred' in self.controlled_attention_type:
++            # Create predictor attention mask (with controlled attention)
++            if (self.controlled_attention_pattern is not None) or (self.max_cls_tokens > 2):
++                collated_masks_attention_pred = create_controlled_mask_context_target(
++                    collated_masks_attention,
++                    n_special_tokens=self.n_special_tokens,
++                    target_masks=collated_target_masks,
++                    context_masks=collated_context_masks)
++        if 'enc' in self.controlled_attention_type:
++            # Create encoder attention mask (with controlled attention)
++            if (self.controlled_attention_pattern is not None) or (self.max_cls_tokens > 2):
++                collated_masks_attention_enc = create_controlled_mask_context_target(
++                    collated_masks_attention,
++                    context_masks=collated_context_masks)
+ 
+         return collated_batch, collated_context_masks, collated_target_masks, collated_masks_attention, collated_masks_attention_enc, collated_masks_attention_pred
+diff --git a/src/nichejepa/masks/utils.py b/src/nichejepa/masks/utils.py
+index 21dbb076..5d6bc6a7 100644
+--- a/src/nichejepa/masks/utils.py
++++ b/src/nichejepa/masks/utils.py
+@@ -63,7 +63,6 @@ def apply_attention_mask(attention_matrix, indices):
+ def create_controlled_mask_context_target(
+     attention_matrix: torch.Tensor,
+     n_special_tokens: Optional[int]=None,
+-    max_cls_tokens: Optional[int]=None,
+     target_masks: Optional[torch.Tensor]=None,
+     context_masks: Optional[torch.Tensor]=None):
+     """
+@@ -92,33 +91,26 @@ def create_controlled_mask_context_target(
+ 
+     # Remove the singleton dimension if it exists in attention_matrix
+     attention_matrix = attention_matrix.squeeze(1)
+-    # Check if target_masks isn't None
+-    if target_masks is None:
+-        # Iterate through the context  masks
+-        for context_indices in context_masks:
+ 
++    # Iterate through the context  masks
++    for context_indices in context_masks:
++        if target_masks is None:
+             selected_submatrix = apply_attention_mask(attention_matrix,
+                                                       context_indices)
+-            
+-            # Append the resulting submatrix to the list
+-            masked_attention_matrices.append(selected_submatrix)
+-        
+-        # Concatenate all submatrices along the batch dimension (dim=0) and unsqueeze to restore singleton dim
+-        return torch.unsqueeze(torch.cat(masked_attention_matrices, dim=0), dim=1)
+-
+-    # Iterate through the context and target masks
+-    for context_indices in context_masks:
+-        for mask_indices in target_masks:
+-            # Step 1: Concatenate context and target indices together (exclude cls tokens)
+-            combined_indices = torch.cat((mask_indices, context_indices[:, max_cls_tokens:]), dim=1)
+-            # Call the helper function to create the attention matrices for the given indices
+-            selected_submatrix = apply_attention_mask(attention_matrix, combined_indices)
+-            
+-            # Append the resulting submatrix to the list
+             masked_attention_matrices.append(selected_submatrix)
+-
+-    # Concatenate all submatrices along the batch dimension and unsqueeze to
+-    # restore singleton dim
++        else:
++            for mask_indices in target_masks:
++                # Step 1: Concatenate context and target indices excluding
++                # special tokens
++                combined_indices = torch.cat((
++                    mask_indices[:, n_special_tokens:],
++                    context_indices[:, n_special_tokens:]), dim=1)
++                selected_submatrix = apply_attention_mask(attention_matrix,
++                                                          combined_indices)
++                masked_attention_matrices.append(selected_submatrix)
++    
++    # Concatenate all submatrices along the batch dimension (dim=0) and
++    # unsqueeze to restore singleton dim
+     return torch.unsqueeze(torch.cat(masked_attention_matrices, dim=0), dim=1)
+ 
+ 
+@@ -127,6 +119,7 @@ def configure_attention_masks(controlled_attention_pattern: torch.Tensor,
+                               seq_len_cell: int,
+                               n_special_tokens: int,
+                               max_cls_tokens: int,
++                              n_segments: int,
+                               ):
+     """
+     Configures attention masks based on the controlled attention pattern.
+@@ -152,6 +145,7 @@ def configure_attention_masks(controlled_attention_pattern: torch.Tensor,
+         The starting index of valid tokens for masking, excluding special
+         tokens, within the attention matrix.
+     max_cls_tokens:
++    n_segments:
+     """
+     # <cls> tokens do not attent to other <cls> tokens
+     if controlled_attention_pattern[0][1]:
+@@ -227,9 +221,9 @@ def configure_attention_masks(controlled_attention_pattern: torch.Tensor,
+ 
+     # Gene tokens do not attent to other gene tokens
+     if controlled_attention_pattern[1][3]:
+-        for i in range(max_cls_tokens):
++        for i in range(n_segments):
+             start_idx = n_special_tokens + (i * seq_len_cell)
+-            if i == (max_cls_tokens - 1):
++            if i == (n_segments - 1):
+                 end_idx = None # last <cls> token will capture until end
+             else:
+                 end_idx = n_special_tokens + ((i + 1) * seq_len_cell)
+diff --git a/src/nichejepa/models/gene_transformers.py b/src/nichejepa/models/gene_transformers.py
+index 3b17a63c..6f2639a1 100644
+--- a/src/nichejepa/models/gene_transformers.py
++++ b/src/nichejepa/models/gene_transformers.py
+@@ -526,10 +526,9 @@ def return_multi_layer_emb(self,
+         
+         # Replace special tokens (except <cls> tokens) with pad tokens for
+         # inference
+-        if self.n_special_tokens > 2:
+-            positions[:, self.max_cls_tokens:self.n_special_tokens] = 0
+-            segments[:, self.max_cls_tokens:self.n_special_tokens] = 0
+-            tokens[:, self.max_cls_tokens:self.n_special_tokens] = 0
++        positions[:, self.max_cls_tokens:self.n_special_tokens] = 0
++        segments[:, self.max_cls_tokens:self.n_special_tokens] = 0
++        tokens[:, self.max_cls_tokens:self.n_special_tokens] = 0
+ 
+         # Get positional, segment and token embeddings
+         pos_emb = self.pos_embed(positions)
+@@ -576,7 +575,7 @@ def __init__(self,
+         self.value_embed = nn.Embedding(self.n_value_bins,
+                                         self.embed_dim)
+         self.special_value_embed = nn.Embedding(
+-            2 + self.n_special_values + self.max_cls_tokens, # include <pad> and zero expression
++            2 + self.n_special_values + self.max_special_tokens, # include <pad> and zero expression
+             self.embed_dim,
+             padding_idx=0)
+         self.value_emb_weights_projection = ValueEmbWeightsProjection(
+@@ -705,9 +704,8 @@ def return_multi_layer_emb(self,
+ 
+         # During inference, replace special tokens (except <cls> tokens) with
+         # <pad> tokens
+-        if self.n_special_tokens > 2:
+-            tokens[:, self.max_cls_tokens:self.n_special_tokens] = 0
+-            segments[:, self.max_cls_tokens:self.n_special_tokens] = 0
++        tokens[:, self.max_cls_tokens:self.n_special_tokens] = 0
++        segments[:, self.max_cls_tokens:self.n_special_tokens] = 0
+ 
+         # Get embeddings for sequence of tokens and segments
+         token_emb = self.token_embed(tokens)
+@@ -866,20 +864,22 @@ def forward(self,
+             # Repeat context embeddings for all target masks
+             z = z.repeat(len(masks_pred), 1, 1)
+ 
+-            # Concatenate context embeddings and mask tokens (both incl. pos
+-            # embedding)
+-            z = torch.cat([
+-                z[:, :self.max_cls_tokens, :], # <cls> tokens
+-                pred_tokens[:, self.max_cls_tokens:, :],
+-                # non <cls> special tokens and target gene tokens
+-                z[:, self.max_cls_tokens:, :]
+-                # non <cls> special tokens and context gene tokens
++            # Concatenate mask tokens and context embeddings of gene tokens
++            z_out = torch.cat([
++                pred_tokens[:, self.n_special_tokens:, :], # target gene tokens
++                z[:, self.n_special_tokens:, :] # context gene tokens
+                 ], dim=1)
+ 
+             # Run forward prop
+             for blk in self.predictor_blocks:
+-                z = blk(z, masks=masks_attention)
+-            z = self.predictor_norm(z)
++                z_out = blk(z_out, masks=masks_attention)
++            z_out = self.predictor_norm(z_out)
++
++            # Concatenate context embeddings of special tokens
++            z = torch.cat([
++                z[:, :self.n_special_tokens, :], # special tokens
++                z_out
++                ], dim=1)
+ 
+             # Return predictions for (target) mask and special tokens
+             z = z[:, :pred_tokens.size(1), :]
+@@ -1001,20 +1001,22 @@ def forward(self,
+             # Repeat context embeddings for all target masks
+             z = z.repeat(len(masks_pred), 1, 1)
+ 
+-            # Concatenate context embeddings and mask tokens (both incl. pos
+-            # embedding)
+-            z = torch.cat([
+-                z[:, :self.max_cls_tokens, :], # <cls> tokens
+-                pred_tokens[:, self.max_cls_tokens:, :],
+-                # non <cls> special tokens and target gene tokens
+-                z[:, self.max_cls_tokens:, :]
+-                # non <cls> special tokens and context gene tokens
++            # Concatenate mask tokens and context embeddings of gene tokens
++            z_out = torch.cat([
++                pred_tokens[:, self.n_special_tokens:, :], # target gene tokens
++                z[:, self.n_special_tokens:, :] # context gene tokens
+                 ], dim=1)
+ 
+             # Run forward prop
+             for blk in self.predictor_blocks:
+-                z = blk(z, masks=masks_attention)
+-            z = self.predictor_norm(z)
++                z_out = blk(z_out, masks=masks_attention)
++            z_out = self.predictor_norm(z_out)
++
++            # Concatenate context embeddings of special tokens
++            z = torch.cat([
++                z[:, :self.n_special_tokens, :], # special tokens
++                z_out
++                ], dim=1)
+ 
+             # Return predictions for (target) mask and special tokens
+             z = z[:, :pred_tokens.size(1), :]
+diff --git a/src/nichejepa/tokenizers/cell_tokenizers.py b/src/nichejepa/tokenizers/cell_tokenizers.py
+index 5855b2c0..17a2e681 100644
+--- a/src/nichejepa/tokenizers/cell_tokenizers.py
++++ b/src/nichejepa/tokenizers/cell_tokenizers.py
+@@ -623,9 +623,9 @@ def _tokenize_adata(self,
+ 
+         adata_dict['batch_value_token'] = [
+             self.token_dict[f'spv_{batch_id_key}']] * n_cells
+-        adata_dict['gene_panel_value_token'] = [self.token_dict[
+-            f'spv_{self.file_path_to_gene_panel_ID_dict[str(adata_file_path)]}']
+-            ] * n_cells
++        # adata_dict['gene_panel_value_token'] = [self.token_dict[
++            # f'spv_{self.file_path_to_gene_panel_ID_dict[str(adata_file_path)]}']
++            # ] * n_cells
+         adata_dict['assay_value_token'] = [
+             self.token_dict[f'spv_{adata.uns["assay"]}']] * n_cells
+         adata_dict['species_value_token'] = [
+@@ -642,9 +642,9 @@ def _tokenize_adata(self,
+         spv_idx_subtract = spv_start_idx - 2 - self.max_cls_tokens
+         adata_dict['batch_value'] = [
+             self.token_dict[f'spv_{batch_id_key}'] - spv_idx_subtract] * n_cells
+-        adata_dict['gene_panel_value'] = [self.token_dict[
+-            f'spv_{self.file_path_to_gene_panel_ID_dict[str(adata_file_path)]}']
+-            - spv_idx_subtract] * n_cells
++        # adata_dict['gene_panel_value'] = [self.token_dict[
++            # f'spv_{self.file_path_to_gene_panel_ID_dict[str(adata_file_path)]}']
++            # - spv_idx_subtract] * n_cells
+         adata_dict['assay_value'] = [
+             self.token_dict[
+                 f'spv_{adata.uns["assay"]}'] - spv_idx_subtract] * n_cells
+@@ -763,20 +763,20 @@ def _format_examples(self,
+         example['assay_token'] = [example['assay_token']]
+         example['species_token'] = [example['species_token']]
+         example['tissue_token'] = [example['tissue_token']]
+-        example['gene_panel_token'] = [example['gene_panel_token']]
++        # example['gene_panel_token'] = [example['gene_panel_token']]
+         example['batch_token'] = [example['batch_token']]
+ 
+         example['assay_value_token'] = [example['assay_value_token']]
+         example['species_value_token'] = [example['species_value_token']]
+         example['tissue_value_token'] = [example['tissue_value_token']]
+-        example['gene_panel_value_token'] = [example['gene_panel_value_token']]
++        # example['gene_panel_value_token'] = [example['gene_panel_value_token']]
+         example['batch_value_token'] = [example['batch_value_token']] 
+ 
+         # Retrieve special token values
+         example['assay_value'] = [example['assay_value']]
+         example['species_value'] = [example['species_value']]
+         example['tissue_value'] = [example['tissue_value']]
+-        example['gene_panel_value'] = [example['gene_panel_value']]
++        # example['gene_panel_value'] = [example['gene_panel_value']]
+         example['batch_value'] = [example['batch_value']]
+ 
+         return example
+diff --git a/src/nichejepa/train.py b/src/nichejepa/train.py
+index eccf1e13..3e554f73 100644
+--- a/src/nichejepa/train.py
++++ b/src/nichejepa/train.py
+@@ -27,6 +27,7 @@
+ import datasets
+ import numpy as np
+ import pandas as pd
++import pickle
+ import torch
+ import torch.multiprocessing as mp
+ import torch.nn.functional as F
+@@ -96,9 +97,8 @@ def train(args: dict,
+ 
+     # Load params from config file
+     dataset_name = args['data']['dataset_name']
++    token_dict_folder_path = args['data']['token_dict_folder_path']
+     tokenizer_type = args['data']['tokenizer_type']
+-    n_special_values = args['data']['n_special_values']
+-    vocab_size = args['data']['vocab_size']
+     seq_len_cell = args['data']['seq_len_cell']
+     seq_len_neighborhood = args['data']['seq_len_neighborhood']
+     n_segments = args['data']['n_segments']
+@@ -107,6 +107,7 @@ def train(args: dict,
+     num_workers = args['data']['num_workers']
+     pin_memory = args['data']['pin_memory']
+ 
++    add_cls = args['meta']['add_cls']
+     gt_type = args['meta']['gt_type']
+     enc_depth = args['meta']['enc_depth'] 
+     enc_emb_dim = args['meta']['enc_emb_dim']    
+@@ -128,6 +129,7 @@ def train(args: dict,
+         controlled_attention_pattern = torch.tensor(args['mask']['controlled_attention_pattern'])
+     else:
+         controlled_attention_pattern = args['mask']['controlled_attention_pattern']
++    controlled_attention_type = args['mask']['controlled_attention_type']
+     restrict_special_attention = args['mask']['restrict_special_attention']
+ 
+     warmup = args['optimization']['warmup']
+@@ -149,16 +151,24 @@ def train(args: dict,
+     load_model = args['state']['load_checkpoint'] or resume_preempt
+     r_file = args['state']['read_checkpoint']
+ 
++    # Load token dict and get token dict-specfic params
++    with open(token_dict_folder_path, 'rb') as file:
++        token_dict = pickle.load(file)
++    vocab_size = len(token_dict)
++    n_special_values = sum(1 for key in token_dict if "spv" in key)
++    max_special_tokens = sum(1 for key in token_dict if "cls" in key) + sum(
++        1 for key in token_dict if "spt" in key)
++
+     # Define tokenizer-specific params
+     if tokenizer_type == 'cell_neighborhood':
+-        max_special_tokens = 7
+-        max_cls_tokens = 2
+-        special_tokens = ['cls_cell', 'cls_neighborhood'] + special_tokens
++        if add_cls:
++            special_tokens = ['cls_cell', 'cls_neighborhood'] + special_tokens            
+     elif tokenizer_type == 'cell_graph':
+-        max_special_tokens = 105
+-        max_cls_tokens = 100
+-        special_tokens = [
+-            f'cls_{i}' for i in range(max_cls_tokens)] + special_tokens
++        if add_cls:
++            special_tokens = [
++                f'cls_{i}' for i in range(n_segments)] + special_tokens
++    
++    max_cls_tokens = sum('cls' in token for token in special_tokens)
+ 
+     # Get token sequence length and number of special tokens
+     n_special_tokens = len(special_tokens)
+@@ -238,6 +248,7 @@ def train(args: dict,
+        mask_collator = BlockMaskCollator(
+             n_targets=n_targets,
+             n_contexts=n_contexts,
++            n_segments=n_segments,
+             seq_len_cell=seq_len_cell,
+             seq_len_neighborhood=seq_len_neighborhood,
+             max_special_tokens=max_special_tokens,
+@@ -245,6 +256,7 @@ def train(args: dict,
+             max_cls_tokens=max_cls_tokens,
+             per_block_mask_ratio=per_block_mask_ratio,
+             controlled_attention_pattern=controlled_attention_pattern,
++            controlled_attention_type=controlled_attention_type,
+             restrict_special_attention=restrict_special_attention)
+     else:
+         mask_collator = RandomMaskCollator(
+@@ -262,7 +274,6 @@ def train(args: dict,
+         vocab_size=vocab_size,
+         seq_len_cell=seq_len_cell,
+         seq_len_neighborhood=seq_len_neighborhood,
+-        max_cls_tokens=max_cls_tokens,
+         max_special_tokens=max_special_tokens,
+         tokenizer_type=tokenizer_type,
+         gt_type=gt_type,
+@@ -274,7 +285,6 @@ def train(args: dict,
+         vocab_size=vocab_size,
+         seq_len_cell=seq_len_cell,
+         seq_len_neighborhood=seq_len_neighborhood,
+-        max_cls_tokens=max_cls_tokens,
+         max_special_tokens=max_special_tokens,
+         tokenizer_type=tokenizer_type,
+         gt_type=gt_type,
+@@ -380,8 +390,10 @@ def save_checkpoint(epoch):
+         train_loader):
+             tokens = udata[0].to(device, non_blocking=True)
+             segments = udata[1].to(device, non_blocking=True)
+-            positions = udata[2].to(device, non_blocking=True)
+-            counts = udata[3].to(device, non_blocking=True)
++            if gt_type == 'rank':
++                positions = udata[2].to(device, non_blocking=True)
++            elif gt_type == 'counts':
++                counts = udata[2].to(device, non_blocking=True)
+             masks_enc = [u.to(device, non_blocking=True) for u in masks_enc]
+             masks_pred = [u.to(device, non_blocking=True) for u in masks_pred]
+             masks_attention = masks_attention.to(device, non_blocking=True)
+@@ -390,13 +402,6 @@ def save_checkpoint(epoch):
+             if masks_attention_pred is not None:
+                 masks_attention_pred = masks_attention_pred.to(device, non_blocking=True)
+ 
+-            #torch.set_printoptions(threshold=float('inf'))
+-            #print(tokens[0, :])
+-            #print(segments[0, :])
+-            #print(counts[0, :])
+-            #print(udata[-1])
+-            #raise ValueError
+-
+             maskA_meter.update(len(masks_enc[0][0]))
+             maskB_meter.update(len(masks_pred[0][0]))
+ 

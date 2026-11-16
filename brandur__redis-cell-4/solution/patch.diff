@@ -1,0 +1,457 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 4f883db..dbbb98a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,6 +8,7 @@ build = "build.rs"
+ crate-type = ["dylib"]
+ 
+ [dependencies]
++bitflags = "0.7.0"
+ libc = "0.2.0"
+ time = "0.1"
+ 
+diff --git a/src/cell/store.rs b/src/cell/store.rs
+index a7065a6..80b978b 100644
+--- a/src/cell/store.rs
++++ b/src/cell/store.rs
+@@ -132,37 +132,36 @@ impl<'a> Store for InternalRedisStore<'a> {
+                                  new: i64,
+                                  ttl: time::Duration)
+                                  -> Result<bool, CellError> {
+-        let val = self.r.coerce_integer(self.r.get(key))?;
+-        match val {
+-            redis::Reply::Nil => Ok(false),
+-
+-            // Still the old value: perform the swap.
+-            redis::Reply::Integer(n) if n == old => {
+-                if ttl.num_seconds() > 1 {
+-                    self.r.setex(key, ttl.num_seconds(), new.to_string().as_str())?;
++        let key = self.r.open_key_writable(key);
++        match key.read()? {
++            Some(s) => {
++                if s.parse::<i64>()? == old {
++                    // Still the old value: perform the swap.
++                    key.write(new.to_string().as_str())?;
++                    key.set_expire(ttl)?;
++                    Ok(true)
+                 } else {
+-                    self.r.set(key, new.to_string().as_str())?;
++                    // Not the old value: something else must have set it. Take no
++                    // action.
++                    Ok(false)
+                 }
+-
+-                Ok(true)
+             }
+ 
+-            // Not the old value: something else must have set it. Take no
+-            // action.
+-            redis::Reply::Integer(_) => Ok(false),
+-
+-            _ => Err(error!("GET returned non-string non-nil value.")),
++            // Value wasn't set.
++            None => Ok(false),
+         }
+     }
+ 
+     fn get_with_time(&self, key: &str) -> Result<(i64, time::Tm), CellError> {
+         // TODO: currently leveraging that CommandError and CellError are the
+         // same thing, but we should probably reconcile this.
+-        let val = self.r.coerce_integer(self.r.get(key))?;
+-        match val {
+-            redis::Reply::Nil => Ok((-1, time::now_utc())),
+-            redis::Reply::Integer(n) => Ok((n, time::now_utc())),
+-            x => Err(error!("Found non-integer in key: {} (type: {:?})", key, x)),
++        let key = self.r.open_key(key);
++        match key.read()? {
++            Some(s) => {
++                let n = s.parse::<i64>()?;
++                Ok((n, time::now_utc()))
++            }
++            None => Ok((-1, time::now_utc())),
+         }
+     }
+ 
+@@ -175,11 +174,15 @@ impl<'a> Store for InternalRedisStore<'a> {
+                                   value: i64,
+                                   ttl: time::Duration)
+                                   -> Result<bool, CellError> {
+-        let val = self.r.setnx(key, value.to_string().as_str())?;
+-        if ttl.num_seconds() > 1 {
+-            self.r.expire(key, ttl.num_seconds())?;
+-        }
+-        Ok(val)
++        let key = self.r.open_key_writable(key);
++        let res = if key.is_empty()? {
++            key.write(value.to_string().as_str())?;
++            Ok(true)
++        } else {
++            Ok(false)
++        };
++        key.set_expire(ttl)?;
++        res
+     }
+ }
+ 
+diff --git a/src/error.rs b/src/error.rs
+index f36975e..a1eb515 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -1,11 +1,12 @@
++use std;
+ use std::error;
+ use std::fmt;
+-use std::string;
+ 
+ #[derive(Debug)]
+ pub enum CellError {
+     Generic(GenericError),
+-    String(string::FromUtf8Error),
++    String(std::string::FromUtf8Error),
++    ParseIntError(std::num::ParseIntError),
+ }
+ 
+ impl CellError {
+@@ -14,6 +15,12 @@ impl CellError {
+     }
+ }
+ 
++impl From<std::num::ParseIntError> for CellError {
++    fn from(err: std::num::ParseIntError) -> CellError {
++        CellError::ParseIntError(err)
++    }
++}
++
+ impl fmt::Display for CellError {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         match *self {
+@@ -21,6 +28,7 @@ impl fmt::Display for CellError {
+             // their implementations.
+             CellError::Generic(ref err) => write!(f, "{}", err),
+             CellError::String(ref err) => write!(f, "{}", err),
++            CellError::ParseIntError(ref err) => write!(f, "{}", err),
+         }
+     }
+ }
+@@ -32,6 +40,7 @@ impl error::Error for CellError {
+         match *self {
+             CellError::Generic(ref err) => err.description(),
+             CellError::String(ref err) => err.description(),
++            CellError::ParseIntError(ref err) => err.description(),
+         }
+     }
+ 
+@@ -43,6 +52,7 @@ impl error::Error for CellError {
+             // implement `Error`.
+             CellError::Generic(ref err) => Some(err),
+             CellError::String(ref err) => Some(err),
++            CellError::ParseIntError(ref err) => Some(err),
+         }
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 71fa65d..5931e25 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,5 @@
++#[macro_use]
++extern crate bitflags;
+ extern crate libc;
+ extern crate time;
+ 
+diff --git a/src/redis/mod.rs b/src/redis/mod.rs
+index 928056c..14c2f04 100644
+--- a/src/redis/mod.rs
++++ b/src/redis/mod.rs
+@@ -8,6 +8,8 @@ use error::CellError;
+ use libc::{c_int, c_long, c_longlong, size_t};
+ use std::error::Error;
+ use std::iter;
++use std::ptr;
++use time;
+ 
+ /// Command is a basic trait for a new command to be registered with a Redis
+ /// module.
+@@ -156,15 +158,6 @@ impl Redis {
+         }
+     }
+ 
+-    pub fn expire(&self, key: &str, ttl: i64) -> Result<bool, CellError> {
+-        let res = self.call("EXPIRE", &[key, ttl.to_string().as_str()])?;
+-        parse_bool(res)
+-    }
+-
+-    pub fn get(&self, key: &str) -> Result<Reply, CellError> {
+-        self.call("GET", &[key])
+-    }
+-
+     pub fn log(&self, level: LogLevel, message: &str) {
+         raw::log(self.ctx,
+                  format!("{:?}\0", level).to_lowercase().as_ptr(),
+@@ -177,6 +170,16 @@ impl Redis {
+         self.log(LogLevel::Notice, message);
+     }
+ 
++    /// Opens a Redis key for read access.
++    pub fn open_key(&self, key: &str) -> RedisKey {
++        RedisKey::open(self.ctx, key)
++    }
++
++    /// Opens a Redis key for read and write access.
++    pub fn open_key_writable(&self, key: &str) -> RedisKeyWritable {
++        RedisKeyWritable::open(self.ctx, key)
++    }
++
+     /// Tells Redis that we're about to reply with an (Redis) array.
+     ///
+     /// Used by invoking once with the expected length and then calling any
+@@ -200,23 +203,130 @@ impl Redis {
+         raw::free_string(self.ctx, redis_str);
+         res
+     }
++}
++
++#[derive(Debug, PartialEq)]
++pub enum KeyMode {
++    Read,
++    ReadWrite,
++    Write,
++}
++
++pub struct RedisKey {
++    ctx: *mut raw::RedisModuleCtx,
++    key_inner: *mut raw::RedisModuleKey,
++    key_str: *mut raw::RedisModuleString,
++}
++
++/// RedisKey is an abstraction over a Redis key that allows readonly
++/// operations.
++impl RedisKey {
++    fn open(ctx: *mut raw::RedisModuleCtx, key: &str) -> RedisKey {
++        let key_str = raw::create_string(ctx, format!("{}\0", key).as_ptr(), key.len());
++        let key_inner = raw::open_key(ctx, key_str, to_raw_mode(KeyMode::Read));
++        RedisKey {
++            ctx: ctx,
++            key_inner: key_inner,
++            key_str: key_str,
++        }
++    }
++
++    /// Detects whether the key pointer given to us by Redis is null.
++    pub fn is_null(&self) -> bool {
++        let null_key: *mut raw::RedisModuleKey = ptr::null_mut();
++        self.key_inner == null_key
++    }
++
++    pub fn read(&self) -> Result<Option<String>, CellError> {
++        let val = if self.is_null() {
++            None
++        } else {
++            Some(read_key(self.key_inner)?)
++        };
++        Ok(val)
++    }
++}
++
++impl Drop for RedisKey {
++    // Frees resources appropriately as a RedisKey goes out of scope.
++    fn drop(&mut self) {
++        raw::close_key(self.key_inner);
++        raw::free_string(self.ctx, self.key_str);
++    }
++}
++
++/// RedisKey is an abstraction over a Redis key that allows read and write
++/// operations.
++pub struct RedisKeyWritable {
++    ctx: *mut raw::RedisModuleCtx,
++    key_inner: *mut raw::RedisModuleKey,
++    key_str: *mut raw::RedisModuleString,
++}
++
++impl RedisKeyWritable {
++    fn open(ctx: *mut raw::RedisModuleCtx, key: &str) -> RedisKeyWritable {
++        let key_str = raw::create_string(ctx, format!("{}\0", key).as_ptr(), key.len());
++        let key_inner = raw::open_key(ctx, key_str, to_raw_mode(KeyMode::ReadWrite));
++        RedisKeyWritable {
++            ctx: ctx,
++            key_inner: key_inner,
++            key_str: key_str,
++        }
++    }
++
++    /// Detects whether the value stored in a Redis key is empty.
++    ///
++    /// Note that an empty key can be reliably detected by looking for a null
++    /// as you open the key in read mode, but when asking for write Redis
++    /// returns a non-null pointer to allow us to write to even an empty key,
++    /// so we have to check the key's value instead.
++    pub fn is_empty(&self) -> Result<bool, CellError> {
++        match self.read()? {
++            Some(s) => {
++                match s.as_str() {
++                    "" => Ok(true),
++                    _ => Ok(false),
++                }
++            }
++            _ => Ok(false),
++        }
++    }
++
++    pub fn read(&self) -> Result<Option<String>, CellError> {
++        Ok(Some(read_key(self.key_inner)?))
++    }
++
++    pub fn set_expire(&self, expire: time::Duration) -> Result<(), CellError> {
++        match raw::set_expire(self.key_inner, expire.num_milliseconds()) {
++            raw::Status::Ok => Ok(()),
+ 
+-    pub fn set(&self, key: &str, val: &str) -> Result<(), CellError> {
+-        let res = self.call("SET", &[key, val])?;
+-        parse_simple_string(res)
++            // Error may occur if the key wasn't open for writing or is an
++            // empty key.
++            raw::Status::Err => Err(error!("Error while setting key expire")),
++        }
+     }
+ 
+-    pub fn setex(&self, key: &str, ttl: i64, val: &str) -> Result<(), CellError> {
+-        let res = self.call("SETEX", &[key, ttl.to_string().as_str(), val])?;
+-        parse_simple_string(res)
++    pub fn write(&self, val: &str) -> Result<(), CellError> {
++        let val_str =
++            raw::create_string(self.ctx, format!("{}\0", val).as_ptr(), val.len());
++        let res = match raw::string_set(self.key_inner, val_str) {
++            raw::Status::Ok => Ok(()),
++            raw::Status::Err => Err(error!("Error while setting key")),
++        };
++        raw::free_string(self.ctx, val_str);
++        res
+     }
++}
+ 
+-    pub fn setnx(&self, key: &str, val: &str) -> Result<bool, CellError> {
+-        let res = self.call("SETNX", &[key, val])?;
+-        parse_bool(res)
++impl Drop for RedisKeyWritable {
++    // Frees resources appropriately as a RedisKey goes out of scope.
++    fn drop(&mut self) {
++        raw::close_key(self.key_inner);
++        raw::free_string(self.ctx, self.key_str);
+     }
+ }
+ 
++
+ /// Reply represents the various types of a replies that we can receive after
+ /// executing a Redis command.
+ #[derive(Debug)]
+@@ -274,6 +384,7 @@ fn parse_args(argv: *mut *mut raw::RedisModuleString,
+     Ok(args)
+ }
+ 
++// TODO: Change error to basic "FromUTF8" and pipe that back through.
+ fn from_byte_string(byte_str: *const u8, length: size_t) -> Result<String, CellError> {
+     let mut vec_str: Vec<u8> = Vec::with_capacity(length as usize);
+     for j in 0..length {
+@@ -287,19 +398,15 @@ fn from_byte_string(byte_str: *const u8, length: size_t) -> Result<String, CellE
+     }
+ }
+ 
+-fn parse_bool(reply: Reply) -> Result<bool, CellError> {
+-    match reply {
+-        Reply::Integer(n) if n == 0 => Ok(false),
+-        Reply::Integer(n) if n == 1 => Ok(true),
+-        r => Err(error!("Command returned non-boolean value (type was {:?}).", r)),
+-    }
++fn read_key(key: *mut raw::RedisModuleKey) -> Result<String, CellError> {
++    let mut length: size_t = 0;
++    from_byte_string(raw::string_dma(key, &mut length, raw::KEYMODE_READ), length)
+ }
+ 
+-fn parse_simple_string(reply: Reply) -> Result<(), CellError> {
+-    match reply {
+-        // may also return a Redis null, but not with the parameters that
+-        // we currently allow
+-        Reply::String(ref s) if s.as_str() == "OK" => Ok(()),
+-        r => Err(error!("Command returned non-string value (type was {:?}).", r)),
++fn to_raw_mode(mode: KeyMode) -> raw::KeyMode {
++    match mode {
++        KeyMode::Read => raw::KEYMODE_READ,
++        KeyMode::ReadWrite => raw::KEYMODE_READ | raw::KEYMODE_WRITE,
++        KeyMode::Write => raw::KEYMODE_WRITE,
+     }
+ }
+diff --git a/src/redis/raw.rs b/src/redis/raw.rs
+index ba39005..8ce53eb 100644
+--- a/src/redis/raw.rs
++++ b/src/redis/raw.rs
+@@ -8,15 +8,14 @@ use libc::{c_int, c_long, c_longlong, size_t};
+ // There's a ~0 chance that any of these will ever change so it's pretty safe.
+ pub const REDISMODULE_APIVER_1: c_int = 1;
+ 
+-#[derive(Debug)]
+-#[derive(PartialEq)]
+-pub enum KeyMode {
+-    Read = (1 << 0),
+-    Write = (1 << 1),
++bitflags! {
++    pub flags KeyMode: c_int {
++        const KEYMODE_READ = (1 << 0),
++        const KEYMODE_WRITE = (1 << 1),
++    }
+ }
+ 
+-#[derive(Debug)]
+-#[derive(PartialEq)]
++#[derive(Debug, PartialEq)]
+ pub enum ReplyType {
+     Unknown = -1,
+     String = 0,
+@@ -26,8 +25,7 @@ pub enum ReplyType {
+     Nil = 4,
+ }
+ 
+-#[derive(Debug)]
+-#[derive(PartialEq)]
++#[derive(Debug, PartialEq)]
+ pub enum Status {
+     Ok = 0,
+     Err = 1,
+@@ -150,6 +148,20 @@ pub fn reply_with_string(ctx: *mut RedisModuleCtx,
+     unsafe { RedisModule_ReplyWithString(ctx, str) }
+ }
+ 
++// Sets the expiry on a key.
++//
++// Expire is in milliseconds.
++pub fn set_expire(key: *mut RedisModuleKey, expire: c_longlong) -> Status {
++    unsafe { RedisModule_SetExpire(key, expire) }
++}
++
++pub fn string_dma(key: *mut RedisModuleKey,
++                  len: *mut size_t,
++                  mode: KeyMode)
++                  -> *const u8 {
++    unsafe { RedisModule_StringDMA(key, len, mode) }
++}
++
+ pub fn string_ptr_len(str: *mut RedisModuleString, len: *mut size_t) -> *const u8 {
+     unsafe { RedisModule_StringPtrLen(str, len) }
+ }
+@@ -227,6 +239,16 @@ extern "C" {
+                                                       str: *mut RedisModuleString)
+                                                       -> Status;
+ 
++    static RedisModule_SetExpire: extern "C" fn(key: *mut RedisModuleKey,
++                                                expire: c_longlong)
++                                                -> Status;
++
++
++    static RedisModule_StringDMA: extern "C" fn(key: *mut RedisModuleKey,
++                                                len: *mut size_t,
++                                                mode: KeyMode)
++                                                -> *const u8;
++
+     static RedisModule_StringPtrLen: extern "C" fn(str: *mut RedisModuleString,
+                                                    len: *mut size_t)
+                                                    -> *const u8;

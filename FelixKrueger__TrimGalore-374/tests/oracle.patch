@@ -1,0 +1,780 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 87489a93..9eb7e8fb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,40 @@
+ 
+ ### Unreleased
+ 
++#### Bug fixes
++
++- **Whether input is gzipped is now decided by reading the file, not by its
++  name.** This corrects two opposite failures:
++
++  - `bgzip`-produced input named `.fq.bgz` (or anything else not ending in
++    `.gz`) failed with `stream did not contain valid UTF-8`, because the
++    compressed bytes were read as text.
++  - A plain FASTQ misnamed `.fastq.gz` failed with `invalid gzip header`.
++    It now reads successfully.
++
++  Both came from the same cause: the format is detected from file *content*,
++  but that verdict was discarded and re-derived from the *filename* by
++  `FastqReader`. Detection is now a three-byte gzip-magic check inside
++  `FastqReader` itself, so every caller gets it right by default, including
++  `--paired` at `--cores 1`, `--passthrough` and `--clump_only`. New
++  `open_with` / `open_threaded_with` / `sanity_check_with` constructors let
++  callers that have already detected the format pass the verdict in and skip
++  the re-check.
++
++  BAM discrimination is unaffected: `detect_input_format` still owns the
++  `BAM\1` payload check, and a `.bam` renamed `.fq.gz` is still read as BAM.
++
++  Two known limitations, both left to separate changes:
++
++  - Output compression still mirrors the input *filename*, so a `.bgz` input
++    produces plain `.fq` output. Moving that decision would change behaviour
++    for every run, including the misnamed-`.gz` file whose input handling
++    changed above.
++  - `.bgz` is not in the extension-stripping list, so a `sample.fq.bgz` input
++    produces `sample.fq_trimmed.fq` alongside
++    `sample.fq.bgz_trimming_report.txt`. MultiQC takes the sample name from
++    the report filename, so the two disagree.
++
+ #### Changes
+ 
+ - **`--clump_only` now supports uBAM in/out** — extending the mode with
+diff --git a/src/fastq.rs b/src/fastq.rs
+index 0d703a47..fc3bb6db 100644
+--- a/src/fastq.rs
++++ b/src/fastq.rs
+@@ -27,6 +27,31 @@ const BUF_SIZE: usize = 64 * 1024;
+ /// `--clumpify` on top for reordering plus a higher gzip level.
+ pub const DEFAULT_GZIP_LEVEL: u32 = 1;
+ 
++/// Content-based gzip check for the constructors that have no caller-supplied
++/// verdict.
++///
++/// Reads three bytes and looks for the gzip magic. That is cheap enough that
++/// guessing from the filename buys nothing, and the filename is wrong in both
++/// directions: `bgzip` output is commonly named `.bgz`, and a plain FASTQ is
++/// sometimes misnamed `.fastq.gz`.
++///
++/// Deliberately contains no BAM logic, so `fastq` does not gain a dependency on
++/// `format` and the `BAM\1` discrimination stays in `detect_input_format` where
++/// it belongs. It cannot misfire on plain FASTQ, whose first byte is `@` and
++/// never `0x1F`.
++///
++/// Also deliberately not `detect_input_format`, which *bails* on empty input.
++/// `demux` reads back a trimmed output that is legitimately empty when every
++/// read was filtered, and that must not become an error. Any failure here
++/// (missing file, permissions, short file) answers "not gzip" and lets the
++/// subsequent open report the real problem.
++fn sniff_gzip(path: &Path) -> bool {
++    let mut magic = [0u8; 3];
++    File::open(path)
++        .and_then(|mut f| std::io::Read::read(&mut f, &mut magic))
++        .is_ok_and(|n| n == 3 && magic == [0x1F, 0x8B, 0x08])
++}
++
+ /// A single FASTQ record with owned data.
+ #[derive(Debug, Clone)]
+ pub struct FastqRecord {
+@@ -244,20 +269,24 @@ pub struct FastqReader {
+ }
+ 
+ impl FastqReader {
+-    /// Open a FASTQ file for synchronous reading.
++    /// Open a FASTQ file for synchronous reading, deciding gzip from the
++    /// filename.
++    ///
++    /// Prefer [`FastqReader::open_with`] when the caller already knows the
++    /// format from file *content* (as `format::detect_input_format` does):
++    /// the filename is the weaker signal and misses e.g. `.fq.bgz`.
+     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+         let path = path.as_ref();
+-        let file = File::open(path)
+-            .with_context(|| format!("Failed to open input file: {}", path.display()))?;
++        Self::open_with(path, sniff_gzip(path))
++    }
+ 
+-        let reader: Box<dyn BufRead + Send> = if path.extension().is_some_and(|ext| ext == "gz") {
+-            Box::new(BufReader::with_capacity(
+-                BUF_SIZE,
+-                MultiGzDecoder::new(file),
+-            ))
+-        } else {
+-            Box::new(BufReader::with_capacity(BUF_SIZE, file))
+-        };
++    /// Open a FASTQ file for synchronous reading.
++    ///
++    /// `is_gzip` comes from the caller, normally `format::detect_input_format`,
++    /// which inspects file content rather than the filename.
++    pub fn open_with<P: AsRef<Path>>(path: P, is_gzip: bool) -> Result<Self> {
++        let path = path.as_ref();
++        let reader = Self::open_reader(path, is_gzip)?;
+ 
+         Ok(FastqReader {
+             source: ReaderSource::Direct {
+@@ -267,13 +296,25 @@ impl FastqReader {
+         })
+     }
+ 
++    /// Open a FASTQ file with background decompression on a dedicated thread,
++    /// deciding gzip from the filename.
++    ///
++    /// Prefer [`FastqReader::open_threaded_with`] when the format is already
++    /// known from file content.
++    pub fn open_threaded<P: AsRef<Path>>(path: P) -> Result<Self> {
++        let path = path.as_ref();
++        Self::open_threaded_with(path, sniff_gzip(path))
++    }
++
+     /// Open a FASTQ file with background decompression on a dedicated thread.
+     ///
+     /// Returns immediately. A background thread reads and decompresses
+     /// the file, sending records through a bounded channel. The main
+     /// thread calls `next_record()` which receives from the channel,
+     /// overlapping decompression with processing.
+-    pub fn open_threaded<P: AsRef<Path>>(path: P) -> Result<Self> {
++    ///
++    /// `is_gzip` comes from the caller; see [`FastqReader::open_with`].
++    pub fn open_threaded_with<P: AsRef<Path>>(path: P, is_gzip: bool) -> Result<Self> {
+         let path = path.as_ref().to_path_buf();
+ 
+         // Validate the file exists before spawning the thread
+@@ -284,7 +325,7 @@ impl FastqReader {
+         let (tx, rx) = std::sync::mpsc::sync_channel(READER_CHANNEL_BATCHES);
+ 
+         let handle = std::thread::spawn(move || {
+-            let mut reader = match Self::open_direct(&path) {
++            let mut reader = match Self::open_direct(&path, is_gzip) {
+                 Ok(r) => r,
+                 Err(e) => {
+                     let _ = tx.send(Err(e));
+@@ -333,20 +374,27 @@ impl FastqReader {
+         })
+     }
+ 
+-    /// Internal: open a file and return the raw reader components (for use in threads).
+-    fn open_direct(path: &Path) -> Result<(Box<dyn BufRead + Send>, String)> {
++    /// Internal: build the buffered byte reader for `path`.
++    ///
++    /// The single place that turns a gzip verdict into a decoder, so the
++    /// verdict is applied identically on the sync and threaded paths.
++    fn open_reader(path: &Path, is_gzip: bool) -> Result<Box<dyn BufRead + Send>> {
+         let file = File::open(path)
+             .with_context(|| format!("Failed to open input file: {}", path.display()))?;
+ 
+-        let reader: Box<dyn BufRead + Send> = if path.extension().is_some_and(|ext| ext == "gz") {
++        Ok(if is_gzip {
+             Box::new(BufReader::with_capacity(
+                 BUF_SIZE,
+                 MultiGzDecoder::new(file),
+             ))
+         } else {
+             Box::new(BufReader::with_capacity(BUF_SIZE, file))
+-        };
++        })
++    }
+ 
++    /// Internal: open a file and return the raw reader components (for use in threads).
++    fn open_direct(path: &Path, is_gzip: bool) -> Result<(Box<dyn BufRead + Send>, String)> {
++        let reader = Self::open_reader(path, is_gzip)?;
+         Ok((reader, String::with_capacity(512)))
+     }
+ 
+@@ -467,11 +515,26 @@ impl FastqReader {
+         }
+     }
+ 
++    /// Perform input sanity checks on the first record, deciding gzip from the
++    /// filename.
++    ///
++    /// Prefer [`FastqReader::sanity_check_with`] when the format is already
++    /// known from file content.
++    pub fn sanity_check<P: AsRef<Path>>(path: P) -> Result<()> {
++        let path = path.as_ref();
++        Self::sanity_check_with(path, sniff_gzip(path))
++    }
++
+     /// Perform input sanity checks on the first record.
+     /// Checks: FASTQ format validation, colorspace detection, empty file.
+-    pub fn sanity_check<P: AsRef<Path>>(path: P) -> Result<()> {
++    ///
++    /// This runs before anything else in `main()`, so it is the first place a
++    /// wrong gzip verdict surfaces: on a `.fq.bgz` input it read the
++    /// compressed bytes as text and failed with "stream did not contain valid
++    /// UTF-8" before the reader factories were ever reached.
++    pub fn sanity_check_with<P: AsRef<Path>>(path: P, is_gzip: bool) -> Result<()> {
+         let path = path.as_ref();
+-        let mut reader = FastqReader::open(path)?;
++        let mut reader = FastqReader::open_with(path, is_gzip)?;
+ 
+         match reader.next_record()? {
+             None => bail!(
+@@ -892,4 +955,90 @@ mod tests {
+             read_id_prefix("@SRR12345.1/3"),
+         );
+     }
++
++    // ---- caller-supplied gzip verdict ----
++
++    fn gz_tmpdir(slug: &str) -> std::path::PathBuf {
++        let dir = std::env::temp_dir().join(slug);
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        dir
++    }
++
++    fn write_gz(path: &Path, body: &str) -> Result<()> {
++        let mut enc = GzEncoder::new(File::create(path)?, Compression::default());
++        write!(enc, "{body}")?;
++        enc.finish()?;
++        Ok(())
++    }
++
++    /// REGRESSION. `.fq.bgz` is gzip content under a non-`.gz` extension.
++    /// `format::detect_input_format` classifies it `FastqGz` from the
++    /// decompressed payload, but `FastqReader::open` derived the verdict from
++    /// the filename and read the compressed bytes as text, failing with
++    /// "stream did not contain valid UTF-8". `open_with` takes the caller's
++    /// already-correct answer instead.
++    #[test]
++    fn open_with_reads_gzip_under_non_gz_extension() -> Result<()> {
++        let dir = gz_tmpdir("tg_fastq_bgz");
++        let p = dir.join("s.fq.bgz");
++        write_gz(&p, "@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ\n")?;
++
++        let mut reader = FastqReader::open_with(&p, true)?;
++        let first = reader.next_record()?.expect("first record");
++        assert_eq!(first.id, "@r1");
++        assert_eq!(first.seq, "ACGT");
++        let second = reader.next_record()?.expect("second record");
++        assert_eq!(second.id, "@r2");
++        assert!(reader.next_record()?.is_none());
++        Ok(())
++    }
++
++    /// The same file through the threaded constructor: the verdict has to
++    /// cross the thread boundary, which is a separate code path.
++    #[test]
++    fn open_threaded_with_reads_gzip_under_non_gz_extension() -> Result<()> {
++        let dir = gz_tmpdir("tg_fastq_bgz_threaded");
++        let p = dir.join("s.fq.bgz");
++        write_gz(&p, "@r1\nACGT\n+\nIIII\n@r2\nTTTT\n+\nJJJJ\n")?;
++
++        let mut reader = FastqReader::open_threaded_with(&p, true)?;
++        assert_eq!(reader.next_record()?.expect("first record").id, "@r1");
++        assert_eq!(reader.next_record()?.expect("second record").id, "@r2");
++        assert!(reader.next_record()?.is_none());
++        Ok(())
++    }
++
++    /// `sanity_check` runs before everything else in `main()`, so it is the
++    /// first place the wrong verdict surfaced.
++    #[test]
++    fn sanity_check_with_accepts_gzip_under_non_gz_extension() -> Result<()> {
++        let dir = gz_tmpdir("tg_fastq_bgz_sanity");
++        let p = dir.join("s.fq.bgz");
++        write_gz(&p, "@r1\nACGT\n+\nIIII\n")?;
++
++        FastqReader::sanity_check_with(&p, true)?;
++        // The un-suffixed entry point must agree: it sniffs the content too,
++        // so there is no longer a "wrong" default to fall into.
++        FastqReader::sanity_check(&p)?;
++        Ok(())
++    }
++
++    /// A `.gz`-named plain file: the caller's `false` must win over the
++    /// filename, the mirror image of the `.bgz` case.
++    ///
++    /// This direction is a user-visible behaviour change, not only an internal
++    /// one: before, a plain FASTQ misnamed `.fastq.gz` failed with
++    /// `invalid gzip header`, and now it reads. See the CHANGELOG entry.
++    #[test]
++    fn open_with_honours_a_plain_verdict_on_a_gz_name() -> Result<()> {
++        let dir = gz_tmpdir("tg_fastq_plain_gz_name");
++        let p = dir.join("plain.fq.gz");
++        std::fs::write(&p, b"@r1\nACGT\n+\nIIII\n")?;
++
++        let mut reader = FastqReader::open_with(&p, false)?;
++        assert_eq!(reader.next_record()?.expect("record").id, "@r1");
++        assert!(reader.next_record()?.is_none());
++        Ok(())
++    }
+ }
+diff --git a/src/format.rs b/src/format.rs
+index a93cb251..ed6c4176 100644
+--- a/src/format.rs
++++ b/src/format.rs
+@@ -258,9 +258,12 @@ pub fn open_sync_reader(
+     preserve_tags: &[String],
+ ) -> Result<Box<dyn crate::fastq::RecordSource>> {
+     match detect_input_format(path)? {
+-        InputFormat::FastqPlain | InputFormat::FastqGz => {
+-            Ok(Box::new(crate::fastq::FastqReader::open(path)?))
+-        }
++        // The detected format is authoritative: it comes from file content,
++        // whereas `FastqReader::open` would re-derive it from the filename and
++        // get `.fq.bgz` wrong.
++        fmt @ (InputFormat::FastqPlain | InputFormat::FastqGz) => Ok(Box::new(
++            crate::fastq::FastqReader::open_with(path, fmt == InputFormat::FastqGz)?,
++        )),
+         InputFormat::UnalignedBam => Ok(Box::new(
+             crate::bam::BamReader::open(path)?.with_preserved_tags(preserve_tags),
+         )),
+@@ -275,9 +278,10 @@ pub fn open_threaded_reader(
+     preserve_tags: &[String],
+ ) -> Result<Box<dyn crate::fastq::RecordSource>> {
+     match detect_input_format(path)? {
+-        InputFormat::FastqPlain | InputFormat::FastqGz => {
+-            Ok(Box::new(crate::fastq::FastqReader::open_threaded(path)?))
+-        }
++        // Detected format wins over the filename; see `open_sync_reader`.
++        fmt @ (InputFormat::FastqPlain | InputFormat::FastqGz) => Ok(Box::new(
++            crate::fastq::FastqReader::open_threaded_with(path, fmt == InputFormat::FastqGz)?,
++        )),
+         InputFormat::UnalignedBam => Ok(Box::new(crate::bam::BamReader::open_threaded_with_tags(
+             path,
+             preserve_tags,
+@@ -292,6 +296,46 @@ mod tests {
+     use flate2::write::GzEncoder;
+     use std::io::Write;
+ 
++    /// REGRESSION. `.fq.bgz` is detected as `FastqGz` from its decompressed
++    /// payload; the factory must hand that answer to `FastqReader` rather than
++    /// letting it re-derive one from the filename. Before this change the run
++    /// died with "stream did not contain valid UTF-8".
++    #[test]
++    fn sync_reader_decompresses_gzip_under_non_gz_extension() -> Result<()> {
++        let dir = fresh_tmpdir("tg_format_bgz_reader");
++        let p = dir.join("s.fq.bgz");
++        {
++            let mut enc = GzEncoder::new(std::fs::File::create(&p)?, Compression::default());
++            enc.write_all(b"@r1\nACGT\n+\nIIII\n")?;
++            enc.finish()?;
++        }
++        assert_eq!(detect_input_format(&p)?, InputFormat::FastqGz);
++
++        let mut reader = open_sync_reader(&p, &[])?;
++        let rec = reader.next_record()?.expect("one record");
++        assert_eq!(rec.id, "@r1");
++        assert_eq!(rec.seq, "ACGT");
++        assert!(reader.next_record()?.is_none());
++        Ok(())
++    }
++
++    /// Same file, threaded factory.
++    #[test]
++    fn threaded_reader_decompresses_gzip_under_non_gz_extension() -> Result<()> {
++        let dir = fresh_tmpdir("tg_format_bgz_reader_threaded");
++        let p = dir.join("s.fq.bgz");
++        {
++            let mut enc = GzEncoder::new(std::fs::File::create(&p)?, Compression::default());
++            enc.write_all(b"@r1\nACGT\n+\nIIII\n")?;
++            enc.finish()?;
++        }
++
++        let mut reader = open_threaded_reader(&p, &[])?;
++        assert_eq!(reader.next_record()?.expect("one record").id, "@r1");
++        assert!(reader.next_record()?.is_none());
++        Ok(())
++    }
++
+     fn fresh_tmpdir(slug: &str) -> std::path::PathBuf {
+         let dir = std::env::temp_dir().join(slug);
+         let _ = std::fs::remove_dir_all(&dir);
+diff --git a/src/io.rs b/src/io.rs
+index 44e4d5db..b2c3f69d 100644
+--- a/src/io.rs
++++ b/src/io.rs
+@@ -9,13 +9,23 @@
+ use anyhow::{Context, Result};
+ use std::path::{Path, PathBuf};
+ 
+-/// True iff `path` ends with a `.gz` extension. The same heuristic that
+-/// `FastqReader` uses to decide whether to wrap the input in a gzip
+-/// decoder, so output naming + reader behaviour stay consistent.
++/// True iff `path` ends with a `.gz` extension.
++///
++/// **Filename-based on purpose, and no longer the same test the reader uses.**
++/// `FastqReader` decides whether to decompress by sniffing the file's first
++/// three bytes, because the name is unreliable in both directions. This
++/// function keeps looking at the name, because it answers a different
++/// question: not "is this input compressed" but "should the output be".
+ ///
+ /// Used to mirror input compression in the output filename / writer:
+ /// `plain.fastq` → `plain_trimmed.fq` (plain), `plain.fastq.gz` →
+ /// `plain_trimmed.fq.gz`. Matches Perl v0.6.x behaviour.
++///
++/// The two can therefore disagree, and today they do: a `.bgz` input is
++/// decompressed correctly but produces plain output, because this returns
++/// false for it. Moving the output decision to the detected format would
++/// change behaviour for every run, including a plain file misnamed `.gz`, so
++/// it is deliberately left for a separate change. See the CHANGELOG.
+ pub fn is_gzipped(path: &Path) -> bool {
+     path.extension().is_some_and(|ext| ext == "gz")
+ }
+diff --git a/src/main.rs b/src/main.rs
+index 7f6db4e8..8edddaea 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -14,7 +14,8 @@ use trim_galore::fastq::{FastqReader, FastqWriter, RecordSource};
+ use trim_galore::fastqc;
+ use trim_galore::filters::{MaxNFilter, UnpairedLengths};
+ use trim_galore::format::{
+-    InputFormat, PairedShape, detect_input_format, reject_bam_format_mismatch_in_pair,
++    InputFormat, PairedShape, detect_input_format, open_sync_reader, open_threaded_reader,
++    reject_bam_format_mismatch_in_pair,
+ };
+ use trim_galore::io as naming;
+ use trim_galore::parallel;
+@@ -28,7 +29,12 @@ use trim_galore::trimmer;
+ /// catches mixed-aligned BAMs that slip past this fast-path.
+ fn sanity_check_any(path: &std::path::Path) -> Result<()> {
+     match detect_input_format(path)? {
+-        InputFormat::FastqPlain | InputFormat::FastqGz => FastqReader::sanity_check(path),
++        // Hand the content-detected verdict down rather than letting
++        // `sanity_check` re-derive it from the filename, which gets
++        // `.fq.bgz` wrong.
++        fmt @ (InputFormat::FastqPlain | InputFormat::FastqGz) => {
++            FastqReader::sanity_check_with(path, fmt == InputFormat::FastqGz)
++        }
+         InputFormat::UnalignedBam => {
+             let mut r = BamReader::open(path)?;
+             match r.next_record()? {
+@@ -42,37 +48,6 @@ fn sanity_check_any(path: &std::path::Path) -> Result<()> {
+     }
+ }
+ 
+-/// Open a threaded reader for `path`, dispatching by detected format.
+-/// `preserve_tags` is honoured for BAM input; silently ignored for FASTQ.
+-fn open_threaded_reader(
+-    path: &std::path::Path,
+-    preserve_tags: &[String],
+-) -> Result<Box<dyn RecordSource>> {
+-    match detect_input_format(path)? {
+-        InputFormat::FastqPlain | InputFormat::FastqGz => {
+-            Ok(Box::new(FastqReader::open_threaded(path)?))
+-        }
+-        InputFormat::UnalignedBam => Ok(Box::new(BamReader::open_threaded_with_tags(
+-            path,
+-            preserve_tags,
+-        )?)),
+-    }
+-}
+-
+-/// Open a sync (single-threaded) reader for `path`, dispatching by detected
+-/// format. Used by the `--cores 1` (serial) path.
+-fn open_sync_reader(
+-    path: &std::path::Path,
+-    preserve_tags: &[String],
+-) -> Result<Box<dyn RecordSource>> {
+-    match detect_input_format(path)? {
+-        InputFormat::FastqPlain | InputFormat::FastqGz => Ok(Box::new(FastqReader::open(path)?)),
+-        InputFormat::UnalignedBam => Ok(Box::new(
+-            BamReader::open(path)?.with_preserved_tags(preserve_tags),
+-        )),
+-    }
+-}
+-
+ type AdapterList = Vec<(String, String)>;
+ type SetupResult = Result<(String, AdapterList, AdapterList, trimmer::TrimConfig)>;
+ type ResolvedAdapter = Result<(String, AdapterList, AdapterList, Option<(usize, usize)>)>;
+diff --git a/tests/integration_gzip_non_gz_extension.rs b/tests/integration_gzip_non_gz_extension.rs
+new file mode 100644
+index 00000000..41f345d1
+--- /dev/null
++++ b/tests/integration_gzip_non_gz_extension.rs
+@@ -0,0 +1,291 @@
++//! Binary-driven integration tests for gzipped input whose filename does not
++//! end in `.gz`.
++//!
++//! These exist because the unit tests did not catch the real gap. The library
++//! tests exercise `FastqReader` directly, so they only cover the paths that
++//! were already fixed; the callers that still derived gzip-ness from the
++//! filename live in `main.rs` and `clump_only.rs` and are only reachable
++//! through the binary. Nine green checks on the first version of this change
++//! missed a `--paired --cores 1` regression for exactly that reason.
++//!
++//! The matrix below is therefore chosen by *dispatch path*, not by flag
++//! aesthetics:
++//!
++//! | Test | Path it covers |
++//! |---|---|
++//! | single-end | `main::run_single`, sync reader |
++//! | paired, `--cores 1` | `main::run_paired` serial, `FastqReader::open` |
++//! | paired, `--cores 2` | `main::run_paired` parallel, threaded reader |
++//! | `--clump_only` | `clump_only.rs`, its own reader construction |
++//!
++//! `CARGO_BIN_EXE_trim_galore` is auto-set by cargo for integration tests.
++
++use std::io::Write;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++/// Locate the `trim_galore` binary built by cargo for this test target.
++fn binary() -> PathBuf {
++    PathBuf::from(env!("CARGO_BIN_EXE_trim_galore"))
++}
++
++/// Create a fresh temp dir for the test, removing any leftover from a prior run.
++fn fresh_tmpdir(slug: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(slug);
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    dir
++}
++
++/// Write `body` to `path`, gzip-compressed, under whatever name is asked for.
++///
++/// The point of every test here is that the name and the content disagree, so
++/// the caller chooses them independently.
++fn write_gz(path: &Path, body: &str) {
++    let mut enc = flate2::write::GzEncoder::new(
++        std::fs::File::create(path).unwrap(),
++        flate2::Compression::default(),
++    );
++    enc.write_all(body.as_bytes()).unwrap();
++    enc.finish().unwrap();
++}
++
++/// A few reads: 40 bases of ordinary sequence followed by the start of the
++/// Illumina adapter.
++///
++/// The sequence half has to be long enough to survive `--length` (20 by
++/// default) once the adapter is cut, or every read is discarded and the output
++/// is a valid but empty file, which would make these tests pass without
++/// checking anything.
++fn sample_reads(tag: &str) -> String {
++    const BODY: &str = "ACGTTGCAACCGGTTAACGTACGTTGCAACCGGTTAACGT"; // 40 bp
++    const ADAPTER: &str = "AGATCGGAAGAGC"; // Illumina, trimmed off
++    let mut s = String::new();
++    for i in 0..8 {
++        let seq = format!("{BODY}{ADAPTER}");
++        let qual = "I".repeat(seq.len());
++        s.push_str(&format!("@{tag}_{i}\n{seq}\n+\n{qual}\n"));
++    }
++    s
++}
++
++/// Read a trimmed output back, whether or not it ended up compressed.
++///
++/// Which of the two it is depends on `io::is_gzipped`, which still looks at
++/// the input *filename*, so a `.bgz` input currently yields plain output. That
++/// asymmetry is deliberate and documented; these tests care that the reads are
++/// correct, not how they are framed.
++///
++/// Note the stems the callers pass: a `.bgz` input is not recognised by
++/// `io::strip_fastq_extensions`, so `pair_R1.fq.bgz` yields
++/// `pair_R1.fq_val_1.fq`, with the inner `.fq` still in the name. That is a
++/// known cosmetic wart (the report file disagrees with the output file, which
++/// matters to MultiQC) and is filed for a separate change; these tests encode
++/// current behaviour rather than the behaviour we would prefer.
++fn read_output(dir: &Path, stem: &str) -> String {
++    let text = read_output_raw(dir, stem);
++    assert!(
++        !text.trim().is_empty(),
++        "output {stem} is empty: every read was filtered, so this test would \
++         pass without checking anything"
++    );
++    text
++}
++
++/// The bytes, with no emptiness check. Split out so the assertion above has
++/// something to call.
++fn read_output_raw(dir: &Path, stem: &str) -> String {
++    let plain = dir.join(format!("{stem}.fq"));
++    let gz = dir.join(format!("{stem}.fq.gz"));
++    if plain.exists() {
++        std::fs::read_to_string(&plain).unwrap()
++    } else {
++        let f = std::fs::File::open(&gz).unwrap_or_else(|e| {
++            panic!("no output at {} or {}: {e}", plain.display(), gz.display())
++        });
++        let mut out = String::new();
++        std::io::Read::read_to_string(&mut flate2::read::MultiGzDecoder::new(f), &mut out).unwrap();
++        out
++    }
++}
++
++/// Single-end `.bgz`. The path that already worked before this change; kept so
++/// a future regression in the sniff is caught here too.
++#[test]
++fn single_end_bgz_input_is_decompressed() {
++    let dir = fresh_tmpdir("tg_bgz_se");
++    let input = dir.join("sample.fq.bgz");
++    write_gz(&input, &sample_reads("se"));
++
++    let out = Command::new(binary())
++        .args(["-o", dir.to_str().unwrap(), input.to_str().unwrap()])
++        .output()
++        .expect("binary must run");
++
++    assert!(
++        out.status.success(),
++        "single-end .bgz must succeed. stderr:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++    let trimmed = read_output(&dir, "sample.fq_trimmed");
++    assert!(
++        trimmed.contains("@se_0"),
++        "trimmed output must contain the reads, got:\n{trimmed}"
++    );
++}
++
++/// Paired-end at `--cores 1`, which is the default and was the regression.
++///
++/// Before the content sniff this failed, and worse than on base `dev`: the
++/// entry guard passed, so the output files were created and truncated before
++/// the first read failed. Asserting on file contents rather than only on the
++/// exit status is what would catch that returning.
++#[test]
++fn paired_bgz_input_serial_is_decompressed() {
++    let dir = fresh_tmpdir("tg_bgz_pe_serial");
++    let r1 = dir.join("pair_R1.fq.bgz");
++    let r2 = dir.join("pair_R2.fq.bgz");
++    write_gz(&r1, &sample_reads("pe1"));
++    write_gz(&r2, &sample_reads("pe2"));
++
++    let out = Command::new(binary())
++        .args([
++            "--paired",
++            "--cores",
++            "1",
++            "-o",
++            dir.to_str().unwrap(),
++            r1.to_str().unwrap(),
++            r2.to_str().unwrap(),
++        ])
++        .output()
++        .expect("binary must run");
++
++    assert!(
++        out.status.success(),
++        "paired .bgz at --cores 1 must succeed. stderr:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++    assert!(read_output(&dir, "pair_R1.fq_val_1").contains("@pe1_0"));
++    assert!(read_output(&dir, "pair_R2.fq_val_2").contains("@pe2_0"));
++}
++
++/// Paired-end at `--cores 2`, which takes the worker-pool path and a different
++/// reader construction. This one passed before the sniff, which is precisely
++/// why it is worth pinning next to the serial case: the two must not diverge.
++#[test]
++fn paired_bgz_input_parallel_is_decompressed() {
++    let dir = fresh_tmpdir("tg_bgz_pe_parallel");
++    let r1 = dir.join("pair_R1.fq.bgz");
++    let r2 = dir.join("pair_R2.fq.bgz");
++    write_gz(&r1, &sample_reads("pp1"));
++    write_gz(&r2, &sample_reads("pp2"));
++
++    let out = Command::new(binary())
++        .args([
++            "--paired",
++            "--cores",
++            "2",
++            "-o",
++            dir.to_str().unwrap(),
++            r1.to_str().unwrap(),
++            r2.to_str().unwrap(),
++        ])
++        .output()
++        .expect("binary must run");
++
++    assert!(
++        out.status.success(),
++        "paired .bgz at --cores 2 must succeed. stderr:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++    assert!(read_output(&dir, "pair_R1.fq_val_1").contains("@pp1_0"));
++    assert!(read_output(&dir, "pair_R2.fq_val_2").contains("@pp2_0"));
++}
++
++/// Serial and parallel must agree on the reads, not merely both succeed.
++#[test]
++fn paired_bgz_serial_and_parallel_agree() {
++    let dir = fresh_tmpdir("tg_bgz_pe_agree");
++    let body1 = sample_reads("ag1");
++    let body2 = sample_reads("ag2");
++
++    let mut outputs = Vec::new();
++    for cores in ["1", "2"] {
++        let sub = dir.join(format!("cores{cores}"));
++        std::fs::create_dir_all(&sub).unwrap();
++        let r1 = sub.join("pair_R1.fq.bgz");
++        let r2 = sub.join("pair_R2.fq.bgz");
++        write_gz(&r1, &body1);
++        write_gz(&r2, &body2);
++
++        let out = Command::new(binary())
++            .args([
++                "--paired",
++                "--cores",
++                cores,
++                "-o",
++                sub.to_str().unwrap(),
++                r1.to_str().unwrap(),
++                r2.to_str().unwrap(),
++            ])
++            .output()
++            .expect("binary must run");
++        assert!(out.status.success(), "--cores {cores} must succeed");
++        outputs.push(read_output(&sub, "pair_R1.fq_val_1"));
++    }
++
++    assert_eq!(
++        outputs[0], outputs[1],
++        "--cores 1 and --cores 2 must produce identical reads from .bgz input"
++    );
++}
++
++/// `--clump_only` builds its own readers and was the third gap.
++#[test]
++fn clump_only_bgz_input_is_decompressed() {
++    let dir = fresh_tmpdir("tg_bgz_clump");
++    let input = dir.join("sample.fq.bgz");
++    write_gz(&input, &sample_reads("cl"));
++
++    let out = Command::new(binary())
++        .args([
++            "--clump_only",
++            "-o",
++            dir.to_str().unwrap(),
++            input.to_str().unwrap(),
++        ])
++        .output()
++        .expect("binary must run");
++
++    assert!(
++        out.status.success(),
++        "--clump_only on .bgz must succeed. stderr:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++}
++
++/// The other direction, which this change also alters: a plain FASTQ misnamed
++/// `.fastq.gz` previously failed with `invalid gzip header` and now reads.
++///
++/// Pinned as a test because it is a user-visible behaviour change, and because
++/// nothing else in the suite would notice if it silently reverted.
++#[test]
++fn plain_fastq_misnamed_gz_is_read_as_plain() {
++    let dir = fresh_tmpdir("tg_bgz_misnamed");
++    let input = dir.join("sample.fastq.gz");
++    std::fs::write(&input, sample_reads("mn")).unwrap();
++
++    let out = Command::new(binary())
++        .args(["-o", dir.to_str().unwrap(), input.to_str().unwrap()])
++        .output()
++        .expect("binary must run");
++
++    assert!(
++        out.status.success(),
++        "plain FASTQ misnamed .gz must now be read. stderr:\n{}",
++        String::from_utf8_lossy(&out.stderr)
++    );
++    // `sample.fastq.gz` IS in the strip list, so this one keeps the tidy stem.
++    assert!(read_output(&dir, "sample_trimmed").contains("@mn_0"));
++}

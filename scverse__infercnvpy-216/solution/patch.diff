@@ -1,0 +1,273 @@
+diff --git a/src/infercnvpy/_numba.py b/src/infercnvpy/_numba.py
+index 624276e..c267102 100644
+--- a/src/infercnvpy/_numba.py
++++ b/src/infercnvpy/_numba.py
+@@ -3,10 +3,13 @@
+ A ``parallel=True`` kernel only runs on the main thread. Called from any other thread (a dask worker, a thread pool),
+ the serial twin runs instead: numba's default ``workqueue`` threading layer (the only one in the macOS wheels) aborts
+ the process on concurrent use, and a caller that brings its own threads should not get numba threads on top.
++
++All kernels use numba's disk cache, with data files named after their cache key (see `_KeyedCacheFile`).
+ """
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import threading
+ from contextlib import contextmanager
+ from functools import update_wrapper
+@@ -14,6 +17,7 @@
+ from typing import TYPE_CHECKING, Any
+ 
+ import numba
++from numba.core.caching import FunctionCache, IndexDataCacheFile
+ 
+ if TYPE_CHECKING:
+     from builtins import range as prange  # numba's prange iterates like range; its own type says nothing about that
+@@ -21,11 +25,47 @@
+ else:
+     from numba import prange
+ 
+-__all__ = ["n_kernel_chunks", "njit_parallel", "numba_threads", "prange"]
++__all__ = ["n_kernel_chunks", "njit", "njit_parallel", "numba_threads", "prange"]
++
++
++class _KeyedCacheFile(IndexDataCacheFile):
++    """numba's cache index and data files, with each data file named after its key (signature, CPU, bytecode).
++
++    numba numbers the data files of a function (``.1.nbc``, ``.2.nbc``, ...) by the free slots in the index as the
++    process read it. Processes that compile different signatures of one function at the same time (pytest-xdist
++    workers, a pool of jobs on one environment) read the same index and pick the same number. The index can then end
++    up mapping one signature to another signature's machine code, and every later call with it fails with "can't
++    unbox array from PyObject" until the cache is deleted. With a name per key, a data file only ever holds the code
++    for its own key. Concurrent index writes can still drop an entry, which only costs one recompilation.
++    """
++
++    def save(self, key, data):
++        digest = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
++        data_name = self._data_name_pattern.replace("{number:d}", digest)
++        self._save_data(data_name, data)  # before the index, so that no index entry points to a missing file
++        overloads = self._load_index()
++        if overloads.get(key) != data_name:
++            overloads[key] = data_name
++            self._save_index(overloads)
++
++
++class _KeyedFunctionCache(FunctionCache):
++    def __init__(self, py_func):
++        super().__init__(py_func)
++        self._cache_file = _KeyedCacheFile(
++            self._cache_path, self._impl.filename_base, self._impl.locator.get_source_stamp()
++        )
++
++
++def njit(fn: Callable[..., Any], /, **options: Any) -> Any:
++    """`numba.njit` with ``nogil=True`` and the disk cache of `_KeyedCacheFile`."""
++    dispatcher = numba.njit(fn, nogil=True, **options)
++    dispatcher._cache = _KeyedFunctionCache(dispatcher.py_func)  # type: ignore[attr-defined]  # what `cache=True` sets
++    return dispatcher
+ 
+ 
+ class njit_parallel:
+-    """Compile a function with numba twice, ``parallel=True`` and serial, both ``cache=True`` and ``nogil=True``.
++    """Compile a function with `njit` twice, ``parallel=True`` and serial.
+ 
+     Calling it runs the parallel version on the main thread and the serial one on any other thread, or always the
+     serial one with ``serial=True`` (for code that runs inside dask tasks). The two versions are distinct function
+@@ -34,8 +74,8 @@ class njit_parallel:
+ 
+     def __init__(self, fn: Callable[..., Any], /):
+         assert isinstance(fn, FunctionType)
+-        self.parallel = numba.njit(_renamed(fn, "parallel"), parallel=True, cache=True, nogil=True)
+-        self.serial = numba.njit(_renamed(fn, "serial"), cache=True, nogil=True)
++        self.parallel = njit(_renamed(fn, "parallel"), parallel=True)
++        self.serial = njit(_renamed(fn, "serial"))
+         update_wrapper(self, fn)
+ 
+     def __call__(self, *args, serial: bool = False):
+diff --git a/src/infercnvpy/tl/_infercnv_kernels.py b/src/infercnvpy/tl/_infercnv_kernels.py
+index 5e83752..48fd176 100644
+--- a/src/infercnvpy/tl/_infercnv_kernels.py
++++ b/src/infercnvpy/tl/_infercnv_kernels.py
+@@ -20,13 +20,12 @@
+ 
+ from __future__ import annotations
+ 
+-import numba
+ import numpy as np
+ 
+-from infercnvpy._numba import njit_parallel, prange
++from infercnvpy._numba import njit, njit_parallel, prange
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _lfc(v, lo, hi, cap):
+     """Clipped log fold change of `v` against the reference bounds `[lo, hi]` (`lo == hi` for one reference)."""
+     if v > hi:
+@@ -42,7 +41,7 @@ def _lfc(v, lo, hi, cap):
+     return d
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _select(a, n, k):
+     """Partially sort `a[:n]` in place so that `a[k]` is its k-th smallest value, and return that (quickselect)."""
+     lo = 0
+@@ -76,7 +75,7 @@ def _select(a, n, k):
+     return a[k]
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _median(values, buf):
+     """Median of `values` (as `np.median`), using `buf` (same size) as scratch."""
+     n = values.size
+@@ -93,7 +92,7 @@ def _median(values, buf):
+     return (lower + upper) / 2
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _smooth(x, p1, p2, win, g0s, gs, As, Bs, Ks, w0s, step):
+     """Running means of the kept windows of one cell (gene-ordered `x`) into `win`, from prefix sums."""
+     for c in range(g0s.size):
+@@ -114,7 +113,7 @@ def _smooth(x, p1, p2, win, g0s, gs, As, Bs, Ks, w0s, step):
+             win[w0 + w] = (p2[s + b] - p2[s]) / weight
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _scatter(win, j, d, first, weights):
+     """Add `d` times the pyramid weights of gene `j` to the weighted window sums `win`, from window `first[j]` on.
+ 
+@@ -126,14 +125,14 @@ def _scatter(win, j, d, first, weights):
+         win[w + m] += d * wj[m]
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _normalise(win, n_windows, window_weight):
+     """Divide the weighted window sums by the sums of their weights: the running means."""
+     for w in range(n_windows):
+         win[w] /= window_weight[w]
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _center_emit(win, buf, thr, centre, out, r, rowstats, counts):
+     """Subtract the median from the running means `win`, write them to `out[r]` as float32.
+ 
+diff --git a/src/infercnvpy/tl/_spatial.py b/src/infercnvpy/tl/_spatial.py
+index e65226b..db51d77 100644
+--- a/src/infercnvpy/tl/_spatial.py
++++ b/src/infercnvpy/tl/_spatial.py
+@@ -13,18 +13,17 @@
+ 
+ from typing import Any
+ 
+-import numba
+ import numpy as np
+ import pandas as pd
+ import scipy.sparse as sp
+ from anndata import AnnData
+ 
+ from infercnvpy._logging import log, log_result
+-from infercnvpy._numba import njit_parallel, numba_threads, prange
++from infercnvpy._numba import njit, njit_parallel, numba_threads, prange
+ from infercnvpy._util import _as_matrix, _params_for_uns
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _row_weights(g_indptr, g_indices, g_data, i, alpha):
+     """Self weight `a` and neighbour scale `(1 - a) / d` of cell `i` (diagonal entries of the graph are ignored)."""
+     d = 0.0
+@@ -73,7 +72,7 @@ def _hop_dense(g_indptr, g_indices, g_data, alpha, X, out):  # pragma: no cover
+                     row[c] += w * X[j, c]
+ 
+ 
+-@numba.njit(cache=True, nogil=True)
++@njit
+ def _icm(indptr, indices, weights, unary, labels, beta, n_iter):  # pragma: no cover
+     """Iterated conditional modes for a Potts model, in place on `labels` (-1 = unlabelled). Returns the sweeps run.
+ 
+diff --git a/tests/test_numba_cache.py b/tests/test_numba_cache.py
+new file mode 100644
+index 0000000..2c862e8
+--- /dev/null
++++ b/tests/test_numba_cache.py
+@@ -0,0 +1,73 @@
++"""The numba disk cache stays correct when processes compile different signatures of one kernel at the same time."""
++
++import os
++import subprocess
++import sys
++import textwrap
++
++KERNEL = """
++from infercnvpy._numba import njit_parallel
++
++@njit_parallel
++def total(x):
++    s = 0.0
++    for v in x:
++        s += v
++    return s
++"""
++
++# Two processes A and B compile `total` for float32 and float64 at the same time, in this order: A writes the index,
++# B (which read the index before A wrote it) writes the index and its data, then A's data write lands.
++# One process plays both, with two copies of the kernel module and numba's file access patched to that order.
++RACE = """
++import importlib.util
++import sys
++
++import numpy as np
++from numba.core.caching import IndexDataCacheFile
++
++
++def kernel():
++    spec = importlib.util.spec_from_file_location("kernels", sys.argv[1])
++    module = sys.modules["kernels"] = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module.total
++
++
++a, b = kernel(), kernel()
++save_data, load_index = IndexDataCacheFile._save_data, IndexDataCacheFile._load_index
++late = []
++IndexDataCacheFile._save_data = lambda self, name, data: late.append((self, name, data))
++a(np.ones(3, dtype=np.float32))
++IndexDataCacheFile._save_data = save_data
++IndexDataCacheFile._load_index = lambda self: {}
++b(np.ones(3))
++IndexDataCacheFile._load_index = load_index
++for args in late:
++    save_data(*args)
++"""
++
++CALL = """
++import numpy as np
++
++import kernels as module
++
++assert module.total(np.ones(3, dtype=np.float32)) == 3
++assert module.total(np.ones(3)) == 3
++"""
++
++
++def test_concurrent_compiles_share_the_cache(tmp_path):
++    kernels = tmp_path / "kernels.py"
++    kernels.write_text(KERNEL)
++    env = {**os.environ, "NUMBA_CACHE_DIR": str(tmp_path / "cache")}
++    for script in (RACE, CALL):
++        res = subprocess.run(
++            [sys.executable, "-c", textwrap.dedent(script), str(kernels)],
++            env=env,
++            cwd=tmp_path,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++        assert res.returncode == 0, res.stderr

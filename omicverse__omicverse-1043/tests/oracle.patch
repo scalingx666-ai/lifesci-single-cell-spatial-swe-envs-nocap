@@ -1,0 +1,189 @@
+diff --git a/omicverse/single/_traj.py b/omicverse/single/_traj.py
+index 1c3c6d099..3e9ce883e 100644
+--- a/omicverse/single/_traj.py
++++ b/omicverse/single/_traj.py
+@@ -477,7 +477,10 @@ def inference(self,method:str='palantir',**kwargs):
+             # Differentiation potential ranked by gene-count correlate (Gulati 2020).
+             # Backend: pycytotrace — `pip install omicverse[trajectory]`
+             import pycytotrace
+-            counts, _ = self._dense_counts()
++            counts, gene_names = self._dense_counts()
++            # Preserve gene labels for ERCC filtering and result provenance.
++            kwargs.setdefault('gene_names', gene_names)
++            kwargs.setdefault('cell_names', list(self.adata.obs_names))
+             # pycytotrace expects genes × cells, like R upstream.
+             res = pycytotrace.cytotrace_run(counts.T, **kwargs)
+             stem = np.asarray(getattr(res, 'cytotrace', res), dtype=float)
+diff --git a/omicverse/space/_split.py b/omicverse/space/_split.py
+index 32189a2fb..0f17cce5c 100644
+--- a/omicverse/space/_split.py
++++ b/omicverse/space/_split.py
+@@ -400,6 +400,8 @@ def _swap_mask(obs: pd.DataFrame) -> np.ndarray:
+         return (
+             (~obs["first_type_neighborhood_agreement"].astype(bool))
+             & (~obs["first_type_class_neighborhood_agreement"].astype(bool))
++            & obs["second_type_class"].notna()
++            & obs["first_type_class_neighborhood"].notna()
+             & (obs["second_type_class"].astype(str) == obs["first_type_class_neighborhood"].astype(str))
+         ).to_numpy()
+     if {"first_type", "second_type", "first_type_neighborhood"}.issubset(obs.columns):
+@@ -459,13 +461,25 @@ def split_balance(
+         balanced[removed, :] = 0
+     adata.layers[result_layer] = balanced.tocsr()
+     status = np.full(adata.n_obs, "raw", dtype=object)
+-    status[use_purified] = "purified"
++    status[use_purified] = (adata.obs["purification_status"].astype(str).to_numpy()[use_purified]
++                            if "purification_status" in adata.obs else "purified")
+     status[removed] = "removed"
+     adata.obs["split_balance_status"] = status
+ 
+     if swap_labels:
+         swap = _swap_mask(adata.obs)
+         adata.obs["split_shift_swap"] = swap
++        # R SPLIT-shift replaces a swapped purified profile with its residual.
++        purified_status = (adata.obs["purification_status"].eq("purified").to_numpy()
++                           if "purification_status" in adata.obs
++                           else np.asarray((raw - purified).sum(axis=1)).ravel() > 0)
++        replace_profile = swap & purified_status & ~removed
++        if replace_profile.any():
++            shifted = (raw - purified).tocsr()
++            shifted.data[shifted.data < 0] = 0
++            shifted.eliminate_zeros()
++            balanced[replace_profile, :] = shifted[replace_profile, :]
++            adata.layers[result_layer] = balanced.tocsr()
+         for first, second in (("first_type", "second_type"), ("weight_first_type", "weight_second_type")):
+             if first in adata.obs and second in adata.obs:
+                 a = adata.obs[first].copy()
+@@ -495,8 +509,26 @@ def split_reassign_residuals(
+     k: int = 20,
+     radius: float | None = None,
+     self_keep: float = 0.0,
++    receiver_policy: Literal["second_type", "all"] = "second_type",
+ ):
+-    """Reassign positive residual counts from purified cells to neighbors."""
++    """Reassign positive residual counts to eligible spatial neighbors.
++
++    By default, recipients must have a ``first_type`` equal to the sender's
++    ``second_type`` and must not have ``spot_class == 'reject'``, matching
++    SPLIT's second_type_neighbors_no_reject rule. Run purify first to populate
++    these labels. ``receiver_policy='all'`` explicitly requests the legacy
++    Python-only redistribution across all neighbors (not R SPLIT parity).
++    """
++    if receiver_policy not in {"second_type", "all"}:
++        raise ValueError("receiver_policy must be 'second_type' or 'all'.")
++    if receiver_policy == "second_type":
++        missing = {"first_type", "second_type"} - set(adata.obs.columns)
++        if missing:
++            raise ValueError("Run purify first or supply first_type and second_type labels.")
++        first_types = adata.obs["first_type"].to_numpy()
++        second_types = adata.obs["second_type"].to_numpy()
++        rejected = (adata.obs["spot_class"].eq("reject").fillna(False).to_numpy()
++                    if "spot_class" in adata.obs else np.zeros(adata.n_obs, dtype=bool))
+     if mode not in {"uniform", "count_proportional"}:
+         raise ValueError("`mode` must be 'uniform' or 'count_proportional'.")
+     if purified_layer not in adata.layers:
+@@ -529,6 +561,12 @@ def split_reassign_residuals(
+         if not is_sender:
+             continue
+         receivers = np.array([j for j in idx[sender] if j >= 0 and j != sender], dtype=int)
++        if receiver_policy == "second_type":
++            if pd.isna(second_types[sender]):
++                receivers = np.array([], dtype=int)
++            else:
++                eligible = pd.Series(first_types[receivers]).eq(second_types[sender]).fillna(False).to_numpy()
++                receivers = receivers[eligible & ~rejected[receivers]]
+         if receivers.size == 0:
+             continue
+         sender_has_receivers[sender] = True
+@@ -568,6 +606,7 @@ def split_reassign_residuals(
+         "k": k,
+         "radius": radius,
+         "self_keep": self_keep,
++        "receiver_policy": receiver_policy,
+     }
+     return None
+ 
+diff --git a/tests/single/test_cytotrace_input.py b/tests/single/test_cytotrace_input.py
+new file mode 100644
+index 000000000..571e820f4
+--- /dev/null
++++ b/tests/single/test_cytotrace_input.py
+@@ -0,0 +1,21 @@
++import sys
++import types
++import numpy as np
++import pandas as pd
++from anndata import AnnData
++
++
++def test_cytotrace_receives_counts_and_gene_identifiers(monkeypatch):
++    from omicverse.single._traj import TrajInfer
++    a = AnnData(np.zeros((3,12)), var=pd.DataFrame(index=['ERCC-control']+[f'g{i}' for i in range(11)]))
++    a.layers['counts'] = np.arange(36).reshape(3,12)
++    seen = {}
++    def backend(matrix, **kwargs):
++        seen.update(matrix=matrix, **kwargs)
++        return types.SimpleNamespace(cytotrace=np.array([0.,.5,1.]))
++    monkeypatch.setitem(sys.modules, 'pycytotrace', types.SimpleNamespace(cytotrace_run=backend))
++    TrajInfer(a).inference(method='cytotrace')
++    np.testing.assert_array_equal(seen['matrix'], a.layers['counts'].T)
++    assert seen['gene_names'] == list(a.var_names)
++    assert seen['cell_names'] == list(a.obs_names)
++    np.testing.assert_array_equal(a.obs['cytotrace_pseudotime'],[1.,.5,0.])
+diff --git a/tests/space/test_split_receivers.py b/tests/space/test_split_receivers.py
+new file mode 100644
+index 000000000..b370dd39f
+--- /dev/null
++++ b/tests/space/test_split_receivers.py
+@@ -0,0 +1,20 @@
++import numpy as np
++import pandas as pd
++from anndata import AnnData
++from scipy import sparse
++from omicverse import space as splitst
++
++
++def test_residuals_only_reach_non_rejected_second_type_neighbors():
++    a = AnnData(np.array([[10.], [3.], [4.], [5.]]))
++    a.layers['counts'] = a.X.copy()
++    a.layers['split_balanced'] = np.array([[6.], [3.], [4.], [5.]])
++    a.obsm['spatial'] = np.array([[0., 0.], [1., 0.], [0., 1.], [1., 1.]])
++    a.obs['first_type'] = ['A', 'B', 'B', 'A']
++    a.obs['second_type'] = ['B', 'A', 'A', 'B']
++    a.obs['spot_class'] = ['singlet', 'singlet', 'reject', 'singlet']
++    splitst.split_reassign_residuals(a, k=3, mode='uniform')
++    np.testing.assert_allclose(a.layers['split_reassigned'].toarray().ravel(), [6, 7, 4, 5])
++    np.testing.assert_allclose(a.uns['split_reassignment_operator'].toarray()[0], [0, 1, 0, 0])
++    splitst.split_reassign_residuals(a, k=3, mode='uniform', receiver_policy='all')
++    np.testing.assert_allclose(a.uns['split_reassignment_operator'].toarray()[0], [0, 1/3, 1/3, 1/3])
+diff --git a/tests/space/test_split_shift_reference.py b/tests/space/test_split_shift_reference.py
+new file mode 100644
+index 000000000..ff74b15ba
+--- /dev/null
++++ b/tests/space/test_split_shift_reference.py
+@@ -0,0 +1,25 @@
++import numpy as np
++import pandas as pd
++from anndata import AnnData
++from omicverse import space as splitst
++
++
++def test_shift_uses_residual_and_does_not_match_missing_classes():
++    a = AnnData(np.array([[10., 6.], [5., 3.], [4., 2.]]))
++    a.layers['counts'] = a.X.copy()
++    a.layers['split_purified'] = np.array([[7., 2.], [5., 3.], [2., 1.]])
++    a.obs['purification_status'] = ['purified', 'raw', 'purified']
++    a.obs['neighborhood_weights_second_type'] = 1.
++    a.obs['first_type'] = ['A', 'A', 'A']
++    a.obs['second_type'] = ['B', None, 'B']
++    a.obs['weight_first_type'] = .7
++    a.obs['weight_second_type'] = .3
++    a.obs['first_type_neighborhood_agreement'] = False
++    a.obs['first_type_class_neighborhood_agreement'] = False
++    a.obs['second_type_class'] = ['B', None, 'B']
++    a.obs['first_type_class_neighborhood'] = ['B', None, 'B']
++    a.obs['spot_class'] = ['singlet', 'singlet', 'reject']
++    splitst.split_balance(a,swap_labels=True,spot_class_key='spot_class')
++    np.testing.assert_allclose(a.layers['split_balanced'].toarray(),[[3,4],[5,3],[0,0]])
++    assert a.obs.split_shift_swap.tolist() == [True, False, True]
++    assert a.obs.split_balance_status.tolist() == ['purified', 'raw', 'removed']

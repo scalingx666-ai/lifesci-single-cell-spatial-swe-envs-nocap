@@ -1,0 +1,371 @@
+diff --git a/omicverse/flow/_gatingml.py b/omicverse/flow/_gatingml.py
+index 2d1ecf4ca..c6745c995 100644
+--- a/omicverse/flow/_gatingml.py
++++ b/omicverse/flow/_gatingml.py
+@@ -19,8 +19,27 @@
+ naming convention in the field.
+ 
+ This module therefore owns a display-name <-> ``xs:ID`` mapping: every gate gets
+-a generated, valid id, and its human name is carried in ``gating:custom_info``
++a generated, valid id, and its human name is carried in ``data-type:custom_info``
+ where it belongs. Round-tripping restores the display names exactly.
++
++SCHEMA COMPLIANCE IS THE POINT, AND WAS THE BUG
++-----------------------------------------------
++Writing something only we can read defeats the entire purpose. Until this was
++fixed the output round-tripped here perfectly and every other tool refused it:
++``flowkit.parse_gating_xml`` validates against the ISAC XSD first and answered
++"File is neither Gating-ML 2.0 compliant nor a FlowJo workspace". Four separate
++violations, none of which our own reader could notice:
++
++* ``Dimension_Type/@compensation-ref`` is ``use="required"`` and was omitted;
++* ``custom_info`` was written LAST, but it comes from ``Custom_Group`` on
++  ``AbstractGate_Type`` and an XSD extension puts the base's content first;
++* ``custom_info`` was written in the ``gating`` namespace; it is declared in
++  DataTypes;
++* ``QuadrantGate_Type`` is ``divider+`` then ``Quadrant+`` and the ``Quadrant``
++  elements were never emitted at all.
++
++``tests/flow/test_gatingml.py`` validates against the real XSD when FlowKit is
++installed, and pins each violation with stdlib assertions when it is not.
+ """
+ 
+ from __future__ import annotations
+@@ -125,9 +144,20 @@ def _add_transform(root: ET.Element, xid: str, tr: Transform) -> None:
+         })
+ 
+ 
++#: Gating-ML requires every dimension to name its compensation. The schema
++#: (``Dimension_Type``, ``use="required"``) allows ``'uncompensated'``,
++#: ``'FCS'``, or the id of a spillover matrix. A gate carries no binding to a
++#: matrix, so ``'uncompensated'`` is the only one we can state truthfully:
++#: it says this gate does not reference a compensation matrix, which is exactly
++#: the case. A caller who compensated first should say so with
++#: ``compensation_ref='FCS'``.
++UNCOMPENSATED = "uncompensated"
++
++
+ def _dim(parent: ET.Element, name: str, xf: Optional[str],
+-         mn: Optional[float] = None, mx: Optional[float] = None) -> ET.Element:
+-    attrs = {}
++         mn: Optional[float] = None, mx: Optional[float] = None,
++         comp: str = UNCOMPENSATED) -> ET.Element:
++    attrs = {_q("gating", "compensation-ref"): comp}
+     if mn is not None:
+         attrs[_q("gating", "min")] = repr(float(mn))
+     if mx is not None:
+@@ -140,6 +170,59 @@ def _dim(parent: ET.Element, name: str, xf: Optional[str],
+     return d
+ 
+ 
++def _custom_info(el: ET.Element, name: str, gate: Gate,
++                 parent: Optional[str] = None) -> None:
++    """The display name, which usually cannot be an ``xs:ID``.
++
++    FIRST CHILD, not last. ``custom_info`` comes from ``Custom_Group`` on
++    ``AbstractGate_Type``; every concrete gate type extends that base by
++    ``complexContent``, and in an XSD extension the BASE's content precedes the
++    extension's sequence. Appending it after the dimensions made the document
++    schema-invalid — "Element 'custom_info': This element is not expected.
++    Expected is ( dimension )" — and a schema-invalid document is one FlowKit
++    refuses outright, so the file round-tripped perfectly here and was unusable
++    anywhere else.
++    """
++    # data-type, NOT gating. `custom_info` is declared in Custom_Group in the
++    # DataTypes schema; `gating:custom_info` is a different, undeclared element
++    # and the validator says so: "Expected is one of ( data-type:custom_info,
++    # gating:dimension )".
++    info = ET.SubElement(el, _q("data-type", "custom_info"))
++    ET.SubElement(info, "omicverse-name").text = name
++    if parent is not None:
++        # Only a BooleanGate needs this: every other kind carries its placement
++        # in gating:parent_id, which means what we mean.
++        ET.SubElement(info, "omicverse-parent").text = parent
++    if isinstance(gate, QuadrantGate):
++        ET.SubElement(info, "omicverse-quadrants").text = "\t".join(gate.quadrant_names)
++
++
++def _quadrants(el: ET.Element, gate: QuadrantGate, gid: str,
++               divider_ids: List[str]) -> None:
++    """The ``Quadrant`` elements the schema requires after the dividers.
++
++    ``QuadrantGate_Type`` is ``divider+`` THEN ``Quadrant+``; we wrote only the
++    dividers, so the gate was structurally incomplete. Each quadrant names, per
++    dimension, which side of that divider it is on.
++
++    Bit order matches ``QuadrantGate.masks``: dimension 0 is the low bit, so
++    for ``dims=(x, y)`` the names run (x-y-, x+y-, x-y+, x+y+). Getting this
++    backwards here would silently swap two populations on export — the reader
++    would restore names attached to the wrong regions.
++    """
++    for i, qname in enumerate(gate.quadrant_names):
++        q = ET.SubElement(el, _q("gating", "Quadrant"),
++                          {_q("gating", "id"): sanitize_id(f"{gid}_q{i}")})
++        for k, (did, div) in enumerate(zip(divider_ids, gate.dividers)):
++            # `location` only has to fall on the correct side; the regions are
++            # unbounded outward, so divider +/- 1 is unambiguous on every scale.
++            above = bool((i >> k) & 1)
++            ET.SubElement(q, _q("gating", "position"), {
++                _q("gating", "divider_ref"): did,
++                _q("gating", "location"): repr(float(div) + (1.0 if above else -1.0)),
++            })
++
++
+ def to_gatingml(strategy: GatingStrategy) -> ET.ElementTree:
+     """Serialise a strategy to a Gating-ML 2.0 document."""
+     root = ET.Element(_q("gating", "Gating-ML"))
+@@ -163,16 +246,28 @@ def to_gatingml(strategy: GatingStrategy) -> ET.ElementTree:
+     for name, gate in strategy.gates.items():
+         parent = strategy.parent_of(name)
+         attrs = {_q("gating", "id"): ids[name]}
+-        if parent != ROOT and parent in ids:
++        # NOT on a BooleanGate. In Gating-ML `parent_id` means the gate is
++        # evaluated WITHIN the parent; ov.flow's boolean deliberately is not —
++        # verified: with parent P keeping 2 of 4 events, `NOT A` returns 3,
++        # i.e. n - A, ignoring P entirely. Writing parent_id would assert a
++        # restriction we do not apply.
++        #
++        # It also broke the consumer outright: FlowKit builds its tree from
++        # parent_id AND from the gateReferences, and the two disagree ->
++        # `NetworkXNoPath: No path between root and DP`. Our own tree placement
++        # travels in custom_info, which from_gatingml already reads.
++        if parent != ROOT and parent in ids and not isinstance(gate, BooleanGate):
+             attrs[_q("gating", "parent_id")] = ids[parent]
+ 
+         if isinstance(gate, RectangleGate):
+             el = ET.SubElement(root, _q("gating", "RectangleGate"), attrs)
++            _custom_info(el, name, gate)
+             for d, (lo, hi) in zip(gate.dims, gate.bounds):
+                 tr = gate.transforms.get(d)
+                 _dim(el, d, _transform_id(d, tr) if tr else None, lo, hi)
+         elif isinstance(gate, PolygonGate):
+             el = ET.SubElement(root, _q("gating", "PolygonGate"), attrs)
++            _custom_info(el, name, gate)
+             for d in gate.dims:
+                 tr = gate.transforms.get(d)
+                 _dim(el, d, _transform_id(d, tr) if tr else None)
+@@ -183,6 +278,7 @@ def to_gatingml(strategy: GatingStrategy) -> ET.ElementTree:
+                                   {_q("data-type", "value"): repr(float(c))})
+         elif isinstance(gate, EllipsoidGate):
+             el = ET.SubElement(root, _q("gating", "EllipsoidGate"), attrs)
++            _custom_info(el, name, gate)
+             for d in gate.dims:
+                 tr = gate.transforms.get(d)
+                 _dim(el, d, _transform_id(d, tr) if tr else None)
+@@ -200,30 +296,34 @@ def to_gatingml(strategy: GatingStrategy) -> ET.ElementTree:
+                           {_q("data-type", "value"): repr(float(gate.distance_square))})
+         elif isinstance(gate, BooleanGate):
+             el = ET.SubElement(root, _q("gating", "BooleanGate"), attrs)
++            _custom_info(el, name, gate,
++                         parent=ids[parent] if parent != ROOT and parent in ids else None)
+             op = ET.SubElement(el, _q("gating", gate.operator))
+             for operand in gate.operands:
+                 ET.SubElement(op, _q("gating", "gateReference"),
+                               {_q("gating", "ref"): ids.get(operand, sanitize_id(operand))})
+         elif isinstance(gate, QuadrantGate):
+             el = ET.SubElement(root, _q("gating", "QuadrantGate"), attrs)
++            _custom_info(el, name, gate)
++            divider_ids: List[str] = []
+             for d, div in zip(gate.dims, gate.dividers):
+                 tr = gate.transforms.get(d)
++                did = sanitize_id(f"div_{name}_{d}")
++                divider_ids.append(did)
+                 dv = ET.SubElement(el, _q("gating", "divider"), {
+-                    _q("gating", "id"): sanitize_id(f"div_{name}_{d}"),
++                    _q("gating", "id"): did,
++                    # QuadrantGateDivider_Type extends Dimension_Type, so the
++                    # same required attribute applies here.
++                    _q("gating", "compensation-ref"): UNCOMPENSATED,
+                     **({_q("gating", "transformation-ref"): _transform_id(d, tr)} if tr else {}),
+                 })
+                 ET.SubElement(dv, _q("data-type", "fcs-dimension"),
+                               {_q("data-type", "name"): d})
+                 ET.SubElement(dv, _q("gating", "value")).text = repr(float(div))
++            _quadrants(el, gate, ids[name], divider_ids)
+         else:                                                 # pragma: no cover
+             raise TypeError(f"cannot serialise gate type {type(gate).__name__}")
+ 
+-        # The DISPLAY name lives here, because it usually cannot be an xs:ID.
+-        info = ET.SubElement(el, _q("gating", "custom_info"))
+-        ET.SubElement(info, "omicverse-name").text = name
+-        if isinstance(gate, QuadrantGate):
+-            ET.SubElement(info, "omicverse-quadrants").text = "\t".join(gate.quadrant_names)
+-
+     return ET.ElementTree(root)
+ 
+ 
+@@ -247,14 +347,31 @@ def _f(el: ET.Element, prefix: str, attr: str) -> Optional[float]:
+ 
+ 
+ def _name_of(el: ET.Element, fallback: str) -> str:
+-    info = el.find(_q("gating", "custom_info"))
+-    if info is not None:
++    # data-type first (correct, and what we now write); gating second, because
++    # documents written before this fix used that namespace and their display
++    # names should keep round-tripping.
++    for ns in ("data-type", "gating"):
++        info = el.find(_q(ns, "custom_info"))
++        if info is None:
++            continue
+         node = info.find("omicverse-name")
+         if node is not None and node.text:
+             return node.text
+     return fallback
+ 
+ 
++def _custom_parent(el: ET.Element) -> Optional[str]:
++    """A BooleanGate's tree placement, which cannot ride in ``parent_id``."""
++    for ns in ("data-type", "gating"):
++        info = el.find(_q(ns, "custom_info"))
++        if info is None:
++            continue
++        node = info.find("omicverse-parent")
++        if node is not None and node.text:
++            return node.text
++    return None
++
++
+ def from_gatingml(tree: ET.ElementTree) -> GatingStrategy:
+     """Parse a Gating-ML 2.0 document back into a strategy."""
+     root = tree.getroot() if isinstance(tree, ET.ElementTree) else tree
+@@ -291,7 +408,7 @@ def from_gatingml(tree: ET.ElementTree) -> GatingStrategy:
+         xid = el.get(_q("gating", "id"))
+         name = _name_of(el, xid)
+         id_to_name[xid] = name
+-        parent_id = el.get(_q("gating", "parent_id"))
++        parent_id = el.get(_q("gating", "parent_id")) or _custom_parent(el)
+ 
+         dims_el = el.findall(_q("gating", "dimension"))
+         dims, transforms, bounds = [], {}, []
+diff --git a/tests/flow/test_gatingml.py b/tests/flow/test_gatingml.py
+index 63d20d0f8..c0b7e6395 100644
+--- a/tests/flow/test_gatingml.py
++++ b/tests/flow/test_gatingml.py
+@@ -152,3 +152,127 @@ def test_quadrants_survive(tmp_path):
+     back = fl.read_gatingml(p)
+     assert back.gates["Q"].dividers == gs.gates["Q"].dividers
+     assert back.gates["Q"].quadrant_names == gs.gates["Q"].quadrant_names
++
++
++# ── schema compliance ───────────────────────────────────────────────────────
++#
++# The document round-tripped through this module perfectly and was rejected by
++# every other tool: `flowkit.parse_gating_xml` answered "File is neither
++# Gating-ML 2.0 compliant nor a FlowJo workspace", because FlowKit validates
++# against the real XSD before it parses. Writing something only we can read is
++# the one thing an interchange format must not do, so these pin each violation
++# with stdlib only — no FlowKit needed to catch a regression.
++
++GATING = "{http://www.isac-net.org/std/Gating-ML/v2.0/gating}"
++DATA = "{http://www.isac-net.org/std/Gating-ML/v2.0/datatypes}"
++GATE_TAGS = {GATING + t for t in
++             ("RectangleGate", "PolygonGate", "EllipsoidGate",
++              "BooleanGate", "QuadrantGate")}
++
++
++def _root(tmp_path, gs):
++    p = str(tmp_path / "schema.xml")
++    fl.write_gatingml(gs, p)
++    return ET.parse(p).getroot()
++
++
++def test_every_dimension_names_its_compensation(tmp_path):
++    """`Dimension_Type/@compensation-ref` is `use="required"`. It was never
++    written, so every gate in every document we produced was invalid."""
++    root = _root(tmp_path, strategy())
++    dims = [d for g in root for d in g if d.tag in (GATING + "dimension", GATING + "divider")]
++    assert dims, "the fixture must contain dimensions"
++    for d in dims:
++        assert d.get(GATING + "compensation-ref") == "uncompensated", ET.tostring(d)
++
++
++def test_custom_info_is_the_first_child_and_in_the_data_type_namespace(tmp_path):
++    """Two separate violations in one element.
++
++    POSITION: `custom_info` comes from `Custom_Group` on `AbstractGate_Type`,
++    and in an XSD `complexContent` extension the base's content precedes the
++    extension's sequence — so it must lead, not trail.
++
++    NAMESPACE: it is declared in the DataTypes schema. `gating:custom_info` is
++    a different, undeclared element.
++    """
++    root = _root(tmp_path, strategy())
++    gates = [g for g in root if g.tag in GATE_TAGS]
++    assert gates
++    for g in gates:
++        kids = list(g)
++        assert kids, ET.tostring(g)
++        assert kids[0].tag == DATA + "custom_info", (g.tag, [k.tag for k in kids])
++        assert g.find(GATING + "custom_info") is None, "the gating: spelling is undeclared"
++
++
++def test_a_quadrant_gate_emits_its_quadrants(tmp_path):
++    """`QuadrantGate_Type` is `divider+` THEN `Quadrant+`. Only the dividers
++    were written, so the gate was structurally incomplete and a consumer had no
++    way to know which region carried which name."""
++    lg = fl.make_transform("logicle", t=262144, w=0.5, m=4.5, a=0.0)
++    gs = fl.GatingStrategy().add_gate(
++        fl.QuadrantGate(name="Q", dims=("CD4", "CD8"), dividers=(0.4, 0.4),
++                        transforms={"CD4": lg, "CD8": lg},
++                        quadrant_names=("DN", "C4", "C8", "DP")))
++    root = _root(tmp_path, gs)
++    q = next(g for g in root if g.tag == GATING + "QuadrantGate")
++    dividers = q.findall(GATING + "divider")
++    quadrants = q.findall(GATING + "Quadrant")
++    assert len(dividers) == 2
++    assert len(quadrants) == 4, "2 dimensions -> 2**2 quadrants"
++    for quad in quadrants:
++        positions = quad.findall(GATING + "position")
++        assert len(positions) == 2, "one position per divider"
++        refs = {p.get(GATING + "divider_ref") for p in positions}
++        assert refs == {d.get(GATING + "id") for d in dividers}
++    # Every quadrant is a distinct combination of sides — two on the same side
++    # of both dividers would be two names for one region.
++    sides = {tuple(sorted(
++        (p.get(GATING + "divider_ref"),
++         float(p.get(GATING + "location")) > 0.4) for p in quad.findall(GATING + "position")))
++        for quad in quadrants}
++    assert len(sides) == 4, sides
++
++
++def test_a_boolean_gate_does_not_claim_a_parent_it_does_not_honour(tmp_path):
++    """In Gating-ML `parent_id` means "evaluated within the parent". ov.flow's
++    boolean deliberately is not: with a parent keeping 2 of 4 events, `NOT A`
++    returns n - A. Writing parent_id asserted a restriction we do not apply,
++    and FlowKit — which builds its tree from parent_id AND the gateReferences —
++    died on the contradiction with `NetworkXNoPath`.
++
++    The placement still round-trips, via custom_info.
++    """
++    gs = strategy()
++    root = _root(tmp_path, gs)
++    b = next(g for g in root if g.tag == GATING + "BooleanGate")
++    assert b.get(GATING + "parent_id") is None
++
++    p = str(tmp_path / "b.xml")
++    fl.write_gatingml(gs, p)
++    back = fl.read_gatingml(p)
++    assert back.parent_of("CD3+ not blast") == gs.parent_of("CD3+ not blast")
++
++
++def test_the_document_validates_against_the_real_gating_ml_schema(tmp_path):
++    """The definitive check, when the XSD is available.
++
++    Skipped rather than vendored: the schema ships with FlowKit, which is not a
++    dependency (it pins numpy>=2). The stdlib tests above cover each violation
++    so a regression is caught without it.
++    """
++    lxml_etree = pytest.importorskip("lxml.etree")
++    flowkit = pytest.importorskip("flowkit")
++    import os
++    xsd = os.path.join(os.path.dirname(flowkit.__file__),
++                       "_resources", "Gating-ML.v2.0.xsd")
++    if not os.path.exists(xsd):
++        pytest.skip("Gating-ML XSD not found in this FlowKit")
++    schema = lxml_etree.XMLSchema(lxml_etree.parse(xsd))
++
++    p = str(tmp_path / "valid.xml")
++    fl.write_gatingml(strategy(), p)
++    doc = lxml_etree.parse(p)
++    assert schema.validate(doc), "\n".join(
++        f"line {e.line}: {e.message}" for e in schema.error_log)

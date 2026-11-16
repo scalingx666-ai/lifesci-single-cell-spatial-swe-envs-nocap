@@ -1,0 +1,980 @@
+diff --git a/python/CHANGELOG.md b/python/CHANGELOG.md
+index 088f34b..b27238a 100644
+--- a/python/CHANGELOG.md
++++ b/python/CHANGELOG.md
+@@ -11,6 +11,20 @@ All notable changes to the Python implementation of mLLMCelltype will be documen
+   the consensus entry point, enabling custom task framing / output contracts
+   (e.g. functional-state annotation) without monkeypatching
+   `DEFAULT_PROMPT_TEMPLATE`. Defaults to `None`, preserving current behavior.
++- Optional token-usage capture at the provider layer. The OpenAI-compatible
++  providers and Gemini (and the shared `call_openai_compatible_api` /
++  `call_http_api_with_retry` core) accept an opt-in `usage_sink` dict that is
++  populated in place with `{prompt_tokens, completion_tokens, total_tokens}` —
++  plus a native `cost` (USD) for OpenRouter, which opts in to
++  `usage: {include: true}` only when a sink is supplied. High-level aggregation
++  (`annotate_clusters` / `get_model_response` / `interactive_consensus_annotation`)
++  is out of scope and left as a follow-up; Anthropic is also deferred.
++- Public usage extractors `extract_chat_completions_usage` and `extract_gemini_usage`
++  (exported from `mllmcelltype.providers`) for callers that parse responses directly.
++
++### Notes
++- Default behavior is unchanged: omitting `usage_sink` leaves request shape and return
++  values byte-identical to prior releases.
+ 
+ ## [2.0.5] - 2026-05-11
+ 
+diff --git a/python/mllmcelltype/providers/__init__.py b/python/mllmcelltype/providers/__init__.py
+index ce73262..9a048b5 100644
+--- a/python/mllmcelltype/providers/__init__.py
++++ b/python/mllmcelltype/providers/__init__.py
+@@ -2,8 +2,9 @@
+ This package contains modules for interacting with various LLM providers."""
+ 
+ from .anthropic import process_anthropic
++from .common import UsageSink, extract_chat_completions_usage
+ from .deepseek import process_deepseek
+-from .gemini import process_gemini
++from .gemini import extract_gemini_usage, process_gemini
+ from .grok import process_grok
+ from .minimax import process_minimax
+ from .openai import process_openai
+@@ -13,6 +14,9 @@
+ from .zhipu import process_zhipu
+ 
+ __all__ = [
++    "UsageSink",
++    "extract_chat_completions_usage",
++    "extract_gemini_usage",
+     "process_anthropic",
+     "process_deepseek",
+     "process_gemini",
+diff --git a/python/mllmcelltype/providers/common.py b/python/mllmcelltype/providers/common.py
+index 3d0a92b..30a2551 100644
+--- a/python/mllmcelltype/providers/common.py
++++ b/python/mllmcelltype/providers/common.py
+@@ -4,7 +4,7 @@
+ 
+ import json
+ import time
+-from collections.abc import Callable
++from collections.abc import Callable, MutableMapping
+ from typing import Any
+ 
+ import requests
+@@ -14,6 +14,45 @@
+ 
+ ResponseParser = Callable[[dict[str, Any]], list[str]]
+ 
++# A caller-supplied dict that, when passed, is populated in place with token
++# usage for the call: prompt_tokens / completion_tokens / total_tokens, plus an
++# optional native `cost` (USD) when the provider returns one. None = no capture.
++UsageSink = MutableMapping[str, Any]
++
++# Maps a raw response payload to the normalized usage schema (or None if absent).
++UsageParser = Callable[[dict[str, Any]], dict[str, Any] | None]
++
++
++def extract_chat_completions_usage(content: dict[str, Any]) -> dict[str, Any] | None:
++    """Extract token usage from an OpenAI-compatible chat completions payload.
++
++    Returns a normalized ``{prompt_tokens, completion_tokens, total_tokens}`` dict
++    (plus ``cost`` when the provider includes a native USD cost, e.g. OpenRouter
++    when ``usage: {include: true}`` was requested), or ``None`` when no usage block
++    is present. Never raises on a malformed/absent ``usage`` block.
++
++    Resilient to provider format drift by design: only the three canonical keys
++    (plus ``cost``) are read; any extra/unknown fields are ignored. Missing keys
++    are reported as ``None`` rather than fabricated, so callers can tell "not
++    reported" from a real zero. Validated live against OpenRouter; the other
++    OpenAI-compatible providers (OpenAI, DeepSeek, Qwen, Grok, StepFun, Zhipu,
++    MiniMax) share this exact path but were not run against their native endpoints.
++    """
++    if not isinstance(content, dict):
++        return None
++    usage = content.get("usage")
++    if not isinstance(usage, dict):
++        return None
++
++    normalized: dict[str, Any] = {
++        "prompt_tokens": usage.get("prompt_tokens"),
++        "completion_tokens": usage.get("completion_tokens"),
++        "total_tokens": usage.get("total_tokens"),
++    }
++    if usage.get("cost") is not None:
++        normalized["cost"] = usage["cost"]
++    return normalized
++
+ 
+ class NonRetryableProviderError(ValueError):
+     """Provider error that should fail fast without retry."""
+@@ -138,8 +177,16 @@ def call_http_api_with_retry(
+     timeout: int = 30,
+     request_json: bool = False,
+     non_retry_exceptions: tuple[type[Exception], ...] = (),
++    usage_sink: UsageSink | None = None,
++    usage_parser: UsageParser = extract_chat_completions_usage,
+ ) -> list[str]:
+-    """Execute an HTTP API request with retry and unified error handling."""
++    """Execute an HTTP API request with retry and unified error handling.
++
++    When ``usage_sink`` is provided, it is populated in place with token usage
++    parsed from the successful response via ``usage_parser`` (default: the
++    OpenAI-compatible extractor). Leaving it ``None`` is byte-identical to the
++    prior behavior.
++    """
+     write_log("Sending API request...")
+ 
+     for attempt in range(max_retries):
+@@ -190,6 +237,12 @@ def call_http_api_with_retry(
+                 raise NonRetryableProviderError(
+                     f"{provider_name} response parser returned {type(res).__name__}, expected list"
+                 )
++            if usage_sink is not None:
++                usage_sink.clear()
++                usage = usage_parser(content)
++                if usage is not None:
++                    usage_sink.update(usage)
++
+             normalized_res = [str(line) for line in res]
+             write_log(f"Got response with {len(normalized_res)} lines")
+             write_log(f"Raw response from {provider_name}:\n{normalized_res}", level="debug")
+@@ -235,8 +288,14 @@ def call_openai_compatible_api(
+     timeout: int = 30,
+     request_json: bool = False,
+     non_retry_exceptions: tuple[type[Exception], ...] = (),
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+-    """Execute a request against an OpenAI-compatible endpoint with retries."""
++    """Execute a request against an OpenAI-compatible endpoint with retries.
++
++    When ``usage_sink`` is provided, it is populated in place with the call's
++    token usage (see :func:`extract_chat_completions_usage`). Default ``None``
++    preserves prior behavior exactly.
++    """
+     headers = {
+         "Content-Type": "application/json",
+         "Authorization": f"Bearer {api_key}",
+@@ -258,4 +317,5 @@ def call_openai_compatible_api(
+         timeout=timeout,
+         request_json=request_json,
+         non_retry_exceptions=non_retry_exceptions,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/deepseek.py b/python/mllmcelltype/providers/deepseek.py
+index 40c57fd..a35bc6c 100644
+--- a/python/mllmcelltype/providers/deepseek.py
++++ b/python/mllmcelltype/providers/deepseek.py
+@@ -6,6 +6,7 @@
+ 
+ from ..logger import write_log
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -14,7 +15,11 @@
+ 
+ 
+ def process_deepseek(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using DeepSeek models.
+ 
+@@ -23,6 +28,7 @@ def process_deepseek(
+         model: The model name (e.g., 'deepseek-v4-flash', 'deepseek-v4-pro')
+         api_key: DeepSeek API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -52,4 +58,5 @@ def process_deepseek(
+         retry_delay=3,
+         timeout=90,
+         request_json=True,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/gemini.py b/python/mllmcelltype/providers/gemini.py
+index 14934c5..597d60c 100644
+--- a/python/mllmcelltype/providers/gemini.py
++++ b/python/mllmcelltype/providers/gemini.py
+@@ -6,7 +6,24 @@
+ from typing import Any
+ 
+ from ..logger import write_log
+-from .common import ensure_api_key
++from .common import UsageSink, ensure_api_key
++
++
++def extract_gemini_usage(response: Any) -> dict[str, Any] | None:
++    """Extract token usage from a Gemini SDK response's ``usage_metadata``.
++
++    Returns the shared ``{prompt_tokens, completion_tokens, total_tokens}`` schema,
++    or ``None`` when no usage metadata is present. Never raises on absent/odd
++    metadata.
++    """
++    metadata = getattr(response, "usage_metadata", None)
++    if metadata is None:
++        return None
++    return {
++        "prompt_tokens": getattr(metadata, "prompt_token_count", None),
++        "completion_tokens": getattr(metadata, "candidates_token_count", None),
++        "total_tokens": getattr(metadata, "total_token_count", None),
++    }
+ 
+ 
+ def _parse_gemini_response(response: Any) -> list[str]:
+@@ -26,7 +43,11 @@ def _parse_gemini_response(response: Any) -> list[str]:
+ 
+ 
+ def process_gemini(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using Google Gemini models.
+ 
+@@ -35,6 +56,7 @@ def process_gemini(
+         model: The model name (e.g., 'gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite')
+         api_key: Google API key
+         base_url: Optional custom base URL (Note: Gemini uses SDK, base_url may not be applicable)
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -85,6 +107,11 @@ def process_gemini(
+             )
+ 
+             result = _parse_gemini_response(response)
++            if usage_sink is not None:
++                usage_sink.clear()
++                usage = extract_gemini_usage(response)
++                if usage is not None:
++                    usage_sink.update(usage)
+             write_log(f"Got response with {len(result)} lines")
+             write_log(f"Raw response from Gemini:\n{result}", level="debug")
+             return result
+diff --git a/python/mllmcelltype/providers/grok.py b/python/mllmcelltype/providers/grok.py
+index 631ff37..af47e6b 100644
+--- a/python/mllmcelltype/providers/grok.py
++++ b/python/mllmcelltype/providers/grok.py
+@@ -6,6 +6,7 @@
+ 
+ from ..logger import write_log
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -14,7 +15,11 @@
+ 
+ 
+ def process_grok(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using Grok models from xAI.
+ 
+@@ -23,6 +28,7 @@ def process_grok(
+         model: The model name (e.g., 'grok-4.3', 'grok-4.3-latest')
+         api_key: xAI API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -42,4 +48,5 @@ def process_grok(
+         url=url,
+         body=body,
+         post_func=requests.post,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/minimax.py b/python/mllmcelltype/providers/minimax.py
+index 9b62367..3f9276f 100644
+--- a/python/mllmcelltype/providers/minimax.py
++++ b/python/mllmcelltype/providers/minimax.py
+@@ -11,6 +11,7 @@
+ from ..url_utils import get_working_minimax_endpoint
+ from .common import (
+     NonRetryableProviderError,
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -43,7 +44,11 @@ def _parse_minimax_response(content: dict[str, Any]) -> list[str]:
+ 
+ 
+ def process_minimax(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using MiniMax models.
+ 
+@@ -52,6 +57,7 @@ def process_minimax(
+         model: The model name (e.g., 'MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M2.5')
+         api_key: MiniMax API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -87,4 +93,5 @@ def process_minimax(
+         post_func=requests.post,
+         response_parser=_parse_minimax_response,
+         non_retry_exceptions=(NonRetryableProviderError,),
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/openai.py b/python/mllmcelltype/providers/openai.py
+index 3a070f1..c7d3655 100644
+--- a/python/mllmcelltype/providers/openai.py
++++ b/python/mllmcelltype/providers/openai.py
+@@ -6,6 +6,7 @@
+ 
+ from ..logger import write_log
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -14,7 +15,11 @@
+ 
+ 
+ def process_openai(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using OpenAI models.
+ 
+@@ -23,6 +28,7 @@ def process_openai(
+         model: The model name (e.g., 'gpt-5.5', 'gpt-5.4-mini')
+         api_key: OpenAI API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -42,4 +48,5 @@ def process_openai(
+         url=url,
+         body=body,
+         post_func=requests.post,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/openrouter.py b/python/mllmcelltype/providers/openrouter.py
+index 1cc1836..99d41f0 100644
+--- a/python/mllmcelltype/providers/openrouter.py
++++ b/python/mllmcelltype/providers/openrouter.py
+@@ -6,6 +6,7 @@
+ 
+ from ..logger import write_log
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -14,7 +15,11 @@
+ 
+ 
+ def process_openrouter(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using OpenRouter API, which provides access to various LLM models.
+ 
+@@ -23,6 +28,9 @@ def process_openrouter(
+         model: The model name (e.g., 'openai/gpt-5.5', 'anthropic/claude-sonnet-4.6', 'anthropic/claude-opus-4.7')
+         api_key: OpenRouter API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage. When
++            provided, the request opts in to OpenRouter's ``usage: {include: true}``
++            so the response carries an accounted ``cost`` (USD) field.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -44,6 +52,11 @@ def process_openrouter(
+         )
+ 
+     body = build_chat_completions_body(model=model, prompt=prompt)
++    if usage_sink is not None:
++        # Opt in to OpenRouter accounting only when the caller wants usage back,
++        # so the default request shape is unchanged.
++        body["usage"] = {"include": True}
++
+     return call_openai_compatible_api(
+         provider_name="OpenRouter",
+         api_key=api_key,
+@@ -54,4 +67,5 @@ def process_openrouter(
+             "HTTP-Referer": "https://github.com/cafferychen777/mLLMCelltype",
+             "X-Title": "mLLMCelltype",
+         },
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/qwen.py b/python/mllmcelltype/providers/qwen.py
+index 1811c37..9f7cda2 100644
+--- a/python/mllmcelltype/providers/qwen.py
++++ b/python/mllmcelltype/providers/qwen.py
+@@ -7,6 +7,7 @@
+ from ..logger import write_log
+ from ..url_utils import get_working_qwen_endpoint
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -15,7 +16,11 @@
+ 
+ 
+ def process_qwen(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using Alibaba Qwen models with smart endpoint selection.
+ 
+@@ -24,6 +29,7 @@ def process_qwen(
+         model: The model name (e.g., 'qwen3.6-plus', 'qwen3.6-flash', 'qwen3.6-max-preview')
+         api_key: DashScope API key
+         base_url: Optional custom base URL (overrides smart selection)
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -54,4 +60,5 @@ def process_qwen(
+         url=url,
+         body=body,
+         post_func=requests.post,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/stepfun.py b/python/mllmcelltype/providers/stepfun.py
+index 721cf65..e26a3db 100644
+--- a/python/mllmcelltype/providers/stepfun.py
++++ b/python/mllmcelltype/providers/stepfun.py
+@@ -6,6 +6,7 @@
+ 
+ from ..logger import write_log
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -14,7 +15,11 @@
+ 
+ 
+ def process_stepfun(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using StepFun models.
+ 
+@@ -23,6 +28,7 @@ def process_stepfun(
+         model: The model name (e.g., 'step-3.5-flash', 'step-3.5-flash-2603', 'step-3')
+         api_key: StepFun API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -48,4 +54,5 @@ def process_stepfun(
+         url=url,
+         body=body,
+         post_func=requests.post,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/mllmcelltype/providers/zhipu.py b/python/mllmcelltype/providers/zhipu.py
+index b4d16a1..fdf73ee 100644
+--- a/python/mllmcelltype/providers/zhipu.py
++++ b/python/mllmcelltype/providers/zhipu.py
+@@ -6,6 +6,7 @@
+ 
+ from ..logger import write_log
+ from .common import (
++    UsageSink,
+     build_chat_completions_body,
+     call_openai_compatible_api,
+     ensure_api_key,
+@@ -14,7 +15,11 @@
+ 
+ 
+ def process_zhipu(
+-    prompt: str, model: str, api_key: str, base_url: str | None = None
++    prompt: str,
++    model: str,
++    api_key: str,
++    base_url: str | None = None,
++    usage_sink: UsageSink | None = None,
+ ) -> list[str]:
+     """Process request using Zhipu AI (ChatGLM) models.
+ 
+@@ -23,6 +28,7 @@ def process_zhipu(
+         model: The model name (e.g., 'glm-5.1', 'glm-5', 'glm-5-turbo')
+         api_key: Zhipu AI API key
+         base_url: Optional custom base URL
++        usage_sink: Optional dict populated in place with token usage.
+ 
+     Returns:
+         List[str]: Processed responses, one per cluster
+@@ -48,4 +54,5 @@ def process_zhipu(
+         url=url,
+         body=body,
+         post_func=requests.post,
++        usage_sink=usage_sink,
+     )
+diff --git a/python/tests/test_providers_common.py b/python/tests/test_providers_common.py
+index d218756..85fd075 100644
+--- a/python/tests/test_providers_common.py
++++ b/python/tests/test_providers_common.py
+@@ -14,6 +14,7 @@
+     call_http_api_with_retry,
+     call_openai_compatible_api,
+     ensure_api_key,
++    extract_chat_completions_usage,
+     parse_chat_completions_response,
+     resolve_endpoint_url,
+ )
+@@ -342,3 +343,208 @@ def test_resolve_endpoint_url_unknown_provider_without_default_fails_fast():
+     """Test missing provider default URL raises clear error before HTTP layer."""
+     with pytest.raises(ValueError, match="No default API URL configured"):
+         resolve_endpoint_url("unknown_provider", "Unknown Provider", None)
++
++
++def test_extract_chat_completions_usage_normalizes_block():
++    """Test usage extractor maps the OpenAI usage block to the shared schema."""
++    usage = extract_chat_completions_usage(
++        {
++            "choices": [{"message": {"content": "x"}}],
++            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
++        }
++    )
++    assert usage == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
++
++
++def test_extract_chat_completions_usage_includes_native_cost():
++    """Test native USD cost (e.g. OpenRouter) is surfaced when present."""
++    usage = extract_chat_completions_usage(
++        {"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "cost": 0.0042}}
++    )
++    assert usage["cost"] == 0.0042
++
++
++def test_extract_chat_completions_usage_absent_returns_none():
++    """Test extractor returns None (does not raise) when no usage block exists."""
++    assert extract_chat_completions_usage({"choices": []}) is None
++
++
++# --- Format-drift resilience: pin behavior so a provider changing shape is caught ---
++
++
++def test_extract_chat_completions_usage_ignores_unknown_fields():
++    """Extra/unknown usage fields are dropped; only canonical keys are read."""
++    usage = extract_chat_completions_usage(
++        {
++            "usage": {
++                "prompt_tokens": 11,
++                "completion_tokens": 7,
++                "total_tokens": 18,
++                "prompt_tokens_details": {"cached_tokens": 4},  # newer OpenAI field
++                "reasoning_tokens": 2,  # future/unknown field
++            }
++        }
++    )
++    assert usage == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
++
++
++def test_extract_chat_completions_usage_partial_reports_none_not_zero():
++    """Missing token keys are reported as None (not fabricated to 0)."""
++    usage = extract_chat_completions_usage({"usage": {"prompt_tokens": 5}})
++    assert usage == {"prompt_tokens": 5, "completion_tokens": None, "total_tokens": None}
++
++
++def test_extract_chat_completions_usage_no_cost_key_when_absent():
++    """`cost` is only present in output when the provider actually returned one."""
++    usage = extract_chat_completions_usage(
++        {"usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}
++    )
++    assert "cost" not in usage
++
++
++def test_extract_chat_completions_usage_malformed_block_returns_none():
++    """A non-dict `usage` (e.g. provider sends a string/null) yields None, not a crash."""
++    assert extract_chat_completions_usage({"usage": "unexpected"}) is None
++    assert extract_chat_completions_usage({"usage": None}) is None
++
++
++def test_call_http_api_with_retry_populates_usage_sink_when_provided():
++    """Test usage sink is filled in place from a successful response's usage block."""
++    response_200 = MagicMock()
++    response_200.status_code = 200
++    response_200.json.return_value = {
++        "choices": [{"message": {"content": "Cluster 1: T cells"}}],
++        "usage": {"prompt_tokens": 42, "completion_tokens": 8, "total_tokens": 50},
++    }
++    post_func = MagicMock(return_value=response_200)
++    sink: dict = {}
++
++    result = call_http_api_with_retry(
++        provider_name="OpenAI",
++        url="https://example.com",
++        body={"messages": []},
++        headers={"Authorization": "Bearer test"},
++        post_func=post_func,
++        response_parser=lambda payload: parse_chat_completions_response(payload, "OpenAI"),
++        max_retries=1,
++        usage_sink=sink,
++    )
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink == {"prompt_tokens": 42, "completion_tokens": 8, "total_tokens": 50}
++
++
++def test_call_http_api_with_retry_default_sink_none_leaves_no_trace():
++    """Test default path (no sink) returns exactly today's value and captures nothing."""
++    response_200 = MagicMock()
++    response_200.status_code = 200
++    response_200.json.return_value = {
++        "choices": [{"message": {"content": "Cluster 1: T cells"}}],
++        "usage": {"prompt_tokens": 42, "completion_tokens": 8, "total_tokens": 50},
++    }
++    post_func = MagicMock(return_value=response_200)
++
++    result = call_http_api_with_retry(
++        provider_name="OpenAI",
++        url="https://example.com",
++        body={"messages": []},
++        headers={"Authorization": "Bearer test"},
++        post_func=post_func,
++        response_parser=lambda payload: parse_chat_completions_response(payload, "OpenAI"),
++        max_retries=1,
++    )
++
++    assert result == ["Cluster 1: T cells"]
++
++
++def test_call_http_api_with_retry_sink_untouched_when_usage_absent():
++    """Test a missing usage block leaves the caller's sink empty (no KeyError)."""
++    response_200 = MagicMock()
++    response_200.status_code = 200
++    response_200.json.return_value = {"choices": [{"message": {"content": "x"}}]}
++    post_func = MagicMock(return_value=response_200)
++    sink: dict = {}
++
++    call_http_api_with_retry(
++        provider_name="OpenAI",
++        url="https://example.com",
++        body={"messages": []},
++        headers={"Authorization": "Bearer test"},
++        post_func=post_func,
++        response_parser=lambda payload: parse_chat_completions_response(payload, "OpenAI"),
++        max_retries=1,
++        usage_sink=sink,
++    )
++
++    assert sink == {}
++
++
++def test_call_http_api_with_retry_replaces_stale_usage_sink_values():
++    """Test each call reports only current usage when callers reuse a sink."""
++    response_200 = MagicMock()
++    response_200.status_code = 200
++    response_200.json.return_value = {
++        "choices": [{"message": {"content": "x"}}],
++        "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9},
++    }
++    post_func = MagicMock(return_value=response_200)
++    sink: dict = {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3, "cost": 0.1}
++
++    call_http_api_with_retry(
++        provider_name="OpenAI",
++        url="https://example.com",
++        body={"messages": []},
++        headers={"Authorization": "Bearer test"},
++        post_func=post_func,
++        response_parser=lambda payload: parse_chat_completions_response(payload, "OpenAI"),
++        max_retries=1,
++        usage_sink=sink,
++    )
++
++    assert sink == {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
++
++
++def test_call_http_api_with_retry_clears_stale_sink_when_usage_absent():
++    """Test absent usage means no current-call usage, not stale previous usage."""
++    response_200 = MagicMock()
++    response_200.status_code = 200
++    response_200.json.return_value = {"choices": [{"message": {"content": "x"}}]}
++    post_func = MagicMock(return_value=response_200)
++    sink: dict = {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
++
++    call_http_api_with_retry(
++        provider_name="OpenAI",
++        url="https://example.com",
++        body={"messages": []},
++        headers={"Authorization": "Bearer test"},
++        post_func=post_func,
++        response_parser=lambda payload: parse_chat_completions_response(payload, "OpenAI"),
++        max_retries=1,
++        usage_sink=sink,
++    )
++
++    assert sink == {}
++
++
++def test_call_openai_compatible_api_surfaces_usage_to_sink():
++    """Test the OpenAI-compatible wrapper threads usage through to the caller's sink."""
++    response_200 = MagicMock()
++    response_200.status_code = 200
++    response_200.json.return_value = {
++        "choices": [{"message": {"content": "Cluster 1: T cells"}}],
++        "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
++    }
++    post_func = MagicMock(return_value=response_200)
++    sink: dict = {}
++
++    result = call_openai_compatible_api(
++        provider_name="OpenAI",
++        api_key="secret-key",
++        url="https://api.example.com/v1/chat/completions",
++        body={"model": "gpt-5.5", "messages": [{"role": "user", "content": "test"}]},
++        post_func=post_func,
++        usage_sink=sink,
++    )
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink["total_tokens"] == 8
+diff --git a/python/tests/test_providers_wrappers.py b/python/tests/test_providers_wrappers.py
+index 58d61b4..12d2c31 100644
+--- a/python/tests/test_providers_wrappers.py
++++ b/python/tests/test_providers_wrappers.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import builtins
++import json
+ from types import ModuleType, SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+@@ -11,7 +12,7 @@
+ from mllmcelltype.providers.anthropic import _parse_anthropic_response, process_anthropic
+ from mllmcelltype.providers.common import NonRetryableProviderError
+ from mllmcelltype.providers.deepseek import process_deepseek
+-from mllmcelltype.providers.gemini import process_gemini
++from mllmcelltype.providers.gemini import extract_gemini_usage, process_gemini
+ from mllmcelltype.providers.grok import process_grok
+ from mllmcelltype.providers.minimax import (
+     _parse_minimax_response,
+@@ -388,6 +389,186 @@ def test_process_gemini_whitespace_base_url_does_not_warn(mock_write_log):
+     )
+ 
+ 
++def _ok_response(payload: dict) -> MagicMock:
++    """Build a 200 OK mock requests.Response returning ``payload`` from .json()."""
++    response = MagicMock()
++    response.status_code = 200
++    response.json.return_value = payload
++    return response
++
++
++@patch("mllmcelltype.providers.openai.requests.post")
++@patch("mllmcelltype.providers.openai.resolve_endpoint_url")
++def test_process_openai_surfaces_usage_through_sink(mock_resolve_endpoint, mock_post):
++    """Test an OpenAI-compatible provider fills the caller's usage sink end-to-end."""
++    mock_resolve_endpoint.return_value = "https://openai.example/v1"
++    mock_post.return_value = _ok_response(
++        {
++            "choices": [{"message": {"content": "Cluster 1: T cells"}}],
++            "usage": {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36},
++        }
++    )
++    sink: dict = {}
++
++    result = process_openai("genes", "gpt-5.5", "test-key", usage_sink=sink)
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink == {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36}
++
++
++@patch("mllmcelltype.providers.openai.requests.post")
++@patch("mllmcelltype.providers.openai.resolve_endpoint_url")
++def test_process_openai_default_path_unchanged(mock_resolve_endpoint, mock_post):
++    """Test default invocation (no sink) returns exactly what it does today."""
++    mock_resolve_endpoint.return_value = "https://openai.example/v1"
++    mock_post.return_value = _ok_response(
++        {
++            "choices": [{"message": {"content": "Cluster 1: T cells"}}],
++            "usage": {"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36},
++        }
++    )
++
++    assert process_openai("genes", "gpt-5.5", "test-key") == ["Cluster 1: T cells"]
++
++
++@patch("mllmcelltype.providers.openrouter.requests.post")
++@patch("mllmcelltype.providers.openrouter.resolve_endpoint_url")
++def test_process_openrouter_surfaces_native_cost(mock_resolve_endpoint, mock_post):
++    """Test OpenRouter surfaces native USD cost when a usage sink is requested."""
++    mock_resolve_endpoint.return_value = "https://openrouter.example/v1"
++    mock_post.return_value = _ok_response(
++        {
++            "choices": [{"message": {"content": "Cluster 1: T cells"}}],
++            "usage": {
++                "prompt_tokens": 20,
++                "completion_tokens": 4,
++                "total_tokens": 24,
++                "cost": 0.0009,
++            },
++        }
++    )
++    sink: dict = {}
++
++    result = process_openrouter("openai/gpt-5.5", "openai/gpt-5.5", "test-key", usage_sink=sink)
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink["total_tokens"] == 24
++    assert sink["cost"] == 0.0009
++
++
++def _posted_body(mock_post: MagicMock) -> dict:
++    """Decode the JSON body actually sent to requests.post (data= or json=)."""
++    kwargs = mock_post.call_args.kwargs
++    if "json" in kwargs:
++        return kwargs["json"]
++    return json.loads(kwargs["data"])
++
++
++@patch("mllmcelltype.providers.openrouter.requests.post")
++@patch("mllmcelltype.providers.openrouter.resolve_endpoint_url")
++def test_process_openrouter_opt_in_changes_request_body_only_with_sink(
++    mock_resolve_endpoint, mock_post
++):
++    """Test the ``usage: {include: true}`` opt-in appears in the body ONLY with a sink.
++
++    Pins the observable request shape (not an internal kwarg): default calls must
++    not perturb the outgoing body, while a sink opts into OpenRouter accounting.
++    """
++    mock_resolve_endpoint.return_value = "https://openrouter.example/v1"
++    payload = {"choices": [{"message": {"content": "Cluster 1: T cells"}}]}
++
++    mock_post.return_value = _ok_response(payload)
++    process_openrouter("openai/gpt-5.5", "openai/gpt-5.5", "test-key")
++    assert "usage" not in _posted_body(mock_post)
++
++    mock_post.return_value = _ok_response(payload)
++    process_openrouter("openai/gpt-5.5", "openai/gpt-5.5", "test-key", usage_sink={})
++    assert _posted_body(mock_post)["usage"] == {"include": True}
++
++
++def test_process_gemini_surfaces_usage_through_sink():
++    """Test Gemini's usage_metadata is normalized into the caller's usage sink."""
++    fake_response = SimpleNamespace(
++        text="Cluster 1: T cells",
++        usage_metadata=SimpleNamespace(
++            prompt_token_count=12,
++            candidates_token_count=5,
++            total_token_count=17,
++        ),
++    )
++    fake_client = SimpleNamespace(
++        models=SimpleNamespace(generate_content=MagicMock(return_value=fake_response))
++    )
++    fake_modules = _build_fake_google_modules(client=fake_client)
++    sink: dict = {}
++
++    with patch.dict("sys.modules", fake_modules, clear=False):
++        result = process_gemini("genes", "gemini-3.1-pro-preview", "test-key", usage_sink=sink)
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink == {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
++
++
++# --- Gemini usage extractor: resilience to provider/SDK format drift ---
++
++
++def test_extract_gemini_usage_ignores_extra_metadata_fields():
++    """Unknown usage_metadata attributes are ignored; canonical keys captured."""
++    metadata = SimpleNamespace(
++        prompt_token_count=40,
++        candidates_token_count=10,
++        total_token_count=50,
++        cached_content_token_count=8,  # future/unknown SDK field
++        thoughts_token_count=3,
++    )
++    usage = extract_gemini_usage(SimpleNamespace(usage_metadata=metadata))
++    assert usage == {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50}
++
++
++def test_extract_gemini_usage_absent_metadata_returns_none():
++    """No usage_metadata attribute → None (sink left untouched, no crash)."""
++    assert extract_gemini_usage(SimpleNamespace(text="x")) is None
++
++
++def test_extract_gemini_usage_partial_metadata_reports_none_not_zero():
++    """A metadata object missing some counts reports None for those, not a guess."""
++    metadata = SimpleNamespace(prompt_token_count=9)  # other counts absent
++    usage = extract_gemini_usage(SimpleNamespace(usage_metadata=metadata))
++    assert usage == {"prompt_tokens": 9, "completion_tokens": None, "total_tokens": None}
++
++
++def test_process_gemini_missing_usage_metadata_leaves_sink_empty():
++    """End-to-end: a response without usage_metadata must not crash or touch the sink."""
++    fake_response = SimpleNamespace(text="Cluster 1: T cells")  # no usage_metadata
++    fake_client = SimpleNamespace(
++        models=SimpleNamespace(generate_content=MagicMock(return_value=fake_response))
++    )
++    fake_modules = _build_fake_google_modules(client=fake_client)
++    sink: dict = {}
++
++    with patch.dict("sys.modules", fake_modules, clear=False):
++        result = process_gemini("genes", "gemini-3.1-pro-preview", "test-key", usage_sink=sink)
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink == {}
++
++
++def test_process_gemini_missing_usage_metadata_clears_stale_sink():
++    """A reused sink must not keep previous usage when Gemini omits metadata."""
++    fake_response = SimpleNamespace(text="Cluster 1: T cells")  # no usage_metadata
++    fake_client = SimpleNamespace(
++        models=SimpleNamespace(generate_content=MagicMock(return_value=fake_response))
++    )
++    fake_modules = _build_fake_google_modules(client=fake_client)
++    sink: dict = {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
++
++    with patch.dict("sys.modules", fake_modules, clear=False):
++        result = process_gemini("genes", "gemini-3.1-pro-preview", "test-key", usage_sink=sink)
++
++    assert result == ["Cluster 1: T cells"]
++    assert sink == {}
++
++
+ @patch("mllmcelltype.providers.gemini.time.sleep")
+ def test_process_gemini_retries_exhausted_raises(mock_sleep):
+     """Test Gemini raises final error after exhausting retries."""

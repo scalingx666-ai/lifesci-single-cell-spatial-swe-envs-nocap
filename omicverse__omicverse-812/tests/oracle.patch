@@ -1,0 +1,1191 @@
+diff --git a/.github/workflows/gpuex-umap-mac.yml b/.github/workflows/gpuex-umap-mac.yml
+new file mode 100644
+index 000000000..4663c389f
+--- /dev/null
++++ b/.github/workflows/gpuex-umap-mac.yml
+@@ -0,0 +1,52 @@
++name: gpuex UMAP (Apple Silicon / MLX)
++
++# Validates the MLX (metal) edge-SGD backend of omicverse.utils.gpuex.umap
++# on a real Apple-Silicon runner — the only place the metal path can run.
++# The torch CPU path is covered by the main python-package workflow; here we
++# specifically exercise the MLX backend (skipped elsewhere).
++
++on:
++  push:
++    paths:
++      - "omicverse/utils/gpuex/umap/**"
++      - "tests/pp/test_gpuex_umap.py"
++      - ".github/workflows/gpuex-umap-mac.yml"
++  pull_request:
++    paths:
++      - "omicverse/utils/gpuex/umap/**"
++      - "tests/pp/test_gpuex_umap.py"
++      - ".github/workflows/gpuex-umap-mac.yml"
++  workflow_dispatch:
++
++jobs:
++  mlx-umap:
++    # macos-14 / macos-latest are Apple Silicon (M-series) with metal.
++    runs-on: macos-14
++    steps:
++      - uses: actions/checkout@v4
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++
++      - name: Install minimal deps + MLX
++        run: |
++          python -m pip install --upgrade pip
++          # Only what the gpuex.umap test needs — no full omicverse install.
++          python -m pip install numpy scipy "scanpy>=1.9" scikit-learn anndata \
++            torch pytest mlx
++
++      - name: Confirm metal is available
++        run: |
++          python -c "import mlx.core as mx; assert mx.metal.is_available(); print('metal OK')"
++
++      - name: Run gpuex UMAP MLX test
++        run: |
++          # Import the package straight from the checkout (avoid the heavy
++          # full install); the gpuex.umap module is dependency-light.
++          PYTHONPATH="$PWD" python -m pytest tests/pp/test_gpuex_umap.py -v
++
++      - name: Speed benchmark — MLX (metal) vs CPU (30k cells)
++        run: |
++          PYTHONPATH="$PWD" python tests/pp/bench_gpuex_umap.py 30000
+diff --git a/omicverse/pp/_preprocess.py b/omicverse/pp/_preprocess.py
+index c5bf63911..139a3266d 100644
+--- a/omicverse/pp/_preprocess.py
++++ b/omicverse/pp/_preprocess.py
+@@ -1839,7 +1839,11 @@ def umap(
+     Behaviour by ``ov.settings.mode``:
+ 
+     * ``'cpu'``                    — scanpy / umap-learn (CPU).
+-    * ``'cpu-gpu-mixed'``          — parametric UMAP on GPU (pumap).
++    * ``'cpu-gpu-mixed'``          — GPU non-parametric UMAP (gpuex), which
++                                     mirrors the CPU algorithm (same fuzzy
++                                     graph, lobpcg spectral init, a/b curve,
++                                     edge-SGD) so the embedding is consistent
++                                     with cpu mode — unlike the old ``pumap``.
+     * anything else (``'gpu'``)    — RAPIDS if available, falls back to
+                                      pumap on import error.
+     """
+@@ -1868,12 +1872,12 @@ def umap(
+             add_reference(adata, 'umap', 'UMAP with scanpy')
+             note(backend=f"omicverse({settings.mode}) · scanpy")
+         elif settings.mode == 'cpu-gpu-mixed':
+-            print(f"{EMOJI['gpu']} Using torch GPU to calculate UMAP...")
++            print(f"{EMOJI['gpu']} Using torch GPU to calculate UMAP (non-parametric)...")
+             print_gpu_usage_color()
+             from ._umap import umap as _umap
+-            _umap(adata, method='pumap', **kwargs)
+-            add_reference(adata, 'umap', 'UMAP with pumap')
+-            note(backend=f"omicverse({settings.mode}) · pumap")
++            _umap(adata, method='umap-gpu', **kwargs)
++            add_reference(adata, 'umap', 'UMAP with gpuex (non-parametric)')
++            note(backend=f"omicverse({settings.mode}) · umap-gpu")
+         else:
+             try:
+                 print(f"{EMOJI['gpu']} Using RAPIDS GPU UMAP...")
+@@ -1883,10 +1887,10 @@ def umap(
+                 note(backend=f"omicverse({settings.mode}) · rapids")
+             except Exception as e:
+                 print(f"{EMOJI['error']} RAPIDS GPU UMAP failed: {e}")
+-                print(f"{EMOJI['error']} Using pumap instead...")
++                print(f"{EMOJI['error']} Using GPU non-parametric UMAP instead...")
+                 from ._umap import umap as _umap
+-                _umap(adata, method='pumap', **kwargs)
+-                note(backend=f"omicverse({settings.mode}) · pumap")
++                _umap(adata, method='umap-gpu', **kwargs)
++                note(backend=f"omicverse({settings.mode}) · umap-gpu")
+         note(viz=[{"function": "ov.pl.embedding",
+                     "kwargs": {"basis": "X_umap",
+                                "color": pick_color_key(adata),
+diff --git a/omicverse/pp/_umap.py b/omicverse/pp/_umap.py
+index 5ce83c555..9e7b517dd 100644
+--- a/omicverse/pp/_umap.py
++++ b/omicverse/pp/_umap.py
+@@ -52,7 +52,7 @@ def umap(  # noqa: PLR0913, PLR0915
+     random_state: _LegacyRandom = 0,
+     a: float | None = None,
+     b: float | None = None,
+-    method: Literal["umap", "rapids","torchdr","mde","pumap"] = "umap",
++    method: Literal["umap", "umap-gpu", "rapids", "torchdr", "mde", "pumap"] = "umap",
+     key_added: str | None = None,
+     neighbors_key: str = "neighbors",
+     copy: bool = False,
+@@ -167,6 +167,36 @@ def umap(  # noqa: PLR0913, PLR0915
+             output_dens=False,
+             verbose=settings.verbosity > 3,
+         )
++    elif method == "umap-gpu":
++        # Non-parametric UMAP on the GPU (omicverse.utils.gpuex.umap). Same
++        # fuzzy graph, spectral init (torch.lobpcg), a/b curve and edge-SGD
++        # update rule as the CPU 'umap' branch — only the optimisation runs on
++        # CUDA. Produces a structurally-equivalent embedding to CPU (unlike the
++        # parametric 'pumap'). n_epochs falls back to scanpy's 500/200 default
++        # inside the backend when maxiter is None (the parallel GPU SGD needs
++        # enough epochs to converge — the CPU branch's 10/20 would collapse it).
++        print(f"   {Colors.GREEN}{EMOJI['start']} Computing UMAP embedding (GPU non-parametric)...{Colors.ENDC}")
++        from ..utils.gpuex.umap import simplicial_set_embedding_torch
++
++        X_umap, _ = simplicial_set_embedding_torch(
++            data=X,
++            graph=neighbors["connectivities"].tocoo(),
++            n_components=n_components,
++            initial_alpha=alpha,
++            a=a,
++            b=b,
++            gamma=gamma,
++            negative_sample_rate=negative_sample_rate,
++            n_epochs=maxiter,  # None -> backend uses 500 (n<=10k) / 200
++            init=init_coords if init_coords is not None else "spectral",
++            random_state=random_state_processed,
++            metric=neigh_params.get("metric", "euclidean"),
++            metric_kwds=neigh_params.get("metric_kwds", {}),
++            densmap=False,
++            densmap_kwds={},
++            output_dens=False,
++            verbose=settings.verbosity > 3,
++        )
+     elif method == "torchdr":
+         print(f"   {Colors.GREEN}{EMOJI['start']} Computing UMAP embedding (TorchDR GPU method)...{Colors.ENDC}")
+         from torchdr import UMAP
+diff --git a/omicverse/utils/gpuex/__init__.py b/omicverse/utils/gpuex/__init__.py
+index c241feed1..06bee09a3 100644
+--- a/omicverse/utils/gpuex/__init__.py
++++ b/omicverse/utils/gpuex/__init__.py
+@@ -10,10 +10,14 @@
+ * ``ov.utils.gpuex.scipy.rankdata`` — vectorised, batched, average-tie
+   ranking for 2-D arrays. Drop-in for ``scipy.stats.rankdata(..., axis=1,
+   method='average')``.
++* ``ov.utils.gpuex.umap`` — non-parametric UMAP embedding (umap-learn /
++  scanpy parity) on the GPU via PyTorch (lobpcg spectral + edge-SGD).
++  Drop-in for ``umap.umap_.simplicial_set_embedding``.
+ """
+ 
+ from __future__ import annotations
+ 
+ from . import scipy  # noqa: F401  (re-export submodule)
++from . import umap  # noqa: F401  (re-export submodule)
+ 
+-__all__ = ["scipy"]
++__all__ = ["scipy", "umap"]
+diff --git a/omicverse/utils/gpuex/umap/__init__.py b/omicverse/utils/gpuex/umap/__init__.py
+new file mode 100644
+index 000000000..b25e7662f
+--- /dev/null
++++ b/omicverse/utils/gpuex/umap/__init__.py
+@@ -0,0 +1,50 @@
++"""GPU non-parametric UMAP — a torch twin of umap-learn / scanpy CPU UMAP.
++
++This package re-implements the *non-parametric* UMAP embedding optimisation
++(umap-learn 0.5.7 ``simplicial_set_embedding`` + ``optimize_layout_euclidean``)
++in PyTorch with GPU acceleration. It exists because omicverse's previous
++GPU/"mixed" UMAP used *parametric* UMAP (an MLP), which produces visibly
++different embeddings from the CPU path; users reported the inconsistency.
++
++The entry point ``simplicial_set_embedding_torch`` is argument-compatible
++with ``umap.umap_.simplicial_set_embedding`` and consumes the same fuzzy
++``connectivities`` graph, so it is a drop-in backend for the CPU UMAP path
++and yields structurally-equivalent output (same fuzzy graph, same a/b curve,
++same spectral init, same edge-SGD update rule).
++
++Device support (``backend='auto'`` picks the best available):
++- **CUDA** (torch) — fully accelerated: lobpcg spectral init + edge-SGD.
++- **Apple Silicon** (MLX/metal) — edge-SGD on metal via ``_sgd_mlx`` (the
++  same MLX path omicverse uses for PCA/Harmony, not torch-MPS, which lacks
++  the float64/sparse coverage here); spectral init runs on CPU.
++- **CPU** (torch) — everything on host.
++
++``backend`` may be ``'auto'`` | ``'torch'`` | ``'mlx'``.
++
++Example
++-------
++>>> import scanpy as sc
++>>> from omicverse.utils.gpuex.umap import (
++...     simplicial_set_embedding_torch, find_ab_params)
++>>> a, b = find_ab_params(spread=1.0, min_dist=0.5)
++>>> emb, _ = simplicial_set_embedding_torch(
++...     adata.X, adata.obsp['connectivities'], n_components=2,
++...     initial_alpha=1.0, a=a, b=b, gamma=1.0, negative_sample_rate=5,
++...     n_epochs=None, init='spectral', random_state=0,
++...     metric='euclidean', metric_kwds={})
++"""
++from ._ab import find_ab_params
++from ._embedding import simplicial_set_embedding_torch
++from ._init import make_epochs_per_sample, noisy_scale_coords
++from ._sgd import optimize_layout_torch
++from ._sgd_mlx import mlx_available, optimize_layout_mlx
++
++__all__ = [
++    "simplicial_set_embedding_torch",
++    "find_ab_params",
++    "make_epochs_per_sample",
++    "noisy_scale_coords",
++    "optimize_layout_torch",
++    "optimize_layout_mlx",
++    "mlx_available",
++]
+diff --git a/omicverse/utils/gpuex/umap/_ab.py b/omicverse/utils/gpuex/umap/_ab.py
+new file mode 100644
+index 000000000..7dbdbda9e
+--- /dev/null
++++ b/omicverse/utils/gpuex/umap/_ab.py
+@@ -0,0 +1,42 @@
++"""UMAP a/b curve-parameter fitting — bit-faithful to umap-learn 0.5.7.
++
++``find_ab_params`` fits the smooth low-dimensional membership curve
++``1 / (1 + a * x^(2b))`` to an offset exponential decay parameterised by
++``spread`` and ``min_dist``. We reproduce umap-learn's exact ``curve_fit``
++so the attractive/repulsive gradients downstream match the CPU path.
++"""
++from __future__ import annotations
++
++import numpy as np
++from scipy.optimize import curve_fit
++
++
++def find_ab_params(spread: float, min_dist: float) -> tuple[float, float]:
++    """Fit ``(a, b)`` for the UMAP low-dim membership curve.
++
++    Identical to ``umap.umap_.find_ab_params``: fit
++    ``1/(1 + a*x**(2b))`` against ``y=1`` for ``x < min_dist`` and
++    ``y=exp(-(x-min_dist)/spread)`` otherwise, over ``x in [0, 3*spread]``.
++
++    Parameters
++    ----------
++    spread
++        Effective scale of embedded points.
++    min_dist
++        Minimum distance between embedded points.
++
++    Returns
++    -------
++    tuple of float
++        The fitted ``(a, b)`` parameters.
++    """
++
++    def curve(x, a, b):
++        return 1.0 / (1.0 + a * x ** (2 * b))
++
++    xv = np.linspace(0, spread * 3, 300)
++    yv = np.zeros(xv.shape)
++    yv[xv < min_dist] = 1.0
++    yv[xv >= min_dist] = np.exp(-(xv[xv >= min_dist] - min_dist) / spread)
++    params, _ = curve_fit(curve, xv, yv)
++    return float(params[0]), float(params[1])
+diff --git a/omicverse/utils/gpuex/umap/_embedding.py b/omicverse/utils/gpuex/umap/_embedding.py
+new file mode 100644
+index 000000000..b879ba486
+--- /dev/null
++++ b/omicverse/utils/gpuex/umap/_embedding.py
+@@ -0,0 +1,180 @@
++"""Orchestrator: a drop-in GPU twin of umap-learn ``simplicial_set_embedding``.
++
++Takes the *same* fuzzy ``connectivities`` graph scanpy already built and
++returns a structurally-equivalent embedding, computed with the torch GPU
++edge-SGD. Argument order/names mirror ``umap.umap_.simplicial_set_embedding``
++so the omicverse CPU UMAP branch can swap backends by changing one call.
++"""
++from __future__ import annotations
++
++import numpy as np
++from sklearn.utils import check_random_state
++
++from ._init import initialize_embedding, make_epochs_per_sample, prune_graph
++from ._sgd import optimize_layout_torch
++
++
++def _default_n_epochs(n_obs: int) -> int:
++    """umap-learn's rule: 500 epochs for small data, 200 for large."""
++    return 500 if n_obs <= 10_000 else 200
++
++
++def simplicial_set_embedding_torch(
++    data,
++    graph,
++    n_components,
++    initial_alpha,
++    a,
++    b,
++    gamma,
++    negative_sample_rate,
++    n_epochs,
++    init,
++    random_state,
++    metric,
++    metric_kwds,
++    densmap=False,
++    densmap_kwds=None,
++    output_dens=False,
++    *,
++    device=None,
++    backend="auto",
++    verbose=False,
++):
++    """GPU non-parametric UMAP embedding of a fuzzy simplicial set.
++
++    Parameters
++    ----------
++    data
++        ``(n, d)`` matrix; only used to seed spectral init. May be sparse.
++    graph
++        ``(n, n)`` scipy sparse fuzzy ``connectivities`` (e.g.
++        ``adata.obsp['connectivities']``).
++    n_components
++        Output dimensionality (usually 2).
++    initial_alpha
++        Initial SGD learning rate (1.0 in standard UMAP).
++    a, b
++        Low-dim membership curve params (``find_ab_params``).
++    gamma
++        Repulsion weight.
++    negative_sample_rate
++        Negative samples per positive sample.
++    n_epochs
++        Epoch count, or ``None`` to use umap-learn's 500/200 rule.
++    init
++        ``'spectral'`` / ``'random'`` / ``'pca'`` or an ``(n, n_components)``
++        array (an explicit array gives bit-identical init to a CPU run).
++    random_state
++        Seed or ``RandomState`` instance.
++    metric, metric_kwds
++        Forwarded to spectral init only.
++    densmap
++        Must be ``False`` (densMAP is not implemented on this path).
++    device
++        ``'cuda'`` / ``'cpu'``; auto-detected when ``None``.
++
++    Returns
++    -------
++    tuple
++        ``(embedding, aux_data)`` — float32 ``(n, n_components)`` array and an
++        (empty) aux dict, matching the umap-learn return signature.
++    """
++    if densmap:
++        raise NotImplementedError(
++            "densMAP is not supported by the GPU UMAP backend; use method='umap'."
++        )
++
++    random_state = check_random_state(random_state)
++    n_obs = graph.shape[0]
++
++    if n_epochs is None:
++        n_epochs = _default_n_epochs(n_obs)
++    n_epochs_max = max(n_epochs) if isinstance(n_epochs, (list, tuple)) else n_epochs
++
++    # 1. dedup + prune weak edges (umap-learn semantics)
++    graph = prune_graph(graph, n_epochs_max)
++
++    # Pick the compute backend. 'auto': torch+CUDA when present, else MLX on
++    # Apple Silicon (metal), else torch CPU. CUDA is the only path that also
++    # GPU-accelerates the spectral init (lobpcg); MLX/CPU do spectral on CPU.
++    use_mlx = False
++    gpu_coo = None
++    dev = None
++    if backend in ("auto", "mlx", "torch"):
++        cuda_ok = False
++        try:
++            import torch
++
++            cuda_ok = torch.cuda.is_available()
++        except Exception:  # noqa: BLE001
++            cuda_ok = False
++        if backend == "mlx":
++            use_mlx = True
++        elif backend == "auto" and not cuda_ok:
++            from ._sgd_mlx import mlx_available
++
++            use_mlx = mlx_available()
++    else:
++        raise ValueError(f"backend must be 'auto'|'torch'|'mlx', got {backend!r}")
++
++    if not use_mlx:
++        # torch path: resolve device once, upload the pruned COO a SINGLE time
++        # so the spectral eigensolve and edge-SGD share resident tensors.
++        try:
++            import torch
++
++            if isinstance(device, torch.device):
++                dev = device
++            elif device is None:
++                dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++            else:
++                dev = torch.device(device)
++            # MPS (Apple) unsupported here (torch float64/sparse gaps) -> CPU.
++            if dev.type == "mps":
++                dev = torch.device("cpu")
++            if dev.type == "cuda":
++                row_t = torch.as_tensor(graph.row, dtype=torch.long, device=dev)
++                col_t = torch.as_tensor(graph.col, dtype=torch.long, device=dev)
++                val_t = torch.as_tensor(graph.data, dtype=torch.float32, device=dev)
++                gpu_coo = (row_t, col_t, val_t, graph.shape[0])
++        except Exception:  # noqa: BLE001 - fall back to host arrays
++            gpu_coo, dev = None, device
++
++    # 2. initial layout (GPU spectral via lobpcg on CUDA; CPU scipy for MLX/CPU)
++    embedding = initialize_embedding(
++        data, graph, n_components, init, random_state,
++        metric=metric, metric_kwds=metric_kwds,
++        gpu_coo=gpu_coo, device=dev,
++    )
++
++    # 3. per-edge sampling schedule
++    epochs_per_sample = make_epochs_per_sample(graph.data, n_epochs_max)
++
++    # 4. edge-SGD
++    seed = int(random_state.randint(np.iinfo(np.int32).max))
++    if use_mlx:
++        from ._sgd_mlx import optimize_layout_mlx
++
++        embedding = optimize_layout_mlx(
++            np.asarray(embedding), graph.row, graph.col, n_epochs_max,
++            epochs_per_sample, a, b, gamma=gamma, initial_alpha=initial_alpha,
++            negative_sample_rate=negative_sample_rate, seed=seed,
++            move_other=True, verbose=verbose,
++        )
++    else:
++        # reuse the resident COO endpoints (head=row, tail=col) on CUDA
++        head = gpu_coo[0] if gpu_coo is not None else graph.row
++        tail = gpu_coo[1] if gpu_coo is not None else graph.col
++        embedding = optimize_layout_torch(
++            embedding, head, tail, n_epochs_max, epochs_per_sample, a, b,
++            gamma=gamma, initial_alpha=initial_alpha,
++            negative_sample_rate=negative_sample_rate, seed=seed, device=dev,
++            move_other=True, verbose=verbose,
++        )
++
++    aux_data: dict = {}
++    if output_dens:
++        aux_data["rad_orig"] = None
++        aux_data["rad_emb"] = None
++    return embedding, aux_data
+diff --git a/omicverse/utils/gpuex/umap/_init.py b/omicverse/utils/gpuex/umap/_init.py
+new file mode 100644
+index 000000000..ef7eace78
+--- /dev/null
++++ b/omicverse/utils/gpuex/umap/_init.py
+@@ -0,0 +1,205 @@
++"""Graph prep + embedding initialisation — faithful to umap-learn 0.5.7.
++
++Everything here runs on CPU/NumPy/SciPy (it is cheap, deterministic, and
++matching the CPU path here matters more than speed): graph dedup/prune,
++``make_epochs_per_sample``, spectral / random / pca / array init, and the
++mandatory ``[0, 10]`` rescale that umap-learn applies to every init.
++"""
++from __future__ import annotations
++
++import numpy as np
++import scipy.sparse
++
++
++def make_epochs_per_sample(weights: np.ndarray, n_epochs: int) -> np.ndarray:
++    """Number of epochs between successive samples of each 1-simplex.
++
++    Identical to ``umap.umap_.make_epochs_per_sample``. Edges with weight 0
++    get ``-1.0`` (never sampled); stronger edges get a smaller value (sampled
++    more often).
++    """
++    result = -1.0 * np.ones(weights.shape[0], dtype=np.float64)
++    n_samples = n_epochs * (weights / weights.max())
++    result[n_samples > 0] = float(n_epochs) / np.float64(n_samples[n_samples > 0])
++    return result
++
++
++def prune_graph(graph: scipy.sparse.spmatrix, n_epochs: int):
++    """Dedup + drop weak edges, mirroring ``simplicial_set_embedding``.
++
++    Zeros out entries below ``graph.data.max() / n_epochs`` and removes them,
++    so weak 1-simplices are never sampled. Returns a COO matrix.
++    """
++    graph = graph.tocoo()
++    graph.sum_duplicates()
++    n_epochs_eff = n_epochs if n_epochs > 10 else 200
++    graph.data[graph.data < (graph.data.max() / float(n_epochs_eff))] = 0.0
++    graph.eliminate_zeros()
++    return graph.tocoo()
++
++
++def noisy_scale_coords(coords, random_state, max_coord=10.0, noise=0.0001):
++    """Scale coords to a ``max_coord`` box and add tiny Gaussian noise.
++
++    Matches umap-learn's ``noisy_scale_coords`` used after spectral/pca init.
++    """
++    expansion = max_coord / np.abs(coords).max()
++    coords = (coords * expansion).astype(np.float32)
++    if noise > 0.0:
++        coords += random_state.normal(scale=noise, size=coords.shape).astype(
++            np.float32
++        )
++    return coords
++
++
++def _gpu_spectral_lobpcg(row_t, col_t, val_t, n, dim, dev):
++    """Smallest non-trivial eigenvectors of the normalized Laplacian on GPU.
++
++    Builds ``L = I - D^{-1/2} A D^{-1/2}`` as a *sparse* tensor (never a dense
++    n×n) from the already-resident COO tensors and runs ``torch.lobpcg`` for
++    the smallest eigenpairs — the same spectral-layout vectors umap-learn
++    keeps (indices ``[1:dim+1]``). Validated to span the same subspace as
++    scipy ``eigsh`` (canonical corr > 0.99) at ~25× the speed.
++
++    Returns an ``(n, dim)`` float32 numpy array, or raises on failure (the
++    caller falls back to the CPU scipy path).
++    """
++    import torch
++
++    k = dim + 1
++    val = val_t.to(torch.float64)
++    # Degree via scatter-add (no second sparse build).
++    deg = torch.zeros(n, dtype=torch.float64, device=dev).index_add_(0, row_t, val)
++    d_inv_sqrt = deg.clamp_min(1.0).rsqrt()
++    # L = I - D^{-1/2} A D^{-1/2}: off-diagonal = -d^{-1/2}_i A_ij d^{-1/2}_j,
++    # plus an identity on the diagonal. coalesce() folds any self-loops in.
++    scaled = -(d_inv_sqrt[row_t] * val * d_inv_sqrt[col_t])
++    diag = torch.arange(n, device=dev)
++    L_row = torch.cat([row_t, diag])
++    L_col = torch.cat([col_t, diag])
++    L_val = torch.cat([scaled, torch.ones(n, dtype=torch.float64, device=dev)])
++    L_sp = torch.sparse_coo_tensor(
++        torch.stack([L_row, L_col]), L_val, (n, n)
++    ).coalesce()
++
++    try:
++        eigvals, eigvecs = torch.lobpcg(
++            L_sp, k=k, largest=False, method="ortho", tol=1e-4, niter=-1
++        )
++    except (RuntimeError, TypeError):
++        # Some torch builds reject method="ortho"/niter=-1; retry plainly.
++        eigvals, eigvecs = torch.lobpcg(L_sp, k=k, largest=False)
++    order = torch.argsort(eigvals)
++    emb = eigvecs[:, order[1:k]].to(torch.float32)
++    del L_sp, scaled, d_inv_sqrt, deg, val
++    return emb.detach().cpu().numpy()
++
++
++def _spectral_layout(data, graph, dim, random_state, metric, metric_kwds,
++                     *, gpu_coo=None, device=None):
++    """Spectral embedding of the fuzzy graph.
++
++    When ``device`` is CUDA and the COO tensors are supplied (or built from
++    ``graph``), use the GPU ``torch.lobpcg`` path; on any failure fall back
++    to umap-learn's own ``spectral_layout`` (scipy ``eigsh``), then a
++    vendored scipy version, then a random layout — guaranteeing parity with
++    the CPU path whenever the GPU path is unavailable.
++    """
++    if device is not None and getattr(device, "type", None) == "cuda":
++        try:
++            import torch
++
++            n = graph.shape[0]
++            if gpu_coo is not None:
++                row_t, col_t, val_t = gpu_coo[0], gpu_coo[1], gpu_coo[2]
++            else:
++                row_t = torch.as_tensor(graph.row, dtype=torch.long, device=device)
++                col_t = torch.as_tensor(graph.col, dtype=torch.long, device=device)
++                val_t = torch.as_tensor(graph.data, dtype=torch.float32,
++                                        device=device)
++            return _gpu_spectral_lobpcg(row_t, col_t, val_t, n, dim, device)
++        except Exception:  # noqa: BLE001 - any GPU failure -> CPU parity path
++            import gc
++
++            try:
++                import torch
++
++                torch.cuda.empty_cache()
++            except Exception:  # noqa: BLE001
++                pass
++            gc.collect()
++
++    try:  # parity-first: reuse umap-learn's exact spectral init
++        from umap.spectral import spectral_layout
++
++        return spectral_layout(
++            data, graph, dim, random_state, metric=metric, metric_kwds=metric_kwds
++        )
++    except Exception:  # noqa: BLE001 - any failure -> vendored scipy path
++        pass
++
++    # Vendored single-component normalized-Laplacian spectral layout.
++    from scipy.sparse import identity, spdiags
++    from scipy.sparse.linalg import eigsh
++
++    n = graph.shape[0]
++    diag_data = np.asarray(graph.sum(axis=0)).ravel()
++    diag_data[diag_data == 0] = 1.0
++    D_inv_sqrt = spdiags(1.0 / np.sqrt(diag_data), 0, n, n)
++    L = identity(n) - D_inv_sqrt @ graph @ D_inv_sqrt
++
++    k = dim + 1
++    num_lanczos = max(2 * k + 1, int(np.sqrt(n)))
++    try:
++        eigenvalues, eigenvectors = eigsh(
++            L, k, which="SM", ncv=num_lanczos, tol=1e-4, v0=np.ones(n),
++            maxiter=n * 5,
++        )
++        order = np.argsort(eigenvalues)[1:k]
++        return eigenvectors[:, order]
++    except Exception:  # noqa: BLE001
++        return random_state.uniform(low=-10.0, high=10.0, size=(n, dim))
++
++
++def initialize_embedding(data, graph, n_components, init, random_state,
++                         metric="euclidean", metric_kwds=None,
++                         *, gpu_coo=None, device=None):
++    """Produce the initial embedding, then rescale to ``[0, 10]`` per dim.
++
++    Handles ``init`` in {'spectral', 'random', 'pca', ndarray}. The final
++    ``10 * (E - min) / (max - min)`` rescale is applied to *every* path, as
++    umap-learn does, so init only sets structure, not scale.
++    """
++    metric_kwds = metric_kwds or {}
++    n = graph.shape[0]
++
++    if isinstance(init, str) and init == "random":
++        embedding = random_state.uniform(
++            low=-10.0, high=10.0, size=(n, n_components)
++        ).astype(np.float32)
++    elif isinstance(init, str) and init == "pca":
++        from sklearn.decomposition import PCA
++
++        X = data.toarray() if scipy.sparse.issparse(data) else np.asarray(data)
++        pca = PCA(n_components=n_components, random_state=random_state)
++        embedding = pca.fit_transform(X).astype(np.float32)
++        embedding = noisy_scale_coords(embedding, random_state)
++    elif isinstance(init, str) and init == "spectral":
++        embedding = _spectral_layout(
++            data, graph, n_components, random_state, metric, metric_kwds,
++            gpu_coo=gpu_coo, device=device,
++        )
++        embedding = noisy_scale_coords(np.asarray(embedding), random_state)
++    else:  # explicit array init (used by the validation harness for parity)
++        embedding = np.asarray(init, dtype=np.float32)
++        if len(np.unique(embedding, axis=0)) < embedding.shape[0]:
++            embedding = embedding + random_state.normal(
++                scale=0.0001, size=embedding.shape
++            ).astype(np.float32)
++
++    # Mandatory final rescale (umap-learn umap_.py ~1188-1192).
++    emb = np.asarray(embedding, dtype=np.float32)
++    span = emb.max(axis=0) - emb.min(axis=0)
++    span[span == 0] = 1.0
++    emb = 10.0 * (emb - emb.min(axis=0)) / span
++    return emb.astype(np.float32)
+diff --git a/omicverse/utils/gpuex/umap/_sgd.py b/omicverse/utils/gpuex/umap/_sgd.py
+new file mode 100644
+index 000000000..917cdf028
+--- /dev/null
++++ b/omicverse/utils/gpuex/umap/_sgd.py
+@@ -0,0 +1,171 @@
++"""GPU edge-sampling SGD — the torch core of non-parametric UMAP.
++
++This reproduces umap-learn 0.5.7's ``optimize_layout_euclidean`` analytic
++gradient updates (NOT autograd, NOT a parametric MLP) on the GPU. Each
++epoch the whole *active* edge set is updated simultaneously with atomic
++``index_add_`` scatter — the standard parallel relaxation of umap-learn's
++sequential per-edge loop (same approach cuML uses). Output is structurally
++equivalent to the CPU embedding (bit-exactness is impossible: different RNG
++family + parallel vs sequential updates).
++
++Gradient formulas, the ``clip(±4)`` bound, the linear ``alpha`` decay, and
++the negative-sample-count schedule are all taken verbatim from
++``umap/layouts.py``.
++"""
++from __future__ import annotations
++
++import numpy as np
++
++CLIP = 4.0
++
++
++def optimize_layout_torch(
++    embedding: np.ndarray,
++    head: np.ndarray,
++    tail: np.ndarray,
++    n_epochs: int,
++    epochs_per_sample: np.ndarray,
++    a: float,
++    b: float,
++    *,
++    gamma: float = 1.0,
++    initial_alpha: float = 1.0,
++    negative_sample_rate: float = 5.0,
++    seed: int = 0,
++    device: str | None = None,
++    move_other: bool = True,
++    verbose: bool = False,
++) -> np.ndarray:
++    """Optimise ``embedding`` with GPU edge-SGD (umap-learn semantics).
++
++    Parameters
++    ----------
++    embedding
++        Initial ``(n, dim)`` float32 layout (already ``[0, 10]`` rescaled).
++    head, tail
++        Int arrays of the COO 1-simplex endpoints (post-prune).
++    n_epochs
++        Total optimisation epochs.
++    epochs_per_sample
++        Per-edge sampling period from ``make_epochs_per_sample`` (``-1`` =
++        never sampled).
++    a, b
++        Low-dim membership curve params from ``find_ab_params``.
++    gamma
++        Repulsion weight.
++    initial_alpha
++        Initial learning rate; decays linearly to ~0.
++    negative_sample_rate
++        Negative samples per positive sample.
++    seed
++        Seed for the torch generator (negative-vertex draws).
++    device
++        ``'cuda'`` / ``'cpu'``; auto-detected when ``None``.
++    move_other
++        Whether tail vertices of positive edges also move (True for the
++        standard single-embedding case).
++
++    Returns
++    -------
++    numpy.ndarray
++        The optimised ``(n, dim)`` float32 embedding.
++    """
++    import torch
++
++    if isinstance(device, torch.device):
++        dev = device
++    elif device is None:
++        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    else:
++        dev = torch.device(device)
++    # MPS lacks float64 (used by the edge schedules) — fall back to CPU.
++    if dev.type == "mps":
++        dev = torch.device("cpu")
++
++    n_vertices = embedding.shape[0]
++
++    # Accept already-on-device tensors (single-transfer path: the graph COO
++    # was uploaded once by the caller and is reused here) or numpy (standalone
++    # / CPU-fallback path). Avoid re-uploading the big edge arrays.
++    def _to_dev(arr, dtype):
++        if isinstance(arr, torch.Tensor):
++            return arr.to(device=dev, dtype=dtype)
++        return torch.as_tensor(np.asarray(arr), dtype=dtype, device=dev)
++
++    if isinstance(embedding, torch.Tensor):
++        emb = embedding.to(device=dev, dtype=torch.float32).contiguous()
++    else:
++        emb = torch.as_tensor(np.ascontiguousarray(embedding),
++                              dtype=torch.float32, device=dev)
++    head_t = _to_dev(head, torch.long)
++    tail_t = _to_dev(tail, torch.long)
++
++    eps_sample = torch.as_tensor(np.asarray(epochs_per_sample),
++                                 dtype=torch.float64, device=dev)
++    eps_neg_sample = eps_sample / negative_sample_rate
++    next_sample = eps_sample.clone()
++    next_neg_sample = eps_neg_sample.clone()
++
++    # Edges with epochs_per_sample < 0 are never sampled (weight was 0).
++    sampleable = eps_sample > 0
++
++    gen = torch.Generator(device=dev)
++    gen.manual_seed(int(seed) & 0x7FFFFFFF)
++
++    rng = range(n_epochs)
++    if verbose:
++        try:
++            from tqdm.auto import tqdm
++
++            rng = tqdm(rng, desc="UMAP(GPU)")
++        except Exception:  # noqa: BLE001
++            pass
++
++    for n in rng:
++        alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
++
++        active = sampleable & (next_sample <= n)
++        if not bool(active.any()):
++            continue
++        idx = active.nonzero(as_tuple=False).squeeze(1)
++        j = head_t[idx]
++        k = tail_t[idx]
++
++        # ---- attractive gradient (positive edges) ----
++        yj = emb[j]
++        yk = emb[k]
++        diff = yj - yk
++        d2 = (diff * diff).sum(dim=1)
++        pos = d2 > 0.0
++        d2c = d2.clamp_min(1e-12)  # masked out below; avoids 0**(b-1) blowup
++        grad_coeff = (-2.0 * a * b * d2c.pow(b - 1.0)) / (a * d2c.pow(b) + 1.0)
++        grad_coeff = torch.where(pos, grad_coeff, torch.zeros_like(grad_coeff))
++        grad = (grad_coeff.unsqueeze(1) * diff).clamp(-CLIP, CLIP) * alpha
++        emb.index_add_(0, j, grad)
++        if move_other:
++            emb.index_add_(0, k, -grad)
++
++        # ---- negative sampling (repulsion) ----
++        n_neg = ((n - next_neg_sample[idx]) / eps_neg_sample[idx]).floor()
++        n_neg = n_neg.clamp_min(0).to(torch.long)
++        total_neg = int(n_neg.sum().item())
++        if total_neg > 0:
++            anchor = torch.repeat_interleave(j, n_neg)
++            neg_k = torch.randint(0, n_vertices, (total_neg,), generator=gen,
++                                  device=dev)
++            ya = emb[anchor]
++            yn = emb[neg_k]
++            dn = ya - yn
++            d2n = (dn * dn).sum(dim=1)
++            posn = d2n > 0.0
++            d2nc = d2n.clamp_min(1e-12)
++            gc = (2.0 * gamma * b) / ((0.001 + d2nc) * (a * d2nc.pow(b) + 1.0))
++            gc = torch.where(posn, gc, torch.zeros_like(gc))
++            gradn = (gc.unsqueeze(1) * dn).clamp(-CLIP, CLIP) * alpha
++            emb.index_add_(0, anchor, gradn)
++            next_neg_sample[idx] += n_neg.to(torch.float64) * eps_neg_sample[idx]
++
++        # ---- advance positive-edge schedule ----
++        next_sample[idx] += eps_sample[idx]
++
++    return emb.detach().cpu().numpy().astype(np.float32)
+diff --git a/omicverse/utils/gpuex/umap/_sgd_mlx.py b/omicverse/utils/gpuex/umap/_sgd_mlx.py
+new file mode 100644
+index 000000000..07c17765a
+--- /dev/null
++++ b/omicverse/utils/gpuex/umap/_sgd_mlx.py
+@@ -0,0 +1,129 @@
++"""Apple-Silicon (MLX/metal) edge-SGD for non-parametric UMAP.
++
++Mirrors :func:`._sgd.optimize_layout_torch` but runs the gradient
++computation on Apple's MLX (metal) backend — the same Apple path
++omicverse already uses for PCA (``_pca_mlx.MLXPCA``) and Harmony, rather
++than torch-MPS (MLX has the float64/sparse coverage MPS lacks here).
++
++Design: the cheap O(edges) schedule bookkeeping and the RNG stay in NumPy
++on the host; only the per-epoch gather → gradient → scatter-add runs on
++MLX. On Apple Silicon's unified memory the host↔device handoff of the
++(small) index arrays is nearly free, so this keeps the embedding resident
++on metal while sidestepping MLX's gaps around boolean-index / argwhere.
++
++Negative sampling uses the same schedule-based per-edge count as the torch
++path (``(n - epoch_of_next_negative_sample) / epochs_per_negative_sample``).
++Bit-equality with umap-learn is not the goal (different RNG + parallel
++updates); the embedding is validated by trustworthiness. Spectral init is
++done on the CPU (scipy) by the caller.
++"""
++from __future__ import annotations
++
++import numpy as np
++
++CLIP = 4.0
++
++
++def mlx_available() -> bool:
++    """True when MLX is importable and a metal device is present."""
++    try:
++        import mlx.core as mx
++
++        return bool(mx.metal.is_available())
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def optimize_layout_mlx(
++    embedding: np.ndarray,
++    head: np.ndarray,
++    tail: np.ndarray,
++    n_epochs: int,
++    epochs_per_sample: np.ndarray,
++    a: float,
++    b: float,
++    *,
++    gamma: float = 1.0,
++    initial_alpha: float = 1.0,
++    negative_sample_rate: float = 5.0,
++    seed: int = 0,
++    move_other: bool = True,
++    verbose: bool = False,
++) -> np.ndarray:
++    """Optimise ``embedding`` with the MLX (metal) edge-SGD.
++
++    Same gradient formulas / clip(±4) / linear alpha decay as the torch and
++    umap-learn paths. Returns the optimised ``(n, dim)`` float32 array.
++    """
++    import mlx.core as mx
++
++    head = np.asarray(head)
++    tail = np.asarray(tail)
++    eps_sample = np.asarray(epochs_per_sample, dtype=np.float64)
++    eps_neg = eps_sample / negative_sample_rate
++    next_sample = eps_sample.copy()
++    next_neg = eps_neg.copy()
++    sampleable = eps_sample > 0
++
++    rng = np.random.default_rng(int(seed) & 0x7FFFFFFF)
++    n_vertices = embedding.shape[0]
++    emb = mx.array(np.ascontiguousarray(embedding, dtype=np.float32))
++
++    rng_iter = range(n_epochs)
++    if verbose:
++        try:
++            from tqdm.auto import tqdm
++
++            rng_iter = tqdm(rng_iter, desc="UMAP(MLX)")
++        except Exception:  # noqa: BLE001
++            pass
++
++    for n in rng_iter:
++        alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
++        active = np.nonzero(sampleable & (next_sample <= n))[0]
++        if active.size == 0:
++            continue
++        j = head[active]
++        k = tail[active]
++
++        # ---- attractive ----
++        jx = mx.array(j)
++        kx = mx.array(k)
++        yj = emb[jx]
++        yk = emb[kx]
++        diff = yj - yk
++        d2 = mx.sum(diff * diff, axis=1)
++        posm = d2 > 0.0
++        d2c = mx.maximum(d2, 1e-12)
++        gc = (-2.0 * a * b * mx.power(d2c, b - 1.0)) / (a * mx.power(d2c, b) + 1.0)
++        gc = mx.where(posm, gc, mx.zeros_like(gc))
++        grad = mx.clip(mx.expand_dims(gc, 1) * diff, -CLIP, CLIP) * alpha
++        emb = emb.at[jx].add(grad)
++        if move_other:
++            emb = emb.at[kx].add(-grad)
++
++        # ---- negative sampling (fixed rate per active edge) ----
++        n_neg = ((n - next_neg[active]) / eps_neg[active]).astype(np.int64)
++        n_neg = np.clip(n_neg, 0, None)
++        total = int(n_neg.sum())
++        if total > 0:
++            anchors = np.repeat(j, n_neg)
++            neg_k = rng.integers(0, n_vertices, size=total)
++            ax = mx.array(anchors)
++            nx = mx.array(neg_k)
++            ya = emb[ax]
++            yn = emb[nx]
++            dn = ya - yn
++            d2n = mx.sum(dn * dn, axis=1)
++            posn = d2n > 0.0
++            d2nc = mx.maximum(d2n, 1e-12)
++            gcn = (2.0 * gamma * b) / ((0.001 + d2nc) * (a * mx.power(d2nc, b) + 1.0))
++            gcn = mx.where(posn, gcn, mx.zeros_like(gcn))
++            gradn = mx.clip(mx.expand_dims(gcn, 1) * dn, -CLIP, CLIP) * alpha
++            emb = emb.at[ax].add(gradn)
++            next_neg[active] += n_neg * eps_neg[active]
++
++        next_sample[active] += eps_sample[active]
++        mx.eval(emb)  # materialise; keeps the lazy graph from growing per epoch
++
++    return np.array(emb).astype(np.float32)
+diff --git a/tests/pp/bench_gpuex_umap.py b/tests/pp/bench_gpuex_umap.py
+new file mode 100644
+index 000000000..0cac72b0f
+--- /dev/null
++++ b/tests/pp/bench_gpuex_umap.py
+@@ -0,0 +1,78 @@
++"""Speed benchmark: gpuex UMAP MLX (metal) vs CPU on synthetic cells.
++
++Run as a script (not collected by pytest — name isn't ``test_*``):
++
++    python tests/pp/bench_gpuex_umap.py [n_cells]
++
++Loads the ``gpuex.umap`` subpackage standalone (numpy/scipy/scanpy/sklearn/
++anndata/torch/mlx only), builds a fuzzy graph on synthetic blobs, and times
++the non-parametric UMAP edge-SGD on the MLX (metal) backend vs the torch CPU
++backend, printing wall-clock and speedup. Used by the macOS CI job to report
++a real Apple-Silicon number; on a box without metal it prints CPU-only.
++"""
++import importlib.util
++import pathlib
++import sys
++import time
++
++import numpy as np
++
++_UMAP_DIR = (
++    pathlib.Path(__file__).resolve().parents[2]
++    / "omicverse" / "utils" / "gpuex" / "umap"
++)
++
++
++def _load():
++    name = "gpuex_umap_standalone"
++    if name in sys.modules:
++        return sys.modules[name]
++    spec = importlib.util.spec_from_file_location(
++        name, _UMAP_DIR / "__init__.py",
++        submodule_search_locations=[str(_UMAP_DIR)],
++    )
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def main(n=30000):
++    import anndata as ad
++    import scanpy as sc
++    from sklearn.datasets import make_blobs
++    from sklearn.manifold import trustworthiness
++
++    g = _load()
++    print(f"=== gpuex UMAP speed benchmark: {n} cells, 200 epochs ===")
++    X, _ = make_blobs(n_samples=n, centers=20, n_features=50, random_state=0)
++    X = X.astype(np.float32)
++    adata = ad.AnnData(X)
++    t = time.time()
++    sc.pp.neighbors(adata, n_neighbors=15, use_rep="X", random_state=0)
++    graph = adata.obsp["connectivities"]
++    print(f"  neighbors graph: {graph.nnz} edges ({time.time()-t:.1f}s, shared cost)")
++    a, b = g.find_ab_params(1.0, 0.5)
++
++    def run(backend, **kw):
++        t = time.time()
++        emb, _ = g.simplicial_set_embedding_torch(
++            X, graph, 2, 1.0, a, b, 1.0, 5, 200, "spectral", 0,
++            "euclidean", {}, backend=backend, **kw)
++        return emb, time.time() - t
++
++    emb_cpu, t_cpu = run("torch", device="cpu")
++    tw_cpu = trustworthiness(X[:8000], emb_cpu[:8000], n_neighbors=15)
++    print(f"  CPU (torch) : {t_cpu:6.1f}s   trustworthiness={tw_cpu:.4f}")
++
++    if g.mlx_available():
++        emb_mlx, t_mlx = run("mlx")
++        tw_mlx = trustworthiness(X[:8000], emb_mlx[:8000], n_neighbors=15)
++        print(f"  MLX (metal) : {t_mlx:6.1f}s   trustworthiness={tw_mlx:.4f}")
++        print(f"  >>> MLX speedup vs CPU: {t_cpu / max(t_mlx, 1e-9):.1f}x")
++    else:
++        print("  MLX (metal) : not available on this host (CPU-only run)")
++
++
++if __name__ == "__main__":
++    main(int(sys.argv[1]) if len(sys.argv) > 1 else 30000)
+diff --git a/tests/pp/test_gpuex_umap.py b/tests/pp/test_gpuex_umap.py
+new file mode 100644
+index 000000000..ba36179c6
+--- /dev/null
++++ b/tests/pp/test_gpuex_umap.py
+@@ -0,0 +1,112 @@
++"""Tests for the GPU non-parametric UMAP backend (omicverse.utils.gpuex.umap).
++
++The torch CPU path runs everywhere (incl. the Ubuntu CI). The MLX (metal)
++path is exercised only when MLX + a metal device are present — i.e. on the
++macOS CI runner (.github/workflows/gpuex-umap-mac.yml) — and skipped
++otherwise.
++
++The ``gpuex.umap`` subpackage is loaded standalone via importlib so this test
++needs only numpy/scipy/scanpy/sklearn/anndata/torch(/mlx) — not a full
++omicverse install (``omicverse.utils.__init__`` eagerly imports the heavy
++plotting stack). That keeps the macOS MLX job lightweight.
++"""
++import importlib.util
++import pathlib
++import sys
++
++import numpy as np
++import pytest
++
++_UMAP_DIR = (
++    pathlib.Path(__file__).resolve().parents[2]
++    / "omicverse" / "utils" / "gpuex" / "umap"
++)
++
++
++def _load_gpuex_umap():
++    name = "gpuex_umap_standalone"
++    if name in sys.modules:
++        return sys.modules[name]
++    spec = importlib.util.spec_from_file_location(
++        name, _UMAP_DIR / "__init__.py",
++        submodule_search_locations=[str(_UMAP_DIR)],
++    )
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++gpuex_umap = _load_gpuex_umap()
++
++
++def _toy_graph(n=1500, centers=6, seed=0):
++    """A small blob dataset + its scanpy fuzzy connectivities graph."""
++    import anndata as ad
++    import scanpy as sc
++    from sklearn.datasets import make_blobs
++
++    X, _ = make_blobs(n_samples=n, centers=centers, n_features=20,
++                      random_state=seed)
++    X = X.astype(np.float32)
++    adata = ad.AnnData(X)
++    sc.pp.neighbors(adata, n_neighbors=15, use_rep="X", random_state=seed)
++    return X, adata.obsp["connectivities"]
++
++
++def _trustworthiness(X, emb, k=15):
++    from sklearn.manifold import trustworthiness
++
++    return trustworthiness(X, emb, n_neighbors=k)
++
++
++def test_find_ab_params_matches_umap_learn():
++    a, b = gpuex_umap.find_ab_params(spread=1.0, min_dist=0.5)
++    assert abs(a - 0.583) < 0.05 and abs(b - 1.334) < 0.05
++
++
++def test_torch_cpu_embedding_preserves_structure():
++    """Non-parametric UMAP on CPU should preserve neighborhood structure."""
++    X, graph = _toy_graph()
++    a, b = gpuex_umap.find_ab_params(1.0, 0.5)
++    emb, _ = gpuex_umap.simplicial_set_embedding_torch(
++        X, graph, 2, 1.0, a, b, 1.0, 5, 500, "spectral", 0, "euclidean", {},
++        device="cpu", backend="torch",
++    )
++    assert emb.shape == (X.shape[0], 2)
++    assert np.isfinite(emb).all()
++    assert _trustworthiness(X, emb) > 0.85
++
++
++def test_backend_validation():
++    X, graph = _toy_graph(n=300)
++    a, b = gpuex_umap.find_ab_params(1.0, 0.5)
++    with pytest.raises(ValueError):
++        gpuex_umap.simplicial_set_embedding_torch(
++            X, graph, 2, 1.0, a, b, 1.0, 5, 50, "spectral", 0, "euclidean", {},
++            backend="not-a-backend",
++        )
++
++
++@pytest.mark.skipif(
++    not _load_gpuex_umap().mlx_available(),
++    reason="MLX/metal not available (Apple Silicon only)",
++)
++def test_mlx_embedding_preserves_structure():
++    """MLX (metal) edge-SGD should match the CPU path's structure quality."""
++    X, graph = _toy_graph()
++    a, b = gpuex_umap.find_ab_params(1.0, 0.5)
++    emb_mlx, _ = gpuex_umap.simplicial_set_embedding_torch(
++        X, graph, 2, 1.0, a, b, 1.0, 5, 500, "spectral", 0, "euclidean", {},
++        backend="mlx",
++    )
++    emb_cpu, _ = gpuex_umap.simplicial_set_embedding_torch(
++        X, graph, 2, 1.0, a, b, 1.0, 5, 500, "spectral", 0, "euclidean", {},
++        device="cpu", backend="torch",
++    )
++    assert emb_mlx.shape == (X.shape[0], 2)
++    assert np.isfinite(emb_mlx).all()
++    tw_mlx = _trustworthiness(X, emb_mlx)
++    tw_cpu = _trustworthiness(X, emb_cpu)
++    assert tw_mlx > 0.85, f"MLX trustworthiness too low: {tw_mlx}"
++    assert abs(tw_mlx - tw_cpu) < 0.05, f"MLX {tw_mlx} vs CPU {tw_cpu}"

@@ -1,0 +1,301 @@
+diff --git a/.github/workflows/run_dev_batch.yml b/.github/workflows/run_dev_batch.yml
+new file mode 100644
+index 00000000..679c8037
+--- /dev/null
++++ b/.github/workflows/run_dev_batch.yml
+@@ -0,0 +1,90 @@
++name: Dev Batch Run
++
++on:
++  workflow_dispatch:
++    inputs:
++      git_ref:
++        description: "Branch, tag, or SHA to run"
++        required: true
++        default: "main"
++      input_file:
++        description: "GCS path to input .h5 file (e.g. gs://bucket/path/to/input.h5)"
++        required: true
++      extra_args:
++        description: "Extra cellbender args (e.g. --total-droplets-included 25000 --epochs 150)"
++        required: false
++        default: ""
++      output_bucket:
++        description: "GCS output prefix (default: gs://broad-dsde-methods-sfleming/cellbender_test/github_dev_runs)"
++        required: false
++        default: "gs://broad-dsde-methods-sfleming/cellbender_test/github_dev_runs"
++      machine_type:
++        description: "GCP machine type (default: n1-highmem-8). Also try: n1-highmem-16."
++        required: false
++        default: "n1-highmem-8"
++      gpu_type:
++        description: "GCP GPU type (default: nvidia-tesla-t4). Also try: nvidia-tesla-k80."
++        required: false
++        default: "nvidia-tesla-t4"
++      cpu_count:
++        description: "CPU count — used only when machine_type is cleared (leave blank to use machine_type)."
++        required: false
++      memory_gb:
++        description: "Memory in GB — used only when machine_type is cleared (leave blank to use machine_type)."
++        required: false
++
++jobs:
++  submit:
++    runs-on: ubuntu-latest
++    timeout-minutes: 5
++    permissions:
++      contents: read
++      id-token: write  # required for Workload Identity Federation
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++        with:
++          ref: ${{ inputs.git_ref }}
++          fetch-depth: 0
++
++      - name: Resolve git SHA
++        id: sha
++        run: |
++          echo "full=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
++
++      - name: Authenticate to Google Cloud
++        uses: google-github-actions/auth@v2
++        with:
++          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
++          service_account: ${{ secrets.BENCHMARK_SERVICE_ACCOUNT }}
++
++      - name: Set up Cloud SDK
++        uses: google-github-actions/setup-gcloud@v2
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++          cache: "pip"
++          cache-dependency-path: ".github/workflows/run_dev_batch.yml"
++
++      - name: Install Python dependencies
++        run: pip install --quiet google-cloud-batch
++
++      - name: Submit batch job
++        run: |
++          EXTRA_HW_ARGS=""
++          if [[ -z "${{ inputs.machine_type }}" ]]; then
++            [[ -n "${{ inputs.cpu_count }}" ]] && EXTRA_HW_ARGS="$EXTRA_HW_ARGS --cpu-count ${{ inputs.cpu_count }}"
++            [[ -n "${{ inputs.memory_gb }}" ]] && EXTRA_HW_ARGS="$EXTRA_HW_ARGS --memory-gb ${{ inputs.memory_gb }}"
++          fi
++          python benchmarking/submit_single.py \
++            --git-hash "${{ steps.sha.outputs.full }}" \
++            --run-id "${{ github.run_id }}-${{ github.run_attempt }}" \
++            --input-file "${{ inputs.input_file }}" \
++            --extra-args "${{ inputs.extra_args }}" \
++            --output-bucket "${{ inputs.output_bucket }}" \
++            --machine-type "${{ inputs.machine_type }}" \
++            --gpu-type "${{ inputs.gpu_type }}" \
++            $EXTRA_HW_ARGS
+diff --git a/benchmarking/submit_benchmarks.py b/benchmarking/submit_benchmarks.py
+index 75797774..4c55db4c 100644
+--- a/benchmarking/submit_benchmarks.py
++++ b/benchmarking/submit_benchmarks.py
+@@ -78,26 +78,21 @@ def _machine_resources(machine_type: str) -> tuple[int, int] | None:
+ ]
+ 
+ 
+-def build_job_script(
++def _build_preamble_lines(
+     git_hash: str,
+     input_gcs: str,
+-    sample: str,
+-    output_gcs_dir: str,
+-    fpr: str | None,
+-    truth_gcs: str | None,
+-) -> str:
++    truth_gcs: str | None = None,
++) -> list[str]:
++    """Shell lines shared by all job scripts: download inputs, install from source, verify CUDA."""
+     lines = [
+         "set -e",
+         'export CLOUDSDK_PYTHON="$(which python3)"',
+         f"gsutil cp {input_gcs} /tmp/input.h5",
+     ]
+-
+     if truth_gcs:
+         lines.append(f"gsutil cp {truth_gcs} /tmp/truth.h5")
+-
+-    # dev_git_hash__ mechanism: uninstall pre-installed CellBender, clone the
+-    # target commit, and reinstall from source so runtime code matches the SHA
+-    # being benchmarked.
++    # Uninstall pre-installed CellBender, clone the target commit, and reinstall
++    # from source so runtime code matches the SHA being tested.
+     lines += [
+         "pip uninstall -y cellbender",
+         "git clone -q https://github.com/broadinstitute/CellBender.git /tmp/CellBender",
+@@ -109,6 +104,18 @@ def build_job_script(
+         "cd /tmp",
+         "python3 -c \"import torch; assert torch.cuda.is_available(), 'CUDA unavailable — GPU driver not configured'\"",
+     ]
++    return lines
++
++
++def build_job_script(
++    git_hash: str,
++    input_gcs: str,
++    sample: str,
++    output_gcs_dir: str,
++    fpr: str | None,
++    truth_gcs: str | None,
++) -> str:
++    lines = _build_preamble_lines(git_hash, input_gcs, truth_gcs)
+ 
+     cmd_parts = [
+         "cellbender remove-background",
+diff --git a/benchmarking/submit_single.py b/benchmarking/submit_single.py
+new file mode 100644
+index 00000000..43ab0d59
+--- /dev/null
++++ b/benchmarking/submit_single.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""Submit a single CellBender Google Batch GPU job for ad-hoc dev testing.
++
++Submits one job and exits immediately — no polling. Check Cloud Logging or the
++GCP Batch console for progress; outputs land in the printed GCS directory.
++
++Usage:
++    python benchmarking/submit_single.py \
++        --git-hash abc1234 \
++        --input-file gs://bucket/path/to/input.h5 \
++        --extra-args "--total-droplets-included 25000 --epochs 150"
++"""
++
++import argparse
++import os
++import re
++import time
++
++from google.cloud import batch_v1
++from submit_benchmarks import (
++    PROJECT,
++    REGION,
++    _build_preamble_lines,
++    _machine_resources,
++    make_job_id,
++    submit_job,
++)
++
++DEFAULT_OUTPUT_BUCKET = "gs://broad-dsde-methods-sfleming/cellbender_test/github_dev_runs"
++
++
++def build_dev_job_script(
++    git_hash: str,
++    input_gcs: str,
++    sample: str,
++    output_gcs_dir: str,
++    extra_args: str,
++) -> str:
++    lines = _build_preamble_lines(git_hash, input_gcs)
++    cmd_parts = [
++        "cellbender remove-background",
++        "    --input /tmp/input.h5",
++        f"    --output /tmp/{sample}_out.h5",
++        "    --cuda",
++    ]
++    if extra_args.strip():
++        cmd_parts.append(f"    {extra_args.strip()}")
++    lines.append(" \\\n".join(cmd_parts))
++    lines.append(f"gsutil -m cp /tmp/{sample}_out* {output_gcs_dir}/")
++    return "\n".join(lines)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--git-hash", required=True, help="Git SHA to run")
++    parser.add_argument("--input-file", required=True, help="GCS path to input .h5 file")
++    parser.add_argument(
++        "--sample-name",
++        default=None,
++        help="Label used in the job ID and output path (default: input filename stem)",
++    )
++    parser.add_argument(
++        "--extra-args",
++        default="",
++        help="Extra args appended verbatim to the cellbender command",
++    )
++    parser.add_argument(
++        "--output-bucket",
++        default=DEFAULT_OUTPUT_BUCKET,
++        help=f"GCS output prefix (default: {DEFAULT_OUTPUT_BUCKET})",
++    )
++    parser.add_argument(
++        "--run-id",
++        default=time.strftime("%Y%m%d%H%M%S"),
++        help="Unique suffix for the Batch job ID (default: timestamp)",
++    )
++
++    hw = parser.add_argument_group(
++        "hardware",
++        "CPU and memory are auto-derived from the machine type for N1/N2 families.",
++    )
++    hw.add_argument("--machine-type", default="n1-highmem-8")
++    hw.add_argument("--gpu-type", default="nvidia-tesla-t4")
++    hw.add_argument("--cpu-count", type=int, default=None)
++    hw.add_argument("--memory-gb", type=int, default=None)
++
++    args = parser.parse_args()
++
++    raw_sample = args.sample_name or os.path.splitext(os.path.basename(args.input_file))[0]
++    sample = re.sub(r"[^a-z0-9\-]", "-", raw_sample.lower()).strip("-")
++
++    machine_type: str | None = args.machine_type or None
++    cpu_count: int | None = args.cpu_count
++    memory_gb: int | None = args.memory_gb
++
++    if machine_type and (cpu_count is None or memory_gb is None):
++        parsed = _machine_resources(machine_type)
++        if parsed:
++            derived_cpu, derived_mem = parsed
++            cpu_count = cpu_count if cpu_count is not None else derived_cpu
++            memory_gb = memory_gb if memory_gb is not None else derived_mem
++        else:
++            print(
++                f"Warning: cannot auto-derive CPU/memory for {machine_type!r}. "
++                "Pass --cpu-count and --memory-gb explicitly.",
++                flush=True,
++            )
++
++    output_gcs_dir = f"{args.output_bucket.rstrip('/')}/{args.git_hash}/{sample}"
++    job_id = make_job_id(args.run_id, sample)
++    script = build_dev_job_script(
++        git_hash=args.git_hash,
++        input_gcs=args.input_file,
++        sample=sample,
++        output_gcs_dir=output_gcs_dir,
++        extra_args=args.extra_args,
++    )
++
++    hw_desc = f"machine={machine_type or 'auto'}, gpu={args.gpu_type}, cpu={cpu_count}, memory={memory_gb}GB"
++    print(f"Hardware: {hw_desc}", flush=True)
++
++    client = batch_v1.BatchServiceClient()
++    print(f"Submitting {job_id} ...", flush=True)
++    job = submit_job(
++        client,
++        job_id,
++        script,
++        machine_type=machine_type,
++        gpu_type=args.gpu_type,
++        cpu_count=cpu_count,
++        memory_gb=memory_gb,
++    )
++
++    print(f"\nJob submitted: {job.name}", flush=True)
++    print(f"Output GCS dir: {output_gcs_dir}", flush=True)
++    print(
++        f"\nLogs: https://console.cloud.google.com/batch/jobs?project={PROJECT}&region={REGION}",
++        flush=True,
++    )
++
++
++if __name__ == "__main__":
++    main()

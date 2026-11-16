@@ -1,0 +1,533 @@
+diff --git a/NAMESPACE b/NAMESPACE
+index 3ee60248b..22ed8b599 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -359,6 +359,7 @@ export(SpatialEcoTyperSpatialPlot)
+ export(SpatialGradientPlot)
+ export(SpatialIntegrationPlot)
+ export(SpatialNeighborhoodPlot)
++export(SpatialNeighborhoodProfile)
+ export(SpatialNetworkPlot)
+ export(SpatialSpotPlot)
+ export(SpatialVariableFeaturePlot)
+diff --git a/NEWS.md b/NEWS.md
+index 5a88f7d0d..f383970ca 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,6 +1,7 @@
+ # scop 0.9.1
+ 
+ * **feat**:
++  * `SpatialNeighborhoodProfile()` returns observed per-cell neighbor counts and fractions at multiple raw-coordinate distances, retaining the full selected tissue context for target cells without modifying the Seurat object or storing an edge table.
+   * `RunDEtest()` sample-level methods gain `min.cells.sample` (default `10`) to drop pseudobulk samples whose cell count in the current `group.by` level is below a threshold, which can reverse DE direction relative to cell-level tests. Set `min.cells.sample = 1` to keep the previous unfiltered behavior.
+   * Internal preprocessing and integration workflows now use scop's Seurat-compatible entry points, enabling validated native acceleration for normalization, variable-feature selection, scaling, PCA, and neighbor search while retaining transparent Seurat fallback for unsupported paths.
+   * The native `SCTransform(vst.flavor = "v2")` path now supports validated numeric and factor `vars.to.regress` designs and `latent.data`; unsupported regression designs continue to delegate to Seurat.
+diff --git a/R/RcppExports.R b/R/RcppExports.R
+index 3347aee96..d766cbb92 100644
+--- a/R/RcppExports.R
++++ b/R/RcppExports.R
+@@ -713,6 +713,10 @@ sct_fused_resid_center_sparse <- function(intercepts, cell_mu_base, csr_row_ptr,
+     .Call(`_scop_sct_fused_resid_center_sparse`, intercepts, cell_mu_base, csr_row_ptr, csr_col_idx, csr_vals, gene_idx, theta, min_var, wide_clip_lo, wide_clip_hi, narrow_clip_lo, narrow_clip_hi, do_center, do_scale, cores)
+ }
+ 
++spatial_neighborhood_profile_cpp <- function(xy, group, query, radii, ng) {
++    .Call(`_scop_spatial_neighborhood_profile_cpp`, xy, group, query, radii, ng)
++}
++
+ tage_elastic_net_predict_cpp <- function(expr, feature_match, imputer, center, scale, coef, intercept) {
+     .Call(`_scop_tage_elastic_net_predict_cpp`, expr, feature_match, imputer, center, scale, coef, intercept)
+ }
+diff --git a/R/SpatialNeighborhoodProfile.R b/R/SpatialNeighborhoodProfile.R
+new file mode 100644
+index 000000000..8bc3cd089
+--- /dev/null
++++ b/R/SpatialNeighborhoodProfile.R
+@@ -0,0 +1,122 @@
++#' Profile cell neighborhoods at several distances
++#'
++#' Count labelled neighbors of selected cells without removing the surrounding
++#' tissue. A native spatial index directly accumulates counts at all distances;
++#' no cell-cell edge table is stored. This is an observed composition summary,
++#' not a colocalization test, an optimal-radius selector, or a communication model.
++#'
++#' @param object A Seurat object. The object is not modified.
++#' @param group.by Metadata column containing nonmissing cell or spot labels.
++#' @param radii Positive, strictly increasing distances in raw coordinate units.
++#'   These are not necessarily micrometers. For spot-based assays, counts refer
++#'   to labelled spots, not inferred numbers of cells.
++#' @param cells Unique target cell IDs, in the desired output order. NULL uses
++#'   all cells in the resolved image/context. Neighbors always come from the
++#'   complete resolved context, not just these targets.
++#' @param sample.by Metadata column identifying independent samples. NULL treats
++#'   the resolved context as one sample; supply this for pooled metadata-only
++#'   coordinates to prevent cross-sample neighbors.
++#' @param image Spatial image name. Required when multiple images are present.
++#' @param coord.cols Metadata coordinate columns when no image is available.
++#' @param cumulative FALSE returns shells [0, r1], (r1, r2], ...; TRUE returns
++#'   cumulative neighborhoods [0, r] at each radius.
++#' @inheritParams thisutils::log_message
++#'
++#' @return A data.frame with cell_id, sample, group, lower, radius, count, total
++#'   and fraction columns. The denominator includes all labelled neighbors in
++#'   that shell/radius. No neighbors gives count = 0 and fraction = NA. Self is
++#'   excluded by cell ID, but distinct cells at identical coordinates are kept.
++#'   Unselected cells have no output rows. The source and parameters attributes
++#'   describe coordinates and the calculation. There is no tissue-edge correction
++#'   or dedicated plot; the table can be used with ordinary R plotting functions.
++#' @export
++#' @examples
++#' # Constructed coordinates and labels, not a biological example.
++#' counts <- matrix(1L, 2, 4, dimnames = list(c("g1", "g2"), letters[1:4]))
++#' object <- SeuratObject::CreateSeuratObject(counts)
++#' object$col <- c(0, 1, 3, 5)
++#' object$row <- c(0, 0, 0, 0)
++#' object$celltype <- c("T", "M", "M", "T")
++#' profile <- SpatialNeighborhoodProfile(
++#'   object, "celltype", radii = c(1, 3), cells = "a", verbose = FALSE
++#' )
++#' profile
++SpatialNeighborhoodProfile <- function(
++  object, group.by, radii, cells = NULL, sample.by = NULL, image = NULL,
++  coord.cols = c("col", "row"), cumulative = FALSE, verbose = TRUE
++) {
++  if (!inherits(object, "Seurat")) stop("object must be a Seurat object", call. = FALSE)
++  validate_scalar_string(group.by, "group.by")
++  if (!is.null(sample.by)) validate_scalar_string(sample.by, "sample.by")
++  if (!is.numeric(radii) || !length(radii) || any(!is.finite(radii)) ||
++      any(radii <= 0) || any(diff(radii) <= 0)) {
++    stop("radii must be positive, finite and strictly increasing", call. = FALSE)
++  }
++  if (!is.logical(cumulative) || length(cumulative) != 1L || is.na(cumulative)) {
++    stop("cumulative must be one nonmissing logical value", call. = FALSE)
++  }
++  verbose <- thisutils::get_verbose(verbose)
++  meta <- object[[]]
++  if (!all(c(group.by, sample.by) %in% names(meta))) {
++    stop("group.by and sample.by must identify metadata columns", call. = FALSE)
++  }
++  resolved <- SpatialCoordinates(object, image = image, coord.cols = coord.cols, space = "raw")
++  co <- resolved$data
++  idx <- match(co$cell_id, rownames(meta))
++  if (!nrow(co) || anyNA(idx) || anyNA(co$cell_id) || any(!nzchar(co$cell_id)) ||
++      anyDuplicated(co$cell_id)) stop("invalid context cell IDs", call. = FALSE)
++  labels <- as.character(meta[[group.by]][idx])
++  samples <- if (is.null(sample.by)) rep("all", nrow(co)) else as.character(meta[[sample.by]][idx])
++  if (anyNA(labels) || anyNA(samples) || any(!nzchar(labels)) || any(!nzchar(samples))) {
++    stop("context labels and sample IDs must be nonmissing and nonempty", call. = FALSE)
++  }
++  if (is.null(cells)) cells <- co$cell_id
++  if (!is.character(cells) || anyNA(cells) || anyDuplicated(cells) ||
++      !all(cells %in% co$cell_id)) stop("cells must be unique IDs in the resolved context", call. = FALSE)
++  xy <- as.matrix(co[, c("x", "y")])
++  if (any(!is.finite(xy)) || min(radii) < sqrt(.Machine$double.xmin) ||
++      max(radii) > sqrt(.Machine$double.xmax) / 4 ||
++      max(abs(xy)) > sqrt(.Machine$double.xmax) / 4 || max(abs(xy)) / max(radii) > 1e12) {
++    stop("unsupported coordinate/radius magnitude; recenter or rescale", call. = FALSE)
++  }
++  groups <- sort(unique(labels))
++  nq <- length(cells); ng <- length(groups); nr <- length(radii)
++  if (as.double(nq) * ng * nr > .Machine$integer.max) {
++    stop("output too large; select fewer cells, groups or radii", call. = FALSE)
++  }
++  target <- match(cells, co$cell_id)
++  counts <- array(0L, c(nq, ng, nr))
++  for (sample in unique(samples[target])) {
++    context <- which(samples == sample)
++    rows <- which(samples[target] == sample)
++    counts[rows, , ] <- spatial_neighborhood_profile_cpp(
++      xy[context, , drop = FALSE], match(labels[context], groups),
++      match(target[rows], context), radii, ng
++    )
++  }
++  if (cumulative && nr > 1L) {
++    for (b in 2:nr) counts[, , b] <- counts[, , b] + counts[, , b - 1L]
++  }
++  out <- expand.grid(cell_id = cells, group = groups, radius = radii,
++                     KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
++  out$sample <- rep(samples[target], ng * nr)
++  out$lower <- rep(if (cumulative) rep(0, nr) else c(0, head(radii, -1L)), each = nq * ng)
++  out$count <- as.vector(counts)
++  totals <- matrix(0, nq, nr)
++  if (nq) for (b in seq_len(nr)) totals[, b] <- rowSums(matrix(counts[, , b], nq, ng))
++  out$total <- as.vector(totals[rep(seq_len(nq), ng), , drop = FALSE])
++  out$fraction <- out$count / out$total
++  out$fraction[out$total == 0] <- NA_real_
++  out <- out[, c("cell_id", "sample", "group", "lower", "radius", "count", "total", "fraction")]
++  attr(out, "source") <- resolved$source
++  attr(out, "parameters") <- list(group.by = group.by, sample.by = sample.by,
++    radii = radii, cumulative = cumulative, context_n = nrow(co), backend = "native")
++  spatial_run_receipt(
++    done = "Spatial neighborhood profile completed",
++    scope = sprintf("%s target cells; %s context cells; %s samples; %s distances (raw coordinate units).",
++                    nq, nrow(co), length(unique(samples)), nr),
++    inspect = "Returned data.frame: count, total and fraction; input object unchanged.",
++    verbose = verbose
++  )
++  out
++}
+diff --git a/_pkgdown.yml b/_pkgdown.yml
+index 41eefd997..c96e99abc 100644
+--- a/_pkgdown.yml
++++ b/_pkgdown.yml
+@@ -250,6 +250,7 @@ reference:
+   - MistyRPlot
+   - StatialKontextualPlot
+   - RunSpatialNeighborhood
++  - SpatialNeighborhoodProfile
+   - RunStatialKontextual
+   - RunSpatialIntegration
+   - RunMistyR
+diff --git a/man/SpatialNeighborhoodProfile.Rd b/man/SpatialNeighborhoodProfile.Rd
+new file mode 100644
+index 000000000..55a8c0e63
+--- /dev/null
++++ b/man/SpatialNeighborhoodProfile.Rd
+@@ -0,0 +1,72 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/SpatialNeighborhoodProfile.R
++\name{SpatialNeighborhoodProfile}
++\alias{SpatialNeighborhoodProfile}
++\title{Profile cell neighborhoods at several distances}
++\usage{
++SpatialNeighborhoodProfile(
++  object,
++  group.by,
++  radii,
++  cells = NULL,
++  sample.by = NULL,
++  image = NULL,
++  coord.cols = c("col", "row"),
++  cumulative = FALSE,
++  verbose = TRUE
++)
++}
++\arguments{
++\item{object}{A Seurat object. The object is not modified.}
++
++\item{group.by}{Metadata column containing nonmissing cell or spot labels.}
++
++\item{radii}{Positive, strictly increasing distances in raw coordinate units.
++These are not necessarily micrometers. For spot-based assays, counts refer
++to labelled spots, not inferred numbers of cells.}
++
++\item{cells}{Unique target cell IDs, in the desired output order. NULL uses
++all cells in the resolved image/context. Neighbors always come from the
++complete resolved context, not just these targets.}
++
++\item{sample.by}{Metadata column identifying independent samples. NULL treats
++the resolved context as one sample; supply this for pooled metadata-only
++coordinates to prevent cross-sample neighbors.}
++
++\item{image}{Spatial image name. Required when multiple images are present.}
++
++\item{coord.cols}{Metadata coordinate columns when no image is available.}
++
++\item{cumulative}{FALSE returns shells [0, r1], (r1, r2], ...; TRUE returns
++cumulative neighborhoods [0, r] at each radius.}
++
++\item{verbose}{Whether to print the message.
++Default is \code{TRUE}.}
++}
++\value{
++A data.frame with cell_id, sample, group, lower, radius, count, total
++  and fraction columns. The denominator includes all labelled neighbors in
++  that shell/radius. No neighbors gives count = 0 and fraction = NA. Self is
++  excluded by cell ID, but distinct cells at identical coordinates are kept.
++  Unselected cells have no output rows. The source and parameters attributes
++  describe coordinates and the calculation. There is no tissue-edge correction
++  or dedicated plot; the table can be used with ordinary R plotting functions.
++}
++\description{
++Count labelled neighbors of selected cells without removing the surrounding
++tissue. A native spatial index directly accumulates counts at all distances;
++no cell-cell edge table is stored. This is an observed composition summary,
++not a colocalization test, an optimal-radius selector, or a communication model.
++}
++\examples{
++# Constructed coordinates and labels, not a biological example.
++counts <- matrix(1L, 2, 4, dimnames = list(c("g1", "g2"), letters[1:4]))
++object <- SeuratObject::CreateSeuratObject(counts)
++object$col <- c(0, 1, 3, 5)
++object$row <- c(0, 0, 0, 0)
++object$celltype <- c("T", "M", "M", "T")
++profile <- SpatialNeighborhoodProfile(
++  object, "celltype", radii = c(1, 3), cells = "a", verbose = FALSE
++)
++profile
++}
+diff --git a/src/RcppExports.cpp b/src/RcppExports.cpp
+index fcb848dc1..eec11350d 100644
+--- a/src/RcppExports.cpp
++++ b/src/RcppExports.cpp
+@@ -2838,6 +2838,20 @@ BEGIN_RCPP
+     return rcpp_result_gen;
+ END_RCPP
+ }
++// spatial_neighborhood_profile_cpp
++Rcpp::IntegerVector spatial_neighborhood_profile_cpp(Rcpp::NumericMatrix xy, Rcpp::IntegerVector group, Rcpp::IntegerVector query, Rcpp::NumericVector radii, int ng);
++RcppExport SEXP _scop_spatial_neighborhood_profile_cpp(SEXP xySEXP, SEXP groupSEXP, SEXP querySEXP, SEXP radiiSEXP, SEXP ngSEXP) {
++BEGIN_RCPP
++    Rcpp::RObject rcpp_result_gen;
++    Rcpp::traits::input_parameter< Rcpp::NumericMatrix >::type xy(xySEXP);
++    Rcpp::traits::input_parameter< Rcpp::IntegerVector >::type group(groupSEXP);
++    Rcpp::traits::input_parameter< Rcpp::IntegerVector >::type query(querySEXP);
++    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type radii(radiiSEXP);
++    Rcpp::traits::input_parameter< int >::type ng(ngSEXP);
++    rcpp_result_gen = Rcpp::wrap(spatial_neighborhood_profile_cpp(xy, group, query, radii, ng));
++    return rcpp_result_gen;
++END_RCPP
++}
+ // tage_elastic_net_predict_cpp
+ NumericVector tage_elastic_net_predict_cpp(NumericMatrix expr, IntegerVector feature_match, NumericVector imputer, NumericVector center, NumericVector scale, NumericVector coef, double intercept);
+ RcppExport SEXP _scop_tage_elastic_net_predict_cpp(SEXP exprSEXP, SEXP feature_matchSEXP, SEXP imputerSEXP, SEXP centerSEXP, SEXP scaleSEXP, SEXP coefSEXP, SEXP interceptSEXP) {
+@@ -3095,6 +3109,7 @@ static const R_CallMethodDef CallEntries[] = {
+     {"_scop_csc_to_csr", (DL_FUNC) &_scop_csc_to_csr, 5},
+     {"_scop_sct_stats_correct_sparse", (DL_FUNC) &_scop_sct_stats_correct_sparse, 13},
+     {"_scop_sct_fused_resid_center_sparse", (DL_FUNC) &_scop_sct_fused_resid_center_sparse, 15},
++    {"_scop_spatial_neighborhood_profile_cpp", (DL_FUNC) &_scop_spatial_neighborhood_profile_cpp, 5},
+     {"_scop_tage_elastic_net_predict_cpp", (DL_FUNC) &_scop_tage_elastic_net_predict_cpp, 7},
+     {"_scop_sparse_row_mean_var", (DL_FUNC) &_scop_sparse_row_mean_var, 5},
+     {"_scop_sparse_row_mean_var_dgc_list", (DL_FUNC) &_scop_sparse_row_mean_var_dgc_list, 2},
+diff --git a/src/spatial_neighborhood_profile.cpp b/src/spatial_neighborhood_profile.cpp
+new file mode 100644
+index 000000000..ec9bc8dae
+--- /dev/null
++++ b/src/spatial_neighborhood_profile.cpp
+@@ -0,0 +1,62 @@
++#include <Rcpp.h>
++#include <unordered_map>
++#include <vector>
++#include <algorithm>
++#include <cmath>
++
++namespace {
++struct Tile {
++  long long x, y;
++  bool operator==(const Tile& b) const { return x == b.x && y == b.y; }
++};
++struct TileHash {
++  size_t operator()(const Tile& a) const {
++    size_t h = std::hash<long long>{}(a.x);
++    return h ^ (std::hash<long long>{}(a.y) + 0x9e3779b9 + (h << 6) + (h >> 2));
++  }
++};
++}
++
++// Validated R entry point supplies one sample, 1-based IDs and sorted radii.
++// Direct reduction avoids materializing a potentially large cell-cell edge list.
++// [[Rcpp::export(rng = false)]]
++Rcpp::IntegerVector spatial_neighborhood_profile_cpp(
++    Rcpp::NumericMatrix xy, Rcpp::IntegerVector group, Rcpp::IntegerVector query,
++    Rcpp::NumericVector radii, int ng) {
++  const int n = xy.nrow(), nq = query.size(), nr = radii.size();
++  if (xy.ncol() != 2 || group.size() != n || nr < 1 || ng < 1)
++    Rcpp::stop("Invalid neighborhood profile dimensions");
++  for (int g : group) if (g < 1 || g > ng) Rcpp::stop("Invalid group index");
++  for (int q : query) if (q < 1 || q > n) Rcpp::stop("Invalid target index");
++  Rcpp::IntegerVector out(static_cast<R_xlen_t>(nq) * ng * nr);
++  out.attr("dim") = Rcpp::IntegerVector::create(nq, ng, nr);
++  const double width = radii[nr - 1];
++  std::vector<double> r2(nr);
++  for (int b = 0; b < nr; ++b) r2[b] = radii[b] * radii[b];
++  std::unordered_map<Tile, std::vector<int>, TileHash> tiles;
++  tiles.reserve(n);
++  for (int j = 0; j < n; ++j) {
++    if (j % 16384 == 0) Rcpp::checkUserInterrupt();
++    tiles[{static_cast<long long>(std::floor(xy(j, 0) / width)),
++           static_cast<long long>(std::floor(xy(j, 1) / width))}].push_back(j);
++  }
++  for (int i = 0; i < nq; ++i) {
++    if (i % 256 == 0) Rcpp::checkUserInterrupt();
++    const int q = query[i] - 1;
++    const auto tx = static_cast<long long>(std::floor(xy(q, 0) / width));
++    const auto ty = static_cast<long long>(std::floor(xy(q, 1) / width));
++    for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) {
++      auto tile = tiles.find({tx + dx, ty + dy});
++      if (tile == tiles.end()) continue;
++      for (int j : tile->second) {
++        if (q == j) continue;
++        const double x = xy(q, 0) - xy(j, 0), y = xy(q, 1) - xy(j, 1);
++        const double d2 = x * x + y * y;
++        if (d2 > r2.back()) continue;
++        const int b = std::lower_bound(r2.begin(), r2.end(), d2) - r2.begin();
++        out[i + static_cast<R_xlen_t>(nq) * (group[j] - 1 + ng * b)]++;
++      }
++    }
++  }
++  return out;
++}
+diff --git a/tests/testthat/test-spatial-neighborhood-profile.R b/tests/testthat/test-spatial-neighborhood-profile.R
+new file mode 100644
+index 000000000..1e050c241
+--- /dev/null
++++ b/tests/testthat/test-spatial-neighborhood-profile.R
+@@ -0,0 +1,141 @@
++profile_fixture <- function(n = 6L) {
++  counts <- matrix(1L, 2, n, dimnames = list(c("g1", "g2"), paste0("c", seq_len(n))))
++  input <- if (n == 1L) SeuratObject::CreateAssayObject(counts) else counts
++  object <- suppressWarnings(SeuratObject::CreateSeuratObject(input))
++  object$col <- seq_len(n) - 1
++  object$row <- rep(0, n)
++  object$label <- rep(c("T", "M"), length.out = n)
++  object$sample <- rep("s1", n)
++  object
++}
++
++profile_quiet <- function(...) SpatialNeighborhoodProfile(..., verbose = FALSE)
++
++profile_oracle <- function(object, result, cumulative = FALSE) {
++  meta <- object[[]]
++  vapply(seq_len(nrow(result)), function(i) {
++    q <- match(result$cell_id[i], rownames(meta))
++    d <- sqrt((meta$col - meta$col[q])^2 + (meta$row - meta$row[q])^2)
++    sum(seq_len(nrow(meta)) != q & meta$sample == result$sample[i] &
++          meta$label == result$group[i] & d <= result$radius[i] &
++          (cumulative | result$lower[i] == 0 | d > result$lower[i]))
++  }, integer(1))
++}
++
++test_that("profiles match brute force and preserve context, identity and ordering", {
++  object <- profile_fixture()
++  object$col <- c(0, 0, 3, -3, 100, 0)
++  object$row <- c(0, 0, 4, -4, 0, 0)
++  object$sample <- c(rep("s1", 5), "s2")
++  before <- serialize(object, NULL)
++  targets <- c("c4", "c1", "c6")
++  out <- profile_quiet(object, "label", c(1, 5), cells = targets, sample.by = "sample")
++  expect_identical(out$count, profile_oracle(object, out))
++  expect_identical(unique(out$cell_id), targets)
++  expect_identical(serialize(object, NULL), before)
++  expect_identical(attr(out, "source")$coordinate_space, "raw")
++  expect_equal(attr(out, "parameters")$context_n, 6)
++  expect_true(all(out$count[out$cell_id == "c6"] == 0))
++  expect_true(all(is.na(out$fraction[out$total == 0])))
++  expect_equal(out$count[out$cell_id == "c1" & out$group == "M" & out$radius == 1], 1L)
++  full <- profile_quiet(object, "label", c(1, 5), sample.by = "sample")
++  key <- function(x) paste(x$cell_id, x$group, x$radius)
++  expect_identical(out$count, full$count[match(key(out), key(full))])
++  shuffled <- object[, rev(colnames(object))]
++  expect_identical(profile_quiet(shuffled, "label", c(1, 5), targets, "sample")$count, out$count)
++  cumulative <- profile_quiet(object, "label", c(1, 5), targets, "sample", cumulative = TRUE)
++  expect_identical(cumulative$count, profile_oracle(object, cumulative, TRUE))
++  valid <- out[out$total > 0, ]
++  expect_true(all(abs(aggregate(fraction ~ cell_id + radius, valid, sum)$fraction - 1) < 1e-12))
++})
++
++test_that("random coordinates and multiple samples agree with a separate oracle", {
++  for (seed in 1:10) {
++    set.seed(seed)
++    object <- profile_fixture(100)
++    object$col <- runif(100, -10, 10)
++    object$row <- runif(100, -10, 10)
++    object$sample <- sample(c("s1", "s2"), 100, TRUE)
++    object$label <- sample(LETTERS[1:4], 100, TRUE)
++    targets <- sample(colnames(object), 12)
++    radii <- sort(runif(4, .1, 5))
++    out <- profile_quiet(object, "label", radii, targets, "sample")
++    expect_identical(out$count, profile_oracle(object, out))
++    cumulative <- profile_quiet(object, "label", radii, targets, "sample", cumulative = TRUE)
++    expect_identical(cumulative$count, profile_oracle(object, cumulative, TRUE))
++    for (r in radii) {
++      single <- profile_quiet(object, "label", r, targets, "sample")
++      expect_identical(cumulative$count[cumulative$radius == r], single$count)
++    }
++  }
++})
++
++test_that("empty targets and single-cell contexts have stable table semantics", {
++  object <- profile_fixture(1)
++  one <- profile_quiet(object, "label", 1)
++  expect_equal(nrow(one), 1L)
++  expect_identical(one$count, 0L)
++  expect_equal(one$total, 0)
++  expect_true(is.na(one$fraction))
++  empty <- profile_quiet(object, "label", c(1, 2), character())
++  expect_s3_class(empty, "data.frame")
++  expect_equal(nrow(empty), 0L)
++  expect_identical(names(empty), names(one))
++  expect_type(empty$count, "integer")
++  expect_type(empty$fraction, "double")
++  expect_equal(attr(empty, "parameters")$context_n, 1L)
++})
++
++test_that("invalid input errors rather than returning a partial profile", {
++  object <- profile_fixture()
++  before <- serialize(object, NULL)
++  expect_error(profile_quiet(NULL, "label", 1), "Seurat")
++  expect_error(profile_quiet(object, "missing", 1), "metadata")
++  expect_error(profile_quiet(object, "label", 1, sample.by = "missing"), "metadata")
++  expect_error(profile_quiet(object, "label", c(1, 1)), "increasing")
++  expect_error(profile_quiet(object, "label", c(2, 1)), "increasing")
++  expect_error(profile_quiet(object, "label", 0), "positive")
++  expect_error(profile_quiet(object, "label", Inf), "finite")
++  expect_error(profile_quiet(object, "label", 1e-200), "magnitude")
++  expect_error(profile_quiet(object, "label", 1, cumulative = NA), "logical")
++  expect_error(profile_quiet(object, "label", 1, c("c1", "c1")), "unique")
++  expect_error(profile_quiet(object, "label", 1, "missing"), "resolved context")
++  expect_identical(serialize(object, NULL), before)
++  object$label[2] <- NA_character_
++  expect_error(profile_quiet(object, "label", 1, "c1"), "nonmissing")
++  object$label[2] <- "M"; object$sample[2] <- ""
++  expect_error(profile_quiet(object, "label", 1, "c1", "sample"), "nonempty")
++  object$col[2] <- NA_real_
++  expect_error(profile_quiet(object, "label", 1), "non-finite")
++})
++
++test_that("multiple images require selection and restrict both targets and context", {
++  object <- profile_fixture(4)
++  assay <- SeuratObject::DefaultAssay(object)
++  object[["slice1"]] <- SeuratObject::CreateFOV(
++    data.frame(x = c(0, 1), y = c(0, 0), row.names = c("c1", "c2")),
++    type = "centroids", assay = assay, key = "s1_"
++  )
++  object[["slice2"]] <- SeuratObject::CreateFOV(
++    data.frame(x = c(0, 10), y = c(0, 0), row.names = c("c3", "c4")),
++    type = "centroids", assay = assay, key = "s2_"
++  )
++  expect_error(profile_quiet(object, "label", 5), "Multiple spatial images")
++  out <- profile_quiet(object, "label", c(5, 10), image = "slice2")
++  expect_identical(unique(out$cell_id), c("c3", "c4"))
++  expect_identical(attr(out, "source")$image, "slice2")
++  expect_equal(attr(out, "parameters")$context_n, 2)
++  expect_true(all(out$count[out$radius == 5] == 0))
++  expect_equal(sum(out$count[out$radius == 10]), 2L)
++  expect_error(profile_quiet(object, "label", 10, "c1", image = "slice2"), "resolved context")
++})
++
++test_that("the thin receipt describes returned, not saved, results", {
++  recorded <- NULL
++  local_mocked_bindings(spatial_run_receipt = function(...) recorded <<- list(...))
++  out <- SpatialNeighborhoodProfile(profile_fixture(), "label", c(1, 3), cells = "c1")
++  expect_s3_class(out, "data.frame")
++  expect_match(recorded$scope, "1 target cells; 6 context cells")
++  expect_match(recorded$inspect, "Returned data.frame")
++  expect_null(recorded$saved)
++})
+diff --git a/vignettes/spatial-main-workflow.Rmd b/vignettes/spatial-main-workflow.Rmd
+index 4312ea235..afdce98b8 100644
+--- a/vignettes/spatial-main-workflow.Rmd
++++ b/vignettes/spatial-main-workflow.Rmd
+@@ -226,6 +226,23 @@ Neighborhood methods answer a different question from domain clustering. Use
+ them after labels are stable, either from metadata, clustering, or
+ deconvolution.
+ 
++For a small observed distance profile, `SpatialNeighborhoodProfile()` returns
++a plain table without modifying the object. Selecting target cells does not
++remove their surrounding tissue from the calculation:
++
++```{r spatial-neighborhood-profile}
++profile <- SpatialNeighborhoodProfile(
++  spatial, group.by = "coda_label", radii = c(100, 200, 400),
++  cells = head(colnames(spatial), 20), cumulative = TRUE, verbose = FALSE
++)
++head(profile)
++```
++
++Distances above are illustrative raw coordinate units, not automatically
++micrometers. Supply `sample.by` for pooled metadata coordinates and `image`
++when multiple images are present. Fractions describe labelled neighbors; an
++empty neighborhood has undefined composition (`NA`), not evidence of depletion.
++
+ ```{r spatial-neighborhood}
+ spatial <- RunSpatialNeighborhood(
+   spatial,

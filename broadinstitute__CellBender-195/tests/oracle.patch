@@ -1,0 +1,342 @@
+diff --git a/cellbender/remove_background/argparser.py b/cellbender/remove_background/argparser.py
+index bc2613ec..b7f49baf 100644
+--- a/cellbender/remove_background/argparser.py
++++ b/cellbender/remove_background/argparser.py
+@@ -67,6 +67,16 @@ def add_subparser_args(subparsers: argparse) -> argparse:
+                                 "Include the droplets which might contain "
+                                 "cells. Droplets beyond TOTAL_DROPLETS_INCLUDED "
+                                 "should be 'surely empty' droplets.")
++    subparser.add_argument("--force-cell-umi-prior",
++                           nargs=None, type=float, default=None,
++                           dest="force_cell_umi_prior",
++                           help="Ignore CellBender's heuristic prior estimation, "
++                                "and use this prior for UMI counts in cells.")
++    subparser.add_argument("--force-empty-umi-prior",
++                           nargs=None, type=float, default=None,
++                           dest="force_empty_umi_prior",
++                           help="Ignore CellBender's heuristic prior estimation, "
++                                "and use this prior for UMI counts in empty droplets.")
+     subparser.add_argument("--model", nargs=None, type=str,
+                            default="full",
+                            choices=["naive", "simple", "ambient", "swapping", "full"],
+diff --git a/cellbender/remove_background/consts.py b/cellbender/remove_background/consts.py
+index 6da1054b..f43a9065 100644
+--- a/cellbender/remove_background/consts.py
++++ b/cellbender/remove_background/consts.py
+@@ -114,3 +114,8 @@
+ # Maximum batch size
+ MAX_BATCH_SIZE = 256
+ SMALLEST_ALLOWED_BATCH = 4  # BatchNorm chokes if there is only 1 cell in last batch
++
++# Guesses during prior estimation
++MAX_TOTAL_DROPLETS_GUESSED = 70000
++MAX_EMPTIES_TO_INCLUDE = 20000
++NUM_EMPTIES_INCREMENT = 20000  # if input expected_cells > heuristic prior total_drops
+diff --git a/cellbender/remove_background/data/dataset.py b/cellbender/remove_background/data/dataset.py
+index 8cbd9769..93602a57 100644
+--- a/cellbender/remove_background/data/dataset.py
++++ b/cellbender/remove_background/data/dataset.py
+@@ -7,7 +7,10 @@
+ import cellbender.remove_background.consts as consts
+ from cellbender.remove_background.data.dataprep import DataLoader
+ from cellbender.remove_background.data.io import load_data
+-from cellbender.remove_background.data.priors import get_priors
++from cellbender.remove_background.data.priors import get_priors, \
++    get_cell_count_given_expected_cells, \
++    get_empty_count_given_expected_cells_and_total_droplets, \
++    compute_crossover_surely_empty_and_stds
+ 
+ from typing import Dict, List, Optional, Iterable, Callable
+ import logging
+@@ -25,6 +28,10 @@ class SingleCellRNACountsDataset:
+         expected_cell_count: Expected number of real cells a priori.
+         total_droplet_barcodes: Total number of droplets to include in the
+             cell-calling analysis.
++        force_cell_umi_prior: User wants to force cell UMI prior to be this
++        force_empty_umi_prior: User wants to force empty UMI prior to be this
++        ambient_counts_in_cells_low_limit: Limit to determine how many features
++            are included in the analysis
+         model_name: Model to use.
+         gene_blacklist: List of integer indices of genes to exclude entirely.
+         exclude_features: List of feature types to exclude from the analysis.
+@@ -33,7 +40,6 @@ class SingleCellRNACountsDataset:
+         low_count_threshold: Droplets with UMI counts below this number are
+             excluded entirely from the analysis.
+         fpr: Target expected false positive rate.
+-        random_seed: Seed for random number generators.
+ 
+     Attributes:
+         input_file: Name of data source file.
+@@ -65,6 +71,8 @@ def __init__(self,
+                  fpr: List[float],
+                  expected_cell_count: Optional[int] = None,
+                  total_droplet_barcodes: Optional[int] = None,
++                 force_cell_umi_prior: Optional[float] = None,
++                 force_empty_umi_prior: Optional[float] = None,
+                  fraction_empties: Optional[float] = None,
+                  ambient_counts_in_cells_low_limit: float = consts.AMBIENT_COUNTS_IN_CELLS_LOW_LIMIT,
+                  gene_blacklist: List[int] = []):
+@@ -106,10 +114,51 @@ def __init__(self,
+ 
+         # Overwrite heuristic priors with user inputs.
+         if expected_cell_count is not None:
++            logger.debug(f'Fixing expected_cells at {expected_cell_count}')
+             self.priors['expected_cells'] = expected_cell_count
++            self.priors.update(
++                get_cell_count_given_expected_cells(
++                    umi_counts=counts, expected_cells=expected_cell_count,
++                )
++            )
++            if (expected_cell_count + consts.NUM_EMPTIES_INCREMENT) > self.priors['total_droplets']:
++                # Bump this up to avoid an immediate error
++                total_drops = expected_cell_count + consts.NUM_EMPTIES_INCREMENT
++                self.priors['total_droplets'] = total_drops
++                logger.debug(f'Incrementing total_droplets to be {total_drops}')
++                if total_droplet_barcodes is None:
++                    # If this isn't getting recomputed next, recompute now
++                    self.priors.update(
++                        get_empty_count_given_expected_cells_and_total_droplets(
++                            umi_counts=counts, expected_cells=self.priors['expected_cells'],
++                            total_droplets=total_drops,
++                        )
++                    )
+         if total_droplet_barcodes is not None:
++            logger.debug(f'Fixing total_droplets at {total_droplet_barcodes}')
+             self.priors['total_droplets'] = total_droplet_barcodes
+-        # TODO add forced priors
++            self.priors.update(
++                get_empty_count_given_expected_cells_and_total_droplets(
++                    umi_counts=counts, expected_cells=self.priors['expected_cells'],
++                    total_droplets=total_droplet_barcodes,
++                )
++            )
++
++        # Force priors if user elects to do so.
++        if force_cell_umi_prior is not None:
++            logger.debug(f'Forcing cell UMI count prior to be {force_cell_umi_prior}')
++            self.priors['cell_counts'] = force_cell_umi_prior
++        if force_empty_umi_prior is not None:
++            logger.debug(f'Forcing empty droplet UMI count prior to be {force_empty_umi_prior}')
++            self.priors['empty_counts'] = force_empty_umi_prior
++            middle = np.sqrt(self.priors['cell_counts'] * force_empty_umi_prior)
++            self.priors['empty_count_upper_limit'] = min(middle, 2 * force_empty_umi_prior)
++
++        # Recompute a few quantities if some things were replaced by user input.
++        compute_crossover_surely_empty_and_stds(umi_counts=counts, priors=self.priors)
++        logger.info(f"Prior on counts for cells is {int(self.priors['cell_counts'])}")
++        logger.info(f"Prior on counts for empty droplets is {int(self.priors['empty_counts'])}")
++        logger.debug('\n'.join(['Priors:'] + [f'{k}: {v}' for k, v in self.priors.items()]))
+ 
+         # Do not analyze features which are not expected to contribute to noise.
+         self._trim_noiseless_features()
+@@ -339,7 +388,7 @@ def _trim_droplets(self):
+                         f"and {len(self.empty_barcode_inds)} empty "
+                         f"droplets.")
+             logger.info(f"Largest surely-empty droplet has "
+-                        f"{self.empty_UMI_threshold} UMI counts.")
++                        f"{int(self.empty_UMI_threshold)} UMI counts.")
+ 
+             if ((low_count_cutoff == self.low_count_threshold)
+                     and (len(self.empty_barcode_inds) == 0)):
+diff --git a/cellbender/remove_background/data/priors.py b/cellbender/remove_background/data/priors.py
+index 49bcc913..b50f5231 100644
+--- a/cellbender/remove_background/data/priors.py
++++ b/cellbender/remove_background/data/priors.py
+@@ -4,6 +4,8 @@
+ import torch
+ from scipy.stats import gaussian_kde
+ 
++from cellbender.remove_background import consts
++
+ from typing import Dict, Tuple, Union
+ import logging
+ 
+@@ -82,7 +84,7 @@ def _peak_density_given_cutoff(umi_counts: np.ndarray,
+     """Run scipy.stats gaussian_kde on part of the UMI curve"""
+ 
+     # get the UMI count values we are including
+-    noncell_counts = umi_counts[umi_counts < cutoff]
++    noncell_counts = umi_counts[umi_counts <= cutoff]
+ 
+     # resample them: the magic of looking at a log log plot
+     n_putative_cells = (umi_counts > cell_count_low_limit).sum()
+@@ -127,6 +129,52 @@ def _peak_density_given_cutoff(umi_counts: np.ndarray,
+     return empty_count_prior, empty_count_upper_limit
+ 
+ 
++def get_cell_count_given_expected_cells(umi_counts: np.ndarray,
++                                        expected_cells: int) -> Dict[str, float]:
++    """In the case where a prior is passed in as input, use it
++
++    Args:
++        umi_counts: Array of UMI counts per droplet, in no particular order
++        expected_cells: Input by user
++
++    Returns:
++        Dict with keys ['cell_counts']
++    """
++    order = np.argsort(umi_counts)[::-1]
++    cell_counts = np.exp(np.mean(np.log(umi_counts[order][:expected_cells]))).item()
++    return {'cell_counts': cell_counts}
++
++
++def get_empty_count_given_expected_cells_and_total_droplets(
++        umi_counts: np.ndarray,
++        expected_cells: int,
++        total_droplets: int,
++) -> Dict[str, float]:
++    """In the case where a prior is passed in as input, use it
++
++    Args:
++        umi_counts: Array of UMI counts per droplet, in no particular order
++        expected_cells: Input by user, or prior estimate
++        total_droplets: Input by user
++
++    Returns:
++        Dict with keys ['empty_counts', 'empty_count_upper_limit']
++    """
++
++    order = np.argsort(umi_counts)[::-1]
++    starting_point = max(expected_cells, total_droplets - 500)
++    empty_counts = np.median(umi_counts[order]
++                             [int(starting_point):int(total_droplets)]).item()
++
++    # need to estimate here
++    cell_counts = np.exp(np.mean(np.log(umi_counts[order][:expected_cells]))).item()
++    middle = np.sqrt(cell_counts * empty_counts)
++    empty_count_upper_limit = min(middle, 1.5 * empty_counts)
++
++    return {'empty_counts': empty_counts,
++            'empty_count_upper_limit': empty_count_upper_limit}
++
++
+ def get_cell_count_empty_count(umi_counts: np.ndarray,
+                                low_count_threshold: float = 15) -> Dict[str, float]:
+     """Obtain priors on cell counts and empty droplet counts from a UMI curve
+@@ -172,7 +220,7 @@ def get_cell_count_empty_count(umi_counts: np.ndarray,
+ 
+     # initial conditions for the loop
+     # start low, but have a failsafe (especially for simulated data)
+-    cutoff = max(0.1 * cell_count_low_limit, reverse_sorted_umi_counts[-50])
++    cutoff = max(0.1 * cell_count_low_limit, umi_counts_for_kde[-100])
+     empty_count_prior = -100
+     empty_count_upper_limit = None
+     delta = np.inf
+@@ -218,7 +266,9 @@ def get_cell_count_empty_count(umi_counts: np.ndarray,
+ def get_expected_cells_and_total_droplets(umi_counts: np.ndarray,
+                                           cell_counts: float,
+                                           empty_counts: float,
+-                                          empty_count_upper_limit: float) -> Dict[str, int]:
++                                          empty_count_upper_limit: float,
++                                          max_empties: int = consts.MAX_EMPTIES_TO_INCLUDE) \
++        -> Dict[str, int]:
+     """Obtain priors on cell counts and empty droplet counts from a UMI curve
+     using heuristics, and without applying any other prior information.
+ 
+@@ -229,9 +279,10 @@ def get_expected_cells_and_total_droplets(umi_counts: np.ndarray,
+         cell_counts: Prior from get_cell_count_empty_count()
+         empty_counts: Prior from get_cell_count_empty_count()
+         empty_count_upper_limit: Prior from get_cell_count_empty_count()
++        max_empties: Do not include more putative empty droplets than this
+ 
+     Returns:
+-        Dict with keys ['expected_cells', 'total_droplets']
++        Dict with keys ['expected_cells', 'total_droplets', 'transition_point']
+ 
+     Example:
+         >>> priors = get_cell_count_empty_count(umi_counts)
+@@ -244,12 +295,28 @@ def get_expected_cells_and_total_droplets(umi_counts: np.ndarray,
+     total_droplets_count_value = np.sqrt(empty_counts * empty_count_upper_limit)
+     total_droplets = (umi_counts >= total_droplets_count_value).sum()
+ 
+-    return {'expected_cells': expected_cells, 'total_droplets': total_droplets}
++    # find the transition point
++    transition_umi_counts = umi_counts[(umi_counts <= cell_counts)
++                                       & (umi_counts >= empty_count_upper_limit)]
++    smoothing_radius = max(1, len(transition_umi_counts) // 20)
++    diff = np.diff(np.sort(transition_umi_counts)[::-1][::smoothing_radius], n=1)
++    transition_point = ((umi_counts > cell_counts).sum()
++                        + np.argmin(diff) * smoothing_radius)
++    logger.debug(f'In get_expected_cells_and_total_droplets(), found transition '
++                 f'point at droplet {transition_point}')
++
++    # ensure out heuristics don't go too far out datasets with many cells
++    total_droplets = min(total_droplets, transition_point + max_empties)
++
++    return {'expected_cells': expected_cells,
++            'total_droplets': total_droplets,
++            'transition_point': transition_point}
+ 
+ 
+ def get_priors(umi_counts: np.ndarray,
+                low_count_threshold: float,
+-               max_total_droplets: int = 70000) -> Dict[str, Union[int, float]]:
++               max_total_droplets: int = consts.MAX_TOTAL_DROPLETS_GUESSED) \
++        -> Dict[str, Union[int, float]]:
+     """Get all priors using get_cell_count_empty_count() and
+     get_expected_cells_and_total_droplets(), employing a failsafe if
+     total_droplets is improbably large.
+@@ -273,6 +340,7 @@ def get_priors(umi_counts: np.ndarray,
+         low_count_threshold=low_count_threshold,
+     )
+     priors.update(get_expected_cells_and_total_droplets(umi_counts=umi_counts, **priors))
++    logger.debug(f'Automatically computed priors: {priors}')
+ 
+     a = 0
+     while priors['total_droplets'] > max_total_droplets:
+@@ -285,10 +353,33 @@ def get_priors(umi_counts: np.ndarray,
+             low_count_threshold=priors['empty_count_upper_limit'],
+         )
+         priors.update(get_expected_cells_and_total_droplets(umi_counts=umi_counts, **priors))
++        logger.debug(f'Automatically computed priors: {priors}')
+         a += 1
+         if a > 5:
+             break
+ 
++    # compute a few last things
++    compute_crossover_surely_empty_and_stds(umi_counts=umi_counts, priors=priors)
++
++    return priors
++
++
++def compute_crossover_surely_empty_and_stds(umi_counts, priors):
++    """Given cell_counts and total_droplets, compute a few more quantities
++
++    Args:
++        umi_counts: Array of UMI counts per droplet, in no particular order
++        priors: Dict of priors
++
++    Returns:
++        None.  Modifies priors dict in place.
++    """
++
++    assert 'total_droplets' in priors.keys(), \
++        'Need total_droplets in priors to run compute_crossover_surely_empty_and_stds()'
++    assert 'cell_counts' in priors.keys(), \
++        'Need cell_counts in priors to run compute_crossover_surely_empty_and_stds()'
++
+     # Compute a crossover point in log count space.
+     reverse_sorted_counts = np.sort(umi_counts)[::-1]
+     surely_empty_counts = reverse_sorted_counts[priors['total_droplets']]
+@@ -301,8 +392,3 @@ def get_priors(umi_counts: np.ndarray,
+     d_std = np.std(log_nonzero_umi_counts[log_nonzero_umi_counts > log_counts_crossover]).item() / 5.
+     d_empty_std = 0.01  # this is basically turned off in favor of epsilon
+     priors.update({'d_std': d_std, 'd_empty_std': d_empty_std})
+-
+-    logger.info(f"Prior on counts for cells is {int(priors['cell_counts'])}")
+-    logger.info(f"Prior on counts for empty droplets is {int(priors['empty_counts'])}")
+-
+-    return priors
+diff --git a/cellbender/remove_background/run.py b/cellbender/remove_background/run.py
+index df8f9f18..3e0e2bd2 100644
+--- a/cellbender/remove_background/run.py
++++ b/cellbender/remove_background/run.py
+@@ -79,6 +79,8 @@ def run_remove_background(args: argparse.Namespace):
+             SingleCellRNACountsDataset(input_file=args.input_file,
+                                        expected_cell_count=args.expected_cell_count,
+                                        total_droplet_barcodes=args.total_droplets,
++                                       force_cell_umi_prior=args.force_cell_umi_prior,
++                                       force_empty_umi_prior=args.force_empty_umi_prior,
+                                        fraction_empties=args.fraction_empties,
+                                        model_name=args.model,
+                                        gene_blacklist=args.blacklisted_genes,

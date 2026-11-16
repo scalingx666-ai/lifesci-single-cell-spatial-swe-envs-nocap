@@ -1,0 +1,408 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 57d6b5c..53aab1d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -64,6 +64,13 @@ Changelog for alevin-fry
+   given, `-r PARSIMONY` silently ran with a large-graph threshold of 0 rather
+   than 1000: both defaults were matched against the strategy as typed. They are
+   now taken from the parsed strategy.
++* `infer` panicked on multi-sample input such as 10x Flex, whose rows `quant`
++  names `<sample>_<barcode>`: it read each row name as a bare barcode. Row names
++  are now carried through as written. A `--quant-subset` line may name a row,
++  keeping that row, or give a bare barcode, keeping it in every sample.
++* `infer --quant-subset` never finished when the list named a barcode that the
++  matrix does not have: its workers waited for as many cells as the list had
++  entries. It now counts the rows kept.
+ 
+ ## [0.18.2](https://github.com/COMBINE-lab/alevin-fry/compare/v0.18.1...v0.18.2) (2026-09-11)
+ 
+diff --git a/docs/source/infer.rst b/docs/source/infer.rst
+index 30d8a1b..821d5cf 100644
+--- a/docs/source/infer.rst
++++ b/docs/source/infer.rst
+@@ -11,13 +11,13 @@ estimation step, that attempts to resolve gene-multimapping UMIs.
+ 
+ This command can takes the following options :
+ 
+-* ``-c, --count-mat <eqc-mat>`` : This provides the path to the (mtx format) matrix of cells by equivalence class counts. **Note**: It is assumed that the parent directory where ``eqc-mat`` is located will also contain a file called ``quants_mat_rows.txt`` containing the row names of the matrix and a file called ``quants_mat_cols.txt`` containing the column names of the files. The ``infer`` command will not run if these other input files are absent from the parent directory of ``eqc-mat``. Nor will it run if ``quants_mat_cols.txt`` does not have one name per feature of the equivalence classes, as with the output of ``quant-probe --dump-eqclasses``, whose equivalence classes are over probes rather than genes. 
++* ``-c, --count-mat <eqc-mat>`` : This provides the path to the (mtx format) matrix of cells by equivalence class counts. **Note**: It is assumed that the parent directory where ``eqc-mat`` is located will also contain a file called ``quants_mat_rows.txt`` containing the row names of the matrix (cell barcodes, or ``<sample>_<barcode>`` for multi-sample input such as 10x Flex; they are written to the output unchanged) and a file called ``quants_mat_cols.txt`` containing the column names of the files. The ``infer`` command will not run if these other input files are absent from the parent directory of ``eqc-mat``. Nor will it run if ``quants_mat_cols.txt`` does not have one name per feature of the equivalence classes, as with the output of ``quant-probe --dump-eqclasses``, whose equivalence classes are over probes rather than genes. 
+ 
+ * ``-e, --eq-labels <eq-labels>`` : This provides the path to the file containing the gene labels of the equivalence class description.
+ 
+ * ``-o, --output-dir <output-dir>`` : This provides the output file directory the quantification matrix, barcodes (row names), and genes (column names) will be written.
+ 
+-* ``--quant-subset <sfile>`` : This optional argument provides a file containing list of barcodes to quantify (one barcode per line, written as a string), those not in this list will be ignored during inference and will not appear in the output quantification matrix.  If this argument is not provided, then all of the original barcodes will be quantified.
++* ``--quant-subset <sfile>`` : This optional argument provides a file containing list of barcodes to quantify (one barcode per line, written as a string), those not in this list will be ignored during inference and will not appear in the output quantification matrix.  For multi-sample input, a line may name a row (``<sample>_<barcode>``), which keeps that row, or give a bare barcode, which keeps that barcode in every sample that has it.  Lines that match no row are ignored.  If this argument is not provided, then all of the original barcodes will be quantified.
+    
+ * ``-t, --threads <threads>`` : This option provides the number of threads to use for processing [default: number of hardware threads].
+ 
+diff --git a/src/infer.rs b/src/infer.rs
+index 58ef4d3..4663ef5 100644
+--- a/src/infer.rs
++++ b/src/infer.rs
+@@ -7,7 +7,6 @@
+  * License: 3-clause BSD, see https://opensource.org/licenses/BSD-3-Clause
+  */
+ 
+-use crate::cellfilter::permit_list_from_file;
+ use anyhow::{Context, anyhow, bail};
+ use crossbeam_queue::ArrayQueue;
+ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+@@ -25,7 +24,12 @@ use std::sync::{Arc, Mutex};
+ use std::thread;
+ 
+ use crate::em::{EmInitType, EmSubsetScratch, em_optimize_subset_with_scratch};
+-use crate::utils::read_filter_list;
++
++/// The cell barcode of a count-matrix row name: `quant` names a row
++/// `<sample>_<barcode>` in a multi-sample run, and by its barcode otherwise.
++fn row_barcode(name: &str) -> &str {
++    name.rsplit_once('_').map_or(name, |(_, bc)| bc)
++}
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub fn infer(
+@@ -86,8 +90,6 @@ pub fn infer(
+         count_mat.cols()
+     );
+ 
+-    let mut num_cells = count_mat.rows();
+-
+     // read in the global equivalence class representation
+     let eq_label_path = std::path::Path::new(eq_label_file);
+     let global_eq_classes = Arc::new(crate::eq_class::IndexedEqList::init_from_eqc_file(
+@@ -140,44 +142,70 @@ pub fn infer(
+         None
+     };
+ 
+-    // if we have a filter list, extract it here
+-    let s = ahash::RandomState::with_seeds(2u64, 7u64, 1u64, 8u64);
+-    let mut retained_bc: HashSet<u64, ahash::RandomState> = HashSet::with_hasher(s);
+-    let mut filter_bc = false;
+-    // read the first barcode in the file to get the barcode
+-    // length.
++    // The row names of the count matrix: a cell barcode, or `<sample>_<barcode>`
++    // in a multi-sample run. They are written to the output as they are read.
+     let bc_path = count_mat_parent.join("quants_mat_rows.txt");
+-    let bc_len;
+-    {
+-        let mut first_line = String::new();
+-        let file = match fs::File::open(&bc_path) {
+-            Ok(file) => file,
+-            Err(_) => panic!("Unable to read first barcode from {:?}", bc_path),
+-        };
+-        let mut rdr = BufReader::new(file);
+-        rdr.read_line(&mut first_line).expect("Unable to read line");
+-        if first_line.ends_with('\n') {
+-            first_line.pop();
+-        }
+-        bc_len = first_line.len() as u16;
++    let row_names: Vec<String> = BufReader::new(
++        fs::File::open(&bc_path)
++            .with_context(|| format!("could not open the row names {}", bc_path.display()))?,
++    )
++    .lines()
++    .collect::<Result<_, _>>()
++    .with_context(|| format!("could not read the row names {}", bc_path.display()))?;
++    if row_names.len() != count_mat.rows() {
++        bail!(
++            "{} names {} rows, but the count matrix has {}",
++            bc_path.display(),
++            row_names.len(),
++            count_mat.rows()
++        );
+     }
+-    let bc_fname = bc_path.to_str().expect("couldn't unwrap barcode file path");
+-    let bcvec = permit_list_from_file(bc_fname, bc_len);
+-
+-    if let Some(fname) = filter_list {
+-        // read in the fitler list
+-        match read_filter_list(fname, bc_len) {
+-            Ok(fset) => {
+-                // the number of cells we expect to
+-                // actually process
+-                num_cells = fset.len();
+-                retained_bc = fset;
+-                filter_bc = true;
+-            }
+-            Err(e) => {
+-                return Err(e);
++
++    // Which rows to quantify. A --quant-subset line that names a row of a
++    // multi-sample run (`<sample>_<barcode>`) keeps that row; a bare barcode keeps
++    // that barcode in every sample. Bare barcodes are compared as k-mers of the
++    // row barcodes' length, as before, so a suffix such as Cell Ranger's `-1`
++    // is ignored.
++    let retained: Vec<bool> = match filter_list {
++        Some(fname) if !row_names.is_empty() => {
++            let bc_len = row_barcode(&row_names[0]).len() as u8;
++            let kmer = |bc: &str| {
++                BitNuclKmer::new(bc.as_bytes(), bc_len, false)
++                    .next()
++                    .map(|(_, k, _)| k.0)
++            };
++            let list = fs::read_to_string(fname)
++                .with_context(|| format!("could not read {}", fname.display()))?;
++            let mut names = HashSet::new();
++            let mut barcodes = HashSet::new();
++            for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
++                if line.contains('_') {
++                    names.insert(line);
++                } else if let Some(k) = kmer(line) {
++                    barcodes.insert(k);
++                }
+             }
++            row_names
++                .iter()
++                .map(|name| {
++                    names.contains(name.as_str())
++                        || kmer(row_barcode(name)).is_some_and(|k| barcodes.contains(&k))
++                })
++                .collect()
+         }
++        _ => vec![true; row_names.len()],
++    };
++    // The workers stop once this many cells are done, so it must be the number of
++    // rows kept, not the length of the --quant-subset list: a listed barcode that
++    // no row has would leave them waiting forever.
++    let num_cells = retained.iter().filter(|&&keep| keep).count();
++    if filter_list.is_some() {
++        info!(
++            log,
++            "quantifying {} of {} cells, from the --quant-subset list",
++            num_cells,
++            row_names.len()
++        );
+     }
+ 
+     // the progress bar we'll use to monitor progress of the EM
+@@ -386,27 +414,15 @@ pub fn infer(
+     let mut bc_writer = BufWriter::new(out_bc_file);
+ 
+     let mut processed_ind = 0_usize;
+-    let short_bc_len = bc_len as u8;
+     // iterate over the rows (cells) of the equivalence class count
+-    // matrix.  The iterator will yield a pair of the row index and
+-    // an iterator over the row data.
+-    // we zip the bcvec iterator (vector of barcodes in row order)
+-    // with the actual rows of the matrix.
+-    for (barcode, row_vec) in bcvec.iter().zip(count_mat.outer_iterator()) {
+-        let process_cell = if filter_bc {
+-            // if the reatined_bc list contains this cell id
+-            // then process it
+-            retained_bc.contains(barcode)
+-        } else {
+-            true
+-        };
+-        if process_cell {
+-            // write to barcode file
+-            let bc_bytes = &bitmer_to_bytes((*barcode, short_bc_len))[..];
+-            writeln!(&mut bc_writer, "{}", unsafe {
+-                std::str::from_utf8_unchecked(bc_bytes)
+-            })
+-            .expect("can't write to barcode file.");
++    // matrix, with their names and whether each is kept.
++    for ((name, keep), row_vec) in row_names
++        .iter()
++        .zip(retained.iter())
++        .zip(count_mat.outer_iterator())
++    {
++        if *keep {
++            writeln!(&mut bc_writer, "{}", name).expect("can't write to barcode file.");
+ 
+             // gather the data from the row's iterator into a vector of
+             // (eq_id, count) tuples.
+diff --git a/tests/infer_rows.rs b/tests/infer_rows.rs
+new file mode 100644
+index 0000000..7477d63
+--- /dev/null
++++ b/tests/infer_rows.rs
+@@ -0,0 +1,188 @@
++//! `infer` over row names as `quant` writes them.
++//!
++//! A multi-sample `quant` names each row `<sample>_<barcode>`. `infer` used to
++//! read every row name as a bare barcode k-mer, so it panicked on these. It also
++//! stopped its workers after as many cells as the `--quant-subset` list had
++//! entries, so a listed barcode that no row had left it waiting forever.
++
++use std::collections::HashMap;
++use std::io::Write;
++use std::path::Path;
++use std::process::{Command, Output, Stdio};
++use std::time::{Duration, Instant};
++
++const BC: &str = "ACGTACGTACGTACGT";
++const OTHER_BC: &str = "TTTTACGTACGTACGT";
++
++/// The input directory of `infer`: two genes and three equivalence classes,
++/// {G0}, {G1} and {G0, G1}, over the given rows, with these counts per row.
++fn write_input(dir: &Path, rows: &[&str], counts: &[&[(usize, u32)]]) {
++    std::fs::create_dir_all(dir).unwrap();
++    std::fs::write(dir.join("quants_mat_cols.txt"), "G0\nG1\n").unwrap();
++    std::fs::write(dir.join("quants_mat_rows.txt"), rows.join("\n") + "\n").unwrap();
++    let mut eqc = flate2::write::GzEncoder::new(
++        std::fs::File::create(dir.join("gene_eqclass.txt.gz")).unwrap(),
++        flate2::Compression::default(),
++    );
++    eqc.write_all(b"2\n3\n0\t0\n1\t1\n0\t1\t2\n").unwrap();
++    eqc.finish().unwrap();
++    let entries: Vec<String> = counts
++        .iter()
++        .enumerate()
++        .flat_map(|(row, cell)| {
++            cell.iter()
++                .map(move |(eq, n)| format!("{} {} {}", row + 1, eq + 1, n))
++        })
++        .collect();
++    std::fs::write(
++        dir.join("geqc_counts.mtx"),
++        format!(
++            "%%MatrixMarket matrix coordinate real general\n{} 3 {}\n{}\n",
++            rows.len(),
++            entries.len(),
++            entries.join("\n")
++        ),
++    )
++    .unwrap();
++}
++
++/// Run `infer`, killing it if it has not finished within a minute.
++fn infer(input: &Path, output: &Path, subset: Option<&Path>) -> Output {
++    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alevin-fry"));
++    cmd.arg("infer")
++        .arg("-c")
++        .arg(input.join("geqc_counts.mtx"))
++        .arg("-e")
++        .arg(input.join("gene_eqclass.txt.gz"))
++        .arg("-o")
++        .arg(output)
++        .args(["-t", "2"])
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped());
++    if let Some(subset) = subset {
++        cmd.arg("--quant-subset").arg(subset);
++    }
++    let mut child = cmd.spawn().unwrap();
++    let start = Instant::now();
++    while child.try_wait().unwrap().is_none() {
++        if start.elapsed() > Duration::from_secs(60) {
++            child.kill().unwrap();
++            panic!("infer did not finish within 60 s");
++        }
++        std::thread::sleep(Duration::from_millis(20));
++    }
++    child.wait_with_output().unwrap()
++}
++
++/// The output as row name -> gene counts.
++fn read_output(dir: &Path) -> HashMap<String, [f64; 2]> {
++    let rows: Vec<String> = std::fs::read_to_string(dir.join("quants_mat_rows.txt"))
++        .unwrap()
++        .lines()
++        .map(str::to_owned)
++        .collect();
++    let mut out: HashMap<String, [f64; 2]> = rows.iter().map(|r| (r.clone(), [0.0; 2])).collect();
++    let text = std::fs::read_to_string(dir.join("quants_mat.mtx")).unwrap();
++    for line in text.lines().filter(|l| !l.starts_with('%')).skip(1) {
++        let v: Vec<&str> = line.split_whitespace().collect();
++        let row = &rows[v[0].parse::<usize>().unwrap() - 1];
++        out.get_mut(row).unwrap()[v[1].parse::<usize>().unwrap() - 1] = v[2].parse().unwrap();
++    }
++    out
++}
++
++fn multi_sample_input(dir: &Path) -> [String; 3] {
++    let rows = [
++        format!("A-A01_{BC}"),
++        format!("A-A02_{BC}"),
++        format!("A-A02_{OTHER_BC}"),
++    ];
++    write_input(
++        dir,
++        &rows.iter().map(String::as_str).collect::<Vec<_>>(),
++        &[&[(0, 3)], &[(1, 2)], &[(0, 1), (1, 1)]],
++    );
++    rows
++}
++
++#[test]
++fn infer_keeps_multi_sample_row_names() {
++    let tmp = tempfile::tempdir().unwrap();
++    let input = tmp.path().join("in");
++    let rows = multi_sample_input(&input);
++
++    let output = infer(&input, &tmp.path().join("out"), None);
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let counts = read_output(&tmp.path().join("out"));
++    assert_eq!(counts.len(), 3);
++    assert_eq!(counts[&rows[0]], [3.0, 0.0]);
++    assert_eq!(counts[&rows[1]], [0.0, 2.0]);
++    assert_eq!(counts[&rows[2]], [1.0, 1.0]);
++}
++
++#[test]
++fn infer_subset_keeps_a_barcode_in_every_sample_and_skips_absent_ones() {
++    let tmp = tempfile::tempdir().unwrap();
++    let input = tmp.path().join("in");
++    let rows = multi_sample_input(&input);
++    // one barcode in two samples, and one that no row has
++    let subset = tmp.path().join("subset.txt");
++    std::fs::write(&subset, format!("{BC}\nGGGGGGGGGGGGGGGG\n")).unwrap();
++
++    let output = infer(&input, &tmp.path().join("out"), Some(&subset));
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let counts = read_output(&tmp.path().join("out"));
++    assert_eq!(counts.len(), 2);
++    assert_eq!(counts[&rows[0]], [3.0, 0.0]);
++    assert_eq!(counts[&rows[1]], [0.0, 2.0]);
++}
++
++#[test]
++fn infer_subset_keeps_a_named_row_only() {
++    let tmp = tempfile::tempdir().unwrap();
++    let input = tmp.path().join("in");
++    let rows = multi_sample_input(&input);
++    let subset = tmp.path().join("subset.txt");
++    std::fs::write(&subset, format!("{}\n", rows[1])).unwrap();
++
++    let output = infer(&input, &tmp.path().join("out"), Some(&subset));
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let counts = read_output(&tmp.path().join("out"));
++    assert_eq!(counts.len(), 1);
++    assert_eq!(counts[&rows[1]], [0.0, 2.0]);
++}
++
++#[test]
++fn infer_subset_on_single_sample_rows() {
++    let tmp = tempfile::tempdir().unwrap();
++    let input = tmp.path().join("in");
++    write_input(&input, &[BC, OTHER_BC], &[&[(0, 3)], &[(2, 4)]]);
++    let subset = tmp.path().join("subset.txt");
++    // with a barcode that no row has, which used to leave the workers waiting
++    // (Cell Ranger's `-1` suffix is ignored, as before)
++    std::fs::write(&subset, format!("{OTHER_BC}-1\nGGGGGGGGGGGGGGGG\n")).unwrap();
++
++    let output = infer(&input, &tmp.path().join("out"), Some(&subset));
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let counts = read_output(&tmp.path().join("out"));
++    assert_eq!(counts.len(), 1);
++    // an ambiguous class with no unique evidence for either gene is split
++    let [g0, g1] = counts[OTHER_BC];
++    assert!((g0 + g1 - 4.0).abs() < 1e-3, "{g0} + {g1}");
++}

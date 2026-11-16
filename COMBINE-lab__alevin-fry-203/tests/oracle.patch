@@ -1,0 +1,409 @@
+diff --git a/docs/source/generate_permit_list.rst b/docs/source/generate_permit_list.rst
+index 0222a39..e8aeae3 100644
+--- a/docs/source/generate_permit_list.rst
++++ b/docs/source/generate_permit_list.rst
+@@ -56,6 +56,14 @@ routing.  ``--sample-bc-correction exact|unique|frequency`` selects its policy,
+ defaults to Exact.  ``--sample-correction-mode exact|1-edit`` remains as a
+ deprecated compatibility alias.
+ 
++The sample-barcode list may have one column (each barcode is its own sample),
++two (``barcode<TAB>name``), or three (``barcode<TAB>canonical_barcode<TAB>name``,
++the 10x Flex format grouping each sample's barcode variants).  Samples are named
++by the list's name column, or by their barcode when it has none.
++``--sample-names`` takes a ``barcode<TAB>name`` file whose names replace those:
++each line may use any barcode of a sample from the list, barcodes of the same
++sample must agree on its name, and no two samples may share a name.
++
+ Sample Frequency can defer structurally ambiguous ``(sample, cell)`` pairs.
+ ``--memory-limit`` sets the total bounded buffer budget (512 MiB by default),
+ and ``--tmp-dir`` chooses where compressed temporary runs are written.
+diff --git a/src/cellfilter.rs b/src/cellfilter.rs
+index 46555f3..a1f77be 100644
+--- a/src/cellfilter.rs
++++ b/src/cellfilter.rs
+@@ -831,7 +831,11 @@ fn do_generate_permit_list_multi_bc(
+     );
+ 
+     // Load known sample barcodes (with rotation → canonical mapping)
+-    let sample_info = load_sample_barcode_list(sample_bc_list_path, gpl_opts.sample_bc_ori, log)?;
++    let mut sample_info =
++        load_sample_barcode_list(sample_bc_list_path, gpl_opts.sample_bc_ori, log)?;
++    if let Some(names_path) = gpl_opts.sample_names.as_ref() {
++        apply_sample_names(&mut sample_info, names_path, gpl_opts.sample_bc_ori, log)?;
++    }
+ 
+     // Build sample barcode correction map (rotation → canonical)
+     let sample_correction_spec = gpl_opts.sample_correction_spec(sample_info.barcode_len as u8);
+@@ -1444,6 +1448,133 @@ struct SampleBarcodeInfo {
+ ///    has 8 rotation variants.
+ ///
+ /// Returns `SampleBarcodeInfo` with canonical barcodes and rotation mapping.
++/// A sample barcode as it appears in the read: reverse-complemented when the
++/// whitelist is in the reverse orientation.
++fn orient_sample_barcode(seq: &str, ori: SampleBarcodeOri) -> String {
++    if ori != SampleBarcodeOri::Reverse {
++        return seq.to_string();
++    }
++    seq.bytes()
++        .rev()
++        .map(|b| match b {
++            b'A' => b'T',
++            b'T' => b'A',
++            b'C' => b'G',
++            b'G' => b'C',
++            b'a' => b't',
++            b't' => b'a',
++            b'c' => b'g',
++            b'g' => b'c',
++            other => other,
++        })
++        .map(|b| b as char)
++        .collect()
++}
++
++fn pack_sample_barcode(seq: &str) -> anyhow::Result<u64> {
++    needletail::bitkmer::BitNuclKmer::new(seq.as_bytes(), seq.len() as u8, false)
++        .next()
++        .map(|(_, kmer, _)| kmer.0)
++        .ok_or_else(|| anyhow!("couldn't pack sample barcode: {}", seq))
++}
++
++/// Apply `--sample-names`: a `barcode<TAB>name` file whose names replace those
++/// from the sample-barcode list. A barcode may be any barcode of the list
++/// (a rotation or a canonical barcode); all barcodes of one sample must agree
++/// on its name, and the resulting sample names must be distinct.
++fn apply_sample_names(
++    info: &mut SampleBarcodeInfo,
++    path: &PathBuf,
++    ori: SampleBarcodeOri,
++    log: &slog::Logger,
++) -> anyhow::Result<()> {
++    let file = File::open(path)
++        .with_context(|| format!("couldn't open sample names file: {}", path.display()))?;
++    let mut named: HashMap<u64, String> = HashMap::new();
++    for line in BufReader::new(file).lines() {
++        let line = line?;
++        let trimmed = line.trim();
++        if trimmed.is_empty() || trimmed.starts_with('#') {
++            continue;
++        }
++        let (barcode, name) = trimmed.split_once('\t').ok_or_else(|| {
++            anyhow!(
++                "sample names file {}: expected `barcode<TAB>name`, found '{}'",
++                path.display(),
++                trimmed
++            )
++        })?;
++        let name = name.trim();
++        if name.is_empty() {
++            bail!(
++                "sample names file {}: barcode '{}' has an empty name",
++                path.display(),
++                barcode
++            );
++        }
++        if barcode.len() != info.barcode_len {
++            bail!(
++                "sample names file {}: barcode '{}' has length {}, but the sample barcodes have length {}",
++                path.display(),
++                barcode,
++                barcode.len(),
++                info.barcode_len
++            );
++        }
++        let packed = pack_sample_barcode(&orient_sample_barcode(barcode, ori))?;
++        let canonical = info
++            .rotation_to_canonical
++            .get(&packed)
++            .copied()
++            .or_else(|| {
++                info.canonical_to_name
++                    .contains_key(&packed)
++                    .then_some(packed)
++            })
++            .ok_or_else(|| {
++                anyhow!(
++                    "sample names file {}: barcode '{}' is not in the sample barcode list",
++                    path.display(),
++                    barcode
++                )
++            })?;
++        match named.entry(canonical) {
++            Entry::Occupied(entry) if entry.get() != name => bail!(
++                "sample names file {}: barcode '{}' names its sample '{}', but another barcode of the same sample names it '{}'",
++                path.display(),
++                barcode,
++                name,
++                entry.get()
++            ),
++            Entry::Occupied(_) => {}
++            Entry::Vacant(entry) => {
++                entry.insert(name.to_string());
++            }
++        }
++    }
++    let num_named = named.len();
++    info.canonical_to_name.extend(named);
++    let mut seen = std::collections::HashSet::new();
++    for canonical in &info.canonical_barcodes {
++        if let Some(name) = info.canonical_to_name.get(canonical)
++            && !seen.insert(name.as_str())
++        {
++            bail!(
++                "after applying {}, more than one sample is named '{}'",
++                path.display(),
++                name
++            );
++        }
++    }
++    info!(
++        log,
++        "Applied {} sample names from {}",
++        num_named,
++        path.display()
++    );
++    Ok(())
++}
++
+ fn load_sample_barcode_list(
+     path: &PathBuf,
+     ori: SampleBarcodeOri,
+@@ -1510,42 +1641,12 @@ fn load_sample_barcode_list(
+             _ => {}
+         }
+ 
+-        let rc = |seq: &str| -> String {
+-            seq.bytes()
+-                .rev()
+-                .map(|b| match b {
+-                    b'A' => b'T',
+-                    b'T' => b'A',
+-                    b'C' => b'G',
+-                    b'G' => b'C',
+-                    b'a' => b't',
+-                    b't' => b'a',
+-                    b'c' => b'g',
+-                    b'g' => b'c',
+-                    other => other,
+-                })
+-                .map(|b| b as char)
+-                .collect()
+-        };
+-
+-        let (observed_owned, canonical_owned);
+-        let (observed_seq, canonical_seq) = if ori == SampleBarcodeOri::Reverse {
+-            observed_owned = rc(observed_seq);
+-            canonical_owned = rc(canonical_seq);
+-            (observed_owned.as_str(), canonical_owned.as_str())
+-        } else {
+-            (observed_seq, canonical_seq)
+-        };
+-
+-        let pack = |seq: &str| -> anyhow::Result<u64> {
+-            needletail::bitkmer::BitNuclKmer::new(seq.as_bytes(), seq.len() as u8, false)
+-                .next()
+-                .map(|(_, kmer, _)| kmer.0)
+-                .ok_or_else(|| anyhow!("couldn't pack sample barcode: {}", seq))
+-        };
++        let observed_owned = orient_sample_barcode(observed_seq, ori);
++        let canonical_owned = orient_sample_barcode(canonical_seq, ori);
++        let (observed_seq, canonical_seq) = (observed_owned.as_str(), canonical_owned.as_str());
+ 
+-        let obs_packed = pack(observed_seq)?;
+-        let canon_packed = pack(canonical_seq)?;
++        let obs_packed = pack_sample_barcode(observed_seq)?;
++        let canon_packed = pack_sample_barcode(canonical_seq)?;
+ 
+         match rotation_to_canonical.entry(obs_packed) {
+             Entry::Occupied(entry) if *entry.get() != canon_packed => {
+@@ -2840,4 +2941,38 @@ mod cell_barcode_correction_tests {
+         std::fs::write(&conflict_path, "AA\tAA\ta\nAA\tCC\tb\n").unwrap();
+         assert!(load_sample_barcode_list(&conflict_path, SampleBarcodeOri::Forward, &log).is_err());
+     }
++
++    #[test]
++    fn sample_names_file_renames_samples_through_any_of_their_barcodes() {
++        let dir = tempfile::tempdir().unwrap();
++        let log = slog::Logger::root(slog::Discard, slog::o!());
++        let list = dir.path().join("list.tsv");
++        std::fs::write(&list, "AA\tAA\ta\nAC\tAA\ta\nCC\tCC\tb\n").unwrap();
++        let names = dir.path().join("names.tsv");
++        let load = || load_sample_barcode_list(&list, SampleBarcodeOri::Forward, &log).unwrap();
++        let apply = |contents: &str| {
++            std::fs::write(&names, contents).unwrap();
++            let mut info = load();
++            apply_sample_names(&mut info, &names, SampleBarcodeOri::Forward, &log).map(|_| info)
++        };
++
++        // a rotation (AC) names its canonical sample (AA); unnamed samples keep theirs
++        let info = apply("# comment\nAC\tfirst\n").unwrap();
++        assert_eq!(get_sample_names(&info), ["first", "b"]);
++        // barcodes of one sample may repeat the same name
++        let info = apply("AA\tfirst\nAC\tfirst\nCC\tsecond\n").unwrap();
++        assert_eq!(get_sample_names(&info), ["first", "second"]);
++        // ... but not disagree, name two samples alike, or name unknown barcodes
++        assert!(apply("AA\tfirst\nAC\tother\n").is_err());
++        assert!(apply("AA\tsame\nCC\tsame\n").is_err());
++        assert!(apply("GG\tghost\n").is_err());
++        assert!(apply("AA first\n").is_err());
++        assert!(apply("AAA\tlong\n").is_err());
++
++        // with a reverse-oriented whitelist, names use the file's own orientation
++        let mut info = load_sample_barcode_list(&list, SampleBarcodeOri::Reverse, &log).unwrap();
++        std::fs::write(&names, "AC\tfirst\n").unwrap();
++        apply_sample_names(&mut info, &names, SampleBarcodeOri::Reverse, &log).unwrap();
++        assert_eq!(get_sample_names(&info), ["first", "b"]);
++    }
+ }
+diff --git a/src/quant.rs b/src/quant.rs
+index 247acf0..44ffa67 100644
+--- a/src/quant.rs
++++ b/src/quant.rs
+@@ -387,6 +387,43 @@ pub fn quantify(quant_opts: QuantOpts) -> anyhow::Result<()> {
+     }
+ }
+ 
++/// First release whose multi-barcode collation stores the manifest ordinal of
++/// each record's sample in `barcodes[0]`; earlier releases stored the sparse
++/// plate index, which quant would map to the wrong sample name (see
++/// COMBINE-lab/simpleaf#195).
++const FIRST_ORDINAL_SAMPLE_COLLATE: (u64, u64, u64) = (0, 15, 0);
++
++/// Refuse a multi-barcode collation written before sample indices became
++/// manifest ordinals. A collation without a readable version is accepted.
++fn ensure_ordinal_sample_indices(collate_json: &std::path::Path) -> anyhow::Result<()> {
++    let Ok(file) = File::open(collate_json) else {
++        return Ok(());
++    };
++    let md: serde_json::Value =
++        serde_json::from_reader(BufReader::new(file)).context("could not parse collate.json")?;
++    let Some(version) = md.get("version_str").and_then(|v| v.as_str()) else {
++        return Ok(());
++    };
++    let Some(parsed) = parse_release_version(version) else {
++        return Ok(());
++    };
++    let (a, b, c) = FIRST_ORDINAL_SAMPLE_COLLATE;
++    anyhow::ensure!(
++        parsed >= FIRST_ORDINAL_SAMPLE_COLLATE,
++        "this multi-sample collation was written by alevin-fry {version}, which recorded plate positions rather than sample ordinals, so cells would be assigned to the wrong samples; re-run `alevin-fry collate` with alevin-fry {a}.{b}.{c} or later"
++    );
++    Ok(())
++}
++
++/// Parse the leading `major.minor.patch` of a version string.
++fn parse_release_version(version: &str) -> Option<(u64, u64, u64)> {
++    let mut parts = version
++        .split(|c: char| !c.is_ascii_digit())
++        .filter(|p| !p.is_empty())
++        .map(|p| p.parse::<u64>().ok());
++    Some((parts.next()??, parts.next()??, parts.next()??))
++}
++
+ struct WorkerConfig {
+     resolution: ResolutionStrategy,
+     usa_mode: bool,
+@@ -1218,8 +1255,25 @@ where
+             // lock. Only row allocation and paired appends must be serialized.
+             let bc_bytes = bitmer_to_bytes((bc.into(), config.barcode_len as u8));
+             let bc_str = unsafe { std::str::from_utf8_unchecked(&bc_bytes) };
+-            let sample_name = sample_idx_from_rec
+-                .and_then(|si| shared.sample_names.as_ref()?.get(si).map(|s| s.as_str()));
++            // Every multi-sample record must name a sample in the manifest; an
++            // index outside it would otherwise drop the sample_name field and
++            // misalign this featureDump.txt row.
++            let sample_name = match (sample_idx_from_rec, shared.sample_names.as_ref()) {
++                (Some(si), Some(names)) => match names.get(si) {
++                    Some(name) => Some(name.as_str()),
++                    None => {
++                        output_error = Some(anyhow::anyhow!(
++                            "cell {} has sample index {}, but collation_manifest.bin names only {} samples; re-run `alevin-fry collate` on this input",
++                            bc_str,
++                            si,
++                            names.len()
++                        ));
++                        shared.output_failed.store(true, Ordering::Relaxed);
++                        break;
++                    }
++                },
++                _ => None,
++            };
+             barcode_buf.clear();
+             feature_buf.clear();
+             if let Some(sn) = sample_name {
+@@ -1627,6 +1681,7 @@ where
+     // The collation stores the integer sample index in barcodes[0] of each record,
+     // so quant reads it directly and indexes into this Vec — no HashMap needed.
+     let sample_names = if manifest_path.exists() {
++        ensure_ordinal_sample_indices(&parent.join("collate.json"))?;
+         let manifest = CollationManifest::read_from_file(&manifest_path)?;
+         let names: Vec<String> = manifest
+             .sample_groups
+@@ -2438,3 +2493,39 @@ pub fn velo_quantify(_quant_opts: QuantOpts) -> anyhow::Result<()> {
+     unimplemented!("not implemented on this branch yet");
+     //Ok(())
+ }
++
++#[cfg(test)]
++mod collate_version_tests {
++    use super::{ensure_ordinal_sample_indices, parse_release_version};
++
++    #[test]
++    fn parses_release_versions() {
++        assert_eq!(parse_release_version("0.15.0"), Some((0, 15, 0)));
++        assert_eq!(parse_release_version("0.18.3-dev"), Some((0, 18, 3)));
++        assert_eq!(parse_release_version("v1.2.3"), Some((1, 2, 3)));
++        assert_eq!(parse_release_version("0.15"), None);
++    }
++
++    #[test]
++    fn rejects_collations_that_stored_plate_positions() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("collate.json");
++        for (version, ok) in [
++            ("0.11.2", false),
++            ("0.14.9", false),
++            ("0.15.0", true),
++            ("0.18.3", true),
++        ] {
++            std::fs::write(&path, format!(r#"{{"version_str": "{version}"}}"#)).unwrap();
++            assert_eq!(
++                ensure_ordinal_sample_indices(&path).is_ok(),
++                ok,
++                "{version}"
++            );
++        }
++        // no collate.json, or no version: accepted
++        std::fs::write(&path, "{}").unwrap();
++        assert!(ensure_ordinal_sample_indices(&path).is_ok());
++        assert!(ensure_ordinal_sample_indices(&dir.path().join("missing.json")).is_ok());
++    }
++}
+diff --git a/tests/multi_barcode_integration.rs b/tests/multi_barcode_integration.rs
+index e43acc0..fd12515 100644
+--- a/tests/multi_barcode_integration.rs
++++ b/tests/multi_barcode_integration.rs
+@@ -25,7 +25,8 @@ use smallvec::smallvec;
+ 
+ /// Number of reference targets in test data
+ const NUM_REFS: u64 = 10;
+-const TEST_VERSION: &str = "0.12.0";
++// The real version: quant rejects multi-sample collations written before 0.15.0.
++const TEST_VERSION: &str = env!("CARGO_PKG_VERSION");
+ /// Sample barcode length (bases)
+ const SAMPLE_BC_LEN: u16 = 8;
+ /// Cell barcode length (bases)
+diff --git a/tests/role_driven_integration.rs b/tests/role_driven_integration.rs
+index d54618c..2c15786 100644
+--- a/tests/role_driven_integration.rs
++++ b/tests/role_driven_integration.rs
+@@ -24,7 +24,8 @@ use libradicl::writers::RadFileWriter;
+ const NUM_REFS: u64 = 4;
+ const CELL_BC_LEN: u16 = 16;
+ const UMI_LEN: u16 = 12;
+-const TEST_VERSION: &str = "0.12.0";
++// The real version: quant rejects multi-sample collations written before 0.15.0.
++const TEST_VERSION: &str = env!("CARGO_PKG_VERSION");
+ 
+ fn packed(idx: u64, len: u16) -> u64 {
+     let mask = (1u64 << (2 * len as u64)) - 1;

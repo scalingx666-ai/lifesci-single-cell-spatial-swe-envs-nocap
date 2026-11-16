@@ -1,0 +1,1192 @@
+diff --git a/docs/source/generate_permit_list.rst b/docs/source/generate_permit_list.rst
+index 0222a39..388facb 100644
+--- a/docs/source/generate_permit_list.rst
++++ b/docs/source/generate_permit_list.rst
+@@ -26,7 +26,9 @@ barcodes are decided):
+   from the x=y line. The algorithm is iterative, because experiments with many low-quality barcodes may predict too many 
+   valid barcodes using this method. Thus, the algorithm is run repeatedly, each time considering a prefix of the CDF from 
+   index 0 through the previous knee's index * 5. Once two subsequent iterations of the algorithm return the same 
+-  knee point, the algorithm terminates.
++  knee point, the algorithm terminates. Knee finding needs at least 3 distinct cell barcodes. A single-sample run
++  with only 1 or 2 fails with an error. In a multi-sample run (``--sample-bc-list``), such a sample is skipped like an
++  empty one: it is reported with ``num_cells`` 0 in ``sample_info.json`` and gets no permit files.
+ 
+ * ``--force-cells <ncells>``: This option will count the number of reads associated with each barcode, and sort the barcodes 
+   in descending order of frequency. Then, it will consider the first <ncells> barcodes to be valid. Any barcode that has 
+diff --git a/src/atac/cellfilter.rs b/src/atac/cellfilter.rs
+index 9add566..116add1 100644
+--- a/src/atac/cellfilter.rs
++++ b/src/atac/cellfilter.rs
+@@ -180,6 +180,20 @@ fn process_unfiltered(
+             kept_barcodes.push(*entry.key());
+         }
+     }
++    // When no barcode is kept, count the reads whose barcode is in the permit
++    // list as given and in the other orientation, so the error raised below
++    // can name a wrong --permit-bc-ori as the cause.
++    let mut listed_reads = 0u64;
++    let mut other_ori_reads = 0u64;
++    if kept_barcodes.is_empty() {
++        listed_reads = hm.iter().map(|entry| *entry.value()).sum();
++        for (&barcode, &count) in &unmatched_bc {
++            let rc = needletail::bitkmer::reverse_complement((barcode, barcode_len as u8));
++            if hm.contains_key(&rc.0) {
++                other_ori_reads += count;
++            }
++        }
++    }
+     for (barcode, count) in unmatched_bc {
+         *observed_counts.entry(barcode).or_insert(0) += count;
+     }
+@@ -292,6 +306,43 @@ fn process_unfiltered(
+         .write_all(meta_info_string.as_bytes())
+         .context("cannot write to generate_permit_list.json file")?;
+ 
++    // Nothing downstream can use an empty permit list: sort would write an empty
++    // BED and still succeed. Fail here instead (generate_permit_list.json above
++    // keeps the correction stats) and say what to check.
++    if kept_barcodes.is_empty() {
++        let (ori, other_ori) = if gpl_opts.rc {
++            ("rc", "fw")
++        } else {
++            ("fw", "rc")
++        };
++        let total_reads: u64 = observed_counts.values().sum();
++        // Only suggest the other orientation when it clearly fits: a wrong
++        // permit list also matches a few reads in the other orientation by
++        // chance, and flipping the orientation would not fix that.
++        if other_ori_reads > listed_reads && 2 * other_ori_reads >= total_reads {
++            bail!(
++                "no cell barcodes were retained: {} of the {} mapped reads have a barcode in the permit list with --permit-bc-ori {}, but {} ({:.2}%) have one with --permit-bc-ori {}. The barcode orientation is probably wrong; re-run generate-permit-list with --permit-bc-ori {} (with `simpleaf atac process`, pass --permit-barcode-ori {}).",
++                listed_reads,
++                total_reads,
++                ori,
++                other_ori_reads,
++                100.0 * other_ori_reads as f64 / total_reads as f64,
++                other_ori,
++                other_ori,
++                other_ori
++            );
++        }
++        bail!(
++            "no cell barcodes were retained: {} of the {} mapped reads have a barcode in the permit list with --permit-bc-ori {} ({} with --permit-bc-ori {}), and no barcode has at least --min-reads {} reads. Check that the permit list matches the chemistry, and the barcode orientation (--permit-bc-ori; --permit-barcode-ori with `simpleaf atac process`).",
++            listed_reads,
++            total_reads,
++            ori,
++            other_ori_reads,
++            other_ori,
++            min_freq
++        );
++    }
++
+     info!(
+         log,
+         "total number of distinct corrected barcodes : {}",
+@@ -369,16 +420,18 @@ pub fn generate_permit_list(gpl_opts: GenPermitListOpts) -> anyhow::Result<u64>
+     let nworkers: usize = gpl_opts.threads.saturating_sub(1).max(1);
+     // open the input rad file and get the total file length from metadata to support
+     // a progress bar
+-    let i_file = File::open(i_dir.join("map.rad")).context("could not open input rad file")?;
++    let rad_path = i_dir.join("map.rad");
++    let i_file = File::open(&rad_path).context("could not open input rad file")?;
+     let metadata = i_file.metadata()?;
+     let file_len = metadata.len();
+ 
+     let ifile = BufReader::new(i_file);
+     let mut rad_reader =
+-        libradicl::readers::ParallelRadReader::<AtacSeqReadRecord, BufReader<File>>::new(
++        libradicl::readers::ParallelRadReader::<AtacSeqReadRecord, BufReader<File>>::try_new(
+             ifile,
+             NonZeroUsize::new(nworkers).unwrap(),
+-        );
++        )
++        .with_context(|| format!("could not read the RAD header of {}", rad_path.display()))?;
+ 
+     let hdr = &rad_reader.prelude.hdr;
+     info!(
+diff --git a/src/atac/deduplicate.rs b/src/atac/deduplicate.rs
+index f5a4937..7d1dc2d 100644
+--- a/src/atac/deduplicate.rs
++++ b/src/atac/deduplicate.rs
+@@ -101,8 +101,12 @@ pub fn do_deduplicate<T: BufRead>(mut br: T, dedup_opts: DeduplicateOpts) -> any
+         1
+     };
+ 
+-    let prelude = RadPrelude::from_bytes(&mut br).unwrap();
+-    let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br).unwrap();
++    let prelude =
++        RadPrelude::from_bytes(&mut br).context("could not read the collated RAD header")?;
++    let file_tag_map = prelude
++        .file_tags
++        .parse_tags_from_bytes(&mut br)
++        .context("could not read the file-level tags of the collated RAD file")?;
+     let log = &dedup_opts.log;
+ 
+     let hdr = &prelude.hdr;
+diff --git a/src/atac/run.rs b/src/atac/run.rs
+index a36d7f9..c75f388 100644
+--- a/src/atac/run.rs
++++ b/src/atac/run.rs
+@@ -7,7 +7,7 @@ use crate::atac::sort::sort;
+ use crate::barcode_correction::{BarcodeNeighborhood, Confidence};
+ use crate::prog_opts::CellBarcodeCorrectionStrategy;
+ use crate::utils::enforce_thread_floor;
+-use anyhow::bail;
++use anyhow::{Context, bail};
+ use clap::ArgMatches;
+ use slog::{Logger, crit, warn};
+ use std::path::PathBuf;
+@@ -102,7 +102,7 @@ pub fn run(opts: &ArgMatches, version: &str, cmdline: &str, log: &Logger) -> any
+             version,
+             log,
+         )
+-        .expect("could not collate.");
++        .with_context(|| format!("could not collate the RAD file in {}", rad_dir.display()))?;
+     }
+ 
+     if let Some(t) = opts.subcommand_matches("sort") {
+@@ -122,7 +122,7 @@ pub fn run(opts: &ArgMatches, version: &str, cmdline: &str, log: &Logger) -> any
+             version,
+             log,
+         )
+-        .expect("could not sort.");
++        .with_context(|| format!("could not sort the RAD file in {}", rad_dir.display()))?;
+     }
+ 
+     if let Some(t) = opts.subcommand_matches("deduplicate") {
+@@ -151,12 +151,12 @@ pub fn run(opts: &ArgMatches, version: &str, cmdline: &str, log: &Logger) -> any
+         let col_json_path = parent.join("collate.json");
+ 
+         if json_path.exists() && col_json_path.exists() {
+-            match deduplicate(dedup_opts) {
+-                Ok(_) => {}
+-                Err(_e) => {
+-                    panic!("Could not dedupicate rad file");
+-                }
+-            };
++            deduplicate(dedup_opts).with_context(|| {
++                format!(
++                    "could not deduplicate the collated RAD file in {}",
++                    input_dir.display()
++                )
++            })?;
+         } else {
+             crit!(
+                 log,
+diff --git a/src/cellfilter.rs b/src/cellfilter.rs
+index 46555f3..ea8c85b 100644
+--- a/src/cellfilter.rs
++++ b/src/cellfilter.rs
+@@ -182,6 +182,9 @@ fn buffer_count(
+     }
+ }
+ 
++/// The fewest distinct cell barcodes `knee_finding::get_knee` can process.
++const MIN_KNEE_BARCODES: usize = 3;
++
+ struct MultiSampleCellOutput {
+     sample_idx: usize,
+     num_cells: u64,
+@@ -220,11 +223,27 @@ fn compile_multi_sample_cell_output(
+     // Preserve the historical multi-sample output contract: unused samples
+     // have metadata/directories but no empty permit files. The compiled plan
+     // remains total so its empty lookup rejects any such records directly.
+-    if cell_hist.is_empty() {
+-        warn!(
+-            log,
+-            "Sample '{}' has no reads — skipping permit list generation", sample_name
+-        );
++    //
++    // Knee finding needs at least three distinct barcodes (with fewer, its
++    // refinement step is left with a single point), so in knee mode a sample
++    // with only one or two, typically a few stray reads in an unused sample of
++    // a large multiplexed run, is skipped the same way and retains no cells.
++    let too_few_for_knee = matches!(filter_method, CellFilterMethod::KneeFinding)
++        && cell_hist.len() < MIN_KNEE_BARCODES;
++    if cell_hist.is_empty() || too_few_for_knee {
++        if cell_hist.is_empty() {
++            warn!(
++                log,
++                "Sample '{}' has no reads — skipping permit list generation", sample_name
++            );
++        } else {
++            warn!(
++                log,
++                "Sample '{}' has only {} distinct cell barcode(s), too few for knee finding — skipping permit list generation",
++                sample_name,
++                cell_hist.len()
++            );
++        }
+         return Ok(MultiSampleCellOutput {
+             sample_idx,
+             num_cells: 0,
+@@ -546,6 +565,15 @@ fn process_filtered(
+         "cell barcode",
+         log,
+     )?;
++    if matches!(filter_meth, CellFilterMethod::KneeFinding)
++        && (1..MIN_KNEE_BARCODES).contains(&hm.len())
++    {
++        bail!(
++            "knee finding needs at least {} distinct cell barcodes, but only {} were observed; check the mapping rate and the chemistry, or select cells with --force-cells, --expect-cells or --unfiltered-pl instead",
++            MIN_KNEE_BARCODES,
++            hm.len()
++        );
++    }
+     let mut valid_barcodes = select_retained_barcodes(&hm, filter_meth, 0, barcode_len, log);
+     valid_barcodes.sort_unstable();
+     valid_barcodes.dedup();
+@@ -689,8 +717,18 @@ pub fn generate_permit_list(gpl_opts: GenPermitListOpts) -> anyhow::Result<u64>
+         anyhow::bail!("execution terminated because input RAD path does not exist.");
+     }
+ 
+-    let prelude = RadPrelude::from_bytes(&mut ifile).unwrap();
+-    let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut ifile).unwrap();
++    let rad_path = i_dir.join("map.rad");
++    let prelude = RadPrelude::from_bytes(&mut ifile)
++        .with_context(|| format!("could not read the RAD header of {}", rad_path.display()))?;
++    let file_tag_map = prelude
++        .file_tags
++        .parse_tags_from_bytes(&mut ifile)
++        .with_context(|| {
++            format!(
++                "could not read the file-level tags of {}",
++                rad_path.display()
++            )
++        })?;
+     let rec_type = afutils::get_record_type_from_prelude(&prelude, &file_tag_map)?;
+ 
+     match rec_type {
+diff --git a/src/convert.rs b/src/convert.rs
+index 66d10eb..233ca9a 100644
+--- a/src/convert.rs
++++ b/src/convert.rs
+@@ -7,7 +7,7 @@
+  * License: 3-clause BSD, see https://opensource.org/licenses/BSD-3-Clause
+  */
+ 
+-use anyhow::bail;
++use anyhow::{Context, bail};
+ use indicatif::{ProgressBar, ProgressStyle};
+ use slog::{crit, info};
+ 
+@@ -590,53 +590,54 @@ where
+     Ok(())
+ }
+ 
+-pub fn view<P>(rad_file: P, print_header: bool, log: &slog::Logger)
++pub fn view<P>(rad_file: P, print_header: bool, log: &slog::Logger) -> anyhow::Result<()>
+ where
+     P: AsRef<Path>,
+ {
+-    let _read_num = view2(rad_file, print_header, log).unwrap();
++    let _read_num = view2(rad_file, print_header, log)?;
++    Ok(())
+ }
+ pub fn view2<P>(rad_file: P, print_header: bool, log: &slog::Logger) -> anyhow::Result<u64>
+ where
+     P: AsRef<Path>,
+ {
+-    let i_file = File::open(rad_file).unwrap();
++    let rad_path = rad_file.as_ref();
++    let i_file = File::open(rad_path)
++        .with_context(|| format!("could not open the RAD file {}", rad_path.display()))?;
+     let mut br = BufReader::new(i_file);
+-    let prelude = RadPrelude::from_bytes(&mut br)?;
++    let prelude = RadPrelude::from_bytes(&mut br)
++        .with_context(|| format!("could not read the RAD header of {}", rad_path.display()))?;
+     let hdr = &prelude.hdr;
+-    let rl_tags = &prelude.read_tags;
+-
+-    // right now, we only handle BC and UMI types of U8—U64, so validate that
+-    const BNAME: &str = "b";
+-    const UNAME: &str = "u";
+-
+-    let mut bct: Option<RadType> = None;
+-    let mut umit: Option<RadType> = None;
+-
+-    for rt in &rl_tags.tags {
+-        // if this is one of our tags
+-        if rt.name == BNAME || rt.name == UNAME {
+-            if !rt.typeid.is_int_type() {
+-                crit!(
+-                    log,
+-                    "currently only RAD types 1--4 are supported for 'b' and 'u' tags."
+-                );
+-                std::process::exit(libradicl::exit_codes::EXIT_UNSUPPORTED_TAG_TYPE);
+-            }
+ 
+-            if rt.name == BNAME {
+-                bct = Some(rt.typeid);
+-            }
+-            if rt.name == UNAME {
+-                umit = Some(rt.typeid);
+-            }
++    let file_tag_map = prelude
++        .file_tags
++        .parse_tags_from_bytes(&mut br)
++        .with_context(|| {
++            format!(
++                "could not read the file-level tags of {}",
++                rad_path.display()
++            )
++        })?;
++    info!(log, "File-level tag map {:?}", file_tag_map);
++
++    // `view` prints the single-barcode scRNA-seq layout (one cell barcode and one
++    // UMI per read), so name the layout of any other file rather than failing on
++    // its tags. The barcode and UMI tag types are validated by the record context
++    // below.
++    let unsupported = match crate::utils::get_record_type_from_prelude(&prelude, &file_tag_map)? {
++        crate::utils::KnownRecordType::RnaShortMultiBC(..) => {
++            Some("a multi-barcode (e.g. 10x Flex)")
+         }
++        crate::utils::KnownRecordType::AtacSeq(_) => Some("a scATAC-seq"),
++        _ => None,
++    };
++    if let Some(layout) = unsupported {
++        bail!(
++            "`alevin-fry view` supports only single-barcode scRNA-seq RAD files, but {} is {} RAD file",
++            rad_path.display(),
++            layout
++        );
+     }
+-    assert!(bct.is_some(), "barcode type tag was missing!");
+-    assert!(umit.is_some(), "umi type tag was missing!");
+-
+-    let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br)?;
+-    info!(log, "File-level tag map {:?}", file_tag_map);
+ 
+     // Barcode/UMI lengths: role-declared if present, else the cblen/ulen file tags
+     // (shared resolver, prefers role and warns on disagreement).
+@@ -656,7 +657,14 @@ where
+     )?;
+ 
+     let mut num_reads: u64 = 0;
+-    let record_context = prelude.get_record_context_prefer_roles::<AlevinFryRecordContext>()?;
++    let record_context = prelude
++        .get_record_context_prefer_roles::<AlevinFryRecordContext>()
++        .with_context(|| {
++            format!(
++                "`alevin-fry view` supports only single-barcode scRNA-seq RAD files with an integer barcode and UMI read tag; could not read the records of {}",
++                rad_path.display()
++            )
++        })?;
+ 
+     let stdout = stdout(); // get the global stdout entity
+     let stdout_l = stdout.lock();
+diff --git a/src/main.rs b/src/main.rs
+index 0615543..3bf70b5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -591,7 +591,7 @@ fn main() -> anyhow::Result<()> {
+     if let Some(t) = opts.subcommand_matches("view") {
+         let rad_file: &PathBuf = t.get_one("rad").unwrap();
+         let print_header = t.get_flag("header");
+-        alevin_fry::convert::view(rad_file, print_header, &log)
++        alevin_fry::convert::view(rad_file, print_header, &log)?;
+     }
+ 
+     // collate a rad file to group together all records corresponding
+@@ -629,7 +629,7 @@ fn main() -> anyhow::Result<()> {
+             VERSION,
+             &log,
+         )
+-        .expect("could not collate.");
++        .with_context(|| format!("could not collate the RAD file in {}", rad_dir.display()))?;
+     }
+ 
+     // perform quantification of a collated rad file.
+@@ -819,7 +819,7 @@ fn main() -> anyhow::Result<()> {
+             output_dir,
+             &log,
+         )
+-        .expect("could not perform inference from equivalence class counts.");
++        .context("could not perform inference from equivalence class counts")?;
+     }
+     Ok(())
+ }
+diff --git a/src/quant.rs b/src/quant.rs
+index 247acf0..83c5b87 100644
+--- a/src/quant.rs
++++ b/src/quant.rs
+@@ -1741,11 +1741,6 @@ where
+                         "--umi-edit-dist 1 (cr-like Hamming-1 UMI correction) is not supported in USA mode (a spliced+unspliced tg-map); it is only meaningful for a spliced-only reference"
+                     );
+                 }
+-                assert_eq!(
+-                    num_bootstraps, 0,
+-                    "currently USA-mode (all-in-one unspliced/spliced/ambiguous) analysis cannot be used with bootstrapping."
+-                );
+-
+                 match resolution {
+                     ResolutionStrategy::Parsimony
+                     | ResolutionStrategy::ParsimonyEm
+@@ -1786,6 +1781,22 @@ where
+         tid_to_gid.len().to_formatted_string(&Locale::en)
+     );
+ 
++    // USA mode is detected from the tg-map, so main.rs cannot reject these
++    // combinations when it parses the arguments; refuse them here, before any
++    // output is written. Bootstrapping is not implemented for USA mode, and
++    // trivial resolution counts molecules per gene id, which USA mode splits
++    // into spliced, unspliced and ambiguous ids.
++    if usa_mode {
++        anyhow::ensure!(
++            num_bootstraps == 0,
++            "currently USA-mode (all-in-one unspliced/spliced/ambiguous) analysis cannot be used with bootstrapping; drop --num-bootstraps or use a 2-column tg-map."
++        );
++        anyhow::ensure!(
++            resolution != ResolutionStrategy::Trivial,
++            "--resolution trivial is not supported in USA mode (a 3-column spliced/unspliced tg-map); use another resolution, such as cr-like or cr-like-em, or a 2-column tg-map."
++        );
++    }
++
+     // read the map for the number of unmapped reads per corrected barcode
+     let bc_unmapped_map: Arc<libradicl::unmapped::CollatedUnmappedCounts> = Arc::new(
+         libradicl::unmapped::CollatedUnmappedCounts::read_from_file(
+@@ -2359,7 +2370,10 @@ where
+ pub fn do_quantify_dispatch<T: BufRead>(mut br: T, quant_opts: QuantOpts) -> anyhow::Result<()> {
+     let log = quant_opts.log;
+     let prelude = RadPrelude::from_bytes(&mut br)?;
+-    let file_tag_map = prelude.file_tags.parse_tags_from_bytes(&mut br).unwrap();
++    let file_tag_map = prelude
++        .file_tags
++        .parse_tags_from_bytes(&mut br)
++        .context("could not read the file-level tags of the collated RAD file")?;
+ 
+     let rec_type = afutils::get_record_type_from_prelude(&prelude, &file_tag_map)?;
+ 
+diff --git a/tests/atac_integration.rs b/tests/atac_integration.rs
+index 7e961b0..9b55020 100644
+--- a/tests/atac_integration.rs
++++ b/tests/atac_integration.rs
+@@ -670,3 +670,164 @@ fn atac_deduplicate_matches_across_compression() {
+         "lz4 per-chunk collation produced different fragments than the uncompressed path"
+     );
+ }
++
++/// Run generate-permit-list on a fresh fixture whose whitelist holds
++/// `whitelist`, in the orientation `rc` selects, returning its result and the
++/// output directory.
++fn permit_list_with(
++    tmp: &Path,
++    whitelist: impl FnOnce(&[u64]) -> Vec<u64>,
++    rc: bool,
++    log: &slog::Logger,
++) -> (anyhow::Result<u64>, PathBuf) {
++    let rad_dir = tmp.join("rad");
++    let gpl_dir = tmp.join("gpl");
++    std::fs::create_dir_all(&rad_dir).unwrap();
++    let mix = CellMix {
++        good: 6,
++        unmapped: 0,
++        multimapped: 0,
++    };
++    let barcodes = create_synthetic_atac_rad(&rad_dir.join("map.rad"), 4, &mix);
++    let wl_path = tmp.join("whitelist.txt");
++    write_whitelist(&wl_path, &whitelist(&barcodes));
++    let gpl_opts = GenPermitListOpts::builder()
++        .input_dir(&rad_dir)
++        .output_dir(&gpl_dir)
++        .fmeth(CellFilterMethod::UnfilteredExternalList(wl_path, 1))
++        .threads(2)
++        .rc(rc)
++        .cmdline("atac_integration_test")
++        .version(TEST_VERSION)
++        .log(log)
++        .build();
++    (generate_permit_list(gpl_opts), gpl_dir)
++}
++
++/// With the wrong `--permit-bc-ori` no barcode matches the permit list. That
++/// used to succeed with an empty permit list, and `atac sort` then wrote an
++/// empty BED and succeeded too. It is now an error that names the orientation
++/// that does match, and generate_permit_list.json still records the stats.
++#[test]
++fn atac_gpl_that_keeps_no_barcode_is_an_error() {
++    let log = make_test_logger();
++
++    let tmp = tempfile::tempdir().unwrap();
++    let (res, gpl_dir) = permit_list_with(tmp.path(), |bcs| bcs.to_vec(), true, &log);
++    let msg = format!("{:#}", res.expect_err("wrong orientation"));
++    assert!(msg.contains("no cell barcodes were retained"), "{msg}");
++    assert!(
++        msg.contains("re-run generate-permit-list with --permit-bc-ori fw"),
++        "{msg}"
++    );
++    assert!(gpl_dir.join("generate_permit_list.json").exists());
++
++    // Nothing matches in either orientation: no orientation to suggest.
++    let tmp = tempfile::tempdir().unwrap();
++    let (res, _) = permit_list_with(
++        tmp.path(),
++        |bcs| bcs.iter().map(|bc| bc ^ 0b11).collect(),
++        false,
++        &log,
++    );
++    let msg = format!("{:#}", res.expect_err("unrelated whitelist"));
++    assert!(msg.contains("no cell barcodes were retained"), "{msg}");
++    assert!(!msg.contains("re-run"), "{msg}");
++
++    // Only a minority of reads (1 of 4 cells) match in the other orientation,
++    // as a wrong permit list can by chance: report the counts, but do not
++    // suggest flipping the orientation.
++    let tmp = tempfile::tempdir().unwrap();
++    let (res, _) = permit_list_with(
++        tmp.path(),
++        |bcs| {
++            let mut wl = vec![bcs[0]];
++            wl.extend(bcs[1..].iter().map(|bc| bc ^ 0b11));
++            wl
++        },
++        true,
++        &log,
++    );
++    let msg = format!("{:#}", res.expect_err("mostly unrelated whitelist"));
++    assert!(msg.contains("no cell barcodes were retained"), "{msg}");
++    assert!(
++        msg.contains("0 of the 24 mapped reads have a barcode in the permit list with --permit-bc-ori rc (6 with --permit-bc-ori fw)"),
++        "{msg}"
++    );
++    assert!(!msg.contains("re-run"), "{msg}");
++
++    // The right orientation is unaffected.
++    let tmp = tempfile::tempdir().unwrap();
++    let (res, _) = permit_list_with(tmp.path(), |bcs| bcs.to_vec(), false, &log);
++    res.expect("matching orientation");
++}
++
++/// An unreadable map.rad is an error naming the file from generate-permit-list,
++/// and an unreadable collated RAD is one from deduplicate; both used to panic.
++#[test]
++fn atac_unreadable_rad_is_an_error() {
++    let log = make_test_logger();
++    let tmp = tempfile::tempdir().unwrap();
++    let rad_dir = tmp.path().join("rad");
++    std::fs::create_dir_all(&rad_dir).unwrap();
++    File::create(rad_dir.join("map.rad")).unwrap();
++    let wl_path = tmp.path().join("whitelist.txt");
++    write_whitelist(&wl_path, &[make_packed_bc(1, CELL_BC_LEN)]);
++    let gpl_dir = tmp.path().join("gpl");
++    let gpl_opts = GenPermitListOpts::builder()
++        .input_dir(&rad_dir)
++        .output_dir(&gpl_dir)
++        .fmeth(CellFilterMethod::UnfilteredExternalList(wl_path, 1))
++        .threads(2)
++        .rc(false)
++        .cmdline("atac_integration_test")
++        .version(TEST_VERSION)
++        .log(&log)
++        .build();
++    let msg = format!(
++        "{:#}",
++        generate_permit_list(gpl_opts).expect_err("empty map.rad")
++    );
++    assert!(
++        msg.contains(&format!("{}", rad_dir.join("map.rad").display())),
++        "{msg}"
++    );
++
++    File::create(gpl_dir.join("map.collated.rad")).unwrap();
++    let opts = DeduplicateOpts::builder()
++        .input_dir(&gpl_dir)
++        .num_threads(2)
++        .rev(false)
++        .cmdline("atac_integration_test")
++        .version(TEST_VERSION)
++        .log(&log)
++        .build();
++    let msg = format!("{:#}", deduplicate(opts).expect_err("empty collated RAD"));
++    assert!(
++        msg.contains("could not read the collated RAD header"),
++        "{msg}"
++    );
++}
++
++/// `view` prints only the single-barcode scRNA-seq layout; on an ATAC RAD it
++/// returns an error that says so.
++#[test]
++fn view_rejects_atac_rad() {
++    let log = make_test_logger();
++    let tmp = tempfile::tempdir().unwrap();
++    let rad = tmp.path().join("map.rad");
++    create_synthetic_atac_rad(
++        &rad,
++        2,
++        &CellMix {
++            good: 2,
++            unmapped: 0,
++            multimapped: 0,
++        },
++    );
++    let msg = format!(
++        "{:#}",
++        alevin_fry::convert::view(&rad, false, &log).expect_err("ATAC view")
++    );
++    assert!(msg.contains("scATAC-seq"), "{msg}");
++}
+diff --git a/tests/error_paths_integration.rs b/tests/error_paths_integration.rs
+new file mode 100644
+index 0000000..1246b22
+--- /dev/null
++++ b/tests/error_paths_integration.rs
+@@ -0,0 +1,558 @@
++//! Integration tests for inputs alevin-fry must reject with an error rather
++//! than a panic.
++//!
++//! Release builds set `panic = "abort"`, so every panic on user input is a
++//! SIGABRT with a core dump and a "panicked at" frame instead of a one-line
++//! error and exit status 1. Each test below feeds one such input: a RAD file
++//! that is too new, truncated or empty, a resolution or bootstrap request USA
++//! mode cannot honour, a multi-sample knee run where a sample has only one or
++//! two cell barcodes, and `view` / `collate` invocations that used to end in an
++//! `unwrap` or `expect`. The library entry points are called directly where
++//! they return the error; the binary is run where the error has to make it out
++//! of `main`. Test builds unwind instead of aborting, so a regression shows up
++//! as exit status 101 there.
++
++use std::fs::File;
++use std::io::{BufWriter, Write};
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++use libradicl::chunk::Chunk;
++use libradicl::codec::ChunkCodec;
++use libradicl::header::{RadHeader, RadPrelude, SpecVersion};
++use libradicl::rad_types::{
++    RadIntId, RadType, TagDesc, TagMap, TagSection, TagSectionLabel, TagValue,
++};
++use libradicl::record::{
++    AlevinFryReadRecord, AlevinFryRecordContext, MultiBarcodeReadRecord, MultiBarcodeRecordContext,
++    RecordContext,
++};
++use libradicl::writers::RadFileWriter;
++use smallvec::smallvec;
++
++use alevin_fry::cellfilter::{CellFilterMethod, generate_permit_list};
++use alevin_fry::collate::collate;
++use alevin_fry::prog_opts::{GenPermitListOpts, QuantOpts, SampleCorrectionMode};
++use alevin_fry::quant::{ResolutionStrategy, SplicedAmbiguityModel, quantify};
++use bio_types::strand::Strand;
++
++/// Spliced/unspliced reference pairs: `tx{2g}` is gene `g` spliced and
++/// `tx{2g+1}` its unspliced counterpart.
++const NUM_GENES: u64 = 3;
++const NUM_REFS: u64 = 2 * NUM_GENES;
++const CELL_BC_LEN: u16 = 16;
++const UMI_LEN: u16 = 12;
++const SAMPLE_BC_LEN: u16 = 8;
++// The real version: quant rejects multi-sample collations written before 0.15.0.
++const TEST_VERSION: &str = env!("CARGO_PKG_VERSION");
++
++fn packed(idx: u64, len: u16) -> u64 {
++    let mask = (1u64 << (2 * len as u64)) - 1;
++    idx.wrapping_mul(2654435761) & mask
++}
++
++/// Render a packed barcode as nucleotides, first base in the most significant
++/// bit pair (the `needletail::bitkmer` layout the barcode lists are read with).
++fn packed_to_nuc(packed: u64, len: usize) -> String {
++    const NUCS: [char; 4] = ['A', 'C', 'G', 'T'];
++    (0..len)
++        .map(|i| NUCS[((packed >> (2 * (len - 1 - i))) & 3) as usize])
++        .collect()
++}
++
++fn make_test_logger() -> slog::Logger {
++    if std::env::var("AF_TEST_VERBOSE").is_ok() {
++        let decorator = slog_term::PlainDecorator::new(slog_term::TestStdoutWriter);
++        let drain = slog_term::CompactFormat::new(decorator).build();
++        let drain = std::sync::Mutex::new(drain);
++        let drain = slog::Fuse::new(drain);
++        return slog::Logger::root(drain, slog::o!());
++    }
++    slog::Logger::root(slog::Discard, slog::o!())
++}
++
++/// The full error chain, as `main` prints it.
++fn chain(err: &anyhow::Error) -> String {
++    format!("{err:#}")
++}
++
++/// Write a versioned (spec major 2) single-barcode RAD with `b`/`u` read tags.
++/// `reads_per_cell[i]` reads carry cell barcode `i`, cycling over the references.
++fn write_single_bc_rad(path: &Path, reads_per_cell: &[usize]) {
++    let hdr = RadHeader {
++        version: SpecVersion::current(),
++        is_paired: 0,
++        ref_count: NUM_REFS,
++        ref_names: (0..NUM_REFS).map(|i| format!("tx{i}")).collect(),
++        num_chunks: 0, // backpatched by RadFileWriter
++    };
++    let mut file_tags = TagSection::new_with_label(TagSectionLabel::FileTags);
++    file_tags.add_tag_desc(TagDesc::new("cblen", RadType::Int(RadIntId::U16)));
++    file_tags.add_tag_desc(TagDesc::new("ulen", RadType::Int(RadIntId::U16)));
++    let mut read_tags = TagSection::new_with_label(TagSectionLabel::ReadTags);
++    read_tags.add_tag_desc(TagDesc::new("b", RadType::Int(RadIntId::U32)));
++    read_tags.add_tag_desc(TagDesc::new("u", RadType::Int(RadIntId::U32)));
++    let mut aln_tags = TagSection::new_with_label(TagSectionLabel::AlignmentTags);
++    aln_tags.add_tag_desc(TagDesc::new(
++        "compressed_ori_refid",
++        RadType::Int(RadIntId::U32),
++    ));
++    let prelude = RadPrelude::from_header_and_tag_sections(hdr, file_tags, read_tags, aln_tags);
++    let mut file_tag_map = TagMap::with_keyset(&prelude.file_tags.tags);
++    file_tag_map.add(TagValue::U16(CELL_BC_LEN));
++    file_tag_map.add(TagValue::U16(UMI_LEN));
++
++    let ctx = AlevinFryRecordContext::get_context_from_tag_section(
++        &prelude.file_tags,
++        &prelude.read_tags,
++        &prelude.aln_tags,
++    )
++    .unwrap();
++    let mut fw = RadFileWriter::new(File::create(path).unwrap(), &prelude, &file_tag_map).unwrap();
++    for (cell, &nreads) in reads_per_cell.iter().enumerate() {
++        let reads: Vec<_> = (0..nreads)
++            .map(|r| AlevinFryReadRecord {
++                bc: packed(cell as u64 + 1, CELL_BC_LEN),
++                umi: packed((cell * 1000 + r) as u64, UMI_LEN),
++                dirs: vec![true],
++                refs: vec![(r as u64 % NUM_REFS) as u32],
++            })
++            .collect();
++        let chunk = Chunk::<AlevinFryReadRecord> {
++            nbytes: 0,
++            nrec: reads.len() as u32,
++            reads,
++        };
++        fw.write_chunk(&chunk, &ctx).unwrap();
++    }
++    fw.finalize().unwrap();
++}
++
++/// Write a two-level (sample, cell) multi-barcode RAD. `samples[s]` lists the
++/// read count of each cell of sample `s`; sample `s` has sample barcode
++/// `sample_bc(s)`.
++fn write_multi_bc_rad(path: &Path, samples: &[Vec<usize>]) {
++    let hdr = RadHeader {
++        version: SpecVersion::Legacy,
++        is_paired: 0,
++        ref_count: NUM_REFS,
++        ref_names: (0..NUM_REFS).map(|i| format!("tx{i}")).collect(),
++        num_chunks: 0,
++    };
++    let mut file_tags = TagSection::new_with_label(TagSectionLabel::FileTags);
++    for name in ["num_barcodes", "b0len", "b1len", "ulen"] {
++        file_tags.add_tag_desc(TagDesc::new(name, RadType::Int(RadIntId::U16)));
++    }
++    file_tags.add_tag_desc(TagDesc::new("known_rad_type", RadType::String));
++    let mut read_tags = TagSection::new_with_label(TagSectionLabel::ReadTags);
++    for name in ["b0", "b1", "u"] {
++        read_tags.add_tag_desc(TagDesc::new(name, RadType::Int(RadIntId::U32)));
++    }
++    let mut aln_tags = TagSection::new_with_label(TagSectionLabel::AlignmentTags);
++    aln_tags.add_tag_desc(TagDesc::new(
++        "compressed_ori_refid",
++        RadType::Int(RadIntId::U32),
++    ));
++    let prelude = RadPrelude::from_header_and_tag_sections(hdr, file_tags, read_tags, aln_tags);
++    let mut file_tag_map = TagMap::with_keyset(&prelude.file_tags.tags);
++    file_tag_map.add(TagValue::U16(2));
++    file_tag_map.add(TagValue::U16(SAMPLE_BC_LEN));
++    file_tag_map.add(TagValue::U16(CELL_BC_LEN));
++    file_tag_map.add(TagValue::U16(UMI_LEN));
++    file_tag_map.add(TagValue::String("sc_rna_multi_bc".to_string()));
++
++    let ctx = MultiBarcodeRecordContext::get_context_from_tag_section(
++        &prelude.file_tags,
++        &prelude.read_tags,
++        &prelude.aln_tags,
++    )
++    .unwrap();
++    let mut fw = RadFileWriter::new(File::create(path).unwrap(), &prelude, &file_tag_map).unwrap();
++    for (s, cells) in samples.iter().enumerate() {
++        for (cell, &nreads) in cells.iter().enumerate() {
++            let cell_bc = packed((s * 1000 + cell) as u64 + 1, CELL_BC_LEN);
++            let reads: Vec<_> = (0..nreads)
++                .map(|r| MultiBarcodeReadRecord {
++                    barcodes: smallvec![sample_bc(s), cell_bc],
++                    umi: packed((s * 100_000 + cell * 100 + r) as u64, UMI_LEN),
++                    dirs: vec![true],
++                    refs: vec![(r as u64 % NUM_REFS) as u32],
++                })
++                .collect();
++            let chunk = Chunk::<MultiBarcodeReadRecord> {
++                nbytes: 0,
++                nrec: reads.len() as u32,
++                reads,
++            };
++            fw.write_chunk(&chunk, &ctx).unwrap();
++        }
++    }
++    fw.finalize().unwrap();
++}
++
++fn sample_bc(s: usize) -> u64 {
++    packed(100 * (s as u64 + 1), SAMPLE_BC_LEN)
++}
++
++/// A named sample list (`barcode<TAB>name`) for samples `0..n`.
++fn write_sample_list(path: &Path, n: usize) {
++    let mut f = BufWriter::new(File::create(path).unwrap());
++    for s in 0..n {
++        writeln!(
++            f,
++            "{}\tsample{s}",
++            packed_to_nuc(sample_bc(s), SAMPLE_BC_LEN as usize)
++        )
++        .unwrap();
++    }
++}
++
++fn single_gpl_opts<'a>(
++    rad_dir: &'a PathBuf,
++    out_dir: &'a PathBuf,
++    fmeth: CellFilterMethod,
++    log: &'a slog::Logger,
++) -> GenPermitListOpts<'a, 'a, 'a, 'a, 'a> {
++    GenPermitListOpts::builder()
++        .input_dir(rad_dir)
++        .output_dir(out_dir)
++        .fmeth(fmeth)
++        .expected_ori(Strand::Unknown)
++        .version(TEST_VERSION)
++        .threads(2)
++        .velo_mode(false)
++        .cmdline("test")
++        .log(log)
++        .build()
++}
++
++fn multi_gpl_opts<'a>(
++    rad_dir: &'a PathBuf,
++    out_dir: &'a PathBuf,
++    fmeth: CellFilterMethod,
++    sample_list: PathBuf,
++    log: &'a slog::Logger,
++) -> GenPermitListOpts<'a, 'a, 'a, 'a, 'a> {
++    GenPermitListOpts::builder()
++        .input_dir(rad_dir)
++        .output_dir(out_dir)
++        .fmeth(fmeth)
++        .expected_ori(Strand::Unknown)
++        .version(TEST_VERSION)
++        .threads(2)
++        .velo_mode(false)
++        .cmdline("test")
++        .log(log)
++        .sample_bc_list(Some(sample_list))
++        .sample_names(None)
++        .sample_correction_mode(SampleCorrectionMode::Exact)
++        .build()
++}
++
++/// A RAD written by a newer spec major, a truncated one and an empty one are
++/// all errors from generate-permit-list that name the file, and the version
++/// error keeps libradicl's "newer than supported" wording.
++#[test]
++fn gpl_rejects_unreadable_rad_header_with_an_error() {
++    let tmp = tempfile::tempdir().unwrap();
++    let log = make_test_logger();
++    let good = tmp.path().join("good.rad");
++    write_single_bc_rad(&good, &[5, 5, 5]);
++    let bytes = std::fs::read(&good).unwrap();
++    assert_eq!(&bytes[..8], b"RAD_FILE");
++
++    let mut too_new = bytes.clone();
++    too_new[8] = 3; // spec major
++    let cases: [(&str, Vec<u8>, &str); 3] = [
++        (
++            "too_new",
++            too_new,
++            "RAD spec major version 3 is newer than supported",
++        ),
++        (
++            "truncated",
++            bytes[..12].to_vec(),
++            "failed to fill whole buffer",
++        ),
++        ("empty", Vec::new(), "failed to fill whole buffer"),
++    ];
++    for (name, data, cause) in cases {
++        let rad_dir = tmp.path().join(name);
++        std::fs::create_dir_all(&rad_dir).unwrap();
++        std::fs::write(rad_dir.join("map.rad"), data).unwrap();
++        let out_dir = tmp.path().join(format!("{name}_out"));
++        let err = generate_permit_list(single_gpl_opts(
++            &rad_dir,
++            &out_dir,
++            CellFilterMethod::ForceCells(3),
++            &log,
++        ))
++        .expect_err(name);
++        let msg = chain(&err);
++        assert!(
++            msg.contains(&format!("{}", rad_dir.join("map.rad").display())),
++            "{name}: {msg}"
++        );
++        assert!(msg.contains(cause), "{name}: {msg}");
++    }
++}
++
++/// USA mode (a 3-column tg-map) supports neither trivial resolution nor
++/// bootstrapping; both are refused before any output is written, and an
++/// allowed resolution still quantifies.
++#[test]
++fn usa_mode_rejects_trivial_resolution_and_bootstraps() {
++    let tmp = tempfile::tempdir().unwrap();
++    let log = make_test_logger();
++    let rad_dir = tmp.path().join("rad");
++    let gpl_dir = tmp.path().join("gpl");
++    std::fs::create_dir_all(&rad_dir).unwrap();
++    write_single_bc_rad(&rad_dir.join("map.rad"), &[12, 9, 7]);
++    generate_permit_list(single_gpl_opts(
++        &rad_dir,
++        &gpl_dir,
++        CellFilterMethod::ForceCells(3),
++        &log,
++    ))
++    .unwrap();
++    collate(
++        gpl_dir.clone(),
++        &rad_dir,
++        2,
++        1_000,
++        ChunkCodec::None,
++        "test",
++        TEST_VERSION,
++        &log,
++    )
++    .unwrap();
++
++    let usa_tg_map = tmp.path().join("t2g_3col.tsv");
++    let mut f = BufWriter::new(File::create(&usa_tg_map).unwrap());
++    for g in 0..NUM_GENES {
++        writeln!(f, "tx{}\tgene{g}\tS", 2 * g).unwrap();
++        writeln!(f, "tx{}\tgene{g}\tU", 2 * g + 1).unwrap();
++    }
++    drop(f);
++
++    let quant = |resolution: ResolutionStrategy, num_bootstraps: u32, out: &PathBuf| {
++        quantify(
++            QuantOpts::builder()
++                .input_dir(&gpl_dir)
++                .tg_map(&usa_tg_map)
++                .output_dir(out)
++                .num_threads(2)
++                .num_bootstraps(num_bootstraps)
++                .init_uniform(false)
++                .summary_stat(false)
++                .dump_eq(false)
++                .resolution(resolution)
++                .pug_exact_umi(false)
++                .sa_model(SplicedAmbiguityModel::WinnerTakeAll)
++                .small_thresh(0)
++                .large_graph_thresh(0)
++                .filter_list(None)
++                .cmdline("test")
++                .version(TEST_VERSION)
++                .log(&log)
++                .build(),
++        )
++    };
++
++    let out = tmp.path().join("q_trivial");
++    let err = quant(ResolutionStrategy::Trivial, 0, &out).expect_err("trivial in USA mode");
++    assert!(
++        chain(&err).contains("--resolution trivial is not supported in USA mode"),
++        "{err:#}"
++    );
++    assert!(!out.exists(), "a refused run must not leave partial output");
++
++    let out = tmp.path().join("q_boot");
++    let err =
++        quant(ResolutionStrategy::CellRangerLikeEm, 4, &out).expect_err("bootstraps in USA mode");
++    assert!(chain(&err).contains("bootstrapping"), "{err:#}");
++    assert!(!out.exists(), "a refused run must not leave partial output");
++
++    let out = tmp.path().join("q_crlike");
++    quant(ResolutionStrategy::CellRangerLike, 0, &out).unwrap();
++    assert!(out.join("alevin").join("quants_mat.mtx").exists());
++}
++
++/// In multi-sample knee mode a sample with only one or two distinct cell
++/// barcodes used to trip knee finding's assertion and abort the whole run. It
++/// is now skipped like an empty sample (no cells, no permit files), the other
++/// samples are filtered as before, and other filter methods still keep those
++/// barcodes.
++#[test]
++fn multi_sample_knee_skips_samples_with_too_few_barcodes() {
++    let tmp = tempfile::tempdir().unwrap();
++    let log = make_test_logger();
++    let rad_dir = tmp.path().join("rad");
++    std::fs::create_dir_all(&rad_dir).unwrap();
++    // sample0: a clear knee (8 large cells, then a tail of small ones);
++    // sample1: a single cell barcode; sample2: two.
++    let mut sample0 = vec![200; 8];
++    sample0.extend([3, 2, 2, 1, 1, 1, 1, 1]);
++    write_multi_bc_rad(&rad_dir.join("map.rad"), &[sample0, vec![40], vec![30, 20]]);
++    let sample_list = tmp.path().join("samples.tsv");
++    write_sample_list(&sample_list, 3);
++
++    let read_info = |dir: &PathBuf| -> serde_json::Value {
++        serde_json::from_reader(File::open(dir.join("sample_info.json")).unwrap()).unwrap()
++    };
++    let sample = |info: &serde_json::Value, name: &str| -> serde_json::Value {
++        info["samples"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .find(|s| s["name"] == name)
++            .unwrap_or_else(|| panic!("no {name} in sample_info.json"))
++            .clone()
++    };
++
++    let knee_dir = tmp.path().join("knee");
++    generate_permit_list(multi_gpl_opts(
++        &rad_dir,
++        &knee_dir,
++        CellFilterMethod::KneeFinding,
++        sample_list.clone(),
++        &log,
++    ))
++    .unwrap();
++    let info = read_info(&knee_dir);
++    // The knee keeps exactly the 8 large cells, as it does when sample0 is run
++    // on its own.
++    assert_eq!(sample(&info, "sample0")["num_cells"], 8);
++    assert!(
++        knee_dir
++            .join("sample_sample0")
++            .join("permit_freq.bin")
++            .exists()
++    );
++    for name in ["sample1", "sample2"] {
++        let s = sample(&info, name);
++        assert_eq!(s["num_cells"], 0, "{name}");
++        assert_eq!(s["num_reads"], 0, "{name}");
++        assert!(
++            !knee_dir
++                .join(format!("sample_{name}"))
++                .join("permit_freq.bin")
++                .exists(),
++            "{name} should have no permit files"
++        );
++    }
++
++    let force_dir = tmp.path().join("force");
++    generate_permit_list(multi_gpl_opts(
++        &rad_dir,
++        &force_dir,
++        CellFilterMethod::ForceCells(2),
++        sample_list,
++        &log,
++    ))
++    .unwrap();
++    let info = read_info(&force_dir);
++    assert_eq!(sample(&info, "sample1")["num_cells"], 1);
++    assert_eq!(sample(&info, "sample2")["num_cells"], 2);
++}
++
++/// Single-sample knee finding on one or two distinct barcodes is an error
++/// rather than an assertion failure; with none, it keeps none as before.
++#[test]
++fn single_sample_knee_with_too_few_barcodes_is_an_error() {
++    let tmp = tempfile::tempdir().unwrap();
++    let log = make_test_logger();
++    for cells in [vec![10], vec![10, 4]] {
++        let name = format!("cells{}", cells.len());
++        let rad_dir = tmp.path().join(&name);
++        std::fs::create_dir_all(&rad_dir).unwrap();
++        write_single_bc_rad(&rad_dir.join("map.rad"), &cells);
++        let out_dir = tmp.path().join(format!("{name}_out"));
++        let err = generate_permit_list(single_gpl_opts(
++            &rad_dir,
++            &out_dir,
++            CellFilterMethod::KneeFinding,
++            &log,
++        ))
++        .expect_err(&name);
++        assert!(
++            chain(&err).contains("knee finding needs at least 3 distinct cell barcodes"),
++            "{name}: {err:#}"
++        );
++    }
++}
++
++/// `view` prints only the single-barcode layout; on a multi-barcode RAD it
++/// returns an error that says so, and a too-new RAD is an error too.
++#[test]
++fn view_rejects_multi_barcode_and_unreadable_rad() {
++    let tmp = tempfile::tempdir().unwrap();
++    let log = make_test_logger();
++    let multi = tmp.path().join("multi.rad");
++    write_multi_bc_rad(&multi, &[vec![3, 2]]);
++    let err = alevin_fry::convert::view(&multi, false, &log).expect_err("multi-barcode view");
++    assert!(chain(&err).contains("multi-barcode"), "{err:#}");
++
++    let single = tmp.path().join("single.rad");
++    write_single_bc_rad(&single, &[2]);
++    let mut bytes = std::fs::read(&single).unwrap();
++    bytes[8] = 3;
++    std::fs::write(&single, bytes).unwrap();
++    let err = alevin_fry::convert::view(&single, false, &log).expect_err("too-new view");
++    assert!(
++        chain(&err).contains("RAD spec major version 3 is newer than supported"),
++        "{err:#}"
++    );
++}
++
++/// Errors from `collate` and `view` leave `main` as an error (exit status 1)
++/// instead of an `expect`/`unwrap` panic. A multi-sample permit list with no
++/// cells is the real-world trigger for collate: a sample barcode list that
++/// matches nothing.
++#[test]
++fn binary_exits_with_an_error_for_zero_cell_collate_and_multi_barcode_view() {
++    let tmp = tempfile::tempdir().unwrap();
++    let log = make_test_logger();
++    let rad_dir = tmp.path().join("rad");
++    std::fs::create_dir_all(&rad_dir).unwrap();
++    write_multi_bc_rad(&rad_dir.join("map.rad"), &[vec![5, 5, 5]]);
++    // A sample list whose only entry is a barcode no read carries.
++    let sample_list = tmp.path().join("samples.tsv");
++    std::fs::write(&sample_list, "AAAAAAAA\tnone\n").unwrap();
++    let gpl_dir = tmp.path().join("gpl");
++    let cells = generate_permit_list(multi_gpl_opts(
++        &rad_dir,
++        &gpl_dir,
++        CellFilterMethod::ForceCells(3),
++        sample_list,
++        &log,
++    ))
++    .unwrap();
++    assert_eq!(cells, 0);
++
++    let af = env!("CARGO_BIN_EXE_alevin-fry");
++    let output = Command::new(af)
++        .arg("collate")
++        .arg("-i")
++        .arg(&gpl_dir)
++        .arg("-r")
++        .arg(&rad_dir)
++        .args(["-t", "2"])
++        .output()
++        .unwrap();
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert_eq!(output.status.code(), Some(1), "{stderr}");
++    assert!(stderr.contains("could not collate"), "{stderr}");
++    assert!(!stderr.contains("panicked"), "{stderr}");
++
++    let output = Command::new(af)
++        .arg("view")
++        .arg("-r")
++        .arg(rad_dir.join("map.rad"))
++        .output()
++        .unwrap();
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert_eq!(output.status.code(), Some(1), "{stderr}");
++    assert!(stderr.contains("multi-barcode"), "{stderr}");
++    assert!(!stderr.contains("panicked"), "{stderr}");
++}

@@ -1,0 +1,457 @@
+diff --git a/docs/roadmap989-moscot.md b/docs/roadmap989-moscot.md
+new file mode 100644
+index 000000000..92e36101c
+--- /dev/null
++++ b/docs/roadmap989-moscot.md
+@@ -0,0 +1,24 @@
++# moscot integration
++
++Adds temporal optimal transport, single-cell to spatial mapping, and slice coupling. Checks convergence by default and returns native moscot problems without overwriting physical coordinates.
++
++Part of [roadmap #989](https://github.com/omicverse/omicverse/issues/989).
++
++## Usage
++
++Install the optional backend with `pip install "omicverse[moscot]"` using **Python 3.11 or later**. The optional backend has a higher Python floor than the base OmicVerse package. Importing OmicVerse does not import the backend.
++
++```python
++import omicverse as ov
++
++transport = ov.single.moscot_temporal(adata, time_key="day", joint_attr="X_pca",
++                                      solve_kwargs={"epsilon": 0.1})
++```
++
++## Contract and validation
++
++Setup, constructor and training/solver options are passed separately. Inputs and outputs are checked; existing output embeddings require explicit overwrite. Native model/problem objects are returned rather than stored in `AnnData.uns`. Backend failures propagate.
++
++Run `python -m pytest tests/test_backend_validation.py tests/test_roadmap989_moscot.py -q`. Integration tests require the real backend; skipped tests do not establish real execution. Small synthetic training runs check execution and output contracts, not convergence on arbitrary biological data.
++
++The generic validation helper is byte-identical across the independent roadmap PRs. This PR introduces only the moscot public API and its optional dependency.
+diff --git a/omicverse/_backend_validation.py b/omicverse/_backend_validation.py
+new file mode 100644
+index 000000000..b5995291b
+--- /dev/null
++++ b/omicverse/_backend_validation.py
+@@ -0,0 +1,82 @@
++"""Validation shared by optional analysis adapters (no backend imports)."""
++from __future__ import annotations
++
++from collections.abc import Mapping
++import numpy as np
++from scipy import sparse
++
++
++def validate_adata(adata):
++    from anndata import AnnData
++    if not isinstance(adata, AnnData):
++        raise TypeError("Expected an AnnData object.")
++    if adata.isbacked or adata.is_view:
++        raise ValueError("Use an in-memory AnnData copy, not a backed object or view.")
++    if not adata.n_obs or not adata.n_vars:
++        raise ValueError("AnnData must contain cells and features.")
++    if not adata.obs_names.is_unique or not adata.var_names.is_unique:
++        raise ValueError("Cell and feature names must be unique.")
++
++
++def validate_matrix(value, name, *, counts=False):
++    data = value.data if sparse.issparse(value) else np.asarray(value)
++    if (not np.issubdtype(data.dtype, np.number) or np.iscomplexobj(data)
++            or not np.isfinite(data).all()):
++        raise ValueError(f"{name} must contain finite numeric values.")
++    if counts and (np.any(data < 0) or not np.allclose(data, np.rint(data), rtol=0, atol=1e-6)):
++        raise ValueError(f"{name} must contain nonnegative integer counts, not normalized expression.")
++
++
++def expression(adata, layer, *, counts=False):
++    validate_adata(adata)
++    if layer is not None and layer not in adata.layers:
++        raise KeyError(f"Expression layer {layer!r} is missing.")
++    value = adata.X if layer is None else adata.layers[layer]
++    if value is None:
++        raise ValueError("Expression matrix is missing.")
++    validate_matrix(value, "Expression", counts=counts)
++    return value
++
++
++def obs_column(adata, key, *, minimum_categories=1):
++    if not isinstance(key, str) or key not in adata.obs:
++        raise KeyError(f"Observation column {key!r} is missing.")
++    values = adata.obs[key]
++    if values.isna().any() or values.nunique() < minimum_categories:
++        raise ValueError(f"obs[{key!r}] must have no missing values and at least {minimum_categories} distinct values.")
++    return values
++
++
++def coordinates(adata, key):
++    if key not in adata.obsm:
++        raise KeyError(f"obsm[{key!r}] is missing.")
++    value = adata.obsm[key]
++    if len(value.shape) != 2 or value.shape[0] != adata.n_obs or value.shape[1] < 2:
++        raise ValueError(f"obsm[{key!r}] must have one row per cell and at least two columns.")
++    validate_matrix(value, key)
++
++
++def kwargs_copy(value, *, reserved=()):
++    if value is None:
++        return {}
++    if not isinstance(value, Mapping):
++        raise TypeError("Backend keyword arguments must be a mapping.")
++    overlap = set(value).intersection(reserved)
++    if overlap:
++        raise ValueError(f"Use the named arguments instead of overriding {sorted(overlap)}.")
++    return dict(value)
++
++
++def write_embedding(adata, key, value):
++    value = np.asarray(value)
++    if value.ndim != 2 or value.shape[0] != adata.n_obs or value.shape[1] == 0:
++        raise ValueError("Backend embedding must have one row per input cell.")
++    validate_matrix(value, "Backend embedding")
++    adata.obsm[key] = value
++
++
++def output_key(adata, key, *, overwrite=False):
++    if not isinstance(key, str) or not key:
++        raise ValueError("Output key must be a nonempty string.")
++    if key in adata.obsm and not overwrite:
++        raise ValueError(f"obsm[{key!r}] already exists; choose another key or use overwrite=True.")
+diff --git a/omicverse/_moscot.py b/omicverse/_moscot.py
+new file mode 100644
+index 000000000..849f6b6ea
+--- /dev/null
++++ b/omicverse/_moscot.py
+@@ -0,0 +1,108 @@
++"""Optimal transport through the optional moscot backend."""
++from __future__ import annotations
++
++import numpy as np
++
++from ._optional import import_optional_module
++from ._registry import register_function
++from ._backend_validation import validate_adata, obs_column, coordinates, kwargs_copy
++
++
++def _solve(problem, prepare_kwargs, solve_kwargs, require_convergence):
++    problem.prepare(**prepare_kwargs)
++    problem.solve(**solve_kwargs)
++    if not problem.solutions:
++        raise RuntimeError("moscot returned no transport solutions.")
++    if require_convergence:
++        failed = [key for key, value in problem.solutions.items() if not bool(value.converged)]
++        if failed:
++            raise RuntimeError(f"moscot did not converge for {failed}; adjust solve_kwargs.")
++    return problem
++
++
++@register_function(aliases=["moscot temporal", "temporal optimal transport"], category="single",
++                   description="Solve time-course transport with moscot and check convergence")
++def moscot_temporal(adata, *, time_key, joint_attr=None, prepare_kwargs=None,
++                    solve_kwargs=None, require_convergence=True):
++    """Prepare and solve temporal OT; return the native TemporalProblem.
++
++    ``time_key`` must contain numeric sampling times, not category codes invented
++    from condition labels. ``joint_attr`` names an obsm representation (e.g.
++    ``X_pca``); None delegates local PCA to moscot. Parameters for prepare and
++    solve are kept separate. No dense transport matrix is copied into AnnData.
++    A nonconverged solve raises by default. The returned problem supports native
++    moscot downstream analyses; its coupling is not a lineage ground truth.
++    """
++    validate_adata(adata)
++    times = obs_column(adata, time_key, minimum_categories=2)
++    try:
++        numeric = np.asarray(times, dtype=float)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("time_key must contain numeric sampling times.") from exc
++    if not np.isfinite(numeric).all() or any(isinstance(x, str) for x in times):
++        raise ValueError("time_key must contain finite numeric sampling times.")
++    if isinstance(joint_attr, str):
++        if joint_attr not in adata.obsm:
++            raise KeyError(f"obsm[{joint_attr!r}] is missing.")
++    prepare = kwargs_copy(prepare_kwargs, reserved=("time_key", "joint_attr"))
++    solve = kwargs_copy(solve_kwargs)
++    backend = import_optional_module("moscot.problems.time", feature="Temporal OT",
++                                     dependencies=("moscot",), install_hint="Install moscot.")
++    return _solve(backend.TemporalProblem(adata),
++                  dict(time_key=time_key, joint_attr=joint_attr, **prepare), solve,
++                  require_convergence)
++
++
++@register_function(aliases=["moscot alignment"], category="space",
++                   description="Solve spatial slice couplings with moscot")
++def moscot_alignment(adata, *, batch_key, spatial_key="spatial", joint_attr=None,
++                     prepare_kwargs=None, solve_kwargs=None, require_convergence=True):
++    """Solve spatial slice OT and return AlignmentProblem.
++
++    Call the returned problem's ``align`` method explicitly to generate aligned
++    coordinates. Solving a coupling alone does not overwrite physical positions.
++    """
++    validate_adata(adata)
++    obs_column(adata, batch_key, minimum_categories=2)
++    coordinates(adata, spatial_key)
++    prepare = kwargs_copy(prepare_kwargs, reserved=("batch_key", "spatial_key", "joint_attr"))
++    solve = kwargs_copy(solve_kwargs)
++    backend = import_optional_module("moscot.problems.space", feature="Spatial OT",
++                                     dependencies=("moscot",), install_hint="Install moscot.")
++    return _solve(backend.AlignmentProblem(adata),
++                  dict(batch_key=batch_key, spatial_key=spatial_key, joint_attr=joint_attr, **prepare),
++                  solve, require_convergence)
++
++
++@register_function(aliases=["moscot mapping"], category="space",
++                   description="Map reference single cells to spatial observations with moscot")
++def moscot_mapping(adata_sc, adata_sp, *, sc_attr=None, spatial_key="spatial",
++                   batch_key=None, prepare_kwargs=None, solve_kwargs=None,
++                   require_convergence=True):
++    """Map single cells to space, returning the native MappingProblem.
++
++    moscot's transport matrices have spatial observations on rows and reference
++    single cells on columns. The two datasets must share gene identifiers.
++    ``sc_attr=None`` supports linear OT when ``solve_kwargs={'alpha': 0}``;
++    quadratic mapping requires a reference representation, e.g. ``X_pca``.
++    """
++    validate_adata(adata_sc)
++    validate_adata(adata_sp)
++    coordinates(adata_sp, spatial_key)
++    if not len(adata_sc.var_names.intersection(adata_sp.var_names)):
++        raise ValueError("Reference and spatial data must share feature names.")
++    if batch_key is not None:
++        obs_column(adata_sp, batch_key)
++    if isinstance(sc_attr, str) and sc_attr not in adata_sc.obsm:
++        raise KeyError(f"Reference obsm[{sc_attr!r}] is missing.")
++    prepare = kwargs_copy(prepare_kwargs, reserved=("sc_attr", "spatial_key", "batch_key"))
++    solve = kwargs_copy(solve_kwargs)
++    if sc_attr is None and solve.get("alpha", 0.5) != 0:
++        raise ValueError("Provide sc_attr for quadratic mapping or use solve_kwargs={'alpha': 0}.")
++    if sc_attr is not None and solve.get("alpha", 0.5) == 0:
++        raise ValueError("Linear mapping (alpha=0) requires sc_attr=None.")
++    backend = import_optional_module("moscot.problems.space", feature="Spatial mapping",
++                                     dependencies=("moscot",), install_hint="Install moscot.")
++    return _solve(backend.MappingProblem(adata_sc=adata_sc, adata_sp=adata_sp),
++                  dict(sc_attr=sc_attr, spatial_key=spatial_key, batch_key=batch_key, **prepare),
++                  solve, require_convergence)
+diff --git a/omicverse/single/__init__.py b/omicverse/single/__init__.py
+index 62793b301..bebe65987 100644
+--- a/omicverse/single/__init__.py
++++ b/omicverse/single/__init__.py
+@@ -110,6 +110,7 @@
+     optimize_granularity,
+     compare_metacell_backends,
+ )
++from .._moscot import moscot_temporal
+ from ._pseudobulk import pseudobulk
+ from ._mdic3 import pyMDIC3
+ from ._gptcelltype import gptcelltype,gpt4celltype,get_cluster_celltype
+diff --git a/omicverse/space/__init__.py b/omicverse/space/__init__.py
+index 822b0cc16..ea89ed677 100644
+--- a/omicverse/space/__init__.py
++++ b/omicverse/space/__init__.py
+@@ -60,6 +60,7 @@
+ 
+ from .._optional import bind_optional_symbols
+ 
++from .._moscot import moscot_alignment, moscot_mapping
+ from ._tangram import Tangram
+ from ._spatrio import CellMap,CellLoc
+ from ._stt import STT
+diff --git a/pyproject.toml b/pyproject.toml
+index fe543e015..e72836713 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -117,6 +117,9 @@ dependencies = [
+ ]
+ 
+ [project.optional-dependencies]
++# Optional moscot backend (roadmap #989).
++moscot = ["moscot>=0.5.2,<0.6"]
++
+ # scanpy itself: no longer needed by omicverse's own code (vendored tools under
+ # omicverse/external and third-party workflows may still use it).
+ scanpy = [
+diff --git a/tests/test_backend_validation.py b/tests/test_backend_validation.py
+new file mode 100644
+index 000000000..1f63a7950
+--- /dev/null
++++ b/tests/test_backend_validation.py
+@@ -0,0 +1,61 @@
++"""Boundary tests and separately selected real-backend integration checks."""
++import importlib
++from types import SimpleNamespace
++
++import anndata as ad
++import numpy as np
++import pandas as pd
++import pytest
++from scipy import sparse
++
++from omicverse import _backend_validation as validation
++
++
++@pytest.fixture
++def data():
++    rng = np.random.default_rng(42)
++    a = ad.AnnData(rng.poisson(4, (64, 24)).astype(np.float32))
++    a.layers["counts"] = a.X.copy()
++    a.obs["sample"] = pd.Categorical(np.repeat(["a", "b", "c", "d"], 16))
++    a.obs["time"] = np.repeat([0, 1], 32)
++    a.obs["condition"] = pd.Categorical(np.repeat(["ctrl", "stim"], 32))
++    a.obsm["spatial"] = rng.normal(size=(64, 2))
++    a.obsm["X_pca"] = rng.normal(size=(64, 4))
++    return a
++
++
++@pytest.mark.parametrize("bad", [np.nan, np.inf, -1, .5])
++@pytest.mark.parametrize("as_sparse", [False, True])
++def test_reject_invalid_counts(data, bad, as_sparse):
++    data.layers["counts"][0, 0] = bad
++    if as_sparse:
++        data.layers["counts"] = sparse.csr_matrix(data.layers["counts"])
++    with pytest.raises(ValueError):
++        validation.expression(data, "counts", counts=True)
++
++
++def test_validation_preserves_sparse(data):
++    data.layers["counts"] = sparse.csr_matrix(data.X)
++    assert validation.expression(data, "counts", counts=True) is data.layers["counts"]
++
++
++def test_reject_missing_and_duplicate_names(data):
++    with pytest.raises(KeyError):
++        validation.expression(data, "absent")
++    data.obs_names = ["same"] * data.n_obs
++    with pytest.raises(ValueError, match="unique"):
++        validation.validate_adata(data)
++
++
++def test_view_requires_explicit_copy(data):
++    with pytest.raises(ValueError, match="view"):
++        validation.validate_adata(data[:10])
++
++
++def test_failed_embedding_does_not_overwrite(data):
++    old = data.obsm["X_pca"].copy()
++    with pytest.raises(ValueError):
++        validation.write_embedding(data, "X_pca", np.full((64, 3), np.nan))
++    np.testing.assert_array_equal(data.obsm["X_pca"], old)
++    with pytest.raises(ValueError, match="already exists"):
++        validation.output_key(data, "X_pca")
+diff --git a/tests/test_roadmap989_moscot.py b/tests/test_roadmap989_moscot.py
+new file mode 100644
+index 000000000..300066bc8
+--- /dev/null
++++ b/tests/test_roadmap989_moscot.py
+@@ -0,0 +1,114 @@
++"""Boundary tests and separately selected real-backend integration checks."""
++import importlib
++from types import SimpleNamespace
++
++import anndata as ad
++import numpy as np
++import pandas as pd
++import pytest
++from scipy import sparse
++
++from omicverse import _backend_validation as validation
++
++
++from omicverse import _moscot as ot
++
++@pytest.fixture
++def data():
++    rng = np.random.default_rng(42)
++    a = ad.AnnData(rng.poisson(4, (64, 24)).astype(np.float32))
++    a.layers["counts"] = a.X.copy()
++    a.obs["sample"] = pd.Categorical(np.repeat(["a", "b", "c", "d"], 16))
++    a.obs["time"] = np.repeat([0, 1], 32)
++    a.obs["condition"] = pd.Categorical(np.repeat(["ctrl", "stim"], 32))
++    a.obsm["spatial"] = rng.normal(size=(64, 2))
++    a.obsm["X_pca"] = rng.normal(size=(64, 4))
++    return a
++
++
++def test_moscot_routes_kwargs_and_retains_problem(data, monkeypatch):
++    class Problem:
++        def __init__(self, a):
++            self.adata = a
++            self.solutions = {(0, 1): SimpleNamespace(converged=True)}
++        def prepare(self, **kw):
++            self.prepare_args = kw
++        def solve(self, **kw):
++            self.solve_args = kw
++    monkeypatch.setattr(ot, "import_optional_module", lambda *a, **k: SimpleNamespace(TemporalProblem=Problem))
++    solve = {"epsilon": .1}
++    p = ot.moscot_temporal(data, time_key="time", joint_attr="X_pca",
++                           prepare_kwargs={"policy": "sequential"}, solve_kwargs=solve)
++    assert p.adata is data
++    assert p.prepare_args == dict(time_key="time", joint_attr="X_pca", policy="sequential")
++    assert p.solve_args == solve == {"epsilon": .1}
++
++
++def test_moscot_nonconvergence_is_not_success():
++    class Problem:
++        solutions = {(0, 1): SimpleNamespace(converged=False)}
++        def prepare(self, **kw): pass
++        def solve(self, **kw): pass
++    with pytest.raises(RuntimeError, match="did not converge"):
++        ot._solve(Problem(), {}, {}, True)
++    assert isinstance(ot._solve(Problem(), {}, {}, False), Problem)
++
++
++def test_moscot_rejects_ambiguous_inputs_before_import(data, monkeypatch):
++    monkeypatch.setattr(ot, "import_optional_module", lambda *a, **k: pytest.fail("Backend should not load"))
++    with pytest.raises(ValueError, match="numeric"):
++        ot.moscot_temporal(data, time_key="condition")
++    with pytest.raises(ValueError, match="named arguments"):
++        ot.moscot_temporal(data, time_key="time", prepare_kwargs={"time_key": "sample"})
++    with pytest.raises(ValueError, match="sc_attr"):
++        ot.moscot_mapping(data, data.copy())
++
++
++@pytest.mark.integration
++def test_real_moscot_temporal(data):
++    pytest.importorskip("moscot", minversion="0.5.2")
++    p = ot.moscot_temporal(data, time_key="time", joint_attr="X_pca",
++                           solve_kwargs={"epsilon": .5, "threshold": 1e-5, "max_iterations": 500})
++    matrix = np.asarray(p.solutions[(0, 1)].transport_matrix)
++    assert matrix.shape == (32, 32)
++    assert np.isfinite(matrix).all() and (matrix >= 0).all()
++    np.testing.assert_allclose(matrix.sum(0), np.full(32, 1 / 32), atol=2e-4)
++    np.testing.assert_allclose(matrix.sum(1), np.full(32, 1 / 32), atol=2e-4)
++
++
++@pytest.mark.integration
++def test_real_moscot_recovers_known_correspondence():
++    pytest.importorskip("moscot", minversion="0.5.2")
++    a = ad.AnnData(np.ones((10, 5)))
++    a.obs["time"] = np.repeat([0, 1], 5)
++    a.obsm["X_known"] = np.vstack([np.eye(5), np.eye(5)])
++    p = ot.moscot_temporal(a, time_key="time", joint_attr="X_known",
++                           solve_kwargs={"epsilon": .05})
++    matrix = np.asarray(p.solutions[(0, 1)].transport_matrix)
++    assert np.trace(matrix) > .99
++    np.testing.assert_array_equal(matrix.argmax(axis=1), np.arange(5))
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("alpha,sc_attr", [(0, None), (.5, "X_pca")])
++def test_real_moscot_mapping(data, alpha, sc_attr):
++    pytest.importorskip("moscot", minversion="0.5.2")
++    ref, sp = data[:20].copy(), data[20:32].copy()
++    p = ot.moscot_mapping(ref, sp, sc_attr=sc_attr,
++                          prepare_kwargs={"joint_attr": {"attr": "X"}},
++                          solve_kwargs={"alpha": alpha, "epsilon": .5, "threshold": 1e-5})
++    matrix = np.asarray(next(iter(p.solutions.values())).transport_matrix)
++    assert matrix.shape == (12, 20)  # spatial rows, reference columns
++    np.testing.assert_allclose(matrix.sum(0), np.full(20, 1 / 20), atol=2e-4)
++    np.testing.assert_allclose(matrix.sum(1), np.full(12, 1 / 12), atol=2e-4)
++
++
++@pytest.mark.integration
++def test_real_moscot_alignment(data):
++    pytest.importorskip("moscot", minversion="0.5.2")
++    data.obs["slice"] = pd.Categorical(np.repeat(["left", "right"], 32))
++    original = data.obsm["spatial"].copy()
++    p = ot.moscot_alignment(data, batch_key="slice", joint_attr="X_pca",
++                            solve_kwargs={"alpha": .5, "epsilon": .5, "max_iterations": 100})
++    assert len(p.solutions) == 1
++    np.testing.assert_array_equal(original, data.obsm["spatial"])

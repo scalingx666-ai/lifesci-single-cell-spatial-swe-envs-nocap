@@ -1,0 +1,1482 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f0fc7f771..9d0de96d7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2744,6 +2744,7 @@ dependencies = [
+  "salmon-index",
+  "salmon-map",
+  "salmon-quant",
++ "serde_json",
+  "tempfile",
+  "tracing",
+  "tracing-subscriber",
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index a7569f5fb..d08bec2f6 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -203,6 +203,15 @@ pub struct AlignQuantOptions {
+     /// invocation (index, read files, threads); phase 2's own record would
+     /// replace it with a RAD-centric one and lose all of that (#1140)
+     pub preserve_cmd_info: bool,
++    /// this run converted alignments into the RAD it is quantifying (`-a`
++    /// `--deterministic`, genome projection) rather than being handed one.
++    /// Only metadata depends on it: `frag_length_source` must say `alignments`
++    /// — the distribution came from the input alignments — instead of leaking
++    /// `rad_baked`, which names an intermediate the user never asked for. It
++    /// cannot be inferred: `preserve_cmd_info` marks the *reads* driver, and a
++    /// standalone `--rad` (where `rad_baked` is correct) looks identical here
++    /// otherwise. Left false by anything reading a user-supplied RAD.
++    pub input_is_alignments: bool,
+     /// the read files behind this RAD, when the driver knows them (reads-mode
+     /// `--deterministic`), for `lib_format_counts.json`'s `read_files` — which
+     /// otherwise reports `[]` because a RAD does not name its reads (#1140)
+@@ -317,6 +326,7 @@ impl AlignQuantOptions {
+             prior_seconds: 0.0,
+             external_start_time: None,
+             preserve_cmd_info: false,
++            input_is_alignments: false,
+             read_files: Vec::new(),
+             dump_eq: false,
+             dump_eq_weights: false,
+@@ -2658,6 +2668,15 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         w.flush()?;
+     }
+ 
++    /// Shape of the positional-bias model: one model per transcript length
++    /// class, each binned over the transcript's relative position. Reported as
++    /// both numbers because either alone is ambiguous.
++    #[derive(Serialize)]
++    struct PosBiasShape {
++        length_classes: usize,
++        bins_per_class: usize,
++    }
++
+     // aux_info/meta_info.json — full field set, matching salmon's alignment mode
+     // (no index hashes since there is no index; no keep_duplicates).
+     #[derive(Serialize)]
+@@ -2678,6 +2697,18 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         gc_bias_correct: bool,
+         pos_bias_correct: bool,
+         num_bias_bins: usize,
++        // salmon-rs extensions: the shapes of the bias models that actually
++        // ran. `num_bias_bins` above cannot carry these — it names C++'s legacy
++        // 4096-bin k-mer counter, which this port replaced — so a reader had no
++        // way to learn what the running models looked like. `None` when that
++        // correction was not requested, which is how a consumer tells "off"
++        // from "on with N bins" (#1140 follow-up).
++        #[serde(skip_serializing_if = "Option::is_none")]
++        seq_bias_context_length: Option<usize>,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        gc_bias_bins: Option<usize>,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        pos_bias_bins: Option<PosBiasShape>,
+         mapping_type: String,
+         /// how the index was built; known only from a salmon RAD's provenance,
+         /// omitted (rather than guessed) for a BAM input
+@@ -2863,37 +2894,79 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         opt_type: if opts.em.use_vbem { "vb" } else { "em" }.to_string(),
+         quant_errors: vec![],
+         num_libraries: 1,
+-        // The format actually applied, not the `-l A` that requested detection:
+-        // reads mode reports the resolved one, and a RAD carries it baked, so a
+-        // requant can report it too.
+-        library_types: vec![res
+-            .detected_library_type
+-            .clone()
+-            .unwrap_or_else(|| opts.lib_type.clone())],
++        // The format the strand filter actually applied — same rule as
++        // `lib_format_counts.json`'s `expected` above, and for the same reason.
++        // The trap: detection now runs under an explicit `-l` too (it powers the
++        // `library_type_mismatch` diagnostic), so `detected_library_type` is
++        // always populated; taking it unconditionally made `-l ISR` on ISF data
++        // report ISF here while `cmd_info.json`, `lib_format_counts.json`, and
++        // the (zero) `num_mapped` all said ISR. Metadata reports *both* formats
++        // deliberately: the applied one here, the inferred one in
++        // `detected_library_type` below — neither is redundant, do not collapse
++        // them into one field.
++        library_types: vec![if LibraryFormat::is_auto(&opts.lib_type) {
++            res.detected_library_type
++                .clone()
++                .unwrap_or_else(|| opts.lib_type.clone())
++        } else {
++            LibraryFormat::parse(&opts.lib_type)
++                .map(|f| f.canonical().to_string())
++                .unwrap_or_else(|_| opts.lib_type.clone())
++        }],
+         frag_dist_length: res.frag_len_dist.len(),
+         frag_length_mean: res.frag_len_mean,
+         frag_length_sd: res.frag_len_sd,
+-        // In the integrated `--deterministic` flow (`preserve_cmd_info`, like
+-        // the invocation record above) provenance describes the user's run,
+-        // not the internal RAD handoff: phase 1 of this same run observed the
+-        // FLD (paired) or defaulted it (single-end, no lengths to observe);
+-        // the intermediate RAD merely carried it. The rad_baked* spellings
+-        // stay for standalone `--rad` input, where the RAD really is the
+-        // source (#1140).
+-        frag_length_source: match (opts.preserve_cmd_info, res.frag_len_source) {
+-            (true, salmon_model::FragLengthSource::RadBaked) => {
++        // In the integrated two-phase flows provenance describes the user's
++        // run, not the internal RAD handoff: phase 1 of this same run observed
++        // the FLD (paired) or defaulted it (single-end, no lengths to observe);
++        // the intermediate RAD merely carried it, and the user never asked for
++        // that RAD. Which input phase 1 read decides the spelling —
++        // `preserve_cmd_info` marks the reads driver, `input_is_alignments` the
++        // `-a`/genome-projection drivers. The rad_baked* spellings stay for
++        // standalone `--rad`, where the RAD really is the source and neither
++        // flag is set (#1140).
++        frag_length_source: match (
++            opts.preserve_cmd_info,
++            opts.input_is_alignments,
++            res.frag_len_source,
++        ) {
++            (true, _, salmon_model::FragLengthSource::RadBaked) => {
+                 salmon_model::FragLengthSource::Reads
+             }
+-            (true, salmon_model::FragLengthSource::RadBakedPrior) => {
++            (_, true, salmon_model::FragLengthSource::RadBaked) => {
++                salmon_model::FragLengthSource::Alignments
++            }
++            // Single-end either way: no fragment lengths existed to observe, so
++            // what the RAD carries is this run's own `--fldMean`/`--fldSD`.
++            (true, _, salmon_model::FragLengthSource::RadBakedPrior)
++            | (_, true, salmon_model::FragLengthSource::RadBakedPrior) => {
+                 salmon_model::FragLengthSource::Prior
+             }
+-            (_, s) => s,
++            (_, _, s) => s,
+         }
+         .as_str(),
+         seq_bias_correct: opts.seq_bias,
+         gc_bias_correct: opts.gc_bias,
+         pos_bias_correct: opts.pos_bias,
++        // Not the running bias models' bin counts: C++ writes
++        // `readBias(FORWARD).counts.size()` (GZipWriter.cpp), the legacy fixed
++        // 4096-bin k-mer counter behind `observed_bias.gz`, which this port
++        // replaced with SBModel/GC/pos models and stubs out in the aux dumps.
++        // There is no such bin count to report here, and the models that did
++        // run publish their own sizes in their dumps, so 0 stands (matching the
++        // reads writer) rather than a number of a different model's bins.
+         num_bias_bins: 0,
++        // Measured from the models this run produced, not from the requested
++        // options: a model's own array length is the truth, where a
++        // configured-but-unbuilt model would otherwise be described as though
++        // it had run.
++        seq_bias_context_length: (!res.bias_dump.obs5_seq.is_empty())
++            .then_some(salmon_model::seqbias::CONTEXT_LENGTH),
++        gc_bias_bins: (!res.bias_dump.obs_gc.is_empty()).then_some(res.bias_dump.obs_gc.len()),
++        pos_bias_bins: res.bias_dump.obs5_pos.first().map(|first| PosBiasShape {
++            length_classes: res.bias_dump.obs5_pos.len(),
++            bins_per_class: first.len(),
++        }),
+         // What the RAD says its producer was; a BAM input has no RAD to ask, and
+         // an older or foreign RAD does not record it, so both fall back to the
+         // value this path has always reported.
+@@ -2914,7 +2987,16 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         index_decoy_seq_hash: index_prov.decoy_seq_hash,
+         index_decoy_name_hash: index_prov.decoy_name_hash,
+         num_valid_targets: rows.len(),
+-        num_decoy_targets: 0,
++        // The decoy block this writer actually held back, derived from the same
++        // `rows` split so the two counts always partition the references
++        // instead of contradicting each other (previously hardcoded 0 even for
++        // a decoy-aware index, while `num_decoy_fragments` reported the real
++        // tally). A RAD without the recorded boundary (BAM input, piscem, or
++        // written before the tags existed) excludes nothing, so 0 there is this
++        // output's true decoy count, not a placeholder — any decoys it does
++        // carry are indistinguishable and are counted in `num_valid_targets`,
++        // exactly as they appear in `quant.sf`.
++        num_decoy_targets: res.names.len() - rows.len(),
+         num_eq_classes: res.num_eq_classes,
+         serialized_eq_classes: opts.dump_eq || opts.dump_eq_weights,
+         eq_class_properties,
+@@ -3025,14 +3107,43 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+     // is the count of aligned fragments and `num_mapped` is those with a strand-
+     // compatible placement that were quantified; label them accordingly so a
+     // <100% rate on a stranded library is not read as lost alignments.
++    // This writer serves every RAD-based driver, so the log must describe the run
++    // the *user* asked for. It used to hard-code "alignment mode" and alignment
++    // wording, so a default reads run — the 2.6.0 default — was labelled as
++    // something it was not, and its unmapped fragments were reported as
++    // "strand-incompatible" even with num_incompatible_fragments = 0. The
++    // machine-readable meta_info.json was always right; only this human-facing
++    // summary lied (#1140 readiness sweep).
++    //
++    // `preserve_cmd_info` marks the integrated reads flow, the same signal the
++    // invocation record and the fragment-length provenance use.
++    let reads_run = opts.preserve_cmd_info;
++    let mode = if reads_run {
++        "reads mode"
++    } else {
++        "alignment mode"
++    };
++    let mapping_type = if reads_run { "mapping" } else { "alignment" };
++    // In reads mode a fragment that did not map simply did not map; only
++    // alignment input can distinguish "aligned but strand-incompatible".
++    let (observed_label, mapped_label, rate_label) = if reads_run {
++        ("observed fragments", "mapped fragments", "mapping rate")
++    } else {
++        (
++            "aligned fragments",
++            "strand-compatible (quantified)",
++            "compatible rate",
++        )
++    };
+     let log = format!(
+-        "salmon (rust port, alignment mode) v{SALMON_VERSION}\nstart: {}\nend:   {}\n\
+-         library type: {}\naligned fragments: {}\nstrand-compatible (quantified): {}\n\
+-         compatible rate: {pct:.4}%\n\
++        "salmon (rust port, {mode}) v{SALMON_VERSION}\nstart: {}\nend:   {}\n\
++         library type: {}\nmapping type: {}\n{observed_label}: {}\n{mapped_label}: {}\n\
++         {rate_label}: {pct:.4}%\n\
+          number of equivalence classes: {}\nfragment length mean (sd): {:.2} ({:.2})\n",
+         res.start_time,
+         asctime_now(),
+         opts.lib_type,
++        mapping_type,
+         res.num_processed,
+         res.num_mapped,
+         res.num_eq_classes,
+diff --git a/crates/salmon-align/src/rad.rs b/crates/salmon-align/src/rad.rs
+index 0122f0e88..2991581e0 100644
+--- a/crates/salmon-align/src/rad.rs
++++ b/crates/salmon-align/src/rad.rs
+@@ -1,4 +1,11 @@
+-//! Parallel RAD-format input quantification (`salmon quant --rad`).
++//! Parallel RAD-format input quantification.
++//!
++//! This is the quantification engine behind four user-facing modes: the default
++//! deterministic reads path (`-i`/`-1`/`-2`), the default deterministic alignment
++//! path (`-a`), genuine RAD input (`--rad`), and genome projection (`-a` with
++//! `--annotation`). The first, second and fourth reach it via a RAD their phase 1
++//! wrote. Diagnostics raised here must therefore not name an input flag: the user
++//! may not have typed the one being blamed.
+ //!
+ //! # Why quantify from a RAD file
+ //!
+@@ -803,8 +810,8 @@ impl RadProvenance {
+             None if !index_applicable => {}
+             None => {
+                 const REASON: &str = "the RAD does not identify the index its mappings \
+-                                      were made against, and the `--rad` path loads no \
+-                                      index of its own";
++                                      were made against, and this quantification pass \
++                                      loads no index of its own";
+                 missing.extend(
+                     [
+                         "keep_duplicates",
+@@ -1711,7 +1718,10 @@ where
+ // Entry point
+ // ---------------------------------------------------------------------------
+ 
+-/// Quantify from a RAD file (`salmon quant --rad`).
++/// Quantify from a RAD file.
++///
++/// Phase 2 of every default path, not just `salmon quant --rad` — see the module
++/// docs before writing a diagnostic that names an input flag.
+ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQuantResult> {
+     let start_time = opts.external_start_time.clone().unwrap_or_else(asctime_now);
+     let run_timer = std::time::Instant::now();
+@@ -1726,11 +1736,33 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+     // Bias correction adjusts an effective length that --noLengthCorrection is
+     // not computing, so the two cannot both apply; reads mode gates it the same
+     // way (`salmon-quant/src/lib.rs`).
++    //
++    // The message must not name the input flag: this is the quantification engine
++    // for four user-facing modes (reads, `-a`, `--rad`, genome projection), so
++    // telling a `-a` user to fix `--rad` would send them after a flag they never
++    // typed. Name what the user did ask for (the bias flags) and what to add.
+     let bias_on = (opts.seq_bias || opts.gc_bias || opts.pos_bias) && !opts.no_length_correction;
+-    anyhow::ensure!(
+-        !bias_on || opts.ref_seqs.is_some() || opts.transcripts.is_some(),
+-        "--seqBias/--gcBias/--posBias with --rad require -t/--targets (the transcriptome FASTA)"
+-    );
++    if bias_on && opts.ref_seqs.is_none() && opts.transcripts.is_none() {
++        let mut requested = Vec::new();
++        if opts.seq_bias {
++            requested.push("--seqBias");
++        }
++        if opts.gc_bias {
++            requested.push("--gcBias");
++        }
++        if opts.pos_bias {
++            requested.push("--posBias");
++        }
++        // "Bias correction (...)" rather than the bare flag list keeps the verb
++        // agreeing whether one bias flag was given or three.
++        anyhow::bail!(
++            "bias correction ({}) needs the reference sequences to model bias against, \
++             and this run has none loaded. Pass `-t/--targets <transcripts.fasta>` (the \
++             transcriptome the fragments were mapped or aligned to), or re-run without \
++             bias correction.",
++            requested.join(", ")
++        );
++    }
+ 
+     // Header: profile, reference names + lengths (from the RAD file tags).
+     let (_reader, prelude, file_tag_map) = open_prelude(rad_path)?;
+diff --git a/crates/salmon-cli/Cargo.toml b/crates/salmon-cli/Cargo.toml
+index 9458d4c9c..268f2e300 100644
+--- a/crates/salmon-cli/Cargo.toml
++++ b/crates/salmon-cli/Cargo.toml
+@@ -34,6 +34,9 @@ sysalloc = []
+ [dev-dependencies]
+ tempfile = { workspace = true }
+ flate2 = { workspace = true }
++# meta_info.json assertions in the metadata-truth tests: parse the field set
++# rather than substring-matching it, so a renamed field fails loudly.
++serde_json = { workspace = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/crates/salmon-cli/src/main.rs b/crates/salmon-cli/src/main.rs
+index c11d48bb0..75d8f1d78 100644
+--- a/crates/salmon-cli/src/main.rs
++++ b/crates/salmon-cli/src/main.rs
+@@ -400,7 +400,10 @@ struct QuantArgs {
+     #[arg(short = 't', long = "targets")]
+     targets: Option<PathBuf>,
+     /// Disable the alignment error model (alignment mode).
+-    #[arg(long = "noErrorModel")]
++    /// Direct opposite of `--errorModel`; passing both was resolved by silent
++    /// precedence (`--noErrorModel` won) and salmon then advised passing
++    /// `--errorModel`, which was already on the command line (#1140).
++    #[arg(long = "noErrorModel", conflicts_with = "error_model")]
+     no_error_model: bool,
+     /// Opt in to the order-independent alignment error model in deterministic
+     /// mode (`-a --deterministic`, requires `-t`). Off by default: deterministic
+@@ -414,7 +417,18 @@ struct QuantArgs {
+     /// salmon projects the spliced genome alignments into transcriptome
+     /// coordinates (via bramble) and quantifies the projected placements. The
+     /// transcript set is taken from the annotation.
+-    #[arg(long = "annotation", value_name = "GTF|GFF")]
++    /// Genome projection is reachable only through `-a <genome.bam>`, so
++    /// without it the whole request — annotation, genome and junction discount
++    /// — was dropped without a word, and the paths were never even checked for
++    /// existence. `--genome`/`--juncMissDiscount` already required this flag;
++    /// this closes the chain (#1140).
++    ///
++    /// The `requires` below is necessary but not sufficient: clap skips a
++    /// `requires` when the required argument conflicts with one already
++    /// present, and `-1/-2`, `-r` and `--rad` all conflict with `-a` — which is
++    /// precisely how a user gets here. `run_quant` therefore checks it
++    /// explicitly as well.
++    #[arg(long = "annotation", value_name = "GTF|GFF", requires = "alignments")]
+     annotation: Option<PathBuf>,
+     // `--genome` / `--juncMissDiscount` are read only by the genome-projection
+     // branch, which `--annotation` selects; without it they were silently
+@@ -632,8 +646,11 @@ struct QuantArgs {
+     )]
+     num_gibbs_samples: u32,
+     /// Gibbs thinning factor.
+-    #[arg(long = "thinningFactor", default_value_t = 16)]
+-    thinning_factor: u32,
++    /// Option-typed (default 16 at use) so passing it without Gibbs sampling
++    /// can be reported rather than silently doing nothing — the sibling
++    /// `--bamCompressThreads` without `--writeBam` already hard-errors.
++    #[arg(long = "thinningFactor")]
++    thinning_factor: Option<u32>,
+     /// (Long reads) Oxford Nanopore model — not supported; use oarfish instead.
+     #[arg(long = "ont")]
+     ont: bool,
+@@ -856,9 +873,12 @@ struct QuantArgs {
+     /// ~2x leaner than the dense representation with identical results.
+     #[arg(long = "reduceGCMemory")]
+     reduce_gc_memory: bool,
+-    /// Skip transcript quantification (EM + Gibbs/bootstrap) and quant.sf, while
+-    /// still mapping, building equivalence classes (use with --dumpEq), detecting
+-    /// library type, and writing metadata. (salmon's --skipQuant)
++    /// Skip transcript quantification (EM + Gibbs/bootstrap) and quant.sf: map
++    /// (or read the alignments), detect the library type, and write metadata.
++    /// The run's deliverable is the RAD of the mappings, kept in the output
++    /// directory; requantify it later with `--rad <file>`. On the default reads
++    /// path the run stops after mapping, so equivalence classes come from that
++    /// requant (`--rad <file> --dumpEq`), not from this run. (salmon's --skipQuant)
+     #[arg(long = "skipQuant")]
+     skip_quant: bool,
+     /// [not yet implemented] quantify from a previously-written equivalence-class
+@@ -877,9 +897,12 @@ struct QuantArgs {
+     /// online alignment path (--online -a), which warns that it lacks it.
+     #[arg(long = "noFragLengthDist")]
+     no_frag_length_dist: bool,
+-    /// Disable the single-end/orphan fragment-length probability estimate.
+-    /// Effective only on the deprecated --online reads path; no effect under
+-    /// the default deterministic mode or RAD input.
++    /// Disable the single-end/orphan fragment-length probability estimate:
++    /// orphans take a flat penalty instead of the bounded-CMF ambiguous weight,
++    /// which can change which transcript wins a contested orphan. Honoured on
++    /// the reads paths and on every RAD-based path (deterministic reads phase 2,
++    /// -a, --rad). Redundant on the deprecated online alignment path
++    /// (--online -a), which weights every orphan flat by construction.
+     #[arg(long = "noSingleFragProb")]
+     no_single_frag_prob: bool,
+     /// [accepted; not yet implemented] write a BAM of posterior-sampled
+@@ -1540,6 +1563,11 @@ fn run_deterministic_align(
+     // Both phases count toward the reported run time (see run_deterministic).
+     let run_start = std::time::Instant::now();
+     let start_time = salmon_align::asctime_now();
++    // This driver converts the user's BAM into the intermediate RAD itself, so
++    // the fragment-length distribution really was derived from alignments —
++    // phase 2 must not report the internal handoff (`rad_baked`), which is the
++    // right answer only for a RAD the user supplied (#1140).
++    opts.input_is_alignments = true;
+     let out_dir = opts.output_dir.clone();
+     // An explicit `--writeRad PATH` is honoured and kept; otherwise a temp under
+     // the output dir, removed on success unless `--keepRad` (or `--skipQuant`,
+@@ -1742,6 +1770,10 @@ fn run_genome_project(
+     // Phase 2 — quantify from the projected RAD (single baked pass). Hand the
+     // reconstructed transcript sequences to bias correction (no `-t` needed).
+     let mut q = q;
++    // Genome projection is alignment input too: the FLD is observed while
++    // projecting the genome BAM, not carried in from a user-supplied RAD, so
++    // `frag_length_source` must say `alignments` rather than `rad_baked`.
++    q.input_is_alignments = true;
+     if q.ref_seqs.is_none() {
+         q.ref_seqs = art.ref_seqs;
+     }
+@@ -1880,10 +1912,12 @@ fn preflight_fastq_complete(paths: &[PathBuf]) -> Result<()> {
+             let (seq, sep, qual) = (tail_lines[n - 3], tail_lines[n - 2], tail_lines[n - 1]);
+             if !sep.starts_with(b"+") || seq.len() != qual.len() {
+                 anyhow::bail!(
+-                    "{} looks truncated: its final record is incomplete (the sequence and \
+-                     quality lines disagree in length, or the `+` separator is missing). \
+-                     Quantifying it would silently report results for only the part that \
+-                     survived. Re-transfer or re-generate the file.",
++                    "{}: its final FASTQ record is incomplete — the `+` separator is \
++                     missing, or the sequence and quality lines differ in length. That is \
++                     what a truncated transfer looks like, but a corrupted or mis-generated \
++                     file looks the same from here, so check the file rather than assuming \
++                     either. Quantifying it would silently report results for only the part \
++                     that parsed.",
+                     path.display()
+                 );
+             }
+@@ -2032,17 +2066,17 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     if args.validate_mappings {
+         tracing::warn!("--validateMappings has no effect (deprecated in salmon too): selective alignment is the default mapping mode; pass --sketch for pseudoalignment.");
+     }
+-    if args.sketch && args.decoy_threshold.unwrap_or(1.0) != 1.0 {
+-        tracing::warn!(
+-            "--decoyThreshold {} has no effect in --sketch mode: sketch (pseudoalignment) \
+-             returns only equally-best mappings, so the decoy-domination comparison \
+-             (bestTxpScore < decoyThreshold * bestDecoyScore) never triggers. A fragment is \
+-             treated as decoy-dominated only when it maps to decoys *and no transcript*; \
+-             otherwise decoy hits are dropped and transcript hits kept (use --allowDecoyOrphans \
+-             to keep transcript hits even when a decoy also matches).",
+-            args.decoy_threshold.unwrap_or(1.0)
++    // Genome projection lives inside the `-a` branch, so `--annotation` without
++    // it silently discards the entire request. clap's `requires` does not fire
++    // for the cases that matter (see the flag's doc comment), so check here.
++    if args.annotation.is_some() && args.alignments.is_none() {
++        anyhow::bail!(
++            "--annotation selects genome-projection mode, which reads a genome BAM: pass it \
++             together with `-a <genome.bam>`. With FASTQ or --rad input there is nothing to \
++             project, and the annotation would be ignored."
+         );
+     }
++
+     // `--noLengthCorrection` and bias correction cannot both apply: every
+     // driver computes `bias_on = (seq||gc||pos) && !no_length_correction`, so
+     // the bias request was silently discarded — and `meta_info.json` went on
+@@ -2065,6 +2099,37 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         );
+     }
+ 
++    // Bias correction reads the reference sequence at each alignment's position,
++    // and a BAM carries only reference names and lengths — so alignment input
++    // needs `-t`. The default (deterministic) `-a` path only discovered this
++    // inside `quantify_rad`, i.e. after the whole BAM had been read and written
++    // to an intermediate RAD (hours on real data), and raised `--rad`'s wording
++    // for an invocation containing no `--rad`. The precondition is fully known
++    // at invocation, so check it before any work (#1140).
++    // Genome projection (`-a --annotation`) is exempt: it reconstructs the
++    // transcript sequences from `--genome` plus the annotation and never reads `-t`.
++    if args.alignments.is_some()
++        && args.annotation.is_none()
++        && args.targets.is_none()
++        && (args.seq_bias || args.gc_bias || args.pos_bias)
++    {
++        let asked: Vec<&str> = [
++            ("--seqBias", args.seq_bias),
++            ("--gcBias", args.gc_bias),
++            ("--posBias", args.pos_bias),
++        ]
++        .iter()
++        .filter_map(|&(n, on)| on.then_some(n))
++        .collect();
++        anyhow::bail!(
++            "{} with alignment input (-a) requires -t/--targets: bias correction is computed \
++             from the reference sequence at each alignment's position, and a BAM carries only \
++             reference names and lengths. Pass the transcriptome FASTA the alignments were \
++             produced against.",
++            asked.join(" / ")
++        );
++    }
++
+     // Bound the global rayon pool (used by the EM and bias passes) to the
+     // requested thread count; otherwise it spans every core regardless of -p.
+     let nthreads = if args.threads == 0 {
+@@ -2242,7 +2307,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         opts.num_pre_aux_model_samples = args.num_pre_aux_model_samples.unwrap_or(5_000);
+         opts.num_bootstraps = args.num_bootstraps;
+         opts.num_gibbs_samples = args.num_gibbs_samples;
+-        opts.thinning_factor = args.thinning_factor;
++        opts.thinning_factor = args.thinning_factor.unwrap_or(16);
+         // --scoreExp scales the best-minus-score soft weight, and the RAD
+         // quantifier applies it to AS-scored placements exactly as it does to
+         // selective-alignment ones — so the deterministic `-a` path honours it.
+@@ -2498,7 +2563,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+         opts.no_frag_length_dist = args.no_frag_length_dist;
+         opts.num_bootstraps = args.num_bootstraps;
+         opts.num_gibbs_samples = args.num_gibbs_samples;
+-        opts.thinning_factor = args.thinning_factor;
++        opts.thinning_factor = args.thinning_factor.unwrap_or(16);
+         let res = quantify_rad(&opts, &rad_path).context("RAD-input quantification failed")?;
+         let pct = if res.num_processed > 0 {
+             100.0 * res.num_mapped as f64 / res.num_processed as f64
+@@ -2535,6 +2600,15 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     }
+ 
+     // Reads (selective-alignment / pseudoalignment) mode.
++    // `-2` alone is reads input with a missing half, not "no reads": the generic
++    // message below sent users hunting for an input they had already typed. The
++    // count-mismatch check further down only fires once `-1` is present, so this
++    // case had no message of its own.
++    anyhow::ensure!(
++        args.mates2.is_empty() || !args.mates1.is_empty(),
++        "-2 given without -1: mates must be supplied as a pair (-1 <mates_1> -2 <mates_2>). \
++         For single-end reads use -r."
++    );
+     anyhow::ensure!(
+         !args.mates1.is_empty() || !args.unmated.is_empty(),
+         "no reads provided: pass -1/-2 (paired), -r (single-end), -a (BAM), or --rad (RAD)"
+@@ -2575,6 +2649,22 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             ],
+         );
+     }
++    // Sketch mode returns only equally-best mappings, so the decoy-domination
++    // comparison never runs and --decoyThreshold is inert. This lives here, not
++    // before mode dispatch: with `-a`/`--rad` input `--sketch` is itself inert
++    // (both are reported by `reads_only_mapping_flags`), so warning up front
++    // told a user that sketch was running on a run that never mapped anything.
++    if args.sketch && args.decoy_threshold.unwrap_or(1.0) != 1.0 {
++        tracing::warn!(
++            "--decoyThreshold {} has no effect in --sketch mode: sketch (pseudoalignment) \
++             returns only equally-best mappings, so the decoy-domination comparison \
++             (bestTxpScore < decoyThreshold * bestDecoyScore) never triggers. A fragment is \
++             treated as decoy-dominated only when it maps to decoys *and no transcript*; \
++             otherwise decoy hits are dropped and transcript hits kept (use --allowDecoyOrphans \
++             to keep transcript hits even when a decoy also matches).",
++            args.decoy_threshold.unwrap_or(1.0)
++        );
++    }
+     // The one-pass reads path writes no intermediate RAD, so the flags that
+     // place or shape one are inert — `-a --online` and `--rad` already say so.
+     if args.online {
+@@ -2590,6 +2680,31 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+             ],
+         );
+     }
++    // Posterior sampling happens inside the quantification pass, so
++    // `--skipQuant` and it cannot both be honoured. The sibling cases
++    // (`--skipQuant --dumpEq`, `--skipQuant -g`) both explain themselves;
++    // these two were discarded in silence (#1140).
++    if args.skip_quant {
++        warn_inert_in_mode(
++            "a --skipQuant run",
++            "posterior sampling happens inside the quantification pass that --skipQuant \
++             skips (quantify the kept RAD with --rad to draw samples from it)",
++            &[
++                ("--numBootstraps", args.num_bootstraps > 0),
++                ("--numGibbsSamples", args.num_gibbs_samples > 0),
++            ],
++        );
++    }
++    // `--thinningFactor` thins a Gibbs chain; with no chain there is nothing to
++    // thin. The analogous `--bamCompressThreads` without `--writeBam` errors,
++    // and this said nothing at all.
++    if args.thinning_factor.is_some() && args.num_gibbs_samples == 0 {
++        warn_inert_in_mode(
++            "a run without Gibbs sampling",
++            "it thins a Gibbs chain, which needs --numGibbsSamples",
++            &[("--thinningFactor", true)],
++        );
++    }
+     // Bias sub-knobs tune a model that only exists when bias correction is on.
+     if !(args.seq_bias || args.gc_bias || args.pos_bias) {
+         warn_inert_in_mode(
+@@ -2672,7 +2787,7 @@ fn run_quant(args: QuantArgs, quiet: bool) -> Result<()> {
+     };
+     opts.num_bootstraps = args.num_bootstraps;
+     opts.num_gibbs_samples = args.num_gibbs_samples;
+-    opts.thinning_factor = args.thinning_factor;
++    opts.thinning_factor = args.thinning_factor.unwrap_or(16);
+     opts.no_length_correction = args.no_length_correction;
+     opts.model_single_frag_prob = !args.no_single_frag_prob;
+     opts.no_frag_length_dist = args.no_frag_length_dist;
+diff --git a/crates/salmon-cli/tests/input_validation.rs b/crates/salmon-cli/tests/input_validation.rs
+index 8818a4295..d3869baa7 100644
+--- a/crates/salmon-cli/tests/input_validation.rs
++++ b/crates/salmon-cli/tests/input_validation.rs
+@@ -290,10 +290,18 @@ fn a_truncated_fastq_is_refused_rather_than_partially_quantified() {
+         !o.status.success(),
+         "a byte-truncated FASTQ must be refused"
+     );
++    // Two wordings are correct here and which one fires depends on where the
++    // cut landed: a short file reports its line count, a file whose final
++    // record is malformed reports that instead (salmon cannot tell a truncated
++    // transfer from a corrupted one, and says so rather than guessing).
++    let err = String::from_utf8_lossy(&o.stderr);
+     assert!(
+-        String::from_utf8_lossy(&o.stderr).contains("looks truncated"),
+-        "{}",
+-        String::from_utf8_lossy(&o.stderr)
++        err.contains("looks truncated") || err.contains("final FASTQ record is incomplete"),
++        "{err}"
++    );
++    assert!(
++        err.contains("mid.fq"),
++        "the error must name the file:\n{err}"
+     );
+ 
+     // Line-boundary truncation: 1, 2 and 3 orphaned lines must all be refused,
+@@ -317,3 +325,175 @@ fn a_truncated_fastq_is_refused_rather_than_partially_quantified() {
+         "intact FASTQ must run"
+     );
+ }
++
++// ---- Group 3: incompatibilities detectable at invocation ------------------
++
++/// Genome projection lives inside the `-a` branch, so `--annotation` with any
++/// other input silently discarded the whole request — annotation, genome and
++/// junction discount — without even checking the paths exist.
++///
++/// clap's `requires` is necessary but not sufficient here, and the test covers
++/// why: clap skips a `requires` when the required argument conflicts with one
++/// already present, and `-1/-2`, `-r` and `--rad` all conflict with `-a`. Those
++/// are exactly the ways a user gets here, so all three are exercised.
++#[test]
++fn annotation_requires_alignment_input() {
++    let dir = tempfile::tempdir().unwrap();
++    let fx = fixture(dir.path());
++    let rad = dir.path().join("m.rad");
++    assert!(Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&fx.index)
++        .args(["-l", "IU", "-1"])
++        .arg(&fx.r1)
++        .arg("-2")
++        .arg(&fx.r2)
++        .args(["-p", "2", "--writeRad"])
++        .arg(&rad)
++        .arg("-o")
++        .arg(dir.path().join("seed"))
++        .status()
++        .unwrap()
++        .success());
++
++    let out = dir.path().join("q");
++    let gtf = dir.path().join("a.gtf");
++    std::fs::write(&gtf, "").unwrap();
++    let inputs: Vec<Vec<&std::ffi::OsStr>> = vec![
++        vec![
++            os("-i"),
++            fx.index.as_os_str(),
++            os("-1"),
++            fx.r1.as_os_str(),
++            os("-2"),
++            fx.r2.as_os_str(),
++        ],
++        vec![os("-i"), fx.index.as_os_str(), os("-r"), fx.se.as_os_str()],
++        vec![os("--rad"), rad.as_os_str()],
++    ];
++    for inp in inputs {
++        let mut v: Vec<&std::ffi::OsStr> = vec![os("quant")];
++        v.extend(inp.iter().copied());
++        v.extend([
++            os("-l"),
++            os("IU"),
++            os("--annotation"),
++            gtf.as_os_str(),
++            os("-p"),
++            os("2"),
++            os("-o"),
++            out.as_os_str(),
++        ]);
++        let o = run(&v);
++        assert!(
++            !o.status.success(),
++            "--annotation without -a must be refused, not silently dropped"
++        );
++        let err = String::from_utf8_lossy(&o.stderr);
++        assert!(
++            err.contains("--annotation") && (err.contains("-a") || err.contains("alignments")),
++            "the error must name both flags:\n{err}"
++        );
++    }
++}
++
++/// `--errorModel` and `--noErrorModel` are direct opposites; passing both was
++/// resolved by silent precedence, after which salmon advised passing
++/// `--errorModel` — already on the command line.
++#[test]
++fn error_model_flags_conflict() {
++    let dir = tempfile::tempdir().unwrap();
++    let fx = fixture(dir.path());
++    let sam = dir.path().join("a.sam");
++    std::fs::write(
++        &sam,
++        "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:txA\tLN:3000\n\
++         r0\t99\ttxA\t1\t60\t100M\t=\t201\t300\t*\t*\tAS:i:200\n\
++         r0\t147\ttxA\t201\t60\t100M\t=\t1\t-300\t*\t*\tAS:i:200\n",
++    )
++    .unwrap();
++    let _ = &fx;
++    let o = run(&[
++        os("quant"),
++        os("-a"),
++        sam.as_os_str(),
++        os("-l"),
++        os("IU"),
++        os("--errorModel"),
++        os("--noErrorModel"),
++        os("-o"),
++        dir.path().join("q").as_os_str(),
++    ]);
++    assert!(!o.status.success(), "opposite flags must conflict");
++    assert!(
++        String::from_utf8_lossy(&o.stderr).contains("cannot be used with"),
++        "{}",
++        String::from_utf8_lossy(&o.stderr)
++    );
++}
++
++/// Posterior sampling happens inside the pass `--skipQuant` skips, and
++/// `--thinningFactor` thins a Gibbs chain that may not exist. Both were
++/// discarded in silence while their siblings explained themselves.
++#[test]
++fn requests_that_cannot_be_honoured_say_so() {
++    let dir = tempfile::tempdir().unwrap();
++    let fx = fixture(dir.path());
++    let out = dir.path().join("q");
++    let base: Vec<&std::ffi::OsStr> = vec![
++        os("quant"),
++        os("-i"),
++        fx.index.as_os_str(),
++        os("-l"),
++        os("IU"),
++        os("-1"),
++        fx.r1.as_os_str(),
++        os("-2"),
++        fx.r2.as_os_str(),
++        os("-p"),
++        os("2"),
++    ];
++
++    let mut v = base.clone();
++    v.extend([
++        os("--skipQuant"),
++        os("--numBootstraps"),
++        os("4"),
++        os("-o"),
++        out.as_os_str(),
++    ]);
++    let o = run(&v);
++    assert!(o.status.success());
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert!(
++        err.contains("--numBootstraps") && err.contains("--skipQuant run"),
++        "--skipQuant must say it is discarding the posterior request:\n{err}"
++    );
++
++    let mut v = base.clone();
++    v.extend([os("--thinningFactor"), os("8"), os("-o"), out.as_os_str()]);
++    let o = run(&v);
++    assert!(o.status.success());
++    assert!(
++        String::from_utf8_lossy(&o.stderr).contains("--thinningFactor has no effect"),
++        "{}",
++        String::from_utf8_lossy(&o.stderr)
++    );
++
++    // Control: with Gibbs actually running, --thinningFactor is silent.
++    let mut v = base.clone();
++    v.extend([
++        os("--numGibbsSamples"),
++        os("20"),
++        os("--thinningFactor"),
++        os("8"),
++        os("-o"),
++        out.as_os_str(),
++    ]);
++    let o = run(&v);
++    assert!(o.status.success());
++    assert!(
++        !String::from_utf8_lossy(&o.stderr).contains("--thinningFactor has no effect"),
++        "--thinningFactor must not warn when Gibbs sampling runs"
++    );
++}
+diff --git a/crates/salmon-cli/tests/metadata_truth.rs b/crates/salmon-cli/tests/metadata_truth.rs
+new file mode 100644
+index 000000000..aa155f60d
+--- /dev/null
++++ b/crates/salmon-cli/tests/metadata_truth.rs
+@@ -0,0 +1,408 @@
++//! Groups 4 and 5 of the pre-2.6.0 readiness sweep: `meta_info.json` fields and
++//! log text that asserted something the run did not do, and errors that arrived
++//! too late or named the wrong flag. All machine-read or user-facing, all on
++//! default paths.
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++const SALMON: &str = env!("CARGO_BIN_EXE_salmon");
++
++fn sequence(mut seed: u64, len: usize) -> String {
++    (0..len)
++        .map(|_| {
++            seed = seed
++                .wrapping_mul(6_364_136_223_846_793_005)
++                .wrapping_add(1_442_695_040_888_963_407);
++            "ACGT".as_bytes()[(seed >> 33) as usize & 3] as char
++        })
++        .collect()
++}
++
++/// Decoy-aware index plus ISF-by-construction read pairs.
++fn fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
++    let (a, b) = (sequence(5, 3000), sequence(19, 3000));
++    let decoy = sequence(101, 4000);
++    let fasta = dir.join("gentrome.fa");
++    std::fs::write(&fasta, format!(">txA\n{a}\n>txB\n{b}\n>decoy1\n{decoy}\n")).unwrap();
++    let decoys = dir.join("decoys.txt");
++    std::fs::write(&decoys, "decoy1\n").unwrap();
++    let index = dir.join("idx");
++    assert!(Command::new(SALMON)
++        .args(["index", "-t"])
++        .arg(&fasta)
++        .arg("-d")
++        .arg(&decoys)
++        .arg("-i")
++        .arg(&index)
++        .args(["-p", "2"])
++        .status()
++        .unwrap()
++        .success());
++
++    let rc = |x: &str| -> String {
++        x.chars()
++            .rev()
++            .map(|c| match c {
++                'A' => 'T',
++                'C' => 'G',
++                'G' => 'C',
++                _ => 'A',
++            })
++            .collect()
++    };
++    let (mut r1, mut r2) = (String::new(), String::new());
++    let q = "I".repeat(100);
++    for i in 0..200 {
++        let s = if i % 2 == 0 { &a } else { &b };
++        let st = (i * 11) % (s.len() - 350);
++        r1.push_str(&format!("@f{i}\n{}\n+\n{q}\n", &s[st..st + 100]));
++        r2.push_str(&format!("@f{i}\n{}\n+\n{q}\n", rc(&s[st + 200..st + 300])));
++    }
++    let (p1, p2) = (dir.join("r1.fq"), dir.join("r2.fq"));
++    std::fs::write(&p1, r1).unwrap();
++    std::fs::write(&p2, r2).unwrap();
++    (index, p1, p2)
++}
++
++fn meta(out: &Path) -> serde_json::Value {
++    let s = std::fs::read_to_string(out.join("aux_info").join("meta_info.json")).unwrap();
++    serde_json::from_str(&s).unwrap()
++}
++
++/// `library_types` reported what the DETECTOR observed rather than what the run
++/// applied, so an explicit `-l` contradicted `cmd_info.json` and
++/// `lib_format_counts.json` in the same directory. Both facts are wanted, so
++/// they now live in separate fields: applied in `library_types`, observed in
++/// `detected_library_type`.
++#[test]
++fn library_types_reports_the_applied_format_and_detected_the_observed_one() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, r1, r2) = fixture(dir.path());
++    let run = |lib: &str, out: &Path| {
++        assert!(Command::new(SALMON)
++            .args(["quant", "-i"])
++            .arg(&index)
++            .args(["-l", lib, "-1"])
++            .arg(&r1)
++            .arg("-2")
++            .arg(&r2)
++            .args(["-p", "2", "-o"])
++            .arg(out)
++            .status()
++            .unwrap()
++            .success());
++    };
++
++    // The reads are ISF. Declaring ISR must be reported as ISR — the run really
++    // did filter that way (and mapped nothing as a result).
++    let wrong = dir.path().join("isr");
++    run("ISR", &wrong);
++    let m = meta(&wrong);
++    assert_eq!(m["library_types"][0], "ISR", "applied format");
++    assert_eq!(m["detected_library_type"], "ISF", "observed format");
++    assert_eq!(m["num_mapped"], 0, "ISR really was applied");
++
++    // Under `-l A` detection *is* the declaration, so both agree.
++    let auto = dir.path().join("auto");
++    run("A", &auto);
++    let m = meta(&auto);
++    assert_eq!(m["library_types"][0], "ISF");
++    assert_eq!(m["detected_library_type"], "ISF");
++}
++
++/// `num_decoy_targets` was hardcoded 0 while `num_decoy_fragments` beside it was
++/// real — self-contradictory, with `meta_info_complete: true`.
++#[test]
++fn decoy_targets_are_counted() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, r1, r2) = fixture(dir.path());
++    let out = dir.path().join("q");
++    assert!(Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&index)
++        .args(["-l", "IU", "-1"])
++        .arg(&r1)
++        .arg("-2")
++        .arg(&r2)
++        .args(["-p", "2", "-o"])
++        .arg(&out)
++        .status()
++        .unwrap()
++        .success());
++    let m = meta(&out);
++    assert_eq!(m["num_valid_targets"], 2, "txA + txB");
++    assert_eq!(
++        m["num_decoy_targets"], 1,
++        "decoy1 must be counted, not zeroed"
++    );
++}
++
++/// A plain `-a` run reported `frag_length_source: "rad_baked"`, naming an
++/// internal intermediate the user never asked for. Genuine `--rad` input keeps
++/// that spelling, because there the RAD really is the source.
++#[test]
++fn frag_length_source_names_the_users_input() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = dir.path().join("a.sam");
++    let mut s = String::from("@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:txA\tLN:3000\n");
++    for i in 0..40 {
++        let (l, r) = (i * 20 + 1, i * 20 + 201);
++        s.push_str(&format!(
++            "p{i}\t99\ttxA\t{l}\t60\t100M\t=\t{r}\t300\t*\t*\tAS:i:200\n"
++        ));
++        s.push_str(&format!(
++            "p{i}\t147\ttxA\t{r}\t60\t100M\t=\t{l}\t-300\t*\t*\tAS:i:200\n"
++        ));
++    }
++    std::fs::write(&sam, s).unwrap();
++
++    let aln = dir.path().join("aln");
++    let rad = dir.path().join("m.rad");
++    assert!(Command::new(SALMON)
++        .args(["quant", "-a"])
++        .arg(&sam)
++        .args(["-l", "IU", "--writeRad"])
++        .arg(&rad)
++        .arg("-o")
++        .arg(&aln)
++        .status()
++        .unwrap()
++        .success());
++    assert_eq!(
++        meta(&aln)["frag_length_source"],
++        "alignments",
++        "alignment input must not report the internal RAD handoff"
++    );
++
++    let from_rad = dir.path().join("rad");
++    assert!(Command::new(SALMON)
++        .args(["quant", "--rad"])
++        .arg(&rad)
++        .args(["-l", "IU", "-o"])
++        .arg(&from_rad)
++        .status()
++        .unwrap()
++        .success());
++    assert_eq!(
++        meta(&from_rad)["frag_length_source"],
++        "rad_baked",
++        "genuine RAD input keeps rad_baked — the RAD really is the source"
++    );
++}
++
++/// `logs/salmon_quant.log` labelled a default reads run "alignment mode",
++/// dropped the documented mapping-type/rate lines, and called unmapped
++/// fragments strand-incompatible on a run with none.
++#[test]
++fn the_run_log_describes_the_mode_the_user_chose() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, r1, r2) = fixture(dir.path());
++    let out = dir.path().join("q");
++    assert!(Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&index)
++        .args(["-l", "IU", "-1"])
++        .arg(&r1)
++        .arg("-2")
++        .arg(&r2)
++        .args(["-p", "2", "-o"])
++        .arg(&out)
++        .status()
++        .unwrap()
++        .success());
++    let log = std::fs::read_to_string(out.join("logs").join("salmon_quant.log")).unwrap();
++    assert!(log.contains("reads mode"), "{log}");
++    assert!(!log.contains("alignment mode"), "{log}");
++    assert!(
++        log.contains("mapping type:"),
++        "documented line missing:\n{log}"
++    );
++    assert!(
++        log.contains("mapping rate:"),
++        "documented line missing:\n{log}"
++    );
++    assert!(
++        !log.contains("strand-compatible"),
++        "reads mode has no strand-compatible/aligned distinction:\n{log}"
++    );
++}
++
++/// `-a` with bias but no `-t` used to read the entire BAM before failing, with a
++/// message naming `--rad` — a flag the invocation did not contain.
++#[test]
++fn alignment_bias_without_targets_fails_immediately_and_names_the_right_flags() {
++    let dir = tempfile::tempdir().unwrap();
++    let sam = dir.path().join("a.sam");
++    std::fs::write(
++        &sam,
++        "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:txA\tLN:3000\n\
++         r0\t99\ttxA\t1\t60\t100M\t=\t201\t300\t*\t*\tAS:i:200\n\
++         r0\t147\ttxA\t201\t60\t100M\t=\t1\t-300\t*\t*\tAS:i:200\n",
++    )
++    .unwrap();
++    let o = Command::new(SALMON)
++        .args(["quant", "-a"])
++        .arg(&sam)
++        .args(["-l", "IU", "--gcBias", "-o"])
++        .arg(dir.path().join("q"))
++        .output()
++        .unwrap();
++    assert!(!o.status.success());
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert!(err.contains("--gcBias") && err.contains("-t"), "{err}");
++    assert!(
++        !err.contains("--rad"),
++        "the message must not name a flag the user did not pass:\n{err}"
++    );
++    assert!(
++        !dir.path().join("q").join("quant.sf").exists(),
++        "it must fail before doing the work"
++    );
++}
++
++/// A FASTQ parse error named neither the file nor anything else useful, though
++/// `-1/-2/-r` accept many files.
++#[test]
++fn a_fastq_parse_error_names_the_file() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, _r1, _r2) = fixture(dir.path());
++    // Valid records, then one with a bad separator mid-file, then more — so the
++    // failure is a genuine parse error rather than the completeness preflight.
++    let bad = dir.path().join("mid.fq");
++    let mut s = String::new();
++    let seq = sequence(3, 60);
++    for i in 0..40 {
++        s.push_str(&format!("@r{i}\n{seq}\n+\n{}\n", "I".repeat(60)));
++    }
++    s.push_str(&format!("@bad\n{seq}\nN\n{}\n", "I".repeat(60)));
++    for i in 40..60 {
++        s.push_str(&format!("@r{i}\n{seq}\n+\n{}\n", "I".repeat(60)));
++    }
++    std::fs::write(&bad, s).unwrap();
++
++    let o = Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&index)
++        .args(["-l", "U", "-r"])
++        .arg(&bad)
++        .args(["-p", "2", "-o"])
++        .arg(dir.path().join("q"))
++        .output()
++        .unwrap();
++    assert!(!o.status.success());
++    let err = String::from_utf8_lossy(&o.stderr);
++    assert!(
++        err.contains("mid.fq"),
++        "the error must name the offending file:\n{err}"
++    );
++}
++
++/// The `--decoyThreshold` inertness warning sat before mode dispatch, so it
++/// fired in `-a`/`--rad` — asserting sketch was running on a run that never
++/// mapped, and where `--sketch` itself was already reported inert.
++#[test]
++fn the_sketch_decoy_threshold_warning_only_fires_in_reads_mode() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, r1, r2) = fixture(dir.path());
++    let sam = dir.path().join("a.sam");
++    std::fs::write(
++        &sam,
++        "@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:txA\tLN:3000\n\
++         r0\t99\ttxA\t1\t60\t100M\t=\t201\t300\t*\t*\tAS:i:200\n\
++         r0\t147\ttxA\t201\t60\t100M\t=\t1\t-300\t*\t*\tAS:i:200\n",
++    )
++    .unwrap();
++    let out = dir.path().join("q");
++
++    let o = Command::new(SALMON)
++        .args(["quant", "-a"])
++        .arg(&sam)
++        .args(["-l", "IU", "--sketch", "--decoyThreshold", "0.5", "-o"])
++        .arg(&out)
++        .output()
++        .unwrap();
++    assert!(
++        !String::from_utf8_lossy(&o.stderr).contains("no effect in --sketch mode"),
++        "must not claim sketch is running in alignment mode"
++    );
++
++    let o = Command::new(SALMON)
++        .args(["quant", "-i"])
++        .arg(&index)
++        .args(["-l", "IU", "-1"])
++        .arg(&r1)
++        .arg("-2")
++        .arg(&r2)
++        .args(["--sketch", "--decoyThreshold", "0.5", "-p", "2", "-o"])
++        .arg(&out)
++        .output()
++        .unwrap();
++    assert!(
++        String::from_utf8_lossy(&o.stderr).contains("no effect in --sketch mode"),
++        "it must still fire where sketch really runs"
++    );
++}
++
++/// `num_bias_bins` names C++'s legacy 4096-bin k-mer counter, which this port
++/// replaced — so it cannot describe the seq/GC/positional models that actually
++/// run, and stays 0. Nothing recorded their shapes, so these fields do.
++///
++/// They are measured from the produced models rather than the requested
++/// options, and are absent when the correction was not requested — that is how
++/// a consumer distinguishes "off" from "on with N bins".
++#[test]
++fn bias_model_shapes_are_recorded() {
++    let dir = tempfile::tempdir().unwrap();
++    let (index, r1, r2) = fixture(dir.path());
++    let run = |extra: &[&str], out: &Path| {
++        let mut c = Command::new(SALMON);
++        c.args(["quant", "-i"])
++            .arg(&index)
++            .args(["-l", "IU", "-1"])
++            .arg(&r1)
++            .arg("-2")
++            .arg(&r2)
++            .args(["-p", "2"])
++            .args(extra)
++            .arg("-o")
++            .arg(out);
++        assert!(c.status().unwrap().success());
++    };
++
++    // Off: the fields are absent, not zero — a zero would read as a real model
++    // with no bins.
++    let off = dir.path().join("off");
++    run(&[], &off);
++    let m = meta(&off);
++    assert!(m.get("seq_bias_context_length").is_none(), "{m}");
++    assert!(m.get("gc_bias_bins").is_none(), "{m}");
++    assert!(m.get("pos_bias_bins").is_none(), "{m}");
++
++    // All three on.
++    let on = dir.path().join("on");
++    run(&["--seqBias", "--gcBias", "--posBias"], &on);
++    let m = meta(&on);
++    assert_eq!(m["seq_bias_context_length"], 9);
++    assert_eq!(m["gc_bias_bins"], 75, "default 25 GC x 3 conditional bins");
++    assert_eq!(m["pos_bias_bins"]["length_classes"], 5);
++    assert_eq!(m["pos_bias_bins"]["bins_per_class"], 20);
++    // num_bias_bins keeps its C++ meaning and stays 0 alongside them.
++    assert_eq!(m["num_bias_bins"], 0);
++
++    // Each field tracks only its own model.
++    let gc = dir.path().join("gc");
++    run(&["--gcBias"], &gc);
++    let m = meta(&gc);
++    assert_eq!(m["gc_bias_bins"], 75);
++    assert!(m.get("seq_bias_context_length").is_none(), "{m}");
++    assert!(m.get("pos_bias_bins").is_none(), "{m}");
++
++    // And follows the knobs, rather than reporting a constant.
++    let tuned = dir.path().join("tuned");
++    run(
++        &["--gcBias", "--numGCBins", "30", "--conditionalGCBins", "4"],
++        &tuned,
++    );
++    assert_eq!(meta(&tuned)["gc_bias_bins"], 120, "30 GC x 4 conditional");
++}
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index e529ddc73..2a0ed0a0d 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -819,7 +819,36 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+                 }
+             }
+         }
+-        mapped.map_err(|e| anyhow::anyhow!("mapping failed: {e}"))?;
++        // Name the inputs on the way out. A FASTQ parse failure arrives here as
++        // paraseq's bare content string ("FASTX error: Invalid FASTQ separator:
++        // N, expected '+'") with no idea which file produced it: `ProcessError`
++        // carries no path, and paraseq drains every reader concurrently on
++        // threads it owns, so the identity is gone before the Result crosses
++        // back. `-1/-2/-r` each take many files, so that message on its own
++        // names nothing the user can act on — this was the only input-error
++        // class in the tree that did not chain a path. This is the last place
++        // that still holds the paths, and it runs once per run (not per record),
++        // so the context is free. With one input we can name it outright; with
++        // several we say plainly that the list is the candidate set and not the
++        // culprit, rather than implying we know which.
++        mapped
++            .map_err(|e| anyhow::anyhow!("mapping failed: {e}"))
++            .with_context(|| {
++                let files: Vec<String> = groups
++                    .iter()
++                    .flatten()
++                    .map(|p| p.display().to_string())
++                    .collect();
++                match files.as_slice() {
++                    [one] => format!("while reading {one}"),
++                    many => format!(
++                        "while reading one of the {} read files (the FASTX reader does not \
++                         report which): {}",
++                        many.len(),
++                        many.join(", ")
++                    ),
++                }
++            })?;
+         if let Some(err) = &diagnostics.failure {
+             tracing::warn!(
+                 "thread broker stopped early ({err:?}); mapping completed with the \
+diff --git a/crates/salmon-quant/src/output.rs b/crates/salmon-quant/src/output.rs
+index e1fe6f889..fbaafd710 100644
+--- a/crates/salmon-quant/src/output.rs
++++ b/crates/salmon-quant/src/output.rs
+@@ -289,6 +289,15 @@ fn write_lib_counts(
+ 
+ /// `aux_info/meta_info.json`: everything a downstream tool or a human needs to
+ /// judge the run — provenance, settings, counters, timing and diagnostics.
++/// Shape of the positional-bias model: one model per transcript length class,
++/// each binned over the transcript's relative position. Reported as both
++/// numbers because either alone is ambiguous.
++#[derive(Serialize)]
++struct PosBiasShape {
++    length_classes: usize,
++    bins_per_class: usize,
++}
++
+ #[derive(Serialize)]
+ struct MetaInfo {
+     salmon_version: String,
+@@ -307,6 +316,18 @@ struct MetaInfo {
+     gc_bias_correct: bool,
+     pos_bias_correct: bool,
+     num_bias_bins: usize,
++    /// salmon-rs extensions: the shapes of the bias models that actually ran.
++    /// `num_bias_bins` above cannot carry these (see its fill site), so without
++    /// them a reader had no way to learn what the running models looked like.
++    /// `None` when that correction was not requested, which is how a consumer
++    /// tells "off" from "on with N bins" (#1140 follow-up). Mirrored in the
++    /// shared alignment/RAD writer so every driver reports the same set.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    seq_bias_context_length: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    gc_bias_bins: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pos_bias_bins: Option<PosBiasShape>,
+     mapping_type: String,
+     /// how the index was built; omitted when the index predates recording it,
+     /// rather than reported as a `false` the run cannot actually vouch for
+@@ -417,7 +438,31 @@ fn write_meta_info(
+         seq_bias_correct: opts.seq_bias,
+         gc_bias_correct: opts.gc_bias,
+         pos_bias_correct: opts.pos_bias,
++        // Not the seq/GC/pos bin count, despite the name. C++ salmon writes
++        // `bcounts.size()` here (`GZipWriter.cpp:532`), where `bcounts` is the
++        // *legacy* k-mer read-bias histogram `ReadKmerDist<6>` — a compile-time
++        // 4^6, identical on every run, describing the length of
++        // `observed_bias.gz` and nothing else. This port dropped that model in
++        // favour of SBModel/GC/positional and emits `observed_bias.gz` only as a
++        // neutral one-element stub (`salmon_model::dumps::write_aux_bias_dumps`),
++        // so the quantity the field names has no value here to report.
++        //
++        // Putting a seq/GC/positional count here would hand a C++-schema reader
++        // a number in the wrong unit, so this stays 0 (the value C++ itself
++        // writes in its empty-meta path) and the real shapes are reported
++        // beside it in the salmon-rs fields below. Deliberately NOT surfaced
++        // via `MissingMetaField`, which reports what an *input* could not
++        // supply, not a field whose C++ meaning no longer applies.
+         num_bias_bins: 0,
++        // The counts the field above cannot carry, measured from the models
++        // this run produced rather than from the requested options.
++        seq_bias_context_length: (!res.bias_dump.obs5_seq.is_empty())
++            .then_some(salmon_model::seqbias::CONTEXT_LENGTH),
++        gc_bias_bins: (!res.bias_dump.obs_gc.is_empty()).then_some(res.bias_dump.obs_gc.len()),
++        pos_bias_bins: res.bias_dump.obs5_pos.first().map(|first| PosBiasShape {
++            length_classes: res.bias_dump.obs5_pos.len(),
++            bins_per_class: first.len(),
++        }),
+         mapping_type: if opts.sketch { "pseudo" } else { "mapping" }.to_string(),
+         keep_duplicates: res.keep_duplicates,
+         index_seq_hash: res.index_seq_hash.clone(),
+diff --git a/docs/cli-flag-status.md b/docs/cli-flag-status.md
+index 342e20552..f1bedec8d 100644
+--- a/docs/cli-flag-status.md
++++ b/docs/cli-flag-status.md
+@@ -59,7 +59,7 @@ misbehaves.
+ | `--numBootstraps`, `--numGibbsSamples`, `--thinningFactor` | ✅ | |
+ | `--vbPrior`, `--perTranscriptPrior`, `--perNucleotidePrior` | ✅ | |
+ | `--rangeFactorizationBins`, `--incompatPrior`, `--sigDigits` | ✅ | |
+-| `--dumpEq`, `--dumpEqWeights`, `--writeUnmappedNames` | ✅ | |
++| `--dumpEq`, `--dumpEqWeights`, `--writeUnmappedNames` | ✅ | The eq dumps come from the pass that builds the classes, so they work in every RAD-based mode (including the 2.6.0 default and `--rad`) as well as `--online`. `--writeUnmappedNames` is reads-mode only: it warns and is ignored under `-a`/`--rad`, where salmon never sees the unmapped reads. |
+ | `--initUniform` | ✅ | |
+ | `--skipQuant` | ✅ | Skips EM + Gibbs/bootstrap + quant.sf; still emits eq-classes/metadata. |
+ | `-g/--geneMap`, `--genes` | ✅ | Gene-level aggregation. Rust also adds `--ignoreTxVersion` (no C++ equivalent) for Ensembl cDNA + GTF identifier mismatches. |
+@@ -76,15 +76,16 @@ misbehaves.
+ | `--seqBias`, `--gcBias`, `--posBias` | ✅ | |
+ | `--fldMean`, `--fldSD`, `--fldMax` | ✅ | Priors. With `--rad` they are ignored unless `--fldPolicy` says otherwise (a salmon RAD bakes its FLD); salmon warns when an explicitly-supplied value is ignored. |
+ | `--fldPolicy` | ✅ | `baked` (default) / `derive` / `prior`: where a RAD requant's fragment-length distribution comes from. Rust-port feature; not in this salmon build. |
+-| `-f/--forgettingFactor` | ✅ | |
+-| `--numAuxModelSamples` | ✅ | Online-phase model-training window. |
++| `-f/--forgettingFactor` | ✅ | Online-path only: since 2.6.0 the deterministic default runs no online phase, so it warns and is ignored without `--online`. |
++| `--numAuxModelSamples` | ✅ | Online-phase model-training window; same `--online`-only caveat as `--forgettingFactor`. |
+ | `--biasSpeedSamp` | ✅ | GC convolution fragment-length stride. |
+ | `--numGCBins`, `--conditionalGCBins` | ✅ | |
+ | `--noBiasLengthThreshold` | ✅ | |
+ | `--reduceGCMemory` | 🟰 | The rank-bitvector GC representation it selects is now the default (faster + ~2× leaner, identical results). |
+ | `--numBiasSamples` | ⛔ | No separate seq-bias sample cap (collected within the aux window). |
+-| `--numPreAuxModelSamples` | ✅ | Pre-aux burn-in window (port default 5000; salmon 1,000,000). |
+-| `--noFragLengthDist`, `--noSingleFragProb` | ⚠️ | FLD-in-fragment-probability toggles (experimental upstream); accepted, not yet implemented. |
++| `--numPreAuxModelSamples` | ✅ | Pre-aux burn-in window (port default 5000; salmon 1,000,000); same `--online`-only caveat as `--forgettingFactor`. |
++| `--noFragLengthDist` | ✅ | Drops the fragment-length term from a placement's probability (the proper-pair PMF term and the orphan ambiguous-length term alike). Honoured on every quantification path — reads, `-a`, `--rad`, deterministic and online — except the deprecated `--online -a`, which warns that it lacks it. |
++| `--noSingleFragProb` | ✅ | Replaces an orphan's bounded-CMF fragment-length estimate with salmon's flat `LOG_EPSILON` penalty. Honoured on the default deterministic / RAD paths as well as `--online`; it changes point estimates wherever orphans are contested. |
+ 
+ ## `salmon quant` — mapping / selective alignment (reads mode)
+ 
+@@ -115,7 +116,8 @@ misbehaves.
+ |------|--------|-------|
+ | `-a/--alignments`, `-t/--targets` | ✅ | BAM/SAM input. |
+ | `--noErrorModel`, `--numErrorBins` | ✅ | |
+-| `--discardOrphans` | ✅ | Alignment-mode orphan discard. |
++| `--discardOrphans` | ✅ | Alignment-mode orphan discard; also honoured when requantifying a RAD (`--rad`), so a requant agrees with the run that wrote the file. |
++| `--hardFilter`, `--scoreExp` | ✅ | Also honoured on `-a`/`--rad`, not just in reads mode: the requant applies them to the RAD's `AS`-derived scores exactly as it does to selective-alignment ones. |
+ | `--ont` | ✅ | Redirect (long-read mode is out of scope, as upstream). |
+ | `--mappingCacheMemoryLimit` | ⚠️ | Rust streams with bounded buffers; no mass-banking cache. |
+ | `--sampleOut`/`-s`, `--sampleUnaligned`/`-u`, `--writeQualities` | ⚠️ | Posterior-sampled BAM output; accepted, not yet implemented. |
+diff --git a/docs/release-notes-2.6.0.md b/docs/release-notes-2.6.0.md
+index 614031d7d..48fd60aea 100644
+--- a/docs/release-notes-2.6.0.md
++++ b/docs/release-notes-2.6.0.md
+@@ -122,8 +122,34 @@ Most of it is invisible from outside; these are the parts that are not.
+   posterior that actually ran (tximport keys off it together with
+   `num_bootstraps`), `serialized_eq_classes` reflects whether classes were
+   dumped, `num_decoy_fragments` reads the counter baked in the RAD instead of a
+-  hardcoded `0`, and `frag_length_source` distinguishes an observed
+-  distribution from the `--fldMean`/`--fldSD` prior a single-end run keeps.
++  hardcoded `0`, `num_decoy_targets` reports the real decoy count instead of a
++  hardcoded `0` (it contradicted `num_decoy_fragments` in the same file), and
++  `frag_length_source` distinguishes an observed distribution from the
++  `--fldMean`/`--fldSD` prior a single-end run keeps — and no longer answers
++  `rad_baked` for a plain `-a` run, which leaked the internal intermediate RAD
++  into the run's own record. Alignment input reports `alignments`; the
++  `rad_baked*` spellings are for a RAD you supplied yourself.
++- **`library_types` reports the library format that was *applied*, not the one
++  the detector observed.** With an explicit `-l` it reported the detected
++  format, contradicting `cmd_info.json` and `lib_format_counts.json` in the same
++  output directory: `-l ISR` on ISF-looking data reported `["ISF"]`, while the
++  run really did filter as ISR and map nothing. The inferred format keeps its
++  own field, so metadata now reports **both** — what was applied
++  (`library_types`) and what was observed (`detected_library_type`). **If you
++  parse `library_types` to learn what salmon detected, read
++  `detected_library_type` instead.**
++- **New: the bias models' shapes are recorded.** `meta_info.json` gains
++  `seq_bias_context_length`, `gc_bias_bins` and `pos_bias_bins`, each present
++  only when that correction ran. `num_bias_bins` keeps its C++ meaning — the
++  size of a legacy k-mer histogram this port replaced — and so stays `0`;
++  nothing previously recorded what the sequence, GC and positional models
++  actually looked like.
++
++- **`logs/salmon_quant.log` describes the run you asked for.** The log is
++  written by the pass that quantifies, which the default reads path now shares
++  with `-a`, so a plain reads run was headed "alignment mode" and reported its
++  unmapped fragments as strand-incompatible. Reads runs are labelled and
++  counted as reads runs again.
+ - **`cmd_info.json` records your invocation**, not phase 2's view of it. The
+   requant used to overwrite it with the alignment-mode schema, so `index`,
+   `mates1`/`mates2`, `threads` and `sketch` vanished from the run's own record
+diff --git a/website/src/content/docs/migrating/from-cpp.mdx b/website/src/content/docs/migrating/from-cpp.mdx
+index 036187a3e..288efff51 100644
+--- a/website/src/content/docs/migrating/from-cpp.mdx
++++ b/website/src/content/docs/migrating/from-cpp.mdx
+@@ -49,9 +49,9 @@ These still parse so existing scripts run; 2.0 logs a warning and ignores them
+ (the behavior is either the default now or handled differently).
+ 
+ - **index:** `--filterSize`
+-- **quant:** `--eqclasses`, `--noFragLengthDist`, `--noSingleFragProb`,
+-  `--mismatchSeedSkip`, `--disableChainingHeuristic`, `--hitFilterPolicy`,
+-  `--maxRecoverReadOcc`, `--validateMappings` (selective alignment is the default)
++- **quant:** `--eqclasses`, `--mismatchSeedSkip`, `--disableChainingHeuristic`,
++  `--hitFilterPolicy`, `--maxRecoverReadOcc`, `--validateMappings` (selective
++  alignment is the default)
+ - **quant -a:** `--mappingCacheMemoryLimit`, `-s/--sampleOut`,
+   `-u/--sampleUnaligned`, `--writeQualities`
+ 
+diff --git a/website/src/content/docs/reference/output-formats.md b/website/src/content/docs/reference/output-formats.md
+index 76e798d63..75544ec29 100644
+--- a/website/src/content/docs/reference/output-formats.md
++++ b/website/src/content/docs/reference/output-formats.md
+@@ -79,7 +79,7 @@ Pretty-printed JSON. tximport keys off several fields (`num_bootstraps`,
+ | `samp_type` | string | `"bootstrap"`, `"gibbs"`, or `"none"` |
+ | `opt_type` | string | `"em"` or `"vb"` |
+ | `num_libraries` | int | currently `1` |
+-| `library_types` | string[] | detected/declared library type(s) |
++| `library_types` | string[] | the library format that was **applied** — the one you gave with `-l`, or the detected one under `-l A`. For what the detector observed, read `detected_library_type` below. |
+ | `frag_dist_length` | int | number of FLD length bins |
+ | `frag_length_mean` / `frag_length_sd` | float | fragment length stats |
+ | `frag_length_source` | string | where the distribution above came from: `reads`, `alignments`, `rad_baked`, `rad_baked_prior`, `rad_derived`, or `prior` |
+@@ -100,6 +100,12 @@ Pretty-printed JSON. tximport keys off several fields (`num_bootstraps`,
+ | `num_bootstraps` | int | inferential-replicate count (0 if none) |
+ | `start_time` / `end_time` | string | asctime |
+ 
++`num_bias_bins` is retained for C++ compatibility and is always `0`. In C++
++salmon it reports the size of the legacy 4096-bin k-mer read-bias histogram
++behind `observed_bias.gz`; this port replaced that model with the sequence, GC
++and positional models, so the quantity it names does not exist here. The shapes
++of the models that *do* run are reported in the three salmon-rs fields above.
++
+ (Plus `quant_errors`, `num_bias_bins`, `serialized_eq_classes`,
+ `num_dovetail_fragments`, `num_fragments_filtered_vm`,
+ `num_alignments_below_threshold_for_mapped_fragments_vm`, and `call`.)
+@@ -118,6 +124,9 @@ aggregates (no per-fragment cost) and are emitted for every mode — reads,
+ | `num_em_iterations` | int | EM/VBEM iterations actually run |
+ | `em_converged` | bool | whether the relative-difference criterion was met before the iteration cap |
+ | `detected_library_type` | string \| null | library format observed by the auto-detector (reads / `--rad`); `null` if not observed (e.g. `-a` transcriptomic BAM) |
++| `seq_bias_context_length` | int | sequence-bias model context length, in nucleotides; omitted when `--seqBias` was not requested |
++| `gc_bias_bins` | int | total GC-bias bins, i.e. `--numGCBins` × `--conditionalGCBins`; omitted when `--gcBias` was not requested |
++| `pos_bias_bins` | object | positional-bias shape, `{ "length_classes", "bins_per_class" }`; omitted when `--posBias` was not requested |
+ | `total_time_seconds` | float | wall-clock seconds for the quantification call |
+ | `peak_rss_kb` | int | peak resident set size in KiB (Linux `VmHWM`; 0 elsewhere) |
+ | `diagnostics` | object[] | structured run diagnostics (see below) |

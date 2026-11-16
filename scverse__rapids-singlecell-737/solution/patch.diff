@@ -1,0 +1,2104 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9c5044735..d37718410 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -270,6 +270,7 @@ if (RSC_BUILD_EXTENSIONS)
+   add_rmm_cuda_module(_wilcoxon_cuda        src/rapids_singlecell/_cuda/wilcoxon/wilcoxon.cu)
+   add_rmm_cuda_module(_wilcoxon_sparse_cuda src/rapids_singlecell/_cuda/wilcoxon/wilcoxon_sparse.cu)
+   add_nb_cuda_module(_rank_stats_cuda   src/rapids_singlecell/_cuda/rank_genes/rank_stats.cu)
++  add_rmm_cuda_module(_rank_stream_cuda src/rapids_singlecell/_cuda/rank_genes/rank_stream.cu)
+   # Harmony CUDA modules
+   add_nb_cuda_module(_harmony_scatter_cuda   src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu)
+   add_nb_cuda_module(_harmony_outer_cuda     src/rapids_singlecell/_cuda/harmony/outer/outer.cu)
+diff --git a/docs/release-notes/0.16.1.md b/docs/release-notes/0.16.1.md
+index e40ad2560..8c3bd9de8 100644
+--- a/docs/release-notes/0.16.1.md
++++ b/docs/release-notes/0.16.1.md
+@@ -4,6 +4,7 @@
+ ```
+ * Add {func}`~rapids_singlecell.tl.ingest` {pr}`725` {smaller}`S Dicks`
+ * Add unified single- and multi-GPU exact Wilcoxon support for host- and device-resident dense, CSR, and CSC input. By default, host input and device OVO use all visible GPUs, while device OVR stays on its owner GPU. {pr}`730` {smaller}`S Dicks`
++* Stream host-resident input to the GPU for ``t-test``, ``wilcoxon_binned``, and {func}`~rapids_singlecell.get.aggregate`, enabling out-of-core analysis and optional multi-GPU. {pr}`737` {smaller}`S Dicks`
+ ```{rubric} Bug fixes
+ ```
+ * Match pertpy's Mixscale control-score standardization by using the sample standard deviation (``ddof=1``) {pr}`733` {smaller}`S Dicks`
+diff --git a/src/rapids_singlecell/_cuda/rank_genes/rank_stream.cu b/src/rapids_singlecell/_cuda/rank_genes/rank_stream.cu
+new file mode 100644
+index 000000000..4b14b116d
+--- /dev/null
++++ b/src/rapids_singlecell/_cuda/rank_genes/rank_stream.cu
+@@ -0,0 +1,801 @@
++// Host-streaming aggregation (sum/sq_sum/count) and binned histograms.
++// Additive-scatter reductions (no per-column ordering, unlike Wilcoxon) →
++// stream host row-blocks (CSR/C-dense) or column-windows (CSC/F-dense) into the
++// device output, reusing the existing device kernels; only a window is ever
++// on-GPU.
++#include <cuda_runtime.h>
++#include <nanobind/stl/optional.h>
++
++#include <optional>
++#include <vector>
++
++#include "../aggr/kernels_aggr.cuh"
++#include "../nb_types.h"
++#include "../streaming/streaming.cuh"
++#include "../wilcoxon_binned/kernels_wilcoxon_binned.cuh"
++
++using namespace nb::literals;
++
++namespace {
++
++constexpr int AGGR_BLOCK = 256;
++constexpr int HIST_BLOCK = 256;
++constexpr int N_STREAMS = DEFAULT_STREAMING_STREAMS;
++constexpr int STREAM_ROW_CAP = 1 << 20;  // bound the per-block indptr buffer
++constexpr int DEFAULT_SUB_BATCH = 4096;  // rows (CSR/C-dense) or cols (CSC/F)
++
++// Greedy contiguous blocks bounded by nnz_cap and seg_cap (>=1 segment).
++template <typename IdxT>
++std::vector<int> plan_nnz_blocks(const IdxT* indptr, int n, size_t nnz_cap,
++                                 int seg_cap) {
++    std::vector<int> bounds;
++    bounds.push_back(0);
++    int seg = 0;
++    while (seg < n) {
++        int start = seg;
++        size_t base = (size_t)indptr[start];
++        int stop = start + 1;
++        while (stop < n && (stop - start) < seg_cap &&
++               (size_t)indptr[stop + 1] - base <= nnz_cap) {
++            stop++;
++        }
++        bounds.push_back(stop);
++        seg = stop;
++    }
++    return bounds;
++}
++
++// Rebase indptr[col .. col+count) to a local origin on-device.
++template <typename IdxT>
++void rebase_block_indptr(const IdxT* d_indptr_full, IdxT* d_out, int col,
++                         int count, cudaStream_t stream) {
++    int blk = (count + UTIL_BLOCK_SIZE - 1) / UTIL_BLOCK_SIZE;
++    rebase_indptr_kernel<IdxT, IdxT>
++        <<<blk, UTIL_BLOCK_SIZE, 0, stream>>>(d_indptr_full, d_out, col, count);
++    CUDA_CHECK_LAST_ERROR(rebase_indptr_kernel);
++}
++
++// Transpose a C-order [rows, cols] device block into an F-order [rows, cols]
++// block (needed only for C-order dense histograms, which read whole columns).
++template <typename T>
++__global__ void transpose_c_to_f_kernel(const T* __restrict__ src,
++                                        T* __restrict__ dst, int rows,
++                                        int cols) {
++    size_t n = (size_t)rows * cols;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
++         i += (size_t)gridDim.x * blockDim.x) {
++        int r = (int)(i / cols);
++        int c = (int)(i % cols);
++        dst[(size_t)c * rows + r] = src[i];
++    }
++}
++
++// Per-stream device scratch for the sparse streamers.
++template <typename InT, typename IdxT>
++struct SparseStreamBufs {
++    InT* d_data = nullptr;
++    IdxT* d_indices = nullptr;
++    IdxT* d_indptr = nullptr;  // rebased, seg_cap+1
++};
++
++// Stream nnz-bounded blocks of a host CSR/CSC through N_STREAMS streams,
++// calling consume(slot, d_data, d_indices, d_indptr_rebased, seg0, n_seg,
++// block_nnz, stream) per block. slot == stream index (keeps per-stream buffer
++// reuse ordered).
++template <typename InT, typename IdxT, typename Consume>
++void stream_sparse_blocks(const InT* h_data, const IdxT* h_indices,
++                          const IdxT* h_indptr, int n_seg, int sub_batch,
++                          Consume&& consume) {
++    if (n_seg <= 0) return;
++    size_t total_nnz = (size_t)h_indptr[n_seg];
++
++    size_t budget = rmm_available_device_bytes(0.8);
++    size_t bytes_per_nnz = sizeof(InT) + sizeof(IdxT);
++    size_t nnz_cap = STREAMING_SAFE_BATCH_NNZ;
++    size_t mem_cap = budget / (size_t)N_STREAMS / bytes_per_nnz;
++    if (mem_cap > 0 && mem_cap < nnz_cap) nnz_cap = mem_cap;
++    if (nnz_cap < 1) nnz_cap = 1;
++
++    int seg_cap = sub_batch > 0 ? sub_batch : DEFAULT_SUB_BATCH;
++    if (seg_cap > STREAM_ROW_CAP) seg_cap = STREAM_ROW_CAP;
++
++    std::vector<int> bounds =
++        plan_nnz_blocks(h_indptr, n_seg, nnz_cap, seg_cap);
++    int n_blocks = (int)bounds.size() - 1;
++
++    size_t max_nnz = 0;
++    for (int b = 0; b < n_blocks; b++) {
++        size_t bnnz =
++            (size_t)h_indptr[bounds[b + 1]] - (size_t)h_indptr[bounds[b]];
++        if (bnnz > max_nnz) max_nnz = bnnz;
++    }
++    if (max_nnz < 1) max_nnz = 1;
++
++    RmmScratchPool pool;
++    IdxT* d_indptr_full = pool.alloc<IdxT>((size_t)n_seg + 1);
++    std::vector<SparseStreamBufs<InT, IdxT>> bufs(N_STREAMS);
++    for (int s = 0; s < N_STREAMS; s++) {
++        bufs[s].d_data = pool.alloc<InT>(max_nnz);
++        bufs[s].d_indices = pool.alloc<IdxT>(max_nnz);
++        bufs[s].d_indptr = pool.alloc<IdxT>((size_t)seg_cap + 1);
++    }
++    ScopedCudaStreams streams(N_STREAMS, cudaStreamDefault);
++    // Pinned staging ring (host cast-copy pageable->pinned, then async
++    // pinned->device): beats whole-array register and pageable staging, and
++    // gives true async DMA that overlaps across devices (mirrors wilcoxon).
++    (void)total_nnz;
++    PinnedRing<InT, IdxT> stage(N_STREAMS, max_nnz);
++
++    cuda_check(
++        cudaMemcpy(d_indptr_full, h_indptr, ((size_t)n_seg + 1) * sizeof(IdxT),
++                   cudaMemcpyHostToDevice),
++        "stream_sparse_blocks indptr H2D");
++    cudaDeviceSynchronize();
++
++    for (int b = 0; b < n_blocks; b++) {
++        int seg0 = bounds[b];
++        int n_block_seg = bounds[b + 1] - seg0;
++        size_t ptr_start = (size_t)h_indptr[seg0];
++        size_t block_nnz = (size_t)h_indptr[seg0 + n_block_seg] - ptr_start;
++        int s = b % N_STREAMS;
++        cudaStream_t stream = streams[s];
++        auto& buf = bufs[s];
++
++        stage.wait(s);  // slot free once its prior async copy finished
++        if (block_nnz > 0) {
++            InT* h_vals = stage.template get<0>(s);
++            IdxT* h_idx = stage.template get<1>(s);
++            host_copy_slice_as<InT, IdxT>(h_data, h_indices, ptr_start,
++                                          (int)block_nnz, h_vals, h_idx);
++            cuda_check(
++                cudaMemcpyAsync(buf.d_data, h_vals, block_nnz * sizeof(InT),
++                                cudaMemcpyHostToDevice, stream),
++                "stream_sparse_blocks data H2D");
++            cuda_check(
++                cudaMemcpyAsync(buf.d_indices, h_idx, block_nnz * sizeof(IdxT),
++                                cudaMemcpyHostToDevice, stream),
++                "stream_sparse_blocks indices H2D");
++        }
++        stage.record(s, stream);  // slot reusable after these copies finish
++        rebase_block_indptr(d_indptr_full, buf.d_indptr, seg0, n_block_seg + 1,
++                            stream);
++        consume(s, buf.d_data, buf.d_indices, buf.d_indptr, seg0, n_block_seg,
++                (int)block_nnz, stream);
++    }
++    sync_streams(streams, "stream_sparse_blocks");
++}
++
++// Aggregation MASK dispatch (mirrors aggr.cu; kernels from kernels_aggr.cuh).
++#define RANK_STREAM_AGGR_DISPATCH(active, LAUNCH)                        \
++    switch (active) {                                                    \
++        case 1:                                                          \
++            LAUNCH(1);                                                   \
++            break;                                                       \
++        case 2:                                                          \
++            LAUNCH(2);                                                   \
++            break;                                                       \
++        case 3:                                                          \
++            LAUNCH(3);                                                   \
++            break;                                                       \
++        case 4:                                                          \
++            LAUNCH(4);                                                   \
++            break;                                                       \
++        case 5:                                                          \
++            LAUNCH(5);                                                   \
++            break;                                                       \
++        case 6:                                                          \
++            LAUNCH(6);                                                   \
++            break;                                                       \
++        case 7:                                                          \
++            LAUNCH(7);                                                   \
++            break;                                                       \
++        default:                                                         \
++            throw std::runtime_error(                                    \
++                "rank_stream aggr: at least one output plane required"); \
++    }
++
++int aggr_active_mask(double* ps, double* pc, double* pq) {
++    return (ps ? AGGR_SUM : 0) | (pc ? AGGR_COUNT : 0) | (pq ? AGGR_SQSUM : 0);
++}
++
++// Return the caller's cell mask, or an all-ones mask allocated from `pool`
++// (which must outlive the streaming call that reads it).
++template <typename Device>
++const bool* alloc_or_mask(
++    const std::optional<gpu_array_c<const bool, Device>>& mask, int n_cells,
++    RmmScratchPool& pool) {
++    if (mask) return mask->data();
++    bool* ones = pool.alloc<bool>((size_t)n_cells);
++    cudaMemset(ones, 1, (size_t)n_cells);
++    return ones;
++}
++
++// ---- aggregation: CSR host (row-block stream, full-output accumulation) ----
++template <typename T, typename IdxT, typename Device>
++void def_aggr_csr_host(nb::module_& m) {
++    m.def(
++        "aggr_csr_host",
++        [](host_array<const T> data, host_array<const IdxT> indices,
++           host_array<const IdxT> indptr, gpu_array_c<const int, Device> cats,
++           std::optional<gpu_array_c<double, Device>> out_sum,
++           std::optional<gpu_array_c<double, Device>> out_count,
++           std::optional<gpu_array_c<double, Device>> out_sqsum,
++           std::optional<gpu_array_c<const bool, Device>> mask, int n_cells,
++           int n_genes, int sub_batch_rows) {
++            double* ps = out_sum ? out_sum->data() : nullptr;
++            double* pc = out_count ? out_count->data() : nullptr;
++            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
++            int active = aggr_active_mask(ps, pc, pq);
++            nb_require((int)indptr.shape(0) == n_cells + 1,
++                       "aggr_csr_host: indptr length must be n_cells+1");
++            const int* d_cats = cats.data();
++            RmmScratchPool mask_pool;
++            const bool* d_mask = alloc_or_mask(mask, n_cells, mask_pool);
++            auto consume = [&](int s, const T* d_data, const IdxT* d_indices,
++                               const IdxT* d_indptr, int seg0, int n_block_seg,
++                               int block_nnz, cudaStream_t stream) {
++                (void)s;
++                (void)block_nnz;
++                dim3 block(AGGR_BLOCK);
++                dim3 grid((unsigned)n_block_seg);
++#define LAUNCH(M)                                                              \
++    csr_aggr_kernel<T, IdxT, M><<<grid, block, 0, stream>>>(                   \
++        d_indptr, d_indices, d_data, ps, pc, pq, d_cats + seg0, d_mask + seg0, \
++        (size_t)n_block_seg, (size_t)n_genes);                                 \
++    CUDA_CHECK_LAST_ERROR(csr_aggr_kernel)
++                RANK_STREAM_AGGR_DISPATCH(active, LAUNCH);
++#undef LAUNCH
++            };
++            stream_sparse_blocks<T, IdxT>(data.data(), indices.data(),
++                                          indptr.data(), n_cells,
++                                          sub_batch_rows, consume);
++        },
++        "data"_a, "indices"_a, "indptr"_a, "cats"_a, nb::kw_only(),
++        "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
++        "out_sqsum"_a = nb::none(), "mask"_a = nb::none(), "n_cells"_a,
++        "n_genes"_a, "sub_batch_rows"_a = DEFAULT_SUB_BATCH,
++        nb::call_guard<nb::gil_scoped_release>());
++}
++
++// ---- aggregation: CSC host (column-window stream, per-window out + scatter)
++// ----
++template <typename T, typename IdxT, typename Device>
++void def_aggr_csc_host(nb::module_& m) {
++    m.def(
++        "aggr_csc_host",
++        [](host_array<const T> data, host_array<const IdxT> indices,
++           host_array<const IdxT> indptr, gpu_array_c<const int, Device> cats,
++           std::optional<gpu_array_c<double, Device>> out_sum,
++           std::optional<gpu_array_c<double, Device>> out_count,
++           std::optional<gpu_array_c<double, Device>> out_sqsum,
++           std::optional<gpu_array_c<const bool, Device>> mask, int n_cells,
++           int n_genes, int sub_batch_cols) {
++            double* ps = out_sum ? out_sum->data() : nullptr;
++            double* pc = out_count ? out_count->data() : nullptr;
++            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
++            int active = aggr_active_mask(ps, pc, pq);
++            nb_require((int)indptr.shape(0) == n_genes + 1,
++                       "aggr_csc_host: indptr length must be n_genes+1");
++            int n_cats = out_sum     ? (int)out_sum->shape(0)
++                         : out_count ? (int)out_count->shape(0)
++                                     : (int)out_sqsum->shape(0);
++            const int* d_cats = cats.data();
++            int sb = sub_batch_cols > 0 ? sub_batch_cols : DEFAULT_SUB_BATCH;
++            RmmScratchPool wpool;
++            const bool* d_mask = alloc_or_mask(mask, n_cells, wpool);
++            // Per-stream window output planes, scattered into the full output.
++            double* w_sum[N_STREAMS] = {nullptr};
++            double* w_count[N_STREAMS] = {nullptr};
++            double* w_sqsum[N_STREAMS] = {nullptr};
++            for (int s = 0; s < N_STREAMS; s++) {
++                if (ps) w_sum[s] = wpool.alloc<double>((size_t)n_cats * sb);
++                if (pc) w_count[s] = wpool.alloc<double>((size_t)n_cats * sb);
++                if (pq) w_sqsum[s] = wpool.alloc<double>((size_t)n_cats * sb);
++            }
++            auto consume = [&](int s, const T* d_data, const IdxT* d_indices,
++                               const IdxT* d_indptr, int seg0, int n_block_seg,
++                               int block_nnz, cudaStream_t stream) {
++                (void)block_nnz;
++                double* ws = ps ? w_sum[s] : nullptr;
++                double* wc = pc ? w_count[s] : nullptr;
++                double* wq = pq ? w_sqsum[s] : nullptr;
++                size_t plane = (size_t)n_cats * n_block_seg;
++                if (ws) cudaMemsetAsync(ws, 0, plane * sizeof(double), stream);
++                if (wc) cudaMemsetAsync(wc, 0, plane * sizeof(double), stream);
++                if (wq) cudaMemsetAsync(wq, 0, plane * sizeof(double), stream);
++                dim3 block(AGGR_BLOCK);
++                dim3 grid((unsigned)n_block_seg);
++#define LAUNCH(M)                                                \
++    csc_aggr_kernel<T, IdxT, M><<<grid, block, 0, stream>>>(     \
++        d_indptr, d_indices, d_data, ws, wc, wq, d_cats, d_mask, \
++        (size_t)n_cells, (size_t)n_block_seg);                   \
++    CUDA_CHECK_LAST_ERROR(csc_aggr_kernel)
++                RANK_STREAM_AGGR_DISPATCH(active, LAUNCH);
++#undef LAUNCH
++                if (ws)
++                    scatter_cols_2d(ps + seg0, ws, n_cats, n_genes, n_block_seg,
++                                    stream);
++                if (wc)
++                    scatter_cols_2d(pc + seg0, wc, n_cats, n_genes, n_block_seg,
++                                    stream);
++                if (wq)
++                    scatter_cols_2d(pq + seg0, wq, n_cats, n_genes, n_block_seg,
++                                    stream);
++            };
++            stream_sparse_blocks<T, IdxT>(data.data(), indices.data(),
++                                          indptr.data(), n_genes, sb, consume);
++        },
++        "data"_a, "indices"_a, "indptr"_a, "cats"_a, nb::kw_only(),
++        "out_sum"_a = nb::none(), "out_count"_a = nb::none(),
++        "out_sqsum"_a = nb::none(), "mask"_a = nb::none(), "n_cells"_a,
++        "n_genes"_a, "sub_batch_cols"_a = DEFAULT_SUB_BATCH,
++        nb::call_guard<nb::gil_scoped_release>());
++}
++
++// ---- aggregation: dense host (C-order row-block, full out; F-order
++// column-window + scatter) ----
++template <typename T, typename Device, typename HostArray, bool FOrder>
++void def_aggr_dense_host(nb::module_& m) {
++    m.def(
++        "aggr_dense_host",
++        [](HostArray X, gpu_array_c<const int, Device> cats,
++           std::optional<gpu_array_c<double, Device>> out_sum,
++           std::optional<gpu_array_c<double, Device>> out_count,
++           std::optional<gpu_array_c<double, Device>> out_sqsum,
++           std::optional<gpu_array_c<const bool, Device>> mask, int sub_batch) {
++            double* ps = out_sum ? out_sum->data() : nullptr;
++            double* pc = out_count ? out_count->data() : nullptr;
++            double* pq = out_sqsum ? out_sqsum->data() : nullptr;
++            int active = aggr_active_mask(ps, pc, pq);
++            int n_cells = (int)X.shape(0);
++            int n_genes = (int)X.shape(1);
++            int n_cats = out_sum     ? (int)out_sum->shape(0)
++                         : out_count ? (int)out_count->shape(0)
++                                     : (int)out_sqsum->shape(0);
++            if (n_cells == 0 || n_genes == 0) return;
++            const T* h_X = X.data();
++            const int* d_cats = cats.data();
++            int sb = sub_batch > 0 ? sub_batch : DEFAULT_SUB_BATCH;
++            int axis =
++                FOrder ? n_genes : n_cells;  // stream cols (F) or rows (C)
++            if (sb > axis) sb = axis < 1 ? 1 : axis;
++
++            size_t budget = rmm_available_device_bytes(0.8);
++            size_t other = FOrder ? (size_t)n_cells : (size_t)n_genes;
++            int n_planes = (ps ? 1 : 0) + (pc ? 1 : 0) + (pq ? 1 : 0);
++            if (other > std::numeric_limits<size_t>::max() / sizeof(T))
++                throw std::runtime_error(
++                    "aggr_dense_host: streaming item size overflow");
++            size_t bytes_per_axis_item = other * sizeof(T);
++            if (FOrder) {
++                size_t scratch_items = (size_t)n_cats * n_planes;
++                if (scratch_items >
++                    (std::numeric_limits<size_t>::max() - bytes_per_axis_item) /
++                        sizeof(double))
++                    throw std::runtime_error(
++                        "aggr_dense_host: window scratch size overflow");
++                bytes_per_axis_item += scratch_items * sizeof(double);
++            }
++            // Leave room for the generated mask and allocator/stream overhead.
++            size_t mask_bytes = (size_t)n_cells * sizeof(bool);
++            size_t window_budget =
++                budget > mask_bytes ? budget - mask_bytes : budget;
++            int n_streams = N_STREAMS;
++            size_t max_sb =
++                window_budget / (size_t)n_streams / bytes_per_axis_item;
++            if (max_sb < 1) {
++                n_streams = 1;
++                max_sb = window_budget / bytes_per_axis_item;
++            }
++            if (max_sb < 1)
++                throw std::runtime_error(
++                    "aggr_dense_host: one streaming row/column exceeds the "
++                    "available device-memory budget");
++            if ((size_t)sb > max_sb) sb = (int)max_sb;
++            int n_batches = (axis - 1) / sb + 1;
++            if (n_streams > n_batches) n_streams = n_batches;
++            size_t max_items = (size_t)sb * other;
++
++            RmmScratchPool pool;
++            const bool* d_mask = alloc_or_mask(mask, n_cells, pool);
++            std::vector<T*> d_block(n_streams, nullptr);
++            std::vector<double*> w_sum(n_streams, nullptr),
++                w_count(n_streams, nullptr), w_sqsum(n_streams, nullptr);
++            for (int s = 0; s < n_streams; s++) {
++                d_block[s] = pool.alloc<T>(max_items);
++                if (FOrder) {
++                    if (ps) w_sum[s] = pool.alloc<double>((size_t)n_cats * sb);
++                    if (pc)
++                        w_count[s] = pool.alloc<double>((size_t)n_cats * sb);
++                    if (pq)
++                        w_sqsum[s] = pool.alloc<double>((size_t)n_cats * sb);
++                }
++            }
++            ScopedCudaStreams streams(n_streams, cudaStreamDefault);
++            // Pageable async copies (see stream_sparse_blocks) — no per-call
++            // pin.
++            cudaDeviceSynchronize();
++
++            int b = 0;
++            for (int p = 0; p < axis; p += sb, b++) {
++                int n_block = (p + sb <= axis) ? sb : (axis - p);
++                int s = b % n_streams;
++                cudaStream_t stream = streams[s];
++                if (FOrder) {
++                    // contiguous column window [p, p+n_block): h_X + p*n_cells
++                    cuda_check(
++                        cudaMemcpyAsync(d_block[s], h_X + (size_t)p * n_cells,
++                                        (size_t)n_block * n_cells * sizeof(T),
++                                        cudaMemcpyHostToDevice, stream),
++                        "aggr_dense_host F window H2D");
++                    double* ws = ps ? w_sum[s] : nullptr;
++                    double* wc = pc ? w_count[s] : nullptr;
++                    double* wq = pq ? w_sqsum[s] : nullptr;
++                    size_t plane = (size_t)n_cats * n_block;
++                    if (ws)
++                        cudaMemsetAsync(ws, 0, plane * sizeof(double), stream);
++                    if (wc)
++                        cudaMemsetAsync(wc, 0, plane * sizeof(double), stream);
++                    if (wq)
++                        cudaMemsetAsync(wq, 0, plane * sizeof(double), stream);
++                    dim3 block(AGGR_BLOCK);
++                    dim3 grid(
++                        strided_grid((long long)n_cells * n_block, AGGR_BLOCK));
++#define LAUNCH(M)                                                            \
++    dense_aggr_kernel_F<T, M>                                                \
++        <<<grid, block, 0, stream>>>(d_block[s], ws, wc, wq, d_cats, d_mask, \
++                                     (size_t)n_cells, (size_t)n_block);      \
++    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_F)
++                    RANK_STREAM_AGGR_DISPATCH(active, LAUNCH);
++#undef LAUNCH
++                    if (ws)
++                        scatter_cols_2d(ps + p, ws, n_cats, n_genes, n_block,
++                                        stream);
++                    if (wc)
++                        scatter_cols_2d(pc + p, wc, n_cats, n_genes, n_block,
++                                        stream);
++                    if (wq)
++                        scatter_cols_2d(pq + p, wq, n_cats, n_genes, n_block,
++                                        stream);
++                } else {
++                    // contiguous row block [p, p+n_block): h_X + p*n_genes
++                    cuda_check(
++                        cudaMemcpyAsync(d_block[s], h_X + (size_t)p * n_genes,
++                                        (size_t)n_block * n_genes * sizeof(T),
++                                        cudaMemcpyHostToDevice, stream),
++                        "aggr_dense_host C row-block H2D");
++                    dim3 block(AGGR_BLOCK);
++                    dim3 grid(
++                        strided_grid((long long)n_block * n_genes, AGGR_BLOCK));
++#define LAUNCH(M)                                                        \
++    dense_aggr_kernel_C<T, M><<<grid, block, 0, stream>>>(               \
++        d_block[s], ps, pc, pq, d_cats + p, d_mask + p, (size_t)n_block, \
++        (size_t)n_genes);                                                \
++    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_C)
++                    RANK_STREAM_AGGR_DISPATCH(active, LAUNCH);
++#undef LAUNCH
++                }
++            }
++            sync_streams(streams, "aggr_dense_host");
++        },
++        "X"_a, "cats"_a, nb::kw_only(), "out_sum"_a = nb::none(),
++        "out_count"_a = nb::none(), "out_sqsum"_a = nb::none(),
++        "mask"_a = nb::none(), "sub_batch"_a = DEFAULT_SUB_BATCH,
++        nb::call_guard<nb::gil_scoped_release>());
++}
++
++// ---- histogram: CSR host (row-block stream, single pass into the full hist)
++// ---- csr_hist_kernel filters the gene window per row; bin 0 is filled
++// Python-side.
++template <typename T, typename IdxT, typename Device>
++void def_hist_csr_host(nb::module_& m) {
++    m.def(
++        "hist_csr_host",
++        [](host_array<const T> data, host_array<const IdxT> indices,
++           host_array<const IdxT> indptr, gpu_array_c<const int, Device> gcodes,
++           gpu_array_c<unsigned int, Device> hist,
++           std::optional<gpu_array_c<double, Device>> group_sums,
++           std::optional<gpu_array_c<double, Device>> group_nnz, int n_cells,
++           int n_genes, int n_groups, int n_bins, double bin_low,
++           double inv_bin_width, int col_start, int col_stop,
++           int sub_batch_rows) {
++            if (col_stop < 0) col_stop = n_genes;
++            nb_require((int)indptr.shape(0) == n_cells + 1,
++                       "hist_csr_host: indptr length must be n_cells+1");
++            nb_require(
++                col_start >= 0 && col_start <= col_stop && col_stop <= n_genes,
++                "hist_csr_host: invalid column range");
++            const int* d_gcodes = gcodes.data();
++            unsigned int* d_hist = hist.data();
++            int window = col_stop - col_start;
++            // Fused means: accumulate group sums (+nnz) on the same window
++            // (single full-width pass only, so each value is added once).
++            double* d_gsum = group_sums ? group_sums->data() : nullptr;
++            double* d_gnnz = group_nnz ? group_nnz->data() : nullptr;
++            int aggr_mask = (d_gsum ? AGGR_SUM : 0) | (d_gnnz ? AGGR_COUNT : 0);
++            RmmScratchPool mask_pool;
++            bool* d_mask = nullptr;
++            if (aggr_mask) {
++                d_mask = mask_pool.alloc<bool>((size_t)n_cells);
++                cudaMemset(d_mask, 1, (size_t)n_cells);
++            }
++            auto consume = [&](int s, const T* d_data, const IdxT* d_indices,
++                               const IdxT* d_indptr, int seg0, int n_block_seg,
++                               int block_nnz, cudaStream_t stream) {
++                (void)s;
++                (void)block_nnz;
++                // gene_start=col_start, n_genes=window → fills the chunk hist.
++                csr_hist_kernel<T, IdxT>
++                    <<<(unsigned)n_block_seg, HIST_BLOCK, 0, stream>>>(
++                        d_data, d_indices, d_indptr, d_gcodes + seg0, d_hist,
++                        n_block_seg, window, n_groups, n_bins, bin_low,
++                        inv_bin_width, col_start);
++                CUDA_CHECK_LAST_ERROR(csr_hist_kernel);
++                if (aggr_mask) {
++                    dim3 grid((unsigned)n_block_seg);
++                    dim3 block(AGGR_BLOCK);
++#define LAUNCH(M)                                                              \
++    csr_aggr_kernel<T, IdxT, M><<<grid, block, 0, stream>>>(                   \
++        d_indptr, d_indices, d_data, d_gsum, d_gnnz, nullptr, d_gcodes + seg0, \
++        d_mask + seg0, (size_t)n_block_seg, (size_t)n_genes);                  \
++    CUDA_CHECK_LAST_ERROR(csr_aggr_kernel)
++                    RANK_STREAM_AGGR_DISPATCH(aggr_mask, LAUNCH);
++#undef LAUNCH
++                }
++            };
++            stream_sparse_blocks<T, IdxT>(data.data(), indices.data(),
++                                          indptr.data(), n_cells,
++                                          sub_batch_rows, consume);
++        },
++        "data"_a, "indices"_a, "indptr"_a, "gcodes"_a, "hist"_a, nb::kw_only(),
++        "group_sums"_a = nb::none(), "group_nnz"_a = nb::none(), "n_cells"_a,
++        "n_genes"_a, "n_groups"_a, "n_bins"_a, "bin_low"_a, "inv_bin_width"_a,
++        "col_start"_a = 0, "col_stop"_a = -1,
++        "sub_batch_rows"_a = DEFAULT_SUB_BATCH,
++        nb::call_guard<nb::gil_scoped_release>());
++}
++
++// ---- histogram: CSC host (column-window stream into the chunk hist) ----
++// Chunk hist (col_stop-col_start, n_groups, nbt); sub-blocks write at their
++// leading-dim offset (gene_start=0 on the rebased view).
++template <typename T, typename IdxT, typename Device>
++void def_hist_csc_host(nb::module_& m) {
++    m.def(
++        "hist_csc_host",
++        [](host_array<const T> data, host_array<const IdxT> indices,
++           host_array<const IdxT> indptr, gpu_array_c<const int, Device> gcodes,
++           gpu_array_c<unsigned int, Device> hist,
++           std::optional<gpu_array_c<double, Device>> group_sums,
++           std::optional<gpu_array_c<double, Device>> group_nnz, int n_cells,
++           int n_genes, int n_groups, int n_bins, double bin_low,
++           double inv_bin_width, int col_start, int col_stop,
++           int sub_batch_cols) {
++            nb_require(
++                col_start >= 0 && col_start <= col_stop && col_stop <= n_genes,
++                "hist_csc_host: invalid column range");
++            int nbt = n_bins + 1;
++            const int* d_gcodes = gcodes.data();
++            unsigned int* d_hist = hist.data();
++            int window = col_stop - col_start;
++            // Fused means: accumulate into group_sums[:, col] via full n_genes
++            // stride + the window's global column offset.
++            double* d_gsum = group_sums ? group_sums->data() : nullptr;
++            double* d_gnnz = group_nnz ? group_nnz->data() : nullptr;
++            int aggr_mask = (d_gsum ? AGGR_SUM : 0) | (d_gnnz ? AGGR_COUNT : 0);
++            RmmScratchPool mask_pool;
++            bool* d_mask = nullptr;
++            if (aggr_mask) {
++                d_mask = mask_pool.alloc<bool>((size_t)n_cells);
++                cudaMemset(d_mask, 1, (size_t)n_cells);
++            }
++            auto consume = [&](int s, const T* d_data, const IdxT* d_indices,
++                               const IdxT* d_indptr, int seg0, int n_block_seg,
++                               int block_nnz, cudaStream_t stream) {
++                (void)s;
++                (void)block_nnz;
++                unsigned int* hist_off = d_hist + (size_t)seg0 * n_groups * nbt;
++                csc_hist_kernel<T, IdxT>
++                    <<<(unsigned)n_block_seg, HIST_BLOCK, 0, stream>>>(
++                        d_data, d_indices, d_indptr, d_gcodes, hist_off,
++                        n_cells, n_block_seg, n_groups, n_bins, bin_low,
++                        inv_bin_width, 0);
++                CUDA_CHECK_LAST_ERROR(csc_hist_kernel);
++                if (aggr_mask) {
++                    size_t off = (size_t)(col_start + seg0);
++                    double* gsum = d_gsum ? d_gsum + off : nullptr;
++                    double* gnnz = d_gnnz ? d_gnnz + off : nullptr;
++                    dim3 grid((unsigned)n_block_seg);
++                    dim3 block(AGGR_BLOCK);
++#define LAUNCH(M)                                                           \
++    csc_aggr_kernel<T, IdxT, M><<<grid, block, 0, stream>>>(                \
++        d_indptr, d_indices, d_data, gsum, gnnz, nullptr, d_gcodes, d_mask, \
++        (size_t)n_cells, (size_t)n_genes);                                  \
++    CUDA_CHECK_LAST_ERROR(csc_aggr_kernel)
++                    RANK_STREAM_AGGR_DISPATCH(aggr_mask, LAUNCH);
++#undef LAUNCH
++                }
++            };
++            stream_sparse_blocks<T, IdxT>(data.data(), indices.data(),
++                                          indptr.data() + col_start, window,
++                                          sub_batch_cols, consume);
++        },
++        "data"_a, "indices"_a, "indptr"_a, "gcodes"_a, "hist"_a, nb::kw_only(),
++        "group_sums"_a = nb::none(), "group_nnz"_a = nb::none(), "n_cells"_a,
++        "n_genes"_a, "n_groups"_a, "n_bins"_a, "bin_low"_a, "inv_bin_width"_a,
++        "col_start"_a, "col_stop"_a, "sub_batch_cols"_a = DEFAULT_SUB_BATCH,
++        nb::call_guard<nb::gil_scoped_release>());
++}
++
++// ---- histogram: dense host (column-window; dense_hist needs whole columns.
++// F-order: contiguous. C-order: strided 2D H2D to a C block, transposed to F)
++// ----
++template <typename T, typename Device, typename HostArray, bool FOrder>
++void def_hist_dense_host(nb::module_& m) {
++    m.def(
++        "hist_dense_host",
++        [](HostArray X, gpu_array_c<const int, Device> gcodes,
++           gpu_array_c<unsigned int, Device> hist,
++           std::optional<gpu_array_c<double, Device>> group_sums,
++           std::optional<gpu_array_c<double, Device>> group_nnz, int n_groups,
++           int n_bins, double bin_low, double inv_bin_width, int col_start,
++           int col_stop, int sub_batch_cols) {
++            int n_cells = (int)X.shape(0);
++            int n_genes_full = (int)X.shape(1);
++            nb_require(col_start >= 0 && col_start <= col_stop &&
++                           col_stop <= n_genes_full,
++                       "hist_dense_host: invalid column range");
++            int nbt = n_bins + 1;
++            const T* h_X = X.data();
++            const int* d_gcodes = gcodes.data();
++            unsigned int* d_hist = hist.data();
++            double* d_gsum = group_sums ? group_sums->data() : nullptr;
++            double* d_gnnz = group_nnz ? group_nnz->data() : nullptr;
++            int aggr_mask = (d_gsum ? AGGR_SUM : 0) | (d_gnnz ? AGGR_COUNT : 0);
++            int window = col_stop - col_start;
++            if (window <= 0) return;
++            RmmScratchPool mask_pool;
++            bool* d_mask = nullptr;
++            if (aggr_mask) {
++                d_mask = mask_pool.alloc<bool>((size_t)n_cells);
++                cudaMemset(d_mask, 1, (size_t)n_cells);
++            }
++            int sb = sub_batch_cols > 0 ? sub_batch_cols : DEFAULT_SUB_BATCH;
++            if (sb > window) sb = window;
++            size_t budget = rmm_available_device_bytes(0.8);
++            size_t per_col = (size_t)n_cells * sizeof(T) * (FOrder ? 1 : 2);
++            size_t mem_cols =
++                budget / (size_t)N_STREAMS / (per_col ? per_col : 1);
++            if (mem_cols >= 1 && (size_t)sb > mem_cols) sb = (int)mem_cols;
++            if (sb < 1) sb = 1;
++
++            // dense_aggr_kernel_F ties data layout to n_genes → fused sum uses
++            // a per-window buffer scattered into group_sums[:, c].
++            int n_sum_rows = d_gsum ? (int)group_sums->shape(0)
++                                    : (d_gnnz ? (int)group_nnz->shape(0) : 0);
++            RmmScratchPool pool;
++            std::vector<T*> d_block(N_STREAMS, nullptr);
++            std::vector<T*> d_blockF(N_STREAMS, nullptr);
++            std::vector<double*> w_gsum(N_STREAMS, nullptr);
++            std::vector<double*> w_gnnz(N_STREAMS, nullptr);
++            for (int s = 0; s < N_STREAMS; s++) {
++                d_block[s] = pool.alloc<T>((size_t)sb * n_cells);
++                if (!FOrder) d_blockF[s] = pool.alloc<T>((size_t)sb * n_cells);
++                if (d_gsum)
++                    w_gsum[s] = pool.alloc<double>((size_t)n_sum_rows * sb);
++                if (d_gnnz)
++                    w_gnnz[s] = pool.alloc<double>((size_t)n_sum_rows * sb);
++            }
++            ScopedCudaStreams streams(N_STREAMS, cudaStreamDefault);
++            // Pageable async copies (see stream_sparse_blocks) — no per-call
++            // pin.
++            cudaDeviceSynchronize();
++
++            int b = 0;
++            for (int c = col_start; c < col_stop; c += sb, b++) {
++                int wc = (c + sb <= col_stop) ? sb : (col_stop - c);
++                int s = b % N_STREAMS;
++                cudaStream_t stream = streams[s];
++                const T* dev_cols;
++                if (FOrder) {
++                    cuda_check(
++                        cudaMemcpyAsync(d_block[s], h_X + (size_t)c * n_cells,
++                                        (size_t)wc * n_cells * sizeof(T),
++                                        cudaMemcpyHostToDevice, stream),
++                        "hist_dense_host F window H2D");
++                    dev_cols = d_block[s];
++                } else {
++                    cuda_check(cudaMemcpy2DAsync(
++                                   d_block[s], (size_t)wc * sizeof(T), h_X + c,
++                                   (size_t)n_genes_full * sizeof(T),
++                                   (size_t)wc * sizeof(T), n_cells,
++                                   cudaMemcpyHostToDevice, stream),
++                               "hist_dense_host C window H2D");
++                    dim3 tb(UTIL_BLOCK_SIZE);
++                    dim3 tg(
++                        strided_grid((long long)n_cells * wc, UTIL_BLOCK_SIZE));
++                    transpose_c_to_f_kernel<T><<<tg, tb, 0, stream>>>(
++                        d_block[s], d_blockF[s], n_cells, wc);
++                    CUDA_CHECK_LAST_ERROR(transpose_c_to_f_kernel);
++                    dev_cols = d_blockF[s];
++                }
++                unsigned int* hist_off =
++                    d_hist + (size_t)(c - col_start) * n_groups * nbt;
++                dense_hist_kernel<T><<<(unsigned)wc, HIST_BLOCK, 0, stream>>>(
++                    dev_cols, d_gcodes, hist_off, n_cells, wc, n_groups, n_bins,
++                    bin_low, inv_bin_width);
++                CUDA_CHECK_LAST_ERROR(dense_hist_kernel);
++                if (aggr_mask) {
++                    // Per-window sum (n_genes=wc) then scatter into
++                    // group_sums[:, c].
++                    double* ws = d_gsum ? w_gsum[s] : nullptr;
++                    double* wn = d_gnnz ? w_gnnz[s] : nullptr;
++                    size_t plane = (size_t)n_sum_rows * wc;
++                    if (ws)
++                        cudaMemsetAsync(ws, 0, plane * sizeof(double), stream);
++                    if (wn)
++                        cudaMemsetAsync(wn, 0, plane * sizeof(double), stream);
++                    dim3 ab(AGGR_BLOCK);
++                    dim3 ag(strided_grid((long long)n_cells * wc, AGGR_BLOCK));
++#define LAUNCH(M)                                                            \
++    dense_aggr_kernel_F<T, M>                                                \
++        <<<ag, ab, 0, stream>>>(dev_cols, ws, wn, nullptr, d_gcodes, d_mask, \
++                                (size_t)n_cells, (size_t)wc);                \
++    CUDA_CHECK_LAST_ERROR(dense_aggr_kernel_F)
++                    RANK_STREAM_AGGR_DISPATCH(aggr_mask, LAUNCH);
++#undef LAUNCH
++                    if (ws)
++                        scatter_cols_2d(d_gsum + c, ws, n_sum_rows,
++                                        n_genes_full, wc, stream);
++                    if (wn)
++                        scatter_cols_2d(d_gnnz + c, wn, n_sum_rows,
++                                        n_genes_full, wc, stream);
++                }
++            }
++            sync_streams(streams, "hist_dense_host");
++        },
++        "X"_a, "gcodes"_a, "hist"_a, nb::kw_only(), "group_sums"_a = nb::none(),
++        "group_nnz"_a = nb::none(), "n_groups"_a, "n_bins"_a, "bin_low"_a,
++        "inv_bin_width"_a, "col_start"_a, "col_stop"_a,
++        "sub_batch_cols"_a = DEFAULT_SUB_BATCH,
++        nb::call_guard<nb::gil_scoped_release>());
++}
++
++template <typename Device>
++void register_bindings(nb::module_& m) {
++    def_aggr_csr_host<float, int, Device>(m);
++    def_aggr_csr_host<double, int, Device>(m);
++    def_aggr_csr_host<float, long long, Device>(m);
++    def_aggr_csr_host<double, long long, Device>(m);
++
++    def_aggr_csc_host<float, int, Device>(m);
++    def_aggr_csc_host<double, int, Device>(m);
++    def_aggr_csc_host<float, long long, Device>(m);
++    def_aggr_csc_host<double, long long, Device>(m);
++
++    def_aggr_dense_host<float, Device, host_array_c2<const float>, false>(m);
++    def_aggr_dense_host<float, Device, host_array_f2<const float>, true>(m);
++    def_aggr_dense_host<double, Device, host_array_c2<const double>, false>(m);
++    def_aggr_dense_host<double, Device, host_array_f2<const double>, true>(m);
++
++    def_hist_csr_host<float, int, Device>(m);
++    def_hist_csr_host<double, int, Device>(m);
++    def_hist_csr_host<float, long long, Device>(m);
++    def_hist_csr_host<double, long long, Device>(m);
++
++    def_hist_csc_host<float, int, Device>(m);
++    def_hist_csc_host<double, int, Device>(m);
++    def_hist_csc_host<float, long long, Device>(m);
++    def_hist_csc_host<double, long long, Device>(m);
++
++    def_hist_dense_host<float, Device, host_array_c2<const float>, false>(m);
++    def_hist_dense_host<float, Device, host_array_f2<const float>, true>(m);
++    def_hist_dense_host<double, Device, host_array_c2<const double>, false>(m);
++    def_hist_dense_host<double, Device, host_array_f2<const double>, true>(m);
++}
++
++}  // namespace
++
++NB_MODULE(_rank_stream_cuda, m) {
++    m.def("_set_host_worker_limit", &set_host_worker_limit, "limit"_a);
++    REGISTER_GPU_BINDINGS(register_bindings, m);
++}
+diff --git a/src/rapids_singlecell/get/_aggregated.py b/src/rapids_singlecell/get/_aggregated.py
+index 0a4833296..cea9cd3c3 100644
+--- a/src/rapids_singlecell/get/_aggregated.py
++++ b/src/rapids_singlecell/get/_aggregated.py
+@@ -5,6 +5,8 @@
+ from typing import TYPE_CHECKING, Literal, Union, get_args
+ 
+ import cupy as cp
++import numpy as np
++import scipy.sparse as sp
+ from anndata import AnnData
+ from cupyx.scipy import sparse as cp_sparse
+ from scanpy._utils import _resolve_axis
+@@ -18,7 +20,6 @@
+ if TYPE_CHECKING:
+     from collections.abc import Collection, Iterable
+ 
+-    import numpy as np
+     import pandas as pd
+     from numpy.typing import NDArray
+ 
+@@ -126,9 +127,63 @@ def count_mean_var(self, funcs=None, *, dof: int = 1, split_every: int = 2):
+             return self.count_mean_var_dask(funcs, dof=dof, split_every=split_every)
+         elif cp_sparse.issparse(self.data):
+             return self.count_mean_var_sparse(funcs, dof=dof)
++        elif isinstance(self.data, np.ndarray) or sp.issparse(self.data):
++            return self.count_mean_var_host(funcs, dof=dof)
+         else:
+             return self.count_mean_var_dense(funcs, dof=dof)
+ 
++    def count_mean_var_host(self, funcs=None, *, dof: int = 1):
++        """Aggregate in-memory host input (numpy / scipy sparse) by streaming
++        row/column blocks to the GPU without materializing the full matrix."""
++        from rapids_singlecell._cuda import _rank_stream_cuda as _rss
++
++        assert dof >= 0
++        funcs = _ALL_FUNCS if funcs is None else set(funcs)
++        need_sum, need_count, need_sqsum = _planes_for_funcs(funcs)
++        n_groups, n_genes = self.n_cells.shape[0], self.data.shape[1]
++
++        sums = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sum else None
++        counts = cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_count else None
++        sq_sums = (
++            cp.zeros((n_groups, n_genes), dtype=cp.float64) if need_sqsum else None
++        )
++        kw = {}
++        if sums is not None:
++            kw["out_sum"] = sums
++        if counts is not None:
++            kw["out_count"] = counts
++        if sq_sums is not None:
++            kw["out_sqsum"] = sq_sums
++        if self.mask is not None:
++            kw["mask"] = cp.asarray(self.mask, dtype=bool)
++
++        X = self.data
++        if sp.issparse(X):
++            if X.format not in {"csr", "csc"}:
++                X = X.tocsr()
++            data = X.data
++            if data.dtype not in (np.float32, np.float64):
++                data = data.astype(np.float32)
++            launch = _rss.aggr_csr_host if X.format == "csr" else _rss.aggr_csc_host
++            launch(
++                data,
++                X.indices,
++                X.indptr,
++                self.groupby,
++                n_cells=X.shape[0],
++                n_genes=n_genes,
++                **kw,
++            )
++        else:
++            if X.dtype not in (np.float32, np.float64):
++                X = X.astype(np.float32)
++            if not (X.flags.c_contiguous or X.flags.f_contiguous):
++                X = np.ascontiguousarray(X)
++            _rss.aggr_dense_host(X, self.groupby, **kw)
++        return self._build_result(
++            funcs, sums=sums, counts=counts, sq_sums=sq_sums, dof=dof
++        )
++
+     def count_mean_var_dask(self, funcs=None, *, dof: int = 1, split_every: int = 2):
+         """
+         This function is used to calculate the sum, mean, and variance of the data matrix.
+@@ -482,7 +537,9 @@ def aggregate(
+     varm
+         If not None, key for aggregation data.
+     return_sparse
+-        Whether to return a sparse matrix. Only works for sparse input data.
++        Whether to return a sparse matrix. Only works for device-resident sparse
++        input. In-memory host input is not streamed for sparse output; it is
++        copied to the GPU first, so it must fit in GPU memory.
+ 
+     Returns
+     -------
+@@ -541,7 +598,16 @@ def aggregate(
+     elif axis == 1:
+         # i.e., all of `varm`, `obsm`, `layers` are None so we use `X` which must be transposed
+         data = data.T
+-    _check_gpu_X(data, allow_dask=True)
++    # In-memory host input streams to the GPU (no full copy); ``return_sparse``
++    # still needs the device path, so copy that case to the GPU.
++    is_host = isinstance(data, np.ndarray) or sp.issparse(data)
++    if is_host and return_sparse:
++        from ._anndata import X_to_GPU
++
++        data = X_to_GPU(data)
++        is_host = False
++    if not is_host:
++        _check_gpu_X(data, allow_dask=True)
+     dim_df = getattr(adata, axis_name)
+     if len(signature(_combine_categories).parameters) == 1:
+         cols = [by] if isinstance(by, str) else list(by)
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/__init__.py b/src/rapids_singlecell/tools/_rank_genes_groups/__init__.py
+index 2167bf7ce..78037f627 100644
+--- a/src/rapids_singlecell/tools/_rank_genes_groups/__init__.py
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/__init__.py
+@@ -163,12 +163,16 @@ def rank_genes_groups(
+         `'wilcoxon_binned'` the default is sized dynamically based on
+         ``n_groups`` and ``n_bins`` to keep histogram memory stable.
+     multi_gpu
+-        GPU selection for exact `'wilcoxon'`. ``None`` uses all visible GPUs
+-        for host input and device OVO, while device OVR stays on its input-owning
+-        GPU. ``False`` uses one GPU, ``True`` uses all visible GPUs, and a list
+-        or comma-separated string selects device IDs. Multi-GPU supports
+-        host/device dense, CSR, and CSC input. Device input must fit on its
+-        owning GPU; forced multi-GPU may be slower due to transfers.
++        GPU selection for `'wilcoxon'`, `'t-test'`, `'t-test_overestim_var'`,
++        and `'wilcoxon_binned'`. For exact `'wilcoxon'`, ``None`` uses all
++        visible GPUs for host input and device OVO, while device OVR stays on
++        its input-owning GPU. For the streaming t-test/binned paths, ``None``
++        and ``False`` use the current GPU. ``True`` uses all visible GPUs, and a
++        list or comma-separated string selects device IDs. Streaming multi-GPU
++        is host-only: CSR/dense input is sharded by cell rows, CSC by gene
++        columns, and results are gathered on the current device. Device-resident
++        t-test/binned input runs on its owning GPU. On small host inputs the
++        sharding overhead can make multi-GPU slower than a single GPU.
+     n_bins
+         Number of histogram bins for `'wilcoxon_binned'`. Higher values give
+         a better approximation at slightly increased cost. Default is 1000
+@@ -246,8 +250,16 @@ def rank_genes_groups(
+         msg = "return_u_values is only supported for method='wilcoxon'."
+         raise ValueError(msg)
+ 
+-    if multi_gpu is not None and multi_gpu is not False and method != "wilcoxon":
+-        msg = "multi_gpu is only supported for method='wilcoxon'."
++    if (
++        multi_gpu is not None
++        and multi_gpu is not False
++        and method
++        not in {"wilcoxon", "t-test", "t-test_overestim_var", "wilcoxon_binned"}
++    ):
++        msg = (
++            "multi_gpu is only supported for method in {'wilcoxon', 't-test', "
++            "'t-test_overestim_var', 'wilcoxon_binned'}."
++        )
+         raise ValueError(msg)
+ 
+     if chunk_size is not None and chunk_size <= 0:
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/_core.py b/src/rapids_singlecell/tools/_rank_genes_groups/_core.py
+index 1c18b059b..d03dee7f5 100644
+--- a/src/rapids_singlecell/tools/_rank_genes_groups/_core.py
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/_core.py
+@@ -124,28 +124,62 @@ def __init__(
+         self.stats_arrays: dict[str, object] | None = None
+         self._sparse_negative_fallback = False
+         self._score_dtype = np.dtype(np.float32)
++        self._multi_gpu: bool | list[int] | str | None = None
+ 
+-    def _basic_stats(self) -> None:
+-        """Compute means, vars, and pts for device-resident input."""
+-        agg = Aggregate(groupby=self.labels.cat, data=self.X)
+-        # Only sum and sq_sum are needed (means/vars are derived locally below);
+-        # count_nonzero is only needed when comp_pts is requested.
++    def _accumulate_planes(
++        self,
++    ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
++        """Sum / sq_sum / (count_nonzero) over ALL categories → (n_cats, n_genes).
++
++        Host input (numpy / scipy) streams blocks to the GPU (no full copy);
++        device / Dask uses the device ``Aggregate``. ``count_nonzero`` only when
++        ``comp_pts``.
++        """
++        X = self.X
++        if isinstance(X, np.ndarray) or sp.issparse(X):
++            return self._stream_planes()
++        agg = Aggregate(groupby=self.labels.cat, data=X)
+         funcs = {"sum", "sq_sum"}
+         if self.comp_pts:
+             funcs.add("count_nonzero")
+         result = agg.count_mean_var(funcs, dof=1)
++        return (
++            result["sum"],
++            result["sq_sum"],
++            result["count_nonzero"] if self.comp_pts else None,
++        )
+ 
+-        # Map Aggregate category order → selected groups order
++    def _stream_planes(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
++        """Host-streaming accumulation of sum / sq_sum / (count_nonzero)."""
++        from ._stream_multi_gpu import (
++            aggr_host_planes,
++            resolve_stream_devices,
++            stream_planes_multi,
++        )
++
++        codes = self.labels.cat.codes.to_numpy()
++        if codes.size and int(codes.min()) < 0:
++            # The streaming kernels index out[group, gene] directly; a missing
++            # (NaN) category (code -1) would corrupt memory, so refuse it — the
++            # device Aggregate path rejects it too.
++            msg = "groupby contains unassigned (NaN) categories; drop them first."
++            raise ValueError(msg)
++        device_ids = resolve_stream_devices(multi_gpu=self._multi_gpu)
++        n_cats = len(self.labels.cat.categories)
++        if len(device_ids) > 1:
++            return stream_planes_multi(self, device_ids)
++        cats = cp.asarray(codes, dtype=cp.int32)
++        return aggr_host_planes(self.X, cats, n_cats, comp_pts=self.comp_pts)
++
++    def _basic_stats(self) -> None:
++        """Compute means, vars, and pts (host input streams, device uses Aggregate)."""
++        sums_all, sq_sums_all, nnz_all = self._accumulate_planes()
++
++        # Map category order → selected groups order.
+         cat_names = list(self.labels.cat.categories)
+         cat_to_idx = {str(name): i for i, name in enumerate(cat_names)}
+         order = [cat_to_idx[str(name)] for name in self.groups_order]
+ 
+-        # Aggregate returns all categories; slice selected groups for outputs.
+-        # Keep all-category totals so ``groups`` subsets get correct rest stats.
+-        sums_all = result["sum"]
+-        sq_sums_all = result["sq_sum"]
+-        nnz_all = result["count_nonzero"] if self.comp_pts else None
+-
+         n = cp.asarray(self.group_sizes, dtype=cp.float64)[:, None]
+         sums = sums_all[order]
+         sq_sums = sq_sums_all[order]
+@@ -162,7 +196,7 @@ def _basic_stats(self) -> None:
+         # For reference='rest', rest includes every category not in this group.
+         # That includes categories omitted by a strict ``groups=`` selection.
+         if self.ireference is None:
+-            n_total = agg.n_cells.sum()
++            n_total = cp.float64(self.X.shape[0])
+             n_rest = n_total - n
+             means_rest = (sums_all.sum(axis=0) - sums) / n_rest
+             rest_ss = (sq_sums_all.sum(axis=0) - sq_sums) - n_rest * means_rest**2
+@@ -239,6 +273,8 @@ def compute_statistics(
+         **kwds,
+     ) -> None:
+         """Compute statistics for all groups."""
++        # Devices for the host-streaming t-test / binned shards.
++        self._multi_gpu = multi_gpu
+         # Exact OVR inserts implicit zeros between negative and positive stored
+         # values analytically. Binned and host OVO sparse paths still need the
+         # sign check; device OVO does not use its result.
+@@ -252,12 +288,10 @@ def compute_statistics(
+             )
+             if needs_signed_fallback:
+                 self._sparse_negative_fallback = _sparse_has_negative(self.X)
+-        if method in {
+-            "t-test",
+-            "t-test_overestim_var",
+-            "wilcoxon_binned",
+-        }:
+-            self.X = X_to_GPU(self.X)
++        if method in {"t-test", "t-test_overestim_var", "wilcoxon_binned"}:
++            # Host input streams (no full copy); device / Dask move to the GPU.
++            if not (isinstance(self.X, np.ndarray) or sp.issparse(self.X)):
++                self.X = X_to_GPU(self.X)
+ 
+         n_genes = self.X.shape[1]
+         if n_genes_user is None:
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py b/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py
+new file mode 100644
+index 000000000..ea81de8d4
+--- /dev/null
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/_stream_multi_gpu.py
+@@ -0,0 +1,295 @@
++"""Multi-GPU sharding for the host-streaming aggregation / binned paths.
++
++Additive-over-cells → format-preserving shards: CSR/dense row-shard (partials
++summed), CSC column-shard (partials concatenated). Each shard runs the
++single-GPU streamer in its own thread (bindings release the GIL → parallel);
++results gather onto the caller's device.
++"""
++
++from __future__ import annotations
++
++import os
++from concurrent.futures import ThreadPoolExecutor
++from typing import TYPE_CHECKING
++
++import cupy as cp
++import numpy as np
++import scipy.sparse as sp
++
++from rapids_singlecell._cuda import _rank_stream_cuda as _rss
++from rapids_singlecell._utils import parse_device_ids
++
++from ._wilcoxon_host import _copy_gpu_array_to_device
++
++if TYPE_CHECKING:
++    from ._core import _RankGenes
++
++
++# Host pageable->pinned copy is the multi-GPU bottleneck; base on core count.
++_MAX_HOST_STAGING_WORKERS = os.cpu_count() or 32
++
++
++def resolve_stream_devices(*, multi_gpu: bool | list[int] | str | None) -> list[int]:
++    """Device ids for a host-streaming run (single current device when off)."""
++    if multi_gpu is None or multi_gpu is False:
++        return [cp.cuda.Device().id]
++    return list(dict.fromkeys(parse_device_ids(multi_gpu=multi_gpu)))
++
++
++def _limit_host_workers(n_devices: int) -> None:
++    """Split the host staging pool across device shards (no CPU oversubscription)."""
++    _rss._set_host_worker_limit(max(1, _MAX_HOST_STAGING_WORKERS // n_devices))
++
++
++def _bands(n: int, k: int) -> list[tuple[int, int]]:
++    edges = np.linspace(0, n, k + 1, dtype=np.int64)
++    return [
++        (int(a), int(b)) for a, b in zip(edges[:-1], edges[1:], strict=True) if b > a
++    ]
++
++
++def _is_col_shard(X) -> bool:
++    """CSC shards by gene columns; CSR / dense shard by cell rows."""
++    return sp.issparse(X) and X.format == "csc"
++
++
++def _shard_view(X, b0: int, b1: int):
++    """Slice a shard via direct attribute assignment (no copy, no nnz scan).
++
++    Avoids two O(nnz) traps: scipy ``X[b0:b1]`` copies data/indices, and the
++    ``sp.csr_matrix((...))`` constructor validates (~200 ms for 100M nnz).
++    """
++    if not sp.issparse(X):
++        return X[b0:b1]
++    ptr0 = int(X.indptr[b0])
++    ptr1 = int(X.indptr[b1])
++    indptr = X.indptr[b0 : b1 + 1] - X.indptr[b0]
++    data = X.data[ptr0:ptr1]
++    indices = X.indices[ptr0:ptr1]
++    if X.format == "csc":
++        shard = sp.csc_matrix((X.shape[0], b1 - b0), dtype=X.data.dtype)
++    else:
++        shard = sp.csr_matrix((b1 - b0, X.shape[1]), dtype=X.data.dtype)
++    shard.data = data
++    shard.indices = indices
++    shard.indptr = indptr
++    return shard
++
++
++def _sum_to_device(parts: list[cp.ndarray], device_id: int) -> cp.ndarray:
++    with cp.cuda.Device(device_id):
++        total = _copy_gpu_array_to_device(parts[0], device_id).copy()
++        for part in parts[1:]:
++            total += _copy_gpu_array_to_device(part, device_id)
++        cp.cuda.runtime.deviceSynchronize()
++    return total
++
++
++def _concat_to_device(parts: list[cp.ndarray], device_id: int, axis: int) -> cp.ndarray:
++    with cp.cuda.Device(device_id):
++        local = [_copy_gpu_array_to_device(part, device_id) for part in parts]
++        out = cp.concatenate(local, axis=axis)
++        cp.cuda.runtime.deviceSynchronize()
++    return out
++
++
++def _host_aggr_data(data: np.ndarray) -> np.ndarray:
++    if data.dtype in (np.float32, np.float64):
++        return data
++    return data.astype(np.float32)
++
++
++def aggr_host_planes(
++    X,
++    cats: cp.ndarray,
++    n_cats: int,
++    *,
++    comp_pts: bool,
++) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
++    """Stream sum / sq_sum / (count) for ``X`` on the current device.
++
++    ``cats`` (device int32) must match ``X``'s rows; outputs are
++    ``(n_cats, X.shape[1])``.
++    """
++    n_cells, n_genes = X.shape
++    out_sum = cp.zeros((n_cats, n_genes), dtype=cp.float64)
++    out_sqsum = cp.zeros((n_cats, n_genes), dtype=cp.float64)
++    out_count = cp.zeros((n_cats, n_genes), dtype=cp.float64) if comp_pts else None
++    kw = {"out_sum": out_sum, "out_sqsum": out_sqsum}
++    if out_count is not None:
++        kw["out_count"] = out_count
++
++    if sp.issparse(X):
++        if X.format not in {"csr", "csc"}:
++            X = X.tocsr()
++        launch = _rss.aggr_csr_host if X.format == "csr" else _rss.aggr_csc_host
++        launch(
++            _host_aggr_data(X.data),
++            X.indices,
++            X.indptr,
++            cats,
++            n_cells=n_cells,
++            n_genes=n_genes,
++            **kw,
++        )
++    else:
++        if X.dtype not in (np.float32, np.float64):
++            X = X.astype(np.float32)
++        if not (X.flags.c_contiguous or X.flags.f_contiguous):
++            X = np.ascontiguousarray(X)
++        _rss.aggr_dense_host(X, cats, **kw)
++    return out_sum, out_sqsum, out_count
++
++
++def stream_planes_multi(
++    rg: _RankGenes, device_ids: list[int]
++) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray | None]:
++    """Sharded sum / sq_sum / (count) over ALL categories → (n_cats, n_genes)."""
++    X = rg.X
++    n_cells, n_genes = X.shape
++    n_cats = len(rg.labels.cat.categories)
++    codes = rg.labels.cat.codes.to_numpy().astype(np.int32, copy=False)
++    comp_pts = rg.comp_pts
++    col_shard = _is_col_shard(X)
++    axis_len = n_genes if col_shard else n_cells
++    bands = _bands(axis_len, len(device_ids))
++    device_ids = device_ids[: len(bands)]
++
++    def run_shard(index: int):
++        device_id = device_ids[index]
++        b0, b1 = bands[index]
++        with cp.cuda.Device(device_id):
++            _limit_host_workers(len(device_ids))
++            shard = _shard_view(X, b0, b1)
++            shard_cats = cp.asarray(
++                codes if col_shard else codes[b0:b1], dtype=cp.int32
++            )
++            out = aggr_host_planes(shard, shard_cats, n_cats, comp_pts=comp_pts)
++            cp.cuda.runtime.deviceSynchronize()
++        return out
++
++    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
++        shards = list(executor.map(run_shard, range(len(device_ids))))
++
++    # Gather onto the caller's device so downstream stats math stays local.
++    dev0 = cp.cuda.Device().id
++    if col_shard:
++        sums = _concat_to_device([s[0] for s in shards], dev0, axis=1)
++        sqsums = _concat_to_device([s[1] for s in shards], dev0, axis=1)
++        counts = (
++            _concat_to_device([s[2] for s in shards], dev0, axis=1)
++            if comp_pts
++            else None
++        )
++    else:
++        sums = _sum_to_device([s[0] for s in shards], dev0)
++        sqsums = _sum_to_device([s[1] for s in shards], dev0)
++        counts = _sum_to_device([s[2] for s in shards], dev0) if comp_pts else None
++    return sums, sqsums, counts
++
++
++def run_binned_hist_multi(
++    X,
++    group_codes_np: np.ndarray,
++    device_ids: list[int],
++    *,
++    n_groups: int,
++    n_hist_groups: int,
++    n_bins: int,
++    bin_low: float,
++    inv_bin_width: float,
++    comp_pts: bool,
++    start: int,
++    stop: int,
++    accumulate_means: bool,
++):
++    """Build one sharded gene-window histogram and gather onto the caller.
++
++    Fused group sums are optional. For CSC they cover ``[start, stop)``; for
++    dense/CSR row shards they retain the full input width required by the
++    aggregation kernels.
++    """
++    from ._wilcoxon_binned import (
++        _launch_csc_host,
++        _launch_csr_host,
++        _launch_dense_host,
++    )
++
++    n_cells, n_genes = X.shape
++    if not 0 <= start < stop <= n_genes:
++        raise ValueError("invalid multi-GPU histogram gene window")
++    col_shard = _is_col_shard(X)
++    axis_len = stop - start if col_shard else n_cells
++    bands = _bands(axis_len, len(device_ids))
++    device_ids = device_ids[: len(bands)]
++
++    def run_shard(index: int):
++        device_id = device_ids[index]
++        b0, b1 = bands[index]
++        with cp.cuda.Device(device_id):
++            _limit_host_workers(len(device_ids))
++            if col_shard:
++                shard = _shard_view(X, start + b0, start + b1)
++                codes = cp.asarray(group_codes_np, dtype=cp.int32)
++                band_genes = b1 - b0
++                launch = _launch_csc_host
++                launch_start, launch_stop = 0, band_genes
++            else:
++                shard = _shard_view(X, b0, b1)
++                codes = cp.asarray(group_codes_np[b0:b1], dtype=cp.int32)
++                band_genes = stop - start
++                launch = _launch_csr_host if sp.issparse(X) else _launch_dense_host
++                launch_start, launch_stop = start, stop
++            sum_genes = band_genes if col_shard else n_genes
++            gsum = (
++                cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64)
++                if accumulate_means
++                else None
++            )
++            gnnz = (
++                cp.zeros((n_groups + 1, sum_genes), dtype=cp.float64)
++                if accumulate_means and comp_pts
++                else None
++            )
++            hist = launch(
++                shard,
++                codes,
++                n_hist_groups,
++                start=launch_start,
++                stop=launch_stop,
++                n_bins=n_bins,
++                bin_low=bin_low,
++                inv_bin_width=inv_bin_width,
++                group_sums=gsum,
++                group_nnz=gnnz,
++            )
++            cp.cuda.runtime.deviceSynchronize()
++        return hist, gsum, gnnz
++
++    with ThreadPoolExecutor(max_workers=len(device_ids)) as executor:
++        shards = list(executor.map(run_shard, range(len(device_ids))))
++
++    home = cp.cuda.Device().id
++    if col_shard:
++        hist = _concat_to_device([s[0] for s in shards], home, axis=0)
++        gsum = (
++            _concat_to_device([s[1] for s in shards], home, axis=1)
++            if accumulate_means
++            else None
++        )
++        gnnz = (
++            _concat_to_device([s[2] for s in shards], home, axis=1)
++            if accumulate_means and comp_pts
++            else None
++        )
++    else:
++        hist = _sum_to_device([s[0] for s in shards], home)
++        gsum = (
++            _sum_to_device([s[1] for s in shards], home) if accumulate_means else None
++        )
++        gnnz = (
++            _sum_to_device([s[2] for s in shards], home)
++            if accumulate_means and comp_pts
++            else None
++        )
++    return hist, gsum, gnnz
+diff --git a/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_binned.py b/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_binned.py
+index 4e1236adb..aff6680fb 100644
+--- a/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_binned.py
++++ b/src/rapids_singlecell/tools/_rank_genes_groups/_wilcoxon_binned.py
+@@ -7,8 +7,10 @@
+ import cupyx.scipy.sparse as cpsp
+ import cupyx.scipy.special as cupyx_special
+ import numpy as np
++import scipy.sparse as sp
+ 
+ from rapids_singlecell._compat import DaskArray
++from rapids_singlecell._cuda import _rank_stream_cuda as _rss
+ from rapids_singlecell._cuda import _wilcoxon_binned_cuda as _wb
+ 
+ from ._utils import MIN_GROUP_SIZE_WARNING, _get_column_block
+@@ -18,12 +20,59 @@
+ 
+     from ._core import _RankGenes
+ 
+-_CHUNK_BUDGET = 30_000_000  # default chunk * n_groups * n_bins (500 * 60 * 1000)
++_AUTO_CHUNK_MEMORY_FRACTION = 0.60
++_COUNT_BYTES = np.dtype(np.uint32).itemsize
++_FLOAT_BYTES = np.dtype(np.float64).itemsize
+ _LOG1P_RANGE = (0.0, 15.0)  # covers log1p(x) for raw counts up to ~3.3 million
+ _DASK_N_BINS = 200
+ _DEFAULT_N_BINS = 1000
+ 
+ 
++def _auto_chunk_width(
++    n_genes: int,
++    n_groups: int,
++    n_hist_groups: int,
++    n_bins_total: int,
++    *,
++    device_ids: list[int],
++    ireference: int | None,
++    tie_correct: bool,
++    gathers_multi_gpu: bool,
++) -> int:
++    """Choose a histogram width from the least-free selected device."""
++    free_bytes = []
++    for device_id in device_ids:
++        with cp.cuda.Device(device_id):
++            free, _ = cp.cuda.runtime.memGetInfo()
++            free_bytes.append(int(free))
++
++    # Histograms are uint32. The gather device can briefly hold both its shard
++    # and the reduced histogram; include both even though the memory pool can
++    # normally reuse the released shard for downstream temporaries.
++    histogram_copies = 2 if gathers_multi_gpu else 1
++    bytes_per_gene = histogram_copies * n_hist_groups * n_bins_total * _COUNT_BYTES
++
++    if ireference is None:
++        # One-vs-rest keeps a float64 histogram plus per-bin totals, cumulative
++        # counts, and midranks. Tie correction adds one more per-bin plane.
++        bytes_per_gene += n_groups * n_bins_total * _FLOAT_BYTES
++        n_bin_planes = 3 + int(tie_correct)
++        bytes_per_gene += n_bin_planes * n_bins_total * _FLOAT_BYTES
++    else:
++        # Reference comparisons materialize pair totals, cumulative counts,
++        # midranks, and the float64 histogram for every group and bin.
++        n_group_bin_bytes = _COUNT_BYTES + 3 * _FLOAT_BYTES
++        if tie_correct:
++            n_group_bin_bytes += _FLOAT_BYTES
++        bytes_per_gene += n_groups * n_bins_total * n_group_bin_bytes
++
++    # Account for group-wise statistic/result temporaries, then reserve the
++    # remaining 40% for the input, allocator fragmentation, and other clients.
++    bytes_per_gene += n_groups * 8 * _FLOAT_BYTES
++    usable_bytes = int(min(free_bytes) * _AUTO_CHUNK_MEMORY_FRACTION)
++    return min(n_genes, max(1, usable_bytes // max(bytes_per_gene, 1)))
++
++
+ def _fill_sparse_zero_bin(hist: cp.ndarray, group_counts: cp.ndarray) -> None:
+     """Fill sparse histogram bin 0 from group size minus nonzero-bin counts."""
+     nonzero_per_group = hist.sum(axis=2)  # (n_genes, n_groups)
+@@ -52,7 +101,7 @@ def _block_max(block, block_info=None):
+ 
+         lo, hi = dask.compute(X.min(), X.max())
+         return float(lo), float(hi)
+-    if cpsp.issparse(X):
++    if cpsp.issparse(X) or sp.issparse(X):
+         if X.nnz == 0:
+             return 0.0, 0.0
+         d = X.data
+@@ -78,7 +127,6 @@ def wilcoxon_binned(
+             stacklevel=4,
+         )
+ 
+-    rg._basic_stats()
+     X = rg.X
+     ireference = rg.ireference
+ 
+@@ -215,21 +263,108 @@ def _block_data_min(block):
+     all_z = np.empty((n_groups, n_genes), dtype=np.float64)
+     all_p = np.empty((n_groups, n_genes), dtype=np.float64)
+ 
++    # Fuse exact-mean accumulation into the histogram pass for host input (one
++    # transfer, not a separate _basic_stats pass). CSC/dense chunks accumulate
++    # their disjoint columns. CSR accumulates every column during the first
++    # histogram window only; later windows disable the fused planes.
++    is_host = isinstance(X, np.ndarray) or sp.issparse(X)
++    fuse_means = (
++        is_host
++        and not rg._sparse_negative_fallback
++        and (
++            isinstance(X, np.ndarray) or (sp.issparse(X) and X.format in {"csr", "csc"})
++        )
++    )
++    n_hist_groups = n_cells_per_group_hist.shape[0]
++    from ._stream_multi_gpu import resolve_stream_devices
++
++    device_ids = resolve_stream_devices(multi_gpu=rg._multi_gpu) if is_host else [0]
++    if fuse_means:
++        group_sums_ext = cp.zeros((n_groups + 1, n_genes), dtype=cp.float64)
++        group_nnz_ext = (
++            cp.zeros((n_groups + 1, n_genes), dtype=cp.float64) if rg.comp_pts else None
++        )
++        batch_kwargs["group_sums"] = group_sums_ext
++        batch_kwargs["group_nnz"] = group_nnz_ext
++    else:
++        rg._basic_stats()
++
++    use_multi_stream = fuse_means and len(device_ids) > 1
++    if use_multi_stream:
++        from ._stream_multi_gpu import run_binned_hist_multi
++
+     if chunk_size is not None:
+         chunk_width = chunk_size
+     else:
+-        # Scale chunk inversely with n_groups * n_bins to keep histogram memory stable.
+-        # Budget = 500 genes * 60 groups * 1000 bins = 30M.
+-        chunk_width = _CHUNK_BUDGET // max(n_groups * n_bins, 1)
++        chunk_width = _auto_chunk_width(
++            n_genes,
++            n_groups,
++            n_hist_groups,
++            n_bins_total,
++            device_ids=device_ids,
++            ireference=ireference,
++            tie_correct=tie_correct,
++            gathers_multi_gpu=use_multi_stream,
++        )
++
++    is_host_csr = sp.issparse(X) and X.format == "csr"
++    is_host_csc = sp.issparse(X) and X.format == "csc"
+     for start in range(0, n_genes, chunk_width):
+         stop = min(start + chunk_width, n_genes)
+ 
+-        z_b, p_b = process_gene_batch(X, start=start, stop=stop, **batch_kwargs)
++        if use_multi_stream:
++            # CSR aggregation covers all genes, so fuse it only into the first
++            # histogram window. Dense/CSC aggregation follows the gene windows.
++            accumulate_means = not is_host_csr or start == 0
++            hist, sums_b, nnz_b = run_binned_hist_multi(
++                X,
++                group_codes_np,
++                device_ids,
++                n_groups=n_groups,
++                n_hist_groups=n_hist_groups,
++                n_bins=n_bins,
++                bin_low=bin_low,
++                inv_bin_width=inv_bin_width,
++                comp_pts=rg.comp_pts,
++                start=start,
++                stop=stop,
++                accumulate_means=accumulate_means,
++            )
++            z_b, p_b = _finish_binned_stats(
++                hist,
++                is_sparse=sp.issparse(X),
++                n_groups=n_groups,
++                n_cells_per_group=n_cells_per_group,
++                n_cells_total=n_cells,
++                n_cells_per_group_hist=n_cells_per_group_hist_gpu,
++                total_counts_from_all=has_unselected,
++                ireference=ireference,
++                tie_correct=tie_correct,
++                use_continuity=use_continuity,
++            )
++            if accumulate_means:
++                if is_host_csc:
++                    group_sums_ext[:, start:stop] = sums_b
++                    if group_nnz_ext is not None:
++                        group_nnz_ext[:, start:stop] = nnz_b
++                else:
++                    group_sums_ext += sums_b
++                    if group_nnz_ext is not None:
++                        group_nnz_ext += nnz_b
++        else:
++            z_b, p_b = process_gene_batch(X, start=start, stop=stop, **batch_kwargs)
++            if is_host_csr and fuse_means and start == 0:
++                # The CSR fused aggregation traverses every stored value, not
++                # only the histogram window. Do not add it again next batch.
++                batch_kwargs["group_sums"] = None
++                batch_kwargs["group_nnz"] = None
+ 
+         all_z[:, start:stop] = cp.asnumpy(z_b)
+         all_p[:, start:stop] = cp.asnumpy(p_b)
+ 
+-    # LFC computed from exact means in _basic_stats() via compute_statistics
++    if fuse_means:
++        _fill_binned_means(rg, group_sums_ext, group_nnz_ext, n_cells)
++
+     return [
+         (group_index, all_z[group_index], all_p[group_index])
+         for group_index in range(n_groups)
+@@ -256,13 +391,19 @@ def process_gene_batch(
+     use_continuity: bool = False,
+     ireference: int | None = None,
+     force_dense: bool = False,
++    group_sums: cp.ndarray | None = None,
++    group_nnz: cp.ndarray | None = None,
+ ) -> tuple[cp.ndarray, cp.ndarray]:
+-    """Process one gene batch, dispatching on Dask vs in-memory."""
++    """Process one gene batch, dispatching on Dask vs in-memory.
++
++    When ``group_sums`` is given, host branches also accumulate exact group sums
++    (+ ``group_nnz``) on the streamed window (fused means, no ``_basic_stats``).
++    """
+     n_hist_groups = n_cells_per_group_hist.shape[0]
+     n_genes_batch = stop - start
+ 
+     is_sparse = False
+-    if force_dense and cpsp.issparse(X):
++    if force_dense and (cpsp.issparse(X) or sp.issparse(X)):
+         # Negative sparse fallback: bin 0 is only correct for nonnegative data.
+         # Densify the column window so dense bins span the full [min, max].
+         hist = _launch_dense(
+@@ -273,6 +414,48 @@ def process_gene_batch(
+             bin_low=bin_low,
+             inv_bin_width=inv_bin_width,
+         )
++    elif isinstance(X, np.ndarray):
++        # In-memory host dense: stream column windows (no full-matrix copy).
++        hist = _launch_dense_host(
++            X,
++            group_codes,
++            n_hist_groups,
++            start=start,
++            stop=stop,
++            n_bins=n_bins,
++            bin_low=bin_low,
++            inv_bin_width=inv_bin_width,
++            group_sums=group_sums,
++            group_nnz=group_nnz,
++        )
++    elif sp.issparse(X) and X.format == "csc":
++        hist = _launch_csc_host(
++            X,
++            group_codes,
++            n_hist_groups,
++            start=start,
++            stop=stop,
++            n_bins=n_bins,
++            bin_low=bin_low,
++            inv_bin_width=inv_bin_width,
++            group_sums=group_sums,
++            group_nnz=group_nnz,
++        )
++        is_sparse = True
++    elif sp.issparse(X) and X.format == "csr":
++        hist = _launch_csr_host(
++            X,
++            group_codes,
++            n_hist_groups,
++            start=start,
++            stop=stop,
++            n_bins=n_bins,
++            bin_low=bin_low,
++            inv_bin_width=inv_bin_width,
++            group_sums=group_sums,
++            group_nnz=group_nnz,
++        )
++        is_sparse = True
+     elif isinstance(X, DaskArray):
+         hist = _process_dask(
+             X,
+@@ -321,6 +504,35 @@ def process_gene_batch(
+             inv_bin_width=inv_bin_width,
+         )
+ 
++    return _finish_binned_stats(
++        hist,
++        is_sparse=is_sparse,
++        n_groups=n_groups,
++        n_cells_per_group=n_cells_per_group,
++        n_cells_total=n_cells_total,
++        n_cells_per_group_hist=n_cells_per_group_hist,
++        total_counts_from_all=total_counts_from_all,
++        ireference=ireference,
++        tie_correct=tie_correct,
++        use_continuity=use_continuity,
++    )
++
++
++def _finish_binned_stats(
++    hist: cp.ndarray,
++    *,
++    is_sparse: bool,
++    n_groups: int,
++    n_cells_per_group: cp.ndarray,
++    n_cells_total: int,
++    n_cells_per_group_hist: cp.ndarray,
++    total_counts_from_all: bool,
++    ireference: int | None,
++    tie_correct: bool,
++    use_continuity: bool,
++) -> tuple[cp.ndarray, cp.ndarray]:
++    """Zero-bin fill + z-scores/p-values from a full (n_genes, n_hist_groups, nbt)
++    histogram (single-GPU chunk or the gathered multi-GPU histogram)."""
+     # Sparse kernels only fill bins 1..n_bins; compute bin 0 (zeros) here.
+     if is_sparse:
+         _fill_sparse_zero_bin(hist, n_cells_per_group_hist)
+@@ -535,6 +747,153 @@ def _launch_csr(
+     return hist
+ 
+ 
++def _host_hist_data(data):
++    """Cast host sparse values to a kernel dtype (float32/float64) as needed."""
++    if data.dtype in (np.float32, np.float64):
++        return data
++    return data.astype(np.float32)
++
++
++def _fill_binned_means(
++    rg: _RankGenes,
++    group_sums_ext: cp.ndarray,
++    group_nnz_ext: cp.ndarray | None,
++    n_cells: int,
++) -> None:
++    """Fill exact means/pts from fused ``(n_groups+1, n_genes)`` sums (row
++    ``n_groups`` = unselected cells, so total = sum across rows)."""
++    n_groups = len(rg.groups_order)
++    group_sums = group_sums_ext[:n_groups]
++    sizes = cp.asarray(rg.group_sizes, dtype=cp.float64)[:, None]
++    rg.means = cp.asnumpy(group_sums / sizes)
++    rg.vars = None
++    rg.pts = (
++        cp.asnumpy(group_nnz_ext[:n_groups] / sizes)
++        if group_nnz_ext is not None
++        else None
++    )
++    if rg.ireference is None:
++        n_rest = cp.float64(n_cells) - sizes
++        total_sums = group_sums_ext.sum(axis=0, keepdims=True)
++        rg.means_rest = cp.asnumpy((total_sums - group_sums) / n_rest)
++        rg.vars_rest = None
++        if group_nnz_ext is not None:
++            total_nnz = group_nnz_ext.sum(axis=0, keepdims=True)
++            rg.pts_rest = cp.asnumpy((total_nnz - group_nnz_ext[:n_groups]) / n_rest)
++        else:
++            rg.pts_rest = None
++    else:
++        rg.means_rest = None
++        rg.vars_rest = None
++        rg.pts_rest = None
++
++
++def _launch_csr_host(
++    X,
++    group_codes: cp.ndarray,
++    n_groups: int,
++    *,
++    start: int,
++    stop: int,
++    n_bins: int,
++    bin_low: float,
++    inv_bin_width: float,
++    group_sums: cp.ndarray | None = None,
++    group_nnz: cp.ndarray | None = None,
++) -> cp.ndarray:
++    """Host CSR histogram: stream row-blocks, filling the [start, stop) window."""
++    n_cells, n_genes = X.shape
++    hist = cp.zeros((stop - start, n_groups, n_bins + 1), dtype=cp.uint32)
++    _rss.hist_csr_host(
++        _host_hist_data(X.data),
++        X.indices,
++        X.indptr,
++        group_codes,
++        hist,
++        group_sums=group_sums,
++        group_nnz=group_nnz,
++        n_cells=n_cells,
++        n_genes=n_genes,
++        n_groups=n_groups,
++        n_bins=n_bins,
++        bin_low=float(bin_low),
++        inv_bin_width=float(inv_bin_width),
++        col_start=start,
++        col_stop=stop,
++    )
++    return hist
++
++
++def _launch_csc_host(
++    X,
++    group_codes: cp.ndarray,
++    n_groups: int,
++    *,
++    start: int,
++    stop: int,
++    n_bins: int,
++    bin_low: float,
++    inv_bin_width: float,
++    group_sums: cp.ndarray | None = None,
++    group_nnz: cp.ndarray | None = None,
++) -> cp.ndarray:
++    """Host CSC histogram: stream the [start, stop) column window."""
++    n_cells, n_genes = X.shape
++    hist = cp.zeros((stop - start, n_groups, n_bins + 1), dtype=cp.uint32)
++    _rss.hist_csc_host(
++        _host_hist_data(X.data),
++        X.indices,
++        X.indptr,
++        group_codes,
++        hist,
++        group_sums=group_sums,
++        group_nnz=group_nnz,
++        n_cells=n_cells,
++        n_genes=n_genes,
++        n_groups=n_groups,
++        n_bins=n_bins,
++        bin_low=float(bin_low),
++        inv_bin_width=float(inv_bin_width),
++        col_start=start,
++        col_stop=stop,
++    )
++    return hist
++
++
++def _launch_dense_host(
++    X: np.ndarray,
++    group_codes: cp.ndarray,
++    n_groups: int,
++    *,
++    start: int,
++    stop: int,
++    n_bins: int,
++    bin_low: float,
++    inv_bin_width: float,
++    group_sums: cp.ndarray | None = None,
++    group_nnz: cp.ndarray | None = None,
++) -> cp.ndarray:
++    """Host dense histogram: stream the [start, stop) column window."""
++    hist = cp.zeros((stop - start, n_groups, n_bins + 1), dtype=cp.uint32)
++    Xh = X if X.dtype in (np.float32, np.float64) else X.astype(np.float32)
++    if not (Xh.flags.c_contiguous or Xh.flags.f_contiguous):
++        Xh = np.ascontiguousarray(Xh)
++    _rss.hist_dense_host(
++        Xh,
++        group_codes,
++        hist,
++        group_sums=group_sums,
++        group_nnz=group_nnz,
++        n_groups=n_groups,
++        n_bins=n_bins,
++        bin_low=float(bin_low),
++        inv_bin_width=float(inv_bin_width),
++        col_start=start,
++        col_stop=stop,
++    )
++    return hist
++
++
+ def _process_dask(
+     X,
+     *,
+diff --git a/tests/test_aggregated.py b/tests/test_aggregated.py
+index b21a26baf..331525122 100644
+--- a/tests/test_aggregated.py
++++ b/tests/test_aggregated.py
+@@ -428,3 +428,78 @@ def test_c_contiguous_vs_fortran_contiguous():
+         a = rsc_get_C.layers[c]
+         b = rsc_get_F.layers[c]
+         cp.testing.assert_allclose(a, b)
++
++
++# ---------------------------------------------------------------------------
++# In-memory host input is streamed to the GPU (no prior transfer) — {pr}`737`.
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++@pytest.mark.parametrize("metric", ["sum", "mean", "var", "count_nonzero", "sq_sum"])
++def test_aggregate_host_matches_device(array_type, metric):
++    """Host-resident input streams to the GPU and matches the device path."""
++    np.random.seed(0)
++    adata = sc.datasets.blobs(n_variables=15, n_centers=5, n_observations=300)
++    adata.obs["blobs"] = adata.obs["blobs"].astype("category")
++    adata.X = array_type(np.abs(adata.X).astype(np.float32))
++
++    host = adata.copy()  # left on host -> streamed
++    dev = adata.copy()
++    rsc.get.anndata_to_GPU(dev)
++
++    r_host = rsc.get.aggregate(host, "blobs", metric)
++    r_dev = rsc.get.aggregate(dev, "blobs", metric)
++    cp.testing.assert_allclose(
++        cp.asarray(r_host.layers[metric]),
++        cp.asarray(r_dev.layers[metric]),
++        rtol=1e-4,
++        atol=1e-5,
++    )
++
++
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++def test_aggregate_host_masked(array_type):
++    """A mask is honored on streamed host input (same known values as device)."""
++    X = np.array(
++        [[1, 2], [3, 6], [100, 100], [2, 4], [4, 8], [200, 200]], dtype=np.float32
++    )
++    obs = pd.DataFrame(
++        {
++            "group": pd.Categorical(["a", "a", "a", "b", "b", "b"]),
++            "mask": [True, True, False, True, True, False],
++        }
++    )
++    adata = ad.AnnData(X=array_type(X), obs=obs)  # host, not transferred
++
++    result = rsc.get.aggregate(adata, by="group", func=["mean", "var"], mask="mask")
++    cp.testing.assert_allclose(
++        result.layers["mean"], cp.array([[2, 4], [3, 6]], dtype=cp.float64)
++    )
++    cp.testing.assert_allclose(
++        result.layers["var"], cp.array([[2, 8], [2, 8]], dtype=cp.float64)
++    )
++
++
++def test_aggregate_host_multi_column():
++    """Multi-column groupby streams host input and matches the device path."""
++    np.random.seed(0)
++    adata = sc.datasets.blobs(n_variables=8, n_centers=4, n_observations=200)
++    adata.obs["blobs"] = adata.obs["blobs"].astype("category")
++    adata.obs["b2"] = pd.Categorical(np.random.randint(0, 3, 200).astype(str))
++    adata.X = csr_matrix(np.abs(adata.X).astype(np.float32))
++
++    host = adata.copy()
++    dev = adata.copy()
++    rsc.get.anndata_to_GPU(dev)
++
++    r_host = rsc.get.aggregate(host, ["blobs", "b2"], ["mean", "count_nonzero"])
++    r_dev = rsc.get.aggregate(dev, ["blobs", "b2"], ["mean", "count_nonzero"])
++    assert r_host.obs_names.equals(r_dev.obs_names)
++    for metric in ("mean", "count_nonzero"):
++        cp.testing.assert_allclose(
++            cp.asarray(r_host.layers[metric]),
++            cp.asarray(r_dev.layers[metric]),
++            rtol=1e-4,
++            atol=1e-5,
++        )
+diff --git a/tests/test_rank_genes_groups_ttest.py b/tests/test_rank_genes_groups_ttest.py
+index 035008996..53dd6e1f9 100644
+--- a/tests/test_rank_genes_groups_ttest.py
++++ b/tests/test_rank_genes_groups_ttest.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import anndata as ad
++import cupy as cp
+ import numpy as np
+ import pytest
+ import scanpy as sc
+@@ -10,6 +11,8 @@
+ 
+ import rapids_singlecell as rsc
+ 
++MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
++
+ 
+ def _make_nonnegative(adata):
+     adata.X = np.abs(adata.X)
+@@ -609,3 +612,75 @@ def test_rank_genes_groups_ttest_key_added(method):
+     assert "pvals_adj" in result
+     assert "logfoldchanges" in result
+     assert "params" in result
++
++
++# ---------------------------------------------------------------------------
++# Streamed host-resident input: CSC coverage and multi-GPU parity — {pr}`737`.
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("reference", ["rest", "1"])
++@pytest.mark.parametrize("method", ["t-test", "t-test_overestim_var"])
++def test_ttest_host_csc_matches_scanpy(reference, method):
++    """Host CSC input streams to the GPU and matches scanpy."""
++    np.random.seed(42)
++    a = sc.datasets.blobs(n_variables=6, n_centers=3, n_observations=200)
++    a.obs["blobs"] = a.obs["blobs"].astype("category")
++    _make_nonnegative(a)
++    gpu = a.copy()
++    gpu.X = sp.csc_matrix(gpu.X.astype(np.float32))
++    cpu = a.copy()
++    cpu.X = cpu.X.astype(np.float64)
++
++    rsc.tl.rank_genes_groups(
++        gpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference
++    )
++    sc.tl.rank_genes_groups(
++        cpu, "blobs", method=method, use_raw=False, n_genes=3, reference=reference
++    )
++    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
++        for group in gpu.uns["rank_genes_groups"][field].dtype.names:
++            np.testing.assert_allclose(
++                np.asarray(gpu.uns["rank_genes_groups"][field][group], dtype=float),
++                np.asarray(cpu.uns["rank_genes_groups"][field][group], dtype=float),
++                rtol=1e-6,
++                atol=1e-8,
++                equal_nan=True,
++            )
++
++
++@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
++@pytest.mark.parametrize("layout", ["dense", "csr", "csc"])
++@pytest.mark.parametrize("reference", ["rest", "1"])
++def test_ttest_host_multi_gpu_matches_single(layout, reference):
++    """Sharded multi-GPU host t-test matches the single-GPU result."""
++    np.random.seed(0)
++    base = sc.datasets.blobs(n_variables=12, n_centers=4, n_observations=600)
++    base.obs["blobs"] = base.obs["blobs"].astype("category")
++    _make_nonnegative(base)
++    mk = {"dense": lambda x: x, "csr": sp.csr_matrix, "csc": sp.csc_matrix}[layout]
++    base.X = mk(base.X.astype(np.float32))
++    devices = [0, 1]
++
++    single = base.copy()
++    multi = base.copy()
++    kwargs = {
++        "method": "t-test",
++        "use_raw": False,
++        "reference": reference,
++        "n_genes": 12,
++    }
++    rsc.tl.rank_genes_groups(single, "blobs", multi_gpu=False, **kwargs)
++    rsc.tl.rank_genes_groups(multi, "blobs", multi_gpu=devices, **kwargs)
++
++    rs, rm = single.uns["rank_genes_groups"], multi.uns["rank_genes_groups"]
++    assert rs["names"].dtype.names == rm["names"].dtype.names
++    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
++        for group in rs[field].dtype.names:
++            np.testing.assert_allclose(
++                np.asarray(rm[field][group], dtype=float),
++                np.asarray(rs[field][group], dtype=float),
++                rtol=1e-5,
++                atol=1e-7,
++                equal_nan=True,
++            )
+diff --git a/tests/test_rank_genes_groups_wilcoxon_binned.py b/tests/test_rank_genes_groups_wilcoxon_binned.py
+index 6922d7ce0..f322c1b33 100644
+--- a/tests/test_rank_genes_groups_wilcoxon_binned.py
++++ b/tests/test_rank_genes_groups_wilcoxon_binned.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import cupy as cp
+ import numpy as np
+ import pytest
+ import scanpy as sc
+@@ -7,6 +8,8 @@
+ import rapids_singlecell as rsc
+ from testing.rapids_singlecell._helper import ARRAY_TYPES_MEM
+ 
++MULTI_GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() >= 2
++
+ 
+ @pytest.fixture
+ def adata_blobs():
+@@ -675,3 +678,29 @@ def test_binned_log1p_invalid_for_negative_sparse_coerces_to_auto(adata_blobs):
+             rtol=1e-13,
+             atol=1e-13,
+         )
++
++
++@pytest.mark.skipif(not MULTI_GPU_AVAILABLE, reason="requires at least two GPUs")
++@pytest.mark.parametrize("array_type", ARRAY_TYPES_MEM)
++@pytest.mark.parametrize("reference", ["rest", "1"])
++def test_binned_host_multi_gpu_matches_single(adata_blobs, array_type, reference):
++    """Sharded multi-GPU host wilcoxon_binned matches the single-GPU result."""
++    base = adata_blobs.copy()
++    base.X = array_type(base.X)
++    single = base.copy()
++    multi = base.copy()
++    kwargs = {"method": "wilcoxon_binned", "use_raw": False, "reference": reference}
++    rsc.tl.rank_genes_groups(single, "blobs", multi_gpu=False, **kwargs)
++    rsc.tl.rank_genes_groups(multi, "blobs", multi_gpu=[0, 1], **kwargs)
++
++    rs, rm = single.uns["rank_genes_groups"], multi.uns["rank_genes_groups"]
++    assert set(rs["names"].dtype.names) == set(rm["names"].dtype.names)
++    for field in ("scores", "logfoldchanges", "pvals", "pvals_adj"):
++        for group in rs[field].dtype.names:
++            np.testing.assert_allclose(
++                np.asarray(rm[field][group], dtype=float),
++                np.asarray(rs[field][group], dtype=float),
++                rtol=1e-5,
++                atol=1e-7,
++                equal_nan=True,
++            )

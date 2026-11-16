@@ -1,0 +1,372 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8bb07b4959..369a31fdda 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -29,8 +29,11 @@ to [Semantic Versioning]. The full commit history is available in the [commit lo
+ - Changed {class}`scvi.external.Tangram` backend to be in Pytorch, {pr}`3786`.
+ - Consolidate parts of the training and data loading between {class}`~scvi.external.GIMVI`
+     and {class}`scvi.external.DIAGVI`, {pr}`3830`.
+-- support validation set in {class}`scvi.model.DestVI` training and raise clear errors for
++- Support validation set in {class}`scvi.model.DestVI` training and raise clear errors for
+     unsupported validation in {class}`scvi.external.RESOLVI`, {pr}`3881`.
++- Extract {meth}`~scvi.nn.FCLayers._build_layer`, {meth}`~scvi.nn.FCLayers._is_linear_layer`,
++    {meth}`~scvi.nn.FCLayers._apply_batch_norm`, and {meth}`~scvi.nn.FCLayers._apply_layer`
++    from {class}`~scvi.nn.FCLayers` as overridable methods for easier inheritance, {pr}`3880`.
+ 
+ #### Removed
+ 
+diff --git a/src/scvi/nn/_base_components.py b/src/scvi/nn/_base_components.py
+index fa3e206230..a4ef76b78c 100644
+--- a/src/scvi/nn/_base_components.py
++++ b/src/scvi/nn/_base_components.py
+@@ -66,6 +66,12 @@ def __init__(
+         activation_fn: nn.Module = nn.ReLU,
+     ):
+         super().__init__()
++        self.bias = bias
++        self.use_batch_norm = use_batch_norm
++        self.use_layer_norm = use_layer_norm
++        self.use_activation = use_activation
++        self.activation_fn = activation_fn
++        self.dropout_rate = dropout_rate
+         self.inject_covariates = inject_covariates
+         layers_dim = [n_in] + (n_layers - 1) * [n_hidden] + [n_out]
+ 
+@@ -80,26 +86,7 @@ def __init__(
+         self.fc_layers = nn.Sequential(
+             collections.OrderedDict(
+                 [
+-                    (
+-                        f"Layer {i}",
+-                        nn.Sequential(
+-                            nn.Linear(
+-                                n_in + self.n_cov * self.inject_into_layer(i),
+-                                n_out,
+-                                bias=bias,
+-                            ),
+-                            # non-default params come from defaults in the original Tensorflow
+-                            # implementation
+-                            nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001)
+-                            if use_batch_norm
+-                            else None,
+-                            nn.LayerNorm(n_out, elementwise_affine=False)
+-                            if use_layer_norm
+-                            else None,
+-                            activation_fn() if use_activation else None,
+-                            nn.Dropout(p=dropout_rate) if dropout_rate > 0 else None,
+-                        ),
+-                    )
++                    (f"Layer {i}", self._build_layer(n_in, n_out, i))
+                     for i, (n_in, n_out) in enumerate(
+                         zip(layers_dim[:-1], layers_dim[1:], strict=True)
+                     )
+@@ -112,6 +99,25 @@ def inject_into_layer(self, layer_num) -> bool:
+         user_cond = layer_num == 0 or (layer_num > 0 and self.inject_covariates)
+         return user_cond
+ 
++    def _build_layer(self, n_in: int, n_out: int, layer_num: int) -> nn.Sequential:
++        """Build one fully-connected layer: linear (+ optional norm / activation / dropout)."""
++        return nn.Sequential(
++            nn.Linear(
++                n_in + self.n_cov * self.inject_into_layer(layer_num),
++                n_out,
++                bias=self.bias,
++            ),
++            # non-default params come from defaults in the original Tensorflow implementation
++            nn.BatchNorm1d(n_out, momentum=0.01, eps=0.001) if self.use_batch_norm else None,
++            nn.LayerNorm(n_out, elementwise_affine=False) if self.use_layer_norm else None,
++            self.activation_fn() if self.use_activation else None,
++            nn.Dropout(p=self.dropout_rate) if self.dropout_rate > 0 else None,
++        )
++
++    def _is_linear_layer(self, layer: nn.Module) -> bool:
++        """Whether ``layer`` is a linear map covariate-injection and scArches hooks act on."""
++        return isinstance(layer, nn.Linear)
++
+     def set_online_update_hooks(self, hook_first_layer=True):
+         """Set online update hooks."""
+         self.hooks = []
+@@ -120,7 +126,7 @@ def _hook_fn_weight(grad):
+             categorical_dims = sum(self.n_cat_list)
+             new_grad = torch.zeros_like(grad)
+             if categorical_dims > 0:
+-                new_grad[:, -categorical_dims:] = grad[:, -categorical_dims:]
++                new_grad[..., -categorical_dims:] = grad[..., -categorical_dims:]
+             return new_grad
+ 
+         def _hook_fn_zero_out(grad):
+@@ -130,7 +136,7 @@ def _hook_fn_zero_out(grad):
+             for layer in layers:
+                 if i == 0 and not hook_first_layer:
+                     continue
+-                if isinstance(layer, nn.Linear):
++                if self._is_linear_layer(layer):
+                     if self.inject_into_layer(i):
+                         w = layer.weight.register_hook(_hook_fn_weight)
+                     else:
+@@ -176,32 +182,38 @@ def forward(self, x: torch.Tensor, *cat_list: int, cont: torch.Tensor | None = N
+             for layer in layers:
+                 if layer is not None:
+                     if isinstance(layer, nn.BatchNorm1d):
+-                        if x.dim() == 3:
+-                            if (
+-                                x.device.type == "mps"
+-                            ):  # TODO: remove this when MPS supports for loop.
+-                                x = torch.cat(
+-                                    [(layer(slice_x.clone())).unsqueeze(0) for slice_x in x], dim=0
+-                                )
+-                            else:
+-                                x = torch.cat(
+-                                    [layer(slice_x).unsqueeze(0) for slice_x in x], dim=0
+-                                )
+-                        else:
+-                            x = layer(x)
++                        x = self._apply_batch_norm(layer, x)
+                     else:
+-                        if isinstance(layer, nn.Linear) and self.inject_into_layer(i):
+-                            if x.dim() == 3:
+-                                cov_list_layer = [
+-                                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1)))
+-                                    for o in cov_list
+-                                ]
+-                            else:
+-                                cov_list_layer = cov_list
+-                            x = torch.cat((x, *cov_list_layer), dim=-1)
+-                        x = layer(x)
++                        x = self._apply_layer(layer, x, cov_list, i)
+         return x
+ 
++    def _apply_batch_norm(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
++        """Apply a batch-norm layer, handling the 3D (and MPS) case."""
++        if x.dim() == 3:
++            if x.device.type == "mps":  # TODO: remove this when MPS supports for loop.
++                return torch.cat([(layer(slice_x.clone())).unsqueeze(0) for slice_x in x], dim=0)
++            return torch.cat([layer(slice_x).unsqueeze(0) for slice_x in x], dim=0)
++        return layer(x)
++
++    def _apply_layer(
++        self,
++        layer: nn.Module,
++        x: torch.Tensor,
++        cov_list: list[torch.Tensor],
++        layer_index: int,
++    ) -> torch.Tensor:
++        """Apply a (non batch-norm) layer, injecting covariates into linear layers."""
++        if self._is_linear_layer(layer) and self.inject_into_layer(layer_index):
++            if x.dim() == 3:
++                # For when we have sampling in inference. x: (n_samples, n_obs, n_hidden)
++                cov_list_layer = [
++                    o.unsqueeze(0).expand((x.size(0), o.size(0), o.size(1))) for o in cov_list
++                ]
++            else:
++                cov_list_layer = cov_list
++            x = torch.cat((x, *cov_list_layer), dim=-1)
++        return layer(x)
++
+ 
+ # Encoder
+ class Encoder(nn.Module):
+diff --git a/tests/nn/test_fclayers.py b/tests/nn/test_fclayers.py
+new file mode 100644
+index 0000000000..9e9e885837
+--- /dev/null
++++ b/tests/nn/test_fclayers.py
+@@ -0,0 +1,198 @@
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from scvi.nn import FCLayers
++
++# ---------------------------------------------------------------------------
++# Basic forward behaviour
++# ---------------------------------------------------------------------------
++
++
++def test_forward_2d_output_shape():
++    fc = FCLayers(n_in=10, n_out=5, n_layers=2, n_hidden=20)
++    x = torch.randn(8, 10)
++    assert fc(x).shape == (8, 5)
++
++
++def test_forward_with_categorical_covariates():
++    n_cats = 4
++    fc = FCLayers(n_in=10, n_out=5, n_cat_list=[n_cats], use_batch_norm=False, dropout_rate=0.0)
++    x = torch.randn(8, 10)
++    cat = torch.randint(0, n_cats, (8, 1))
++    assert fc(x, cat).shape == (8, 5)
++
++
++def test_forward_3d_input_with_batch_norm():
++    """3D input (n_samples, n_obs, n_in) is handled correctly by the slice-and-cat path."""
++    fc = FCLayers(n_in=10, n_out=5, use_batch_norm=True, dropout_rate=0.0)
++    fc.eval()
++    x = torch.randn(3, 8, 10)
++    assert fc(x).shape == (3, 8, 5)
++
++
++# ---------------------------------------------------------------------------
++# _apply_batch_norm: 3D slicing is equivalent to per-sample application
++# ---------------------------------------------------------------------------
++
++
++def test_apply_batch_norm_3d_matches_manual_slicing():
++    n_features = 16
++    bn = nn.BatchNorm1d(n_features)
++    bn.eval()
++
++    fc = FCLayers(n_in=n_features, n_out=n_features, use_batch_norm=True, dropout_rate=0.0)
++
++    x = torch.randn(4, 8, n_features)
++    out = fc._apply_batch_norm(bn, x)
++
++    expected = torch.cat([bn(x[i]).unsqueeze(0) for i in range(x.size(0))], dim=0)
++    assert out.shape == (4, 8, n_features)
++    assert torch.allclose(out, expected)
++
++
++def test_apply_batch_norm_2d_passthrough():
++    n_features = 16
++    bn = nn.BatchNorm1d(n_features)
++    bn.eval()
++
++    fc = FCLayers(n_in=n_features, n_out=n_features, use_batch_norm=True, dropout_rate=0.0)
++    x = torch.randn(8, n_features)
++    out = fc._apply_batch_norm(bn, x)
++
++    assert out.shape == (8, n_features)
++    assert torch.allclose(out, bn(x))
++
++
++# ---------------------------------------------------------------------------
++# Subclassing seam: _build_layer
++# ---------------------------------------------------------------------------
++
++
++def test_subclass_build_layer_replaces_layer_factory():
++    """Overriding _build_layer lets a subclass insert its own layer structure."""
++
++    class CustomFCLayers(FCLayers):
++        def _build_layer(self, n_in: int, n_out: int, layer_num: int) -> nn.Sequential:
++            return nn.Sequential(
++                nn.Linear(n_in + self.n_cov * self.inject_into_layer(layer_num), n_out),
++                nn.Tanh(),
++            )
++
++    # use_batch_norm and dropout_rate are ignored by the custom factory
++    fc = CustomFCLayers(n_in=10, n_out=5, use_batch_norm=True, dropout_rate=0.3)
++    layer_types = [type(l) for l in fc.fc_layers[0] if l is not None]
++
++    assert nn.BatchNorm1d not in layer_types
++    assert nn.Dropout not in layer_types
++    assert nn.Tanh in layer_types
++
++    assert fc(torch.randn(8, 10)).shape == (8, 5)
++
++
++def test_subclass_build_layer_receives_correct_dims_with_covariates():
++    """_build_layer is called with dimensions that already account for covariates on layer 0."""
++
++    recorded = {}
++
++    class CaptureFCLayers(FCLayers):
++        def _build_layer(self, n_in: int, n_out: int, layer_num: int) -> nn.Sequential:
++            recorded[layer_num] = (n_in, n_out)
++            return super()._build_layer(n_in, n_out, layer_num)
++
++    n_cats = 3
++    CaptureFCLayers(
++        n_in=10,
++        n_out=5,
++        n_cat_list=[n_cats],
++        n_layers=2,
++        n_hidden=20,
++        use_batch_norm=False,
++        dropout_rate=0.0,
++    )
++
++    # layer 0: n_in passed is the raw n_in; _build_layer adds n_cov internally
++    assert recorded[0] == (10, 20)
++    assert recorded[1] == (20, 5)
++
++
++# ---------------------------------------------------------------------------
++# Subclassing seam: _is_linear_layer
++# ---------------------------------------------------------------------------
++
++
++def test_subclass_is_linear_layer_gates_covariate_injection():
++    """When _is_linear_layer returns False for a layer, covariates are NOT injected."""
++
++    class NonInjectingFCLayers(FCLayers):
++        def _is_linear_layer(self, layer: nn.Module) -> bool:
++            return False  # never inject
++
++        def _build_layer(self, n_in: int, n_out: int, layer_num: int) -> nn.Sequential:
++            # build without enlarging n_in for covariates so sizes are consistent
++            return nn.Sequential(nn.Linear(n_in, n_out))
++
++    n_cats = 4
++    fc = NonInjectingFCLayers(
++        n_in=10, n_out=5, n_cat_list=[n_cats], use_batch_norm=False, dropout_rate=0.0
++    )
++    x = torch.randn(8, 10)
++    cat = torch.randint(0, n_cats, (8, 1))
++    # should not raise: cat tensor is ignored because _is_linear_layer → False
++    assert fc(x, cat).shape == (8, 5)
++
++
++def test_subclass_is_linear_layer_used_by_set_online_update_hooks():
++    """set_online_update_hooks registers hooks only on layers identified by _is_linear_layer."""
++
++    class CustomLinear(nn.Linear):
++        pass
++
++    class CustomFCLayers(FCLayers):
++        def _is_linear_layer(self, layer: nn.Module) -> bool:
++            return isinstance(layer, CustomLinear)
++
++        def _build_layer(self, n_in: int, n_out: int, layer_num: int) -> nn.Sequential:
++            return nn.Sequential(
++                CustomLinear(n_in + self.n_cov * self.inject_into_layer(layer_num), n_out)
++            )
++
++    n_cats = 3
++    fc = CustomFCLayers(
++        n_in=10, n_out=5, n_cat_list=[n_cats], use_batch_norm=False, dropout_rate=0.0
++    )
++    fc.set_online_update_hooks()
++    assert len(fc.hooks) > 0
++
++
++# ---------------------------------------------------------------------------
++# Gradient hook correctness (tests the [... , ] fix for 3-D grad tensors)
++# ---------------------------------------------------------------------------
++
++
++def test_gradient_hook_preserves_categorical_grad_only():
++    """After set_online_update_hooks, only categorical weight gradients are non-zero."""
++    n_cats = 3
++    fc = FCLayers(
++        n_in=10,
++        n_out=5,
++        n_cat_list=[n_cats],
++        n_layers=1,
++        use_batch_norm=False,
++        use_activation=False,
++        dropout_rate=0.0,
++    )
++    fc.set_online_update_hooks()
++
++    x = torch.randn(8, 10)
++    cat = torch.randint(0, n_cats, (8, 1))
++    fc(x, cat).sum().backward()
++
++    linear = fc.fc_layers[0][0]  # first (only) layer, first sub-module
++    grad = linear.weight.grad  # shape: (n_out, n_in + n_cats) = (5, 13)
++
++    # non-categorical columns should be zeroed out by the hook
++    assert torch.all(grad[:, :-n_cats] == 0), "non-categorical weight grad should be zero"
++    # categorical columns should have non-zero grad (with high probability)
++    assert not torch.all(grad[:, -n_cats:] == 0), "categorical weight grad should be non-zero"

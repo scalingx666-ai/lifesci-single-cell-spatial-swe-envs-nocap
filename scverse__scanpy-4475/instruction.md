@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Backport PR #4404 on branch 1.12.x (fix: handle zero counts in Pearson residual normalization)
+
+## Description
+
+Backport PR #4404: fix: handle zero counts in Pearson residual normalization
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `dce8af65d24c`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

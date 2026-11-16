@@ -1,0 +1,496 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0021500fcd..df6ae7037b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,12 +12,17 @@ to [Semantic Versioning]. The full commit history is available in the [commit lo
+ - Add a `residual` option to {class}`scvi.nn.FCLayers` that wraps every block except the first in
+     a skip connection, whenever that block's input and output widths match. The first block is
+     always excluded, so the flag needs `n_layers >= 2` to have any effect, {pr}`4019`.
++- Add a `residual` option to {class}`scvi.external.DRVI` that turns on skip connections in the
++    encoder and decoder, {pr}`4020`.
+ 
+ #### Changed
+ 
+ - {class}`scvi.nn.FCLayers`'s `forward` now accepts arbitrary `**kwargs` and threads them to the
+     `_apply_layer` and `_apply_batch_norm` hooks, so subclasses can branch on per-call context.
+     The base layers ignore them, {pr}`4019`.
++- Break the DRVI module, decoder, split layers and interpretability mixin into overridable seams
++    so downstream models can subclass them without copying `generative`. Behaviour is unchanged,
++    {pr}`4020`.
+ 
+ ### 1.5.1 (2026-09-10)
+ 
+diff --git a/src/scvi/external/drvi/_base_components.py b/src/scvi/external/drvi/_base_components.py
+index 1a323fe173..dc4afc893d 100644
+--- a/src/scvi/external/drvi/_base_components.py
++++ b/src/scvi/external/drvi/_base_components.py
+@@ -86,7 +86,8 @@ def _build_layer(self, n_in: int, n_out: int, layer_num: int) -> nn.Module:
+     def _is_linear_layer(self, layer: nn.Module) -> bool:
+         return isinstance(layer, (nn.Linear, StackedLinearLayer))
+ 
+-    def _apply_layer(self, layer, x, cov_list, layer_index, **kwargs):
++    def _inject_covariates(self, layer, x, cov_list, layer_index):
++        """Concatenate the covariates onto ``x``, broadcast over the split dimension."""
+         if self._is_linear_layer(layer) and self.inject_into_layer(layer_index):
+             if x.dim() not in (3, 4):
+                 raise ValueError(
+@@ -97,7 +98,10 @@ def _apply_layer(self, layer, x, cov_list, layer_index, **kwargs):
+             cov_list_layer = [o.unsqueeze(-2).expand(*x.shape[:-1], o.size(-1)) for o in cov_list]
+             if cov_list_layer:
+                 x = torch.cat((x, *cov_list_layer), dim=-1)
+-        return layer(x)
++        return x
++
++    def _apply_layer(self, layer, x, cov_list, layer_index, **kwargs):
++        return layer(self._inject_covariates(layer, x, cov_list, layer_index))
+ 
+     def _apply_batch_norm(self, layer, x, **kwargs):
+         # batch norm over n_split * n_hidden features: fold all leading dims into the batch axis
+@@ -170,6 +174,8 @@ class DecoderDRVI(nn.Module):
+         Keyword arguments for :class:`SplitFCLayers`.
+     """
+ 
++    _fc_layers_cls = SplitFCLayers
++
+     def __init__(
+         self,
+         n_input: int,
+@@ -228,7 +234,7 @@ def __init__(
+         last_reuse = reuse_weights in ("everywhere", "last", "hidden_except_first")
+ 
+         # per-split decoder body operating on (*, n_split, n_split_output)
+-        self.px_decoder = SplitFCLayers(
++        self.px_decoder = self._fc_layers_cls(
+             n_in=n_split_output,
+             n_out=n_hidden,
+             n_cat_list=n_cat_list,
+@@ -254,7 +260,7 @@ def _make_head(n_out: int) -> nn.Module:
+         self.px_r_decoder = _make_head(n_output) if model_cell_dispersion else None
+         self.px_dropout_decoder = _make_head(n_output) if model_zero_inflation else None
+ 
+-    def _apply_split(self, z: torch.Tensor) -> torch.Tensor:
++    def _apply_split(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+         """Map latent ``(*, n_latent)`` to splits ``(*, n_split, n_split_output)``."""
+         *lead_shape, n_latent = z.shape
+         if self.split_method == "split_mask":
+@@ -282,6 +288,7 @@ def forward(
+         z: torch.Tensor,
+         *cat_list: int,
+         cont: torch.Tensor | None = None,
++        **kwargs,
+     ):
+         """Decode ``z`` into **log-space** per-gene parameters.
+ 
+@@ -294,9 +301,12 @@ def forward(
+         module (not here). Any number of leading dimensions (e.g. an ``n_samples`` axis) is
+         supported and preserved: the split transform, the per-split FC layers and the aggregation
+         all act on the last one or two dimensions.
++
++        The split-mapping is an overridable seam (``_apply_split``); any extra ``**kwargs``
++        are threaded to it and to the per-split FC body.
+         """
+-        z_split = self._apply_split(z)  # (*, n_split, n_split_output)
+-        h = self.px_decoder(z_split, *cat_list, cont=cont)  # (*, n_split, n_hidden)
++        z_split = self._apply_split(z, **kwargs)  # (*, n_split, n_split_output)
++        h = self.px_decoder(z_split, *cat_list, cont=cont, **kwargs)  # (*, n_split, n_hidden)
+ 
+         # per-split scale logits aggregated over splits, kept in log space
+         px_scale_logit_per_split = self.px_scale_decoder(h)  # (*, n_split, n_genes)
+diff --git a/src/scvi/external/drvi/_distributions.py b/src/scvi/external/drvi/_distributions.py
+index 88e55dabd6..c465d074af 100644
+--- a/src/scvi/external/drvi/_distributions.py
++++ b/src/scvi/external/drvi/_distributions.py
+@@ -5,6 +5,7 @@
+ from torch.distributions import Distribution, constraints
+ from torch.distributions.utils import broadcast_all
+ 
++from scvi.distributions import NegativeBinomial, Normal, Poisson, ZeroInflatedNegativeBinomial
+ from scvi.distributions._negative_binomial import _gamma, _lgamma_fn
+ from scvi.distributions._utils import _needs_cpu_detour
+ 
+@@ -130,3 +131,53 @@ def __repr__(self) -> str:
+             if (v := self.__dict__[p]) is not None
+         )
+         return self.__class__.__name__ + "(" + args_string + ")"
++
++
++def build_gene_likelihood(
++    gene_likelihood: str,
++    px_scale_logit: torch.Tensor,
++    px_r_logit: torch.Tensor,
++    px_dropout_logit: torch.Tensor | None = None,
++    size_factor: torch.Tensor | None = None,
++) -> Distribution:
++    """Build the per-gene count/normal distribution from a DRVI decoder's log-space parameters.
++
++    Parameters
++    ----------
++    gene_likelihood
++        One of ``"nb"``, ``"pnb"``, ``"zinb"``, ``"poisson"``, ``"normal"``, ``"normal_unit_var"``.
++    px_scale_logit
++        Aggregated per-gene log-space scale logits, shape ``(*, n_genes)``.
++    px_r_logit
++        Per-gene dispersion logit: ``log theta`` for the NB family, ``log variance`` for the
++        normal likelihoods.
++    px_dropout_logit
++        ZINB dropout logits (used only when ``gene_likelihood == "zinb"``).
++    size_factor
++        Log library size, shape ``(*, 1)``; added to the log-softmax scale to form ``log(mu)``.
++        Required for the count likelihoods (``"nb"``, ``"pnb"``, ``"zinb"``, ``"poisson"``); unused
++        by ``"normal"`` / ``"normal_unit_var"``.
++    """
++    if gene_likelihood in ("nb", "pnb", "zinb", "poisson"):
++        # log_softmax over genes, then add the (log) library size to get log(mu)
++        px_scale_log = px_scale_logit - torch.logsumexp(px_scale_logit, dim=-1, keepdim=True)
++        px_rate_log = size_factor + px_scale_log  # size_factor == log(library size)
++        if gene_likelihood == "pnb":
++            return LogNegativeBinomial(log_m=px_rate_log, log_r=px_r_logit, log_scale=px_scale_log)
++        px_scale = torch.exp(px_scale_log)
++        px_rate = torch.exp(px_rate_log)
++        if gene_likelihood == "nb":
++            return NegativeBinomial(mu=px_rate, theta=torch.exp(px_r_logit), scale=px_scale)
++        if gene_likelihood == "poisson":
++            return Poisson(rate=px_rate, scale=px_scale)
++        return ZeroInflatedNegativeBinomial(
++            mu=px_rate, theta=torch.exp(px_r_logit), zi_logits=px_dropout_logit, scale=px_scale
++        )
++    if gene_likelihood == "normal":
++        # Gaussian with the mean modeled directly (the raw log-space decoder output, no
++        # library/softmax) and per-gene variance modeled in log space.
++        var = torch.nan_to_num(torch.exp(px_r_logit), posinf=100.0, neginf=0.0) + 1e-8
++        return Normal(px_scale_logit, var.sqrt(), normal_mu=px_scale_logit)
++    if gene_likelihood == "normal_unit_var":
++        return Normal(px_scale_logit, torch.ones_like(px_scale_logit), normal_mu=px_scale_logit)
++    raise ValueError(f"Unknown gene_likelihood: {gene_likelihood}")
+diff --git a/src/scvi/external/drvi/_interpretability_mixin.py b/src/scvi/external/drvi/_interpretability_mixin.py
+index a4e2044d11..5f51fa59cd 100644
+--- a/src/scvi/external/drvi/_interpretability_mixin.py
++++ b/src/scvi/external/drvi/_interpretability_mixin.py
+@@ -43,6 +43,44 @@ def _sparse_std(x: sparse.csr_matrix, axis: int = 0, ddof: int = 0) -> np.ndarra
+     return np.sqrt(np.maximum(var, 0))
+ 
+ 
++def get_direct_effect_of_latent_splits(
++    unaggregated_params: Tensor,
++    split_aggregation: str,
++    add_to_counts: float,
++) -> Tensor:
++    """Per-split, per-gene effect ``(n_cells, n_splits, n_genes)`` from a decoder's split params.
++
++    Parameters
++    ----------
++    unaggregated_params
++        Per-split decoder parameters, shape ``(n_cells, n_splits, n_genes)``, as exposed by
++        :class:`~scvi.external.drvi.DecoderDRVI` in ``inspect_mode``.
++    split_aggregation
++        How the decoder aggregates the splits: ``"logsumexp"`` or ``"mean"``.
++    add_to_counts
++        Pseudo-count added before taking the effect ratio (``"logsumexp"`` only).
++    """
++    if split_aggregation == "logsumexp":
++        # softmax(x) == softmax(x + c); the library / -log(K) constants cancel, but the
++        # add_to_counts offset depends on the total decoder effect (a 1e6-count cell).
++        total_effect_per_cell = torch.logsumexp(unaggregated_params, dim=[-2, -1])
++        log_add_to_counts = total_effect_per_cell + np.log(add_to_counts / 1e6)
++        log_mean_params = torch.cat(
++            [
++                unaggregated_params,
++                log_add_to_counts.reshape(-1, 1, 1).expand(-1, -1, unaggregated_params.shape[-1]),
++            ],
++            dim=-2,
++        )  # n_samples x (n_splits + 1) x n_genes
++        return -torch.log(1 - F.softmax(log_mean_params, dim=-2)[:, :-1, :])
++    elif split_aggregation == "mean":
++        return torch.abs(unaggregated_params)
++    else:
++        raise NotImplementedError(
++            "Only 'logsumexp' and 'mean' aggregations are supported for interpretability."
++        )
++
++
+ class InterpretabilityMixin:
+     """Interpretability analyses for DRVI's latent factors (splits).
+ 
+@@ -66,6 +104,16 @@ def _get_norm_of_splits(self, latent: Tensor) -> Tensor:
+         n_latent = latent.shape[-1]
+         return latent.reshape(*latent.shape[:-1], n_split, n_latent // n_split).norm(dim=-1)
+ 
++    def _get_direct_effect_of_latent_splits(
++        self, generative_outputs: dict, add_to_counts: float
++    ) -> Tensor:
++        """Per-split, per-gene effect ``(n_cells, n_splits, n_genes)`` from the decoder params."""
++        return get_direct_effect_of_latent_splits(
++            generative_outputs[DRVI_MODULE_KEYS.PX_UNAGGREGATED_PARAMS_KEY],
++            self.module.split_aggregation,
++            add_to_counts,
++        )
++
+     @torch.inference_mode()
+     def iterate_on_effect_of_splits_within_distribution(
+         self,
+@@ -121,33 +169,9 @@ def iterate_on_effect_of_splits_within_distribution(
+         ):
+             # posterior mean, n_cells x n_latent
+             latent = inference_outputs[MODULE_KEYS.QZ_KEY].loc
+-
+-            if self.module.split_aggregation == "logsumexp":
+-                # softmax(x) == softmax(x + c); the library / -log(K) constants cancel, but the
+-                # add_to_counts offset depends on the total decoder effect (a 1e6-count cell).
+-                log_mean_params = generative_outputs[
+-                    DRVI_MODULE_KEYS.PX_UNAGGREGATED_PARAMS_KEY
+-                ]  # n_samples x n_splits x n_genes
+-                total_effect_per_cell = torch.logsumexp(log_mean_params, dim=[-2, -1])
+-                log_add_to_counts = total_effect_per_cell + np.log(add_to_counts / 1e6)
+-                log_mean_params = torch.cat(
+-                    [
+-                        log_mean_params,
+-                        log_add_to_counts.reshape(-1, 1, 1).expand(
+-                            -1, -1, log_mean_params.shape[-1]
+-                        ),
+-                    ],
+-                    dim=-2,
+-                )  # n_samples x (n_splits + 1) x n_genes
+-                effect_tensor = -torch.log(1 - F.softmax(log_mean_params, dim=-2)[:, :-1, :])
+-            elif self.module.split_aggregation == "mean":
+-                effect_tensor = torch.abs(
+-                    generative_outputs[DRVI_MODULE_KEYS.PX_UNAGGREGATED_PARAMS_KEY]
+-                )
+-            else:
+-                raise NotImplementedError(
+-                    "Only 'logsumexp' and 'mean' aggregations are supported for interpretability."
+-                )
++            effect_tensor = self._get_direct_effect_of_latent_splits(
++                generative_outputs, add_to_counts
++            )
+ 
+             if directional:
+                 pos_mask = (latent > 0).float().unsqueeze(-1)
+diff --git a/src/scvi/external/drvi/_model.py b/src/scvi/external/drvi/_model.py
+index 14fe09d4bd..59c0d6993a 100644
+--- a/src/scvi/external/drvi/_model.py
++++ b/src/scvi/external/drvi/_model.py
+@@ -57,7 +57,7 @@ class DRVI(SCVI, GenerativeMixin, InterpretabilityMixin):
+         Additional keyword args for :class:`~scvi.model.SCVI` /
+         :class:`~scvi.external.drvi.DRVIModule`
+         (e.g. ``n_hidden``, ``n_layers``, ``n_split_output``, ``dispersion``,
+-        ``batch_representation``, ``activation_fn``, ``use_observed_lib_size``).
++        ``batch_representation``, ``activation_fn``, ``residual``, ``use_observed_lib_size``).
+ 
+     Examples
+     --------
+diff --git a/src/scvi/external/drvi/_module.py b/src/scvi/external/drvi/_module.py
+index 0474e13129..4c1487ec4e 100644
+--- a/src/scvi/external/drvi/_module.py
++++ b/src/scvi/external/drvi/_module.py
+@@ -4,18 +4,13 @@
+ 
+ import torch
+ from torch import nn
++from torch.distributions import Normal
+ from torch.nn.functional import linear, one_hot
+ 
+ from scvi import REGISTRY_KEYS
+-from scvi.distributions import (
+-    NegativeBinomial,
+-    Normal,
+-    Poisson,
+-    ZeroInflatedNegativeBinomial,
+-)
+ from scvi.external.drvi._base_components import DecoderDRVI
+ from scvi.external.drvi._constants import DRVI_MODULE_KEYS
+-from scvi.external.drvi._distributions import LogNegativeBinomial
++from scvi.external.drvi._distributions import build_gene_likelihood
+ from scvi.module import VAE
+ from scvi.module._constants import MODULE_KEYS
+ from scvi.module.base import auto_move_data
+@@ -125,6 +120,10 @@ class DRVIModule(VAE):
+         after an underscore (e.g. ``"ReLU"``, ``"GELU"``, ``"ELU_0.5"``, ``"LeakyReLU_0.2"``), an
+         ``nn.Module`` subclass, or an instance. Applied only to the latent encoder, not the
+         library encoder.
++    residual
++        Add residual skip connections around the same-width hidden blocks of the encoder body and
++        the decoder split body (the :class:`~scvi.nn.FCLayers` ``residual`` flag). Requires
++        ``n_layers >= 2`` to have any effect.
+     extra_encoder_kwargs
+         Extra keyword arguments for the encoder :class:`~scvi.nn.FCLayers`.
+     extra_decoder_kwargs
+@@ -133,6 +132,8 @@ class DRVIModule(VAE):
+         Additional keyword arguments for :class:`~scvi.module.VAE`.
+     """
+ 
++    _decoder_cls = DecoderDRVI
++
+     def __init__(
+         self,
+         n_input: int,
+@@ -158,6 +159,7 @@ def __init__(
+         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
+         activation_fn: str | type[nn.Module] = "elu",
+         mean_activation: str | type[nn.Module] | nn.Module | None = None,
++        residual: bool = False,
+         extra_encoder_kwargs: dict | None = None,
+         extra_decoder_kwargs: dict | None = None,
+         **kwargs,
+@@ -166,6 +168,10 @@ def __init__(
+         activation = _resolve_activation(activation_fn)
+         extra_encoder_kwargs = {"activation_fn": activation, **(extra_encoder_kwargs or {})}
+         decoder_extra_kwargs = {"activation_fn": activation, **(extra_decoder_kwargs or {})}
++        if residual:
++            # residual skips around same-width hidden blocks of the encoder and decoder bodies
++            extra_encoder_kwargs["residual"] = True
++            decoder_extra_kwargs["residual"] = True
+ 
+         super().__init__(
+             n_input,
+@@ -194,6 +200,7 @@ def __init__(
+         self.n_split_latent = n_split_latent
+         self.split_method = split_method
+         self.split_aggregation = split_aggregation
++        self.residual = residual
+         # analysis flags read by the generative / interpretability mixins
+         self.inspect_mode = False
+         self.fully_deterministic = False
+@@ -211,7 +218,7 @@ def __init__(
+         use_layer_norm_decoder = use_layer_norm in ("decoder", "both")
+ 
+         # replace the inherited decoder with drvi additive decoder
+-        self.decoder = DecoderDRVI(
++        self.decoder = self._decoder_cls(
+             n_latent,
+             n_input,
+             n_split=self.n_split_latent,
+@@ -240,6 +247,25 @@ def _regular_inference(self, *args, **kwargs):
+             outputs[MODULE_KEYS.Z_KEY] = self.z_encoder.z_transformation(qz.loc)
+         return outputs
+ 
++    def _compute_px_r_logit(
++        self,
++        px_r_logit: torch.Tensor,
++        y: torch.Tensor | None,
++        batch_index: torch.Tensor,
++        **kwargs,
++    ) -> torch.Tensor:
++        """Resolve the dispersion logit, before exponentiation.
++
++        That is ``log theta`` for the (log-)NB likelihoods and ``log variance`` for Normal.
++        """
++        if self.dispersion == "gene-label":
++            px_r_logit = linear(one_hot(y.squeeze(-1), self.n_labels).float(), self.px_r)
++        elif self.dispersion == "gene-batch":
++            px_r_logit = linear(one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
++        elif self.dispersion == "gene":
++            px_r_logit = self.px_r
++        return px_r_logit
++
+     @auto_move_data
+     def generative(
+         self,
+@@ -251,13 +277,14 @@ def generative(
+         size_factor: torch.Tensor | None = None,
+         y: torch.Tensor | None = None,
+         transform_batch: torch.Tensor | None = None,
++        **kwargs,
+     ) -> dict[str, Distribution | torch.Tensor | None]:
+         """Run the generative process via the additive decoder.
+ 
+         Mirrors :meth:`scvi.module.VAE.generative` but passes continuous covariates to the decoder
+         separately (so the split transformation only sees the latent dimensions). With the
+         embedding batch representation, the learned batch embedding is injected into each split as
+-        an extra continuous covariate.
++        an extra continuous covariate. Any extra ``**kwargs`` are handed to the decoder.
+         """
+         categorical_input = torch.split(cat_covs, 1, dim=1) if cat_covs is not None else ()
+         if transform_batch is not None:
+@@ -291,45 +318,13 @@ def generative(
+             z,
+             *decoder_cats,
+             cont=decoder_cont,
++            **kwargs,
+         )
+-        # log_softmax over genes, then add the (log) library size to get log(mu)
+-        px_scale_log = px_scale_logit - torch.logsumexp(px_scale_logit, dim=-1, keepdim=True)
+-        px_rate_log = size_factor + px_scale_log  # size_factor == log(library size)
+-
+-        # dispersion logit, before exponentiation: log-theta for the (log-)NB likelihoods and
+-        # log-variance for the normal likelihoods.
+-        if self.dispersion == "gene-label":
+-            px_r_logit = linear(one_hot(y.squeeze(-1), self.n_labels).float(), self.px_r)
+-        elif self.dispersion == "gene-batch":
+-            px_r_logit = linear(one_hot(batch_index.squeeze(-1), self.n_batch).float(), self.px_r)
+-        elif self.dispersion == "gene":
+-            px_r_logit = self.px_r
++        px_r_logit = self._compute_px_r_logit(px_r_logit, y, batch_index, **kwargs)
+ 
+-        if self.gene_likelihood == "pnb":
+-            px = LogNegativeBinomial(log_m=px_rate_log, log_r=px_r_logit, log_scale=px_scale_log)
+-        elif self.gene_likelihood in ("nb", "zinb", "poisson"):
+-            px_scale = torch.exp(px_scale_log)
+-            px_rate = torch.exp(px_rate_log)
+-            if self.gene_likelihood == "nb":
+-                px = NegativeBinomial(mu=px_rate, theta=torch.exp(px_r_logit), scale=px_scale)
+-            elif self.gene_likelihood == "zinb":
+-                px = ZeroInflatedNegativeBinomial(
+-                    mu=px_rate,
+-                    theta=torch.exp(px_r_logit),
+-                    zi_logits=px_dropout_logit,
+-                    scale=px_scale,
+-                )
+-            else:  # poisson
+-                px = Poisson(rate=px_rate, scale=px_scale)
+-        elif self.gene_likelihood == "normal":
+-            # Gaussian with the mean modeled directly (the raw log-space decoder output, no
+-            # library/softmax) and per-gene variance modeled in log space.
+-            var = torch.nan_to_num(torch.exp(px_r_logit), posinf=100.0, neginf=0.0) + 1e-8
+-            px = Normal(px_scale_logit, var.sqrt(), normal_mu=px_scale_logit)
+-        elif self.gene_likelihood == "normal_unit_var":
+-            px = Normal(px_scale_logit, torch.ones_like(px_scale_logit), normal_mu=px_scale_logit)
+-        else:
+-            raise ValueError(f"Unknown gene_likelihood: {self.gene_likelihood}")
++        px = build_gene_likelihood(
++            self.gene_likelihood, px_scale_logit, px_r_logit, px_dropout_logit, size_factor
++        )
+ 
+         if self.use_observed_lib_size:
+             pl = None
+diff --git a/tests/external/drvi/test_drvi.py b/tests/external/drvi/test_drvi.py
+index 21ff16528e..74a1d1a7f4 100644
+--- a/tests/external/drvi/test_drvi.py
++++ b/tests/external/drvi/test_drvi.py
+@@ -183,6 +183,37 @@ def test_drvi_mean_activation(save_path):
+     np.testing.assert_allclose(z_mean, loaded.get_latent_representation(give_mean=True), atol=1e-5)
+ 
+ 
++def test_drvi_residual(save_path):
++    """residual=True adds skip connections on the encoder and decoder bodies (off by default), the
++    latent stays finite, and the flag round-trips through save/load."""
++    adata = mock_adata()
++    DRVI.setup_anndata(adata, batch_key="batch", labels_key="labels")
++
++    default = DRVI(adata, n_latent=8, n_layers=2)
++    assert default.module.residual is False
++    assert default.module.z_encoder.encoder.residual is False
++    assert default.module.decoder.px_decoder.residual is False
++
++    model = DRVI(adata, n_latent=8, n_layers=2, residual=True)
++    assert model.module.residual is True
++    assert model.module.z_encoder.encoder.residual is True
++    assert model.module.decoder.px_decoder.residual is True
++
++    model.train(max_epochs=2, batch_size=adata.n_obs)
++    z = model.get_latent_representation()
++    assert z.shape == (adata.n_obs, 8)
++    assert np.isfinite(z).all()
++
++    # the residual flag round-trips through save/load and the latent is reproduced
++    dir_path = os.path.join(save_path, "drvi_residual_model/")
++    model.save(dir_path, overwrite=True)
++    loaded = DRVI.load(dir_path, adata=adata)
++    assert loaded.module.residual is True
++    assert loaded.module.z_encoder.encoder.residual is True
++    assert loaded.module.decoder.px_decoder.residual is True
++    np.testing.assert_allclose(z, loaded.get_latent_representation(), atol=1e-5)
++
++
+ def test_drvi_batch_embedding():
+     """Batch embedding (EmbeddingMixin) is supported: the embedded batch is injected into each
+     split, and get_batch_representation works."""

@@ -1,0 +1,2011 @@
+diff --git a/docs/streaming-output.md b/docs/streaming-output.md
+new file mode 100644
+index 00000000..4da0e61f
+--- /dev/null
++++ b/docs/streaming-output.md
+@@ -0,0 +1,58 @@
++# Streaming quantification output
++
++Quantification writes the count matrix and optional bootstrap mean/variance
++matrices without retaining triplets for the whole experiment. Each worker
++formats entries into a reusable 256 KiB batch outside the matrix lock. A batch
++is appended under the lock when it reaches the threshold, including midway
++through a large cell; each worker flushes its final partial batch before exiting.
++The file writer also has a 256 KiB buffer.
++
++Matrix serialization memory therefore scales with workers and active output
++matrices rather than total nonzeros. Each active worker batch reserves 256 KiB
++plus room for one formatted entry, and each active matrix has one 256 KiB file
++buffer. Bootstrap inference can still retain the current cell's replicate
++vectors; the change removes accumulation across cells.
++
++Rows are assigned while appending paired barcode and feature records under
++their existing lock. Both text records are formatted before acquiring that
++lock. Matrix coordinates retain the assigned row index, so batches from
++different workers may interleave safely. Barcode/feature files use explicit
++256 KiB buffers too.
++
++The MatrixMarket header reserves 20 characters for its final nonzero count.
++Finalization seeks through `BufWriter`, which flushes the body, writes the
++padded count through the buffer, and explicitly flushes the patch. Trailing
++whitespace on the size line is intentional. Batches are checked against the
++declared row and column dimensions before writing. A barcode filter that
++selects more sample/cell pairs than its declared row count returns an error;
++support for counting such filtered pairs is a separate concern.
++
++Output I/O failures propagate through the worker result. Other workers stop
++quantifying and drain queued input, allowing the producer to finish without
++blocking on its bounded queue. All workers are joined before returning an
++error. Reader errors and final buffer flush errors also propagate, and failure
++paths do not write new success metadata. The CLI preserves the error context
++and exits unsuccessfully instead of replacing these errors with a panic.
++This lifecycle handles returned I/O errors; it is not general recovery from
++arbitrary panics in quantification or record parsing.
++
++Bootstrap mean and variance calculations preserve their existing semantics.
++`--summary-stat` retains the population-variance convention used by bootstrap
++inference; summarizing full replicate vectors retains the sample-variance
++convention. No bootstrap files are produced when bootstrapping is disabled,
++and files are removed on successful completion when no bootstrap means were
++produced, matching the previous output file set.
++
++Unit tests cover bounded batches spanning a large cell, numeric roundtrips,
++coordinate/count overflow, bounds validation, write coalescing, poisoned locks,
++and injected write/seek/flush failures. Integration tests compare every
++barcode/gene count with one and multiple workers, cover empty and fractional
++output and USA axes, exercise deterministic bootstrap statistics in both modes,
++and use subprocess deadlines to test output failures and truncated input.
++
++For performance measurements, compare release builds with the same dependency
++lockfile, target CPU flags, thread count, input, and quantification options.
++Use separate Cargo target directories for different source checkouts. Measure
++wall time and peak RSS without tracing, and collect filesystem-write counts in
++separate traced runs. Align complete barcode and gene axes when comparing
++matrices; aggregate row/column sums are insufficient to establish equivalence.
+diff --git a/src/lib.rs b/src/lib.rs
+index fa313d78..355c25a1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21,6 +21,7 @@ pub mod em;
+ pub mod eq_class;
+ pub mod infer;
+ pub mod knee_finding;
++mod matrix_market;
+ pub mod multinomial;
+ pub mod prog_opts;
+ pub mod pugutils;
+diff --git a/src/main.rs b/src/main.rs
+index dd07c212..801477be 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -7,11 +7,9 @@
+  * License: 3-clause BSD, see https://opensource.org/licenses/BSD-3-Clause
+  */
+ 
+-use anyhow::{anyhow, bail};
++use anyhow::{Context, bail};
+ use bio_types::strand::Strand;
+ use clap::{Command, arg, builder::ArgGroup, crate_authors, crate_version, value_parser};
+-use csv::Error as CSVError;
+-use csv::ErrorKind;
+ use itertools::Itertools;
+ use mimalloc::MiMalloc;
+ use rand::RngExt;
+@@ -758,57 +756,12 @@ fn main() -> anyhow::Result<()> {
+         // then proceed.  otherwise print a critical error.
+         if json_path.exists() {
+             let velo_mode = alevin_fry::utils::is_velo_mode(quant_opts.input_dir);
+-            if velo_mode {
+-                match alevin_fry::quant::velo_quantify(quant_opts) {
+-                    // if we're all good; then great!
+-                    Ok(_) => {}
+-                    // if we have an error, see if it's an error parsing
+-                    // the CSV or something else.
+-                    Err(e) => match e.downcast_ref::<CSVError>() {
+-                        Some(error) => {
+-                            match *error.kind() {
+-                                // if a deserialize error, we already complained about it
+-                                ErrorKind::Deserialize { .. } => {
+-                                    return Err(anyhow!("execution terminated unexpectedly"));
+-                                }
+-                                // if another type of error, just panic for now
+-                                _ => {
+-                                    panic!("could not quantify rad file.");
+-                                }
+-                            }
+-                        }
+-                        // if something else, just panic
+-                        None => {
+-                            panic!("could not quantify rad file.");
+-                        }
+-                    },
+-                }; // end match if
++            let result = if velo_mode {
++                alevin_fry::quant::velo_quantify(quant_opts)
+             } else {
+-                match alevin_fry::quant::quantify(quant_opts) {
+-                    // if we're all good; then great!
+-                    Ok(_) => {}
+-                    // if we have an error, see if it's an error parsing
+-                    // the CSV or something else.
+-                    Err(e) => match e.downcast_ref::<CSVError>() {
+-                        Some(error) => {
+-                            match *error.kind() {
+-                                // if a deserialize error, we already complained about it
+-                                ErrorKind::Deserialize { .. } => {
+-                                    return Err(anyhow!("execution terminated unexpectedly"));
+-                                }
+-                                // if another type of error, just panic for now
+-                                _ => {
+-                                    panic!("could not quantify rad file.");
+-                                }
+-                            }
+-                        }
+-                        // if something else, just panic
+-                        None => {
+-                            panic!("could not quantify rad file.");
+-                        }
+-                    },
+-                }; //end quant if
+-            }; // end velo_mode if
++                alevin_fry::quant::quantify(quant_opts)
++            };
++            result.context("could not quantify RAD file")?;
+         } else {
+             crit!(
+                 log,
+diff --git a/src/matrix_market.rs b/src/matrix_market.rs
+new file mode 100644
+index 00000000..61e37d09
+--- /dev/null
++++ b/src/matrix_market.rs
+@@ -0,0 +1,452 @@
++//! Bounded, buffered output for MatrixMarket coordinate matrices.
++
++use std::fmt::Write as FmtWrite;
++use std::io::{self, BufWriter, Seek, SeekFrom, Write};
++use std::sync::Mutex;
++
++pub(crate) const MATRIX_BUFFER_CAPACITY: usize = 256 * 1024;
++const NNZ_FIELD_WIDTH: usize = 20;
++// A decimal usize needs at most usize::BITS characters; 64 more cover any
++// displayed f32 and the separators. Reserve this slack once so the entry
++// crossing the batch threshold does not double the String's allocation.
++const ENTRY_CAPACITY: usize = 2 * usize::BITS as usize + 64;
++const BANNER: &str = "%%MatrixMarket matrix coordinate real general\n% written by sprs\n";
++
++enum WriterState {
++    Open,
++    Finished,
++    Failed,
++}
++
++/// A seekable matrix stream whose nonzero count is filled in on completion.
++///
++/// Coordinates can arrive in any order. Each batch is checked against the
++/// declared dimensions before its bytes are appended. An I/O failure makes
++/// the stream unusable: retrying a partially written batch could duplicate
++/// coordinates or overwrite data after a failed seek.
++pub(crate) struct MatrixMarketWriter<W: Write + Seek> {
++    writer: BufWriter<W>,
++    rows: usize,
++    cols: usize,
++    nnz: u64,
++    nnz_offset: u64,
++    state: WriterState,
++}
++
++impl<W: Write + Seek> MatrixMarketWriter<W> {
++    pub(crate) fn new(inner: W, rows: usize, cols: usize) -> io::Result<Self> {
++        let mut writer = BufWriter::with_capacity(MATRIX_BUFFER_CAPACITY, inner);
++        writer.write_all(BANNER.as_bytes())?;
++        let size_prefix = format!("{rows} {cols} ");
++        writer.write_all(size_prefix.as_bytes())?;
++        let nnz_offset = (BANNER.len() + size_prefix.len()) as u64;
++        writer.write_all(&[b' '; NNZ_FIELD_WIDTH])?;
++        writer.write_all(b"\n")?;
++        Ok(Self {
++            writer,
++            rows,
++            cols,
++            nnz: 0,
++            nnz_offset,
++            state: WriterState::Open,
++        })
++    }
++
++    pub(crate) fn append(&mut self, batch: &MatrixBatch) -> io::Result<()> {
++        self.require_open()?;
++        if batch.nnz == 0 {
++            return Ok(());
++        }
++        if batch.max_row >= self.rows || batch.max_col >= self.cols {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!(
++                    "matrix batch contains zero-based row {} or column {} outside dimensions {} x {}",
++                    batch.max_row, batch.max_col, self.rows, self.cols
++                ),
++            ));
++        }
++        let nnz = self.nnz.checked_add(batch.nnz).ok_or_else(|| {
++            io::Error::new(io::ErrorKind::InvalidInput, "matrix entry count overflow")
++        })?;
++        if let Err(error) = self.writer.write_all(batch.text.as_bytes()) {
++            self.state = WriterState::Failed;
++            return Err(error);
++        }
++        self.nnz = nnz;
++        Ok(())
++    }
++
++    /// Flush all entries, patch the reserved count field, and flush that patch.
++    /// Successful finalization is idempotent; appends are subsequently rejected.
++    pub(crate) fn finish(&mut self) -> io::Result<u64> {
++        if matches!(self.state, WriterState::Finished) {
++            return Ok(self.nnz);
++        }
++        self.require_open()?;
++        let result = (|| {
++            // BufWriter::seek flushes the body before moving the underlying
++            // stream. Keep formatting inside the buffer so each padding space
++            // in the fixed-width field does not become a filesystem write.
++            self.writer.seek(SeekFrom::Start(self.nnz_offset))?;
++            write!(self.writer, "{:<width$}", self.nnz, width = NNZ_FIELD_WIDTH)?;
++            self.writer.flush()
++        })();
++        match result {
++            Ok(()) => {
++                self.state = WriterState::Finished;
++                Ok(self.nnz)
++            }
++            Err(error) => {
++                self.state = WriterState::Failed;
++                Err(error)
++            }
++        }
++    }
++
++    fn require_open(&self) -> io::Result<()> {
++        match self.state {
++            WriterState::Open => Ok(()),
++            WriterState::Finished => Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "matrix stream has already been finalized",
++            )),
++            WriterState::Failed => Err(io::Error::other(
++                "matrix stream cannot continue after an I/O failure",
++            )),
++        }
++    }
++}
++
++/// Worker-local text staging, flushed while traversing entries rather than at
++/// cell boundaries. Even a single very large cell cannot grow this buffer
++/// beyond the threshold plus one formatted entry. Empty batches allocate no
++/// staging storage. Coordinates passed to `push` are zero-based.
++#[derive(Default)]
++pub(crate) struct MatrixBatch {
++    text: String,
++    nnz: u64,
++    max_row: usize,
++    max_col: usize,
++}
++
++impl MatrixBatch {
++    pub(crate) fn push<W: Write + Seek>(
++        &mut self,
++        row: usize,
++        col: usize,
++        val: f32,
++        output: &Mutex<MatrixMarketWriter<W>>,
++    ) -> io::Result<()> {
++        let one_based_row = row.checked_add(1).ok_or_else(|| {
++            io::Error::new(io::ErrorKind::InvalidInput, "matrix row index overflow")
++        })?;
++        let one_based_col = col.checked_add(1).ok_or_else(|| {
++            io::Error::new(io::ErrorKind::InvalidInput, "matrix column index overflow")
++        })?;
++        let nnz = self.nnz.checked_add(1).ok_or_else(|| {
++            io::Error::new(io::ErrorKind::InvalidInput, "matrix batch count overflow")
++        })?;
++        if self.text.capacity() == 0 {
++            self.text
++                .try_reserve_exact(MATRIX_BUFFER_CAPACITY + ENTRY_CAPACITY)
++                .map_err(io::Error::other)?;
++        }
++        writeln!(self.text, "{one_based_row} {one_based_col} {val}").map_err(io::Error::other)?;
++        self.nnz = nnz;
++        self.max_row = self.max_row.max(row);
++        self.max_col = self.max_col.max(col);
++        if self.text.len() >= MATRIX_BUFFER_CAPACITY {
++            self.flush(output)?;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn flush<W: Write + Seek>(
++        &mut self,
++        output: &Mutex<MatrixMarketWriter<W>>,
++    ) -> io::Result<()> {
++        if self.nnz == 0 {
++            return Ok(());
++        }
++        output
++            .lock()
++            .map_err(|_| io::Error::other("matrix output lock is poisoned"))?
++            .append(self)?;
++        // Preserve the batch on failure, and reuse its allocation on success.
++        self.text.clear();
++        self.nnz = 0;
++        self.max_row = 0;
++        self.max_col = 0;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++
++    #[derive(Clone, Copy)]
++    enum Fault {
++        Write,
++        ShortWrite,
++        Seek,
++        Flush,
++    }
++
++    #[derive(Default)]
++    struct TestStream {
++        data: Cursor<Vec<u8>>,
++        write_lengths: Vec<usize>,
++        fault: Option<Fault>,
++    }
++
++    impl Write for TestStream {
++        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
++            if matches!(self.fault, Some(Fault::Write)) {
++                return Err(io::Error::other("injected write failure"));
++            }
++            let length = if matches!(self.fault, Some(Fault::ShortWrite)) {
++                self.fault = Some(Fault::Write);
++                data.len().min(7)
++            } else {
++                data.len()
++            };
++            self.write_lengths.push(length);
++            self.data.write(&data[..length])
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            if matches!(self.fault, Some(Fault::Flush)) {
++                Err(io::Error::other("injected flush failure"))
++            } else {
++                Ok(())
++            }
++        }
++    }
++
++    impl Seek for TestStream {
++        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++            if matches!(self.fault, Some(Fault::Seek)) {
++                Err(io::Error::other("injected seek failure"))
++            } else {
++                self.data.seek(pos)
++            }
++        }
++    }
++
++    fn parse_matrix(bytes: &[u8]) -> ((usize, usize, usize), Vec<(usize, usize, f32)>) {
++        let text = std::str::from_utf8(bytes).unwrap();
++        assert!(text.starts_with(BANNER));
++        let mut lines = text.lines().filter(|line| !line.starts_with('%'));
++        let dims: Vec<usize> = lines
++            .next()
++            .unwrap()
++            .split_whitespace()
++            .map(|field| field.parse().unwrap())
++            .collect();
++        assert_eq!(dims.len(), 3);
++        let entries: Vec<_> = lines
++            .map(|line| {
++                let fields: Vec<_> = line.split_whitespace().collect();
++                assert_eq!(fields.len(), 3);
++                let row = fields[0].parse::<usize>().unwrap();
++                let col = fields[1].parse::<usize>().unwrap();
++                assert!((1..=dims[0]).contains(&row));
++                assert!((1..=dims[1]).contains(&col));
++                (row, col, fields[2].parse::<f32>().unwrap())
++            })
++            .collect();
++        assert_eq!(entries.len(), dims[2]);
++        ((dims[0], dims[1], dims[2]), entries)
++    }
++
++    #[test]
++    fn round_trips_empty_and_fractional_matrices() {
++        let mut empty = MatrixMarketWriter::new(Cursor::new(Vec::new()), 0, 5).unwrap();
++        assert_eq!(empty.finish().unwrap(), 0);
++        assert_eq!(empty.finish().unwrap(), 0);
++        assert_eq!(parse_matrix(empty.writer.get_ref().get_ref()).0, (0, 5, 0));
++        assert!(empty.append(&MatrixBatch::default()).is_err());
++
++        let output = Mutex::new(MatrixMarketWriter::new(Cursor::new(Vec::new()), 3, 5).unwrap());
++        let mut batch = MatrixBatch::default();
++        batch.push(2, 4, 0.25, &output).unwrap();
++        batch.push(0, 0, 0.0, &output).unwrap();
++        batch.flush(&output).unwrap();
++        batch.push(1, 2, -3.5, &output).unwrap();
++        batch.flush(&output).unwrap();
++        let mut writer = output.lock().unwrap();
++        assert_eq!(writer.finish().unwrap(), 3);
++        let (dims, entries) = parse_matrix(writer.writer.get_ref().get_ref());
++        assert_eq!(dims, (3, 5, 3));
++        assert_eq!(entries, vec![(3, 5, 0.25), (1, 1, 0.0), (2, 3, -3.5)]);
++    }
++
++    #[test]
++    fn one_large_cell_uses_multiple_bounded_batches() {
++        const ENTRIES: usize = 50_000;
++        let output =
++            Mutex::new(MatrixMarketWriter::new(Cursor::new(Vec::new()), 1, ENTRIES).unwrap());
++        let values = [
++            0.25,
++            f32::MAX,
++            f32::MIN_POSITIVE,
++            f32::from_bits(1),
++            -f32::from_bits(1),
++        ];
++        let mut batch = MatrixBatch::default();
++        let mut allocated_capacity = None;
++        for col in 0..ENTRIES {
++            batch
++                .push(0, col, values[col % values.len()], &output)
++                .unwrap();
++            assert!(batch.text.len() < MATRIX_BUFFER_CAPACITY);
++            let initial_capacity = *allocated_capacity.get_or_insert(batch.text.capacity());
++            assert!(initial_capacity >= MATRIX_BUFFER_CAPACITY + ENTRY_CAPACITY);
++            assert_eq!(batch.text.capacity(), initial_capacity);
++        }
++        assert!(
++            output.lock().unwrap().nnz > 0,
++            "the cell must flush before its last entry"
++        );
++        batch.flush(&output).unwrap();
++        assert_eq!(batch.nnz, 0);
++        assert!(batch.text.is_empty());
++        let mut writer = output.lock().unwrap();
++        assert_eq!(writer.finish().unwrap(), ENTRIES as u64);
++        let (_, entries) = parse_matrix(writer.writer.get_ref().get_ref());
++        for (col, &(row, actual_col, value)) in entries.iter().enumerate() {
++            assert_eq!(
++                (row, actual_col, value),
++                (1, col + 1, values[col % values.len()])
++            );
++        }
++    }
++
++    #[test]
++    fn coalesces_small_batches_and_header_padding() {
++        let output = Mutex::new(MatrixMarketWriter::new(TestStream::default(), 100, 10).unwrap());
++        let mut batch = MatrixBatch::default();
++        for row in 0..100 {
++            for col in 0..10 {
++                batch.push(row, col, 1.25, &output).unwrap();
++            }
++            batch.flush(&output).unwrap();
++        }
++        let mut writer = output.lock().unwrap();
++        assert!(writer.writer.get_ref().write_lengths.is_empty());
++        assert_eq!(writer.finish().unwrap(), 1000);
++        let stream = writer.writer.get_ref();
++        assert_eq!(
++            stream.write_lengths.len(),
++            2,
++            "one body write plus one patch write"
++        );
++        assert_eq!(stream.write_lengths[1], NNZ_FIELD_WIDTH);
++        assert_eq!(parse_matrix(stream.data.get_ref()).0, (100, 10, 1000));
++    }
++
++    #[test]
++    fn rejects_bounds_before_writing_and_keeps_failed_batch() {
++        for (rows, cols, row, col) in [(2, 1, 2, 0), (2, 1, 0, 1), (0, 1, 0, 0)] {
++            let output =
++                Mutex::new(MatrixMarketWriter::new(TestStream::default(), rows, cols).unwrap());
++            let mut batch = MatrixBatch::default();
++            batch.push(row, col, 1.0, &output).unwrap();
++            assert_eq!(
++                batch.flush(&output).unwrap_err().kind(),
++                io::ErrorKind::InvalidInput
++            );
++            assert_eq!(batch.nnz, 1);
++            assert!(!batch.text.is_empty());
++            let writer = output.lock().unwrap();
++            assert_eq!(writer.nnz, 0);
++            assert!(writer.writer.get_ref().write_lengths.is_empty());
++        }
++    }
++
++    #[test]
++    fn rejects_coordinate_and_count_overflow() {
++        let output = Mutex::new(MatrixMarketWriter::new(TestStream::default(), 1, 1).unwrap());
++        let mut batch = MatrixBatch::default();
++        assert!(batch.push(usize::MAX, 0, 1.0, &output).is_err());
++        assert!(batch.push(0, usize::MAX, 1.0, &output).is_err());
++        assert!(batch.text.is_empty());
++        batch.nnz = u64::MAX;
++        assert!(batch.push(0, 0, 1.0, &output).is_err());
++        assert!(batch.text.is_empty());
++
++        let mut batch = MatrixBatch::default();
++        batch.push(0, 0, 1.0, &output).unwrap();
++        output.lock().unwrap().nnz = u64::MAX;
++        assert!(batch.flush(&output).is_err());
++        assert!(
++            output
++                .lock()
++                .unwrap()
++                .writer
++                .get_ref()
++                .write_lengths
++                .is_empty()
++        );
++    }
++
++    #[test]
++    fn propagates_finalization_write_seek_and_flush_failures() {
++        for fault in [Fault::Write, Fault::ShortWrite, Fault::Seek, Fault::Flush] {
++            let mut writer = MatrixMarketWriter::new(TestStream::default(), 0, 0).unwrap();
++            writer.writer.get_mut().fault = Some(fault);
++            assert!(writer.finish().is_err());
++            assert!(
++                writer.finish().is_err(),
++                "a partially completed stream must not be retried"
++            );
++            assert!(writer.append(&MatrixBatch::default()).is_err());
++        }
++    }
++
++    #[test]
++    fn preserves_batch_on_automatic_flush_failure() {
++        let output = Mutex::new(MatrixMarketWriter::new(TestStream::default(), 1, 50_000).unwrap());
++        output.lock().unwrap().writer.get_mut().fault = Some(Fault::ShortWrite);
++        let mut batch = MatrixBatch::default();
++        let mut failed = false;
++        for col in 0..50_000 {
++            if batch.push(0, col, 1.25, &output).is_err() {
++                failed = true;
++                break;
++            }
++        }
++        assert!(failed);
++        assert!(batch.nnz > 0);
++        assert!(batch.text.len() >= MATRIX_BUFFER_CAPACITY);
++        let mut writer = output.lock().unwrap();
++        assert_eq!(writer.nnz, 0);
++        assert!(writer.finish().is_err());
++    }
++
++    #[test]
++    fn reports_poisoned_output_as_an_error() {
++        let output = std::sync::Arc::new(Mutex::new(
++            MatrixMarketWriter::new(Cursor::new(Vec::new()), 1, 1).unwrap(),
++        ));
++        let other = output.clone();
++        assert!(
++            std::thread::spawn(move || {
++                let _guard = other.lock().unwrap();
++                panic!("inject lock poisoning");
++            })
++            .join()
++            .is_err()
++        );
++        let mut batch = MatrixBatch::default();
++        batch.push(0, 0, 1.0, &output).unwrap();
++        assert_eq!(
++            batch.flush(&output).unwrap_err().kind(),
++            io::ErrorKind::Other
++        );
++        assert_eq!(batch.nnz, 1);
++    }
++}
+diff --git a/src/quant.rs b/src/quant.rs
+index 94ec28a2..ac036311 100644
+--- a/src/quant.rs
++++ b/src/quant.rs
+@@ -24,7 +24,7 @@ use std::io::Write;
+ use std::io::{BufRead, BufReader, BufWriter};
+ use std::str::FromStr;
+ use std::string::ToString;
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::thread;
+ 
+@@ -48,6 +48,7 @@ use crate::em::{
+     em_optimize_subset_with_scratch, run_bootstrap_with_scratch,
+ };
+ use crate::eq_class::{EqMap, EqMapType, IndexedEqList};
++use crate::matrix_market::{MATRIX_BUFFER_CAPACITY, MatrixBatch, MatrixMarketWriter};
+ use crate::prog_opts::QuantOpts;
+ 
+ /// Shared closure that extracts a sample index from a record.
+@@ -125,87 +126,78 @@ impl FromStr for ResolutionStrategy {
+ /// provides efficient storage for the 3D (cells × genes × replicates) array
+ /// via chunked, compressed datasets in `.h5ad` format.
+ struct BootstrapHelper {
+-    num_bootstraps: u32,
+     summary_stat: bool,
+-    /// Thread-local bootstrap mean triplets: (row, col, val)
+-    mean_triplets: Vec<(usize, usize, f32)>,
+-    /// Thread-local bootstrap variance triplets: (row, col, val)
+-    var_triplets: Vec<(usize, usize, f32)>,
++    mean: MatrixBatch,
++    variance: MatrixBatch,
++}
++
++struct BootstrapOutput {
++    mean: Mutex<MatrixMarketWriter<File>>,
++    variance: Mutex<MatrixMarketWriter<File>>,
+ }
+ 
+ impl BootstrapHelper {
+-    fn new(
+-        _output_path: &std::path::Path,
+-        num_bootstraps: u32,
+-        summary_stat: bool,
+-    ) -> BootstrapHelper {
+-        if num_bootstraps > 0 && !summary_stat {
+-            eprintln!(
+-                "NOTE: Full per-replicate bootstrap output is not yet supported in MTX format. \
+-                 Summary statistics (mean, variance) will be written instead. \
+-                 Full replicate output will be available in a future release via AnnData/h5ad."
+-            );
+-        }
+-        BootstrapHelper {
+-            num_bootstraps,
++    fn new(summary_stat: bool) -> Self {
++        Self {
+             summary_stat,
+-            mean_triplets: Vec::new(),
+-            var_triplets: Vec::new(),
++            mean: MatrixBatch::default(),
++            variance: MatrixBatch::default(),
+         }
+     }
+ 
+-    /// Record bootstrap results for one cell. Computes mean and variance
+-    /// across replicates and stores nonzero entries as sparse triplets.
+-    fn record_cell(&mut self, row_index: usize, bootstraps: &[Vec<f32>]) {
++    fn record_cell(
++        &mut self,
++        row_index: usize,
++        bootstraps: &[Vec<f32>],
++        output: &BootstrapOutput,
++    ) -> std::io::Result<()> {
+         if bootstraps.is_empty() {
+-            return;
++            return Ok(());
+         }
+-
+-        let (mean_vec, var_vec) = if self.summary_stat && bootstraps.len() == 2 {
+-            // run_bootstrap already returned [mean, var]
+-            (&bootstraps[0], &bootstraps[1])
+-        } else {
+-            // Shouldn't happen in current flow, but handle gracefully
+-            return;
+-        };
+-
+-        for (col, &val) in mean_vec.iter().enumerate() {
+-            if val != 0.0 {
+-                self.mean_triplets.push((row_index, col, val));
++        if self.summary_stat {
++            if bootstraps.len() != 2 {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    "bootstrap summary must contain mean and variance",
++                ));
+             }
+-        }
+-        for (col, &val) in var_vec.iter().enumerate() {
+-            if val != 0.0 {
+-                self.var_triplets.push((row_index, col, val));
++            for (col, &val) in bootstraps[0].iter().enumerate() {
++                if val != 0.0 {
++                    self.mean.push(row_index, col, val, &output.mean)?;
++                }
+             }
+-        }
+-    }
+-
+-    /// Compute mean and variance from full bootstrap replicates for one cell.
+-    fn record_cell_from_replicates(&mut self, row_index: usize, bootstraps: &[Vec<f32>]) {
+-        if bootstraps.is_empty() {
+-            return;
+-        }
+-        let n = bootstraps.len() as f32;
+-        let num_genes = bootstraps[0].len();
+-
+-        for col in 0..num_genes {
+-            let mean: f32 = bootstraps.iter().map(|b| b[col]).sum::<f32>() / n;
+-            if mean != 0.0 {
+-                self.mean_triplets.push((row_index, col, mean));
+-                let var: f32 = bootstraps
+-                    .iter()
+-                    .map(|b| {
+-                        let d = b[col] - mean;
+-                        d * d
+-                    })
+-                    .sum::<f32>()
+-                    / (n - 1.0).max(1.0);
+-                if var != 0.0 {
+-                    self.var_triplets.push((row_index, col, var));
++            for (col, &val) in bootstraps[1].iter().enumerate() {
++                if val != 0.0 {
++                    self.variance.push(row_index, col, val, &output.variance)?;
++                }
++            }
++        } else {
++            let n = bootstraps.len() as f32;
++            for col in 0..bootstraps[0].len() {
++                let mean = bootstraps.iter().map(|b| b[col]).sum::<f32>() / n;
++                if mean != 0.0 {
++                    self.mean.push(row_index, col, mean, &output.mean)?;
++                    let variance = bootstraps
++                        .iter()
++                        .map(|b| {
++                            let d = b[col] - mean;
++                            d * d
++                        })
++                        .sum::<f32>()
++                        / (n - 1.0).max(1.0);
++                    if variance != 0.0 {
++                        self.variance
++                            .push(row_index, col, variance, &output.variance)?;
++                    }
+                 }
+             }
+         }
++        Ok(())
++    }
++
++    fn flush(&mut self, output: &BootstrapOutput) -> std::io::Result<()> {
++        self.mean.flush(&output.mean)?;
++        self.variance.flush(&output.variance)
+     }
+ }
+ 
+@@ -421,8 +413,13 @@ struct WorkerSharedState<R: MappedRecord> {
+     /// single stream behind a lock would serialize the consumers.
+     chunks: libradicl::readers::MetaChunkStream<R>,
+     tid_to_gid: Arc<Vec<u32>>,
+-    cells_remaining: Arc<AtomicUsize>,
+     bcout: Arc<Mutex<QuantOutputInfo>>,
++    /// Streaming count-matrix writer. Guarded by its own mutex (separate from
++    /// `bcout`) so appending a cell's entries never lengthens the barcode/
++    /// feature critical section, and vice-versa.
++    matrix_out: Arc<Mutex<MatrixMarketWriter<File>>>,
++    bootstrap_out: Option<Arc<BootstrapOutput>>,
++    output_failed: Arc<AtomicBool>,
+     eqid_map_lock: Arc<Mutex<EqcMap>>,
+     alt_res_cells: Arc<Mutex<Vec<u64>>>,
+     empty_resolved_cells: Arc<Mutex<Vec<u64>>>,
+@@ -431,7 +428,6 @@ struct WorkerSharedState<R: MappedRecord> {
+     /// cells took it is part of how the output should be interpreted.
+     tiny_cell_resolved_cells: Arc<Mutex<Vec<u64>>>,
+     unmapped_count: Arc<libradicl::unmapped::CollatedUnmappedCounts>,
+-    mmrate: Arc<Mutex<Vec<f64>>>,
+     /// Sample names indexed by sample index. None for single-barcode.
+     sample_names: Option<Arc<Vec<String>>>,
+     /// Extracts the sample index from a record. None for single-barcode types.
+@@ -663,7 +659,7 @@ fn run_worker_thread<B, R, P>(
+     log: slog::Logger,
+     num_eq_targets: u32,
+     eq_map_type: EqMapType,
+-) -> (usize, Vec<(usize, usize, f32)>, BootstrapHelper)
++) -> anyhow::Result<usize>
+ where
+     B: ConvertiblePrimitiveInteger,
+     u64: From<B>,
+@@ -691,16 +687,13 @@ where
+     // complete global gene axis in every worker up front.
+     let mut expressed_vec = Vec::<f32>::new();
+     let mut expressed_ind = Vec::<usize>::new();
+-    // Thread-local triplet buffer for MTX output. Accumulating triplets locally
+-    // avoids holding the global mutex during add_triplet, which was the primary
+-    // bottleneck serializing all workers.
+-    let mut local_triplets: Vec<(usize, usize, f32)> = Vec::new();
+-    // Thread-local bootstrap helper for accumulating summary stat triplets
+-    let mut boot_helper = BootstrapHelper::new(
+-        std::path::Path::new(""),
+-        config.num_bootstraps,
+-        config.summary_stat,
+-    );
++    // Batches are bounded independently of cell size and formatted off-lock.
++    use std::fmt::Write as _;
++    let mut matrix_batch = MatrixBatch::default();
++    let mut boot_helper = BootstrapHelper::new(config.summary_stat);
++    let mut barcode_buf = String::new();
++    let mut feature_buf = String::new();
++    let mut output_error = None;
+     // Reusable buffers for the small-cell sparse fast path
+     let mut gene_umi_buf: Vec<(u32, u64)> = Vec::new();
+     let mut umi_gene_triplets: Vec<(u64, u32, u32)> = Vec::new();
+@@ -735,9 +728,16 @@ where
+     // remaining fields of `shared` stay usable inside the loop.
+     let chunks = shared.chunks;
+     for meta_chunk in chunks {
++        // Continue consuming queued chunks after an output failure. Returning
++        // immediately could leave the producer blocked on its bounded queue.
++        if shared.output_failed.load(Ordering::Relaxed) {
++            continue;
++        }
+         let first_cell_in_chunk = meta_chunk.first_chunk_index;
+         for (cn, mut c) in meta_chunk.iter().enumerate() {
+-            shared.cells_remaining.fetch_sub(1, Ordering::SeqCst);
++            if shared.output_failed.load(Ordering::Relaxed) {
++                break;
++            }
+             let cell_num = first_cell_in_chunk + cn;
+ 
+             let nbytes = c.nbytes;
+@@ -939,7 +939,6 @@ where
+                                 &log,
+                             );
+                             counts = ct.0;
+-                            shared.mmrate.lock().unwrap()[cell_num] = ct.1;
+                             eq_map.clear();
+                         }
+                         ResolutionStrategy::Parsimony
+@@ -1202,87 +1201,73 @@ where
+             // expressed mean / max expression
+             let mean_by_max = mean_expr / max_umi;
+ 
+-            let row_index: usize; // the index for this row (cell)
+-            {
+-                // writing the files
+-                let bc_mer: BitKmer = (bc.into(), config.barcode_len as u8);
+-
+-                // Scope the lock to minimize hold time — triplet accumulation
+-                // happens after the lock is released.
+-                {
+-                    let writer_deref = shared.bcout.lock();
+-                    let writer = &mut *writer_deref.unwrap();
+-
+-                    // get the row index and then increment it
+-                    row_index = writer.row_index;
++            // Decode and format both auxiliary rows before taking the shared
++            // lock. Only row allocation and paired appends must be serialized.
++            let bc_bytes = bitmer_to_bytes((bc.into(), config.barcode_len as u8));
++            let bc_str = unsafe { std::str::from_utf8_unchecked(&bc_bytes) };
++            let sample_name = sample_idx_from_rec
++                .and_then(|si| shared.sample_names.as_ref()?.get(si).map(|s| s.as_str()));
++            barcode_buf.clear();
++            feature_buf.clear();
++            if let Some(sn) = sample_name {
++                writeln!(barcode_buf, "{}_{}", sn, bc_str).unwrap();
++                write!(feature_buf, "{}\t{}\t", bc_str, sn).unwrap();
++            } else {
++                writeln!(barcode_buf, "{}", bc_str).unwrap();
++                write!(feature_buf, "{}\t", bc_str).unwrap();
++            }
++            writeln!(
++                feature_buf,
++                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
++                num_mapped + num_unmapped,
++                num_mapped,
++                sum_umi,
++                mapping_rate,
++                dedup_rate,
++                mean_by_max,
++                num_expr,
++                num_genes_over_mean
++            )
++            .unwrap();
++
++            let cell_output = (|| -> anyhow::Result<usize> {
++                let row_index = {
++                    let mut writer = shared
++                        .bcout
++                        .lock()
++                        .map_err(|_| anyhow::anyhow!("barcode/feature output lock was poisoned"))?;
++                    let row_index = writer.row_index;
++                    writer
++                        .barcode_file
++                        .write_all(barcode_buf.as_bytes())
++                        .context("could not write barcode output")?;
++                    writer
++                        .feature_file
++                        .write_all(feature_buf.as_bytes())
++                        .context("could not write feature output")?;
+                     writer.row_index += 1;
+-
+-                    // write to barcode file
+-                    let bc_bytes = &bitmer_to_bytes(bc_mer)[..];
+-                    let bc_str = unsafe { std::str::from_utf8_unchecked(bc_bytes) };
+-
+-                    // For multi-barcode data, prefix with sample name.
+-                    // The sample index was read from the first record's
+-                    // barcodes[0] (written by the scatter phase), so
+-                    // assignment is correct regardless of chunk order.
+-                    let sample_name = sample_idx_from_rec
+-                        .and_then(|si| shared.sample_names.as_ref()?.get(si).map(|s| s.as_str()));
+-
+-                    if let Some(sn) = sample_name {
+-                        writeln!(&mut writer.barcode_file, "{}_{}", sn, bc_str)
+-                    } else {
+-                        writeln!(&mut writer.barcode_file, "{}", bc_str)
+-                    }
+-                    .expect("can't write to barcode file.");
+-
+-                    // write to feature dump file
+-                    if let Some(sn) = sample_name {
+-                        writeln!(
+-                            &mut writer.feature_file,
+-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+-                            bc_str,
+-                            sn,
+-                            (num_mapped + num_unmapped),
+-                            num_mapped,
+-                            sum_umi,
+-                            mapping_rate,
+-                            dedup_rate,
+-                            mean_by_max,
+-                            num_expr,
+-                            num_genes_over_mean
+-                        )
+-                    } else {
+-                        writeln!(
+-                            &mut writer.feature_file,
+-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+-                            bc_str,
+-                            (num_mapped + num_unmapped),
+-                            num_mapped,
+-                            sum_umi,
+-                            mapping_rate,
+-                            dedup_rate,
+-                            mean_by_max,
+-                            num_expr,
+-                            num_genes_over_mean
+-                        )
+-                    }
+-                    .expect("can't write to feature file");
+-                } // lock on bc_writer released here (end of scope)
+-
+-                // Accumulate MTX triplets in thread-local buffer (no lock held)
++                    row_index
++                };
+                 for (&ind, &val) in expressed_ind.iter().zip(expressed_vec.iter()) {
+-                    local_triplets.push((row_index, ind, val));
++                    matrix_batch
++                        .push(row_index, ind, val, &shared.matrix_out)
++                        .context("could not write count matrix")?;
+                 }
+-
+-                // Record bootstrap summary stats (mean/var) as sparse triplets
+-                if config.num_bootstraps > 0 && !bootstraps.is_empty() {
+-                    if config.summary_stat {
+-                        boot_helper.record_cell(row_index, &bootstraps);
+-                    } else {
+-                        boot_helper.record_cell_from_replicates(row_index, &bootstraps);
+-                    }
++                if let Some(output) = &shared.bootstrap_out {
++                    boot_helper
++                        .record_cell(row_index, &bootstraps, output)
++                        .context("could not write bootstrap matrices")?;
++                }
++                Ok(row_index)
++            })();
++            let row_index = match cell_output {
++                Ok(row_index) => row_index,
++                Err(error) => {
++                    output_error = Some(error);
++                    shared.output_failed.store(true, Ordering::Relaxed);
++                    break;
+                 }
+-            } // end of cell processing
++            };
+ 
+             // if we are dumping the equivalence class output, fill in
+             // the in-memory representation here.
+@@ -1305,7 +1290,7 @@ where
+                         }
+                     }
+                     if !found {
+-                        geqmap.global_eqc.insert(labels.to_vec().clone(), next_id);
++                        geqmap.global_eqc.insert(labels.clone(), next_id);
+                         next_id += 1;
+                     }
+                 }
+@@ -1328,7 +1313,27 @@ where
+             }
+         } // for all cells in this meta chunk
+     } // for each meta chunk
+-    (local_nrec, local_triplets, boot_helper)
++    if !shared.output_failed.load(Ordering::Relaxed) {
++        let flush_output = (|| -> anyhow::Result<()> {
++            matrix_batch
++                .flush(&shared.matrix_out)
++                .context("could not flush count matrix batch")?;
++            if let Some(output) = &shared.bootstrap_out {
++                boot_helper
++                    .flush(output)
++                    .context("could not flush bootstrap batches")?;
++            }
++            Ok(())
++        })();
++        if let Err(error) = flush_output {
++            output_error = Some(error);
++            shared.output_failed.store(true, Ordering::Relaxed);
++        }
++    }
++    match output_error {
++        Some(error) => Err(error),
++        None => Ok(local_nrec),
++    }
+ }
+ 
+ pub(crate) fn do_quantify<T: BufRead, B, R, P>(
+@@ -1565,10 +1570,7 @@ where
+     // populates the queue, and the remaining worker threads
+     // pop a chunk, perform the quantification, and update the
+     // output.  The updating of the output requires acquiring
+-    // two locks (1) to update the data in the matrix and
+-    // (2) to write to the barcode file.  We also have to
+-    // decrement an atomic coutner for the numebr of cells that
+-    // remain to be processed.
++    // separate locks for matrix batches and paired barcode/feature rows.
+ 
+     // create a thread-safe queue based on the number of worker threads
+     let n_workers = if num_threads > 1 {
+@@ -1581,8 +1583,6 @@ where
+         std::num::NonZeroUsize::new(n_workers).unwrap(),
+     );
+ 
+-    // the number of cells left to process
+-    let cells_to_process = Arc::new(AtomicUsize::new(num_cells as usize));
+     // each thread needs a *read-only* copy of this transcript <-> gene map
+     let tid_to_gid_shared = std::sync::Arc::new(tid_to_gid);
+     // the number of reference sequences
+@@ -1603,7 +1603,12 @@ where
+     let bc_path = output_matrix_path.join("quants_mat_rows.txt");
+     let bc_file = fs::File::create(bc_path)?;
+ 
+-    let _boot_helper = BootstrapHelper::new(output_path, num_bootstraps, summary_stat);
++    if num_bootstraps > 0 && !summary_stat {
++        warn!(
++            log,
++            "Full per-replicate MTX output is not supported; writing bootstrap mean and variance instead."
++        );
++    }
+ 
+     let ff_path = output_path.join("featureDump.txt");
+     let mut ff_file = fs::File::create(ff_path)?;
+@@ -1622,14 +1627,6 @@ where
+     let empty_resolved_cells = Arc::new(Mutex::new(Vec::<u64>::new()));
+     let tiny_cell_resolved_cells = Arc::new(Mutex::new(Vec::<u64>::new()));
+ 
+-    // Estimate initial triplet capacity for MTX output. The 10% density assumption
+-    // is far too high for large multiplexed datasets (actual density is often <0.5%).
+-    // Cap at 256M entries (~3GB) to avoid overallocation; the vec will grow as needed.
+-    let _tmcap = {
+-        let estimate = (0.1f64 * num_genes as f64 * num_cells as f64).round() as usize;
+-        estimate.min(256_000_000)
+-    };
+-
+     // the length of the vector of gene counts we'll use
+     let num_rows = if usa_mode {
+         // the number of genes should be the max gene id + 1
+@@ -1658,14 +1655,29 @@ where
+     };
+ 
+     let bc_writer = Arc::new(Mutex::new(QuantOutputInfo {
+-        barcode_file: BufWriter::new(bc_file),
+-        feature_file: BufWriter::new(ff_file),
++        barcode_file: BufWriter::with_capacity(MATRIX_BUFFER_CAPACITY, bc_file),
++        feature_file: BufWriter::with_capacity(MATRIX_BUFFER_CAPACITY, ff_file),
+         row_index: 0usize,
+     }));
+ 
+-    let mmrate = Arc::new(Mutex::new(vec![0f64; num_cells as usize]));
++    let open_matrix = |name: &str| -> anyhow::Result<MatrixMarketWriter<File>> {
++        let path = output_matrix_path.join(name);
++        let file =
++            File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
++        Ok(MatrixMarketWriter::new(file, num_cells as usize, num_rows)?)
++    };
++    let matrix_out = Arc::new(Mutex::new(open_matrix("quants_mat.mtx")?));
++    let bootstrap_out = if num_bootstraps > 0 {
++        Some(Arc::new(BootstrapOutput {
++            mean: Mutex::new(open_matrix("bootstraps_mean.mtx")?),
++            variance: Mutex::new(open_matrix("bootstraps_var.mtx")?),
++        }))
++    } else {
++        None
++    };
++    let output_failed = Arc::new(AtomicBool::new(false));
+ 
+-    type WorkerResult = (usize, Vec<(usize, usize, f32)>, BootstrapHelper);
++    type WorkerResult = anyhow::Result<usize>;
+     let mut thread_handles: Vec<thread::JoinHandle<WorkerResult>> = Vec::with_capacity(n_workers);
+ 
+     // This is the hash table that will hold the global
+@@ -1689,11 +1701,13 @@ where
+         let log = log.clone();
+         // the shared tid_to_gid map
+         let tid_to_gid = tid_to_gid_shared.clone();
+-        // and the atomic counter of remaining work
+-        let cells_remaining = cells_to_process.clone();
+ 
+         // and the file writer
+         let bcout = bc_writer.clone();
++        // and the streaming count-matrix writer
++        let matrix_out = matrix_out.clone();
++        let bootstrap_out = bootstrap_out.clone();
++        let output_failed = output_failed.clone();
+         // global gene-level eqc map
+         let eqid_map_lockc = eqid_map_lock.clone();
+         // and will need to know the barcode length
+@@ -1701,7 +1715,6 @@ where
+         let empty_resolved_cells = empty_resolved_cells.clone();
+         let tiny_cell_resolved_cells = tiny_cell_resolved_cells.clone();
+         let unmapped_count = bc_unmapped_map.clone();
+-        let mmrate = mmrate.clone();
+ 
+         // if we are performing parsimony-gene or parsimony-gene-em
+         // resolution, then the equivalence classes will be immediately
+@@ -1751,14 +1764,15 @@ where
+         let shared = WorkerSharedState {
+             chunks,
+             tid_to_gid,
+-            cells_remaining,
+             bcout,
++            matrix_out,
++            bootstrap_out,
++            output_failed,
+             eqid_map_lock: eqid_map_lockc,
+             alt_res_cells,
+             empty_resolved_cells,
+             tiny_cell_resolved_cells,
+             unmapped_count,
+-            mmrate,
+             sample_names: sample_names.clone(),
+             sample_idx_extractor: sample_bc_extractor.clone(),
+         };
+@@ -1777,7 +1791,7 @@ where
+ 
+     // push the work onto the queue for the worker threads
+     // we spawned above.
+-    let _ = if let Some(ret_bc) = retained_bc {
++    let reader_result = if let Some(ret_bc) = retained_bc {
+         let filter_fn =
+             |buf: &[u8], record_context: &<R as MappedRecord>::ParsingContext| -> bool {
+                 let ch = R::peek_collatable_header(&buf[8..], record_context)
+@@ -1790,98 +1804,114 @@ where
+         chunk_reader.start(&mut br, Some(cb))
+     };
+ 
++    let mut total_records = 0usize;
++    let mut worker_error = None;
++    for handle in thread_handles {
++        let result = match handle.join() {
++            Ok(result) => result,
++            Err(_) => Err(anyhow::anyhow!("quantification worker panicked")),
++        };
++        match result {
++            Ok(records) => total_records += records,
++            Err(error) if worker_error.is_none() => worker_error = Some(error),
++            Err(_) => {}
++        }
++    }
++    // Every worker is joined even when input or output failed. Never finalize
++    // a partial matrix or write success metadata on these error paths.
++    if let Some(error) = worker_error {
++        return Err(error);
++    }
++    reader_result.context("could not read collated RAD input")?;
++
++    let emitted_rows = {
++        let mut writer = bc_writer
++            .lock()
++            .map_err(|_| anyhow::anyhow!("barcode/feature output lock was poisoned"))?;
++        writer
++            .barcode_file
++            .flush()
++            .context("could not flush barcode output")?;
++        writer
++            .feature_file
++            .flush()
++            .context("could not flush feature output")?;
++        writer.row_index
++    };
++    anyhow::ensure!(
++        emitted_rows <= num_cells as usize,
++        "quantification emitted {} rows, but the matrix declares only {}; check the cell filter for shared barcodes across samples",
++        emitted_rows,
++        num_cells
++    );
++    let total_nnz = matrix_out
++        .lock()
++        .map_err(|_| anyhow::anyhow!("count matrix output lock was poisoned"))?
++        .finish()
++        .context("could not finalize count matrix")?;
++    info!(
++        log,
++        "wrote streamed count matrix: {} nonzeros",
++        total_nnz.to_formatted_string(&Locale::en)
++    );
++
++    if let Some(output) = bootstrap_out {
++        let output = Arc::try_unwrap(output)
++            .map_err(|_| anyhow::anyhow!("bootstrap output is still held by a worker"))?;
++        let mean_nnz = output
++            .mean
++            .lock()
++            .map_err(|_| anyhow::anyhow!("bootstrap mean output lock was poisoned"))?
++            .finish()
++            .context("could not finalize bootstrap mean matrix")?;
++        let var_nnz = output
++            .variance
++            .lock()
++            .map_err(|_| anyhow::anyhow!("bootstrap variance output lock was poisoned"))?
++            .finish()
++            .context("could not finalize bootstrap variance matrix")?;
++        // Preserve the existing file set when no bootstrap means were produced.
++        // Close first so removal also works on platforms that lock open files.
++        drop(output);
++        if mean_nnz == 0 {
++            fs::remove_file(output_matrix_path.join("bootstraps_mean.mtx"))?;
++            fs::remove_file(output_matrix_path.join("bootstraps_var.mtx"))?;
++        } else {
++            info!(
++                log,
++                "wrote bootstrap summary statistics: mean ({} entries), variance ({} entries)",
++                mean_nnz,
++                var_nnz
++            );
++        }
++    }
++
+     let gn_path = output_matrix_path.join("quants_mat_cols.txt");
+-    let gn_file = File::create(gn_path).expect("couldn't create gene name file.");
++    let gn_file = File::create(gn_path).context("could not create gene name output")?;
+     let mut gn_writer = BufWriter::new(gn_file);
+ 
+     // if we are not using unspliced then just write the gene names
+     if !usa_mode {
+         for g in gene_names {
+-            gn_writer.write_all(format!("{}\n", g).as_bytes())?;
++            writeln!(gn_writer, "{}", g)?;
+         }
+     } else {
+         // otherwise, we write the spliced names, the unspliced names, and then
+         // the ambiguous names
+         for g in gene_names.iter() {
+-            gn_writer.write_all(format!("{}\n", *g).as_bytes())?;
++            writeln!(gn_writer, "{}", g)?;
+         }
+         // unspliced
+         for g in gene_names.iter() {
+-            gn_writer.write_all(format!("{}-U\n", *g).as_bytes())?;
++            writeln!(gn_writer, "{}-U", g)?;
+         }
+         // ambiguous
+         for g in gene_names.iter() {
+-            gn_writer.write_all(format!("{}-A\n", *g).as_bytes())?;
++            writeln!(gn_writer, "{}-A", g)?;
+         }
+     }
+ 
+-    let mut total_records = 0usize;
+-    let mut all_triplets: Vec<(usize, usize, f32)> = Vec::new();
+-    let mut all_boot_mean_triplets: Vec<(usize, usize, f32)> = Vec::new();
+-    let mut all_boot_var_triplets: Vec<(usize, usize, f32)> = Vec::new();
+-    for h in thread_handles {
+-        match h.join() {
+-            Ok((rc, triplets, boot)) => {
+-                total_records += rc;
+-                all_triplets.extend(triplets);
+-                if boot.num_bootstraps > 0 {
+-                    all_boot_mean_triplets.extend(boot.mean_triplets);
+-                    all_boot_var_triplets.extend(boot.var_triplets);
+-                }
+-            }
+-            Err(_e) => {
+-                info!(log, "thread panicked");
+-            }
+-        }
+-    }
+-
+-    // Write the MTX output
+-    info!(
+-        log,
+-        "building triplet matrix from {} entries",
+-        all_triplets.len().to_formatted_string(&Locale::en),
+-    );
+-
+-    let mut trimat = sprs::TriMatI::<f32, u32>::with_capacity(
+-        (num_cells as usize, num_rows),
+-        all_triplets.len(),
+-    );
+-    for (row, col, val) in all_triplets {
+-        trimat.add_triplet(row, col, val);
+-    }
+-
+-    let mtx_path = output_matrix_path.join("quants_mat.mtx");
+-    sprs::io::write_matrix_market(mtx_path, &trimat)?;
+-
+-    // Write bootstrap summary stat matrices if bootstraps were computed
+-    if num_bootstraps > 0 && !all_boot_mean_triplets.is_empty() {
+-        let mut mean_trimat = sprs::TriMatI::<f32, u32>::with_capacity(
+-            (num_cells as usize, num_rows),
+-            all_boot_mean_triplets.len(),
+-        );
+-        for (row, col, val) in all_boot_mean_triplets {
+-            mean_trimat.add_triplet(row, col, val);
+-        }
+-        let mean_path = output_matrix_path.join("bootstraps_mean.mtx");
+-        sprs::io::write_matrix_market(mean_path, &mean_trimat)?;
+-
+-        let mut var_trimat = sprs::TriMatI::<f32, u32>::with_capacity(
+-            (num_cells as usize, num_rows),
+-            all_boot_var_triplets.len(),
+-        );
+-        for (row, col, val) in all_boot_var_triplets {
+-            var_trimat.add_triplet(row, col, val);
+-        }
+-        let var_path = output_matrix_path.join("bootstraps_var.mtx");
+-        sprs::io::write_matrix_market(var_path, &var_trimat)?;
+-
+-        info!(
+-            log,
+-            "wrote bootstrap summary statistics: mean ({} entries), variance ({} entries)",
+-            mean_trimat.nnz(),
+-            var_trimat.nnz(),
+-        );
+-    }
++    gn_writer.flush().context("could not flush gene names")?;
+ 
+     let pb_msg = format!(
+         "finished quantifying {} cells.",
+@@ -1933,11 +1963,12 @@ where
+     });
+ 
+     let mut meta_info_file =
+-        File::create(output_path.join("quant.json")).expect("couldn't create quant.json file.");
+-    let aux_info_str = serde_json::to_string_pretty(&meta_info).expect("could not format json.");
++        File::create(output_path.join("quant.json")).context("could not create quant.json")?;
++    let aux_info_str =
++        serde_json::to_string_pretty(&meta_info).context("could not format quant.json")?;
+     meta_info_file
+         .write_all(aux_info_str.as_bytes())
+-        .expect("cannot write to quant.json file");
++        .context("could not write quant.json")?;
+ 
+     // k3yavi: Todo delete after api stability
+     // creating a dummy cmd_info.json for R compatibility
+diff --git a/tests/streaming_matrix_market.rs b/tests/streaming_matrix_market.rs
+new file mode 100644
+index 00000000..cf979ea9
+--- /dev/null
++++ b/tests/streaming_matrix_market.rs
+@@ -0,0 +1,616 @@
++//! Exercise the actual quantification writer, including its patched size line.
++
++use std::collections::{BTreeMap, HashSet};
++use std::fs::{self, File};
++use std::path::{Path, PathBuf};
++
++use alevin_fry::prog_opts::QuantOpts;
++use alevin_fry::quant::{ResolutionStrategy, SplicedAmbiguityModel, quantify};
++use libradicl::chunk::Chunk;
++use libradicl::collation::{CollationManifest, SampleGroup};
++use libradicl::header::{RadHeader, RadPrelude};
++use libradicl::rad_types::{
++    RadIntId, RadType, TagDesc, TagMap, TagSection, TagSectionLabel, TagValue,
++};
++use libradicl::record::{MultiBarcodeReadRecord, MultiBarcodeRecordContext, RecordContext};
++use libradicl::writers::RadFileWriter;
++use needletail::bitkmer::bitmer_to_bytes;
++use smallvec::smallvec;
++
++const BC_LEN: u16 = 16;
++const NUM_GENES: usize = 3;
++type Entries = BTreeMap<(String, String), f32>;
++
++struct Fixture {
++    input: PathBuf,
++    tg_map: PathBuf,
++    rows: HashSet<String>,
++    entries: Entries,
++}
++
++fn barcode(cell: usize) -> u64 {
++    (cell as u64 + 1).wrapping_mul(2_654_435_761) & u32::MAX as u64
++}
++
++fn barcode_label(cell: usize) -> String {
++    String::from_utf8(bitmer_to_bytes((barcode(cell), BC_LEN as u8))).unwrap()
++}
++
++/// Each chunk already has the sample index in b0 and one cell barcode in b1,
++/// just as collate writes it. Samples deliberately reuse their cell barcodes.
++fn fixture(root: &Path, cells_per_sample: usize, ambiguous_only: bool) -> Fixture {
++    let input = root.join("input");
++    fs::create_dir_all(&input).unwrap();
++    fs::write(input.join("collate.json"), r#"{"compressed_output":false}"#).unwrap();
++    let tg_map = root.join("tg_map.tsv");
++    fs::write(&tg_map, "tx0\tgene0\ntx1\tgene1\ntx2\tgene2\n").unwrap();
++
++    let mut file_tags = TagSection::new_with_label(TagSectionLabel::FileTags);
++    for name in ["num_barcodes", "b0len", "b1len", "ulen"] {
++        file_tags.add_tag_desc(TagDesc {
++            name: name.into(),
++            typeid: RadType::Int(RadIntId::U16),
++        });
++    }
++    let mut read_tags = TagSection::new_with_label(TagSectionLabel::ReadTags);
++    for name in ["b0", "b1", "u"] {
++        read_tags.add_tag_desc(TagDesc {
++            name: name.into(),
++            typeid: RadType::Int(RadIntId::U32),
++        });
++    }
++    let mut aln_tags = TagSection::new_with_label(TagSectionLabel::AlignmentTags);
++    aln_tags.add_tag_desc(TagDesc {
++        name: "compressed_ori_refid".into(),
++        typeid: RadType::Int(RadIntId::U32),
++    });
++    let prelude = RadPrelude {
++        hdr: RadHeader {
++            is_paired: 0,
++            ref_count: NUM_GENES as u64,
++            ref_names: (0..NUM_GENES).map(|i| format!("tx{i}")).collect(),
++            num_chunks: 0,
++        },
++        file_tags,
++        read_tags,
++        aln_tags,
++    };
++    let mut tags = TagMap::with_keyset(&prelude.file_tags.tags);
++    for value in [2, 8, BC_LEN, 12] {
++        tags.add(TagValue::U16(value));
++    }
++    let context = MultiBarcodeRecordContext::get_context_from_tag_section(
++        &prelude.file_tags,
++        &prelude.read_tags,
++        &prelude.aln_tags,
++    )
++    .unwrap();
++    let mut writer = RadFileWriter::new(
++        File::create(input.join("map.collated.rad")).unwrap(),
++        &prelude,
++        &tags,
++    )
++    .unwrap();
++    let mut manifest = CollationManifest::new(vec!["sample".into(), "cell".into()]);
++    let mut rows = HashSet::new();
++    let mut entries = Entries::new();
++    for sample in 0..2 {
++        let mut num_records = 0;
++        for cell in 0..cells_per_sample {
++            let label = format!("sample{sample}_{}", barcode_label(cell));
++            rows.insert(label.clone());
++            let mut reads = Vec::new();
++            if ambiguous_only || cell % 17 == 0 {
++                // CR-like drops these gene-ambiguous molecules, retaining an
++                // empty matrix row. Uniform EM instead assigns half to each.
++                reads.push(MultiBarcodeReadRecord {
++                    barcodes: smallvec![sample as u64, barcode(cell)],
++                    umi: 0,
++                    dirs: vec![true, true],
++                    refs: vec![0, 1],
++                });
++            } else {
++                for (gene, count) in [(0, 1 + cell % 31), (1, 1 + (cell + 7 * sample) % 29)] {
++                    entries.insert((label.clone(), format!("gene{gene}")), count as f32);
++                    for umi in 0..count {
++                        reads.push(MultiBarcodeReadRecord {
++                            barcodes: smallvec![sample as u64, barcode(cell)],
++                            umi: (gene * 100 + umi) as u64,
++                            dirs: vec![true],
++                            refs: vec![gene as u32],
++                        });
++                    }
++                }
++            }
++            num_records += reads.len() as u64;
++            writer
++                .write_chunk(
++                    &Chunk {
++                        nbytes: 0,
++                        nrec: reads.len() as u32,
++                        reads,
++                    },
++                    &context,
++                )
++                .unwrap();
++        }
++        manifest.add_sample_group(SampleGroup {
++            key: sample as u64,
++            name: Some(format!("sample{sample}")),
++            chunk_start: (sample * cells_per_sample) as u64,
++            num_chunks: cells_per_sample as u64,
++            num_records,
++        });
++    }
++    writer.finalize().unwrap();
++    manifest
++        .write_to_file(&input.join("collation_manifest.bin"))
++        .unwrap();
++    Fixture {
++        input,
++        tg_map,
++        rows,
++        entries,
++    }
++}
++
++fn run_quant(
++    fixture: &Fixture,
++    output: &PathBuf,
++    threads: u32,
++    fractional: bool,
++    filter: Option<&PathBuf>,
++) -> anyhow::Result<()> {
++    run_quant_with_bootstraps(fixture, output, threads, fractional, filter, 0, false)
++}
++
++fn run_quant_with_bootstraps(
++    fixture: &Fixture,
++    output: &PathBuf,
++    threads: u32,
++    fractional: bool,
++    filter: Option<&PathBuf>,
++    num_bootstraps: u32,
++    summary_stat: bool,
++) -> anyhow::Result<()> {
++    let log = slog::Logger::root(slog::Discard, slog::o!());
++    quantify(
++        QuantOpts::builder()
++            .input_dir(&fixture.input)
++            .tg_map(&fixture.tg_map)
++            .output_dir(output)
++            .num_threads(threads)
++            .num_bootstraps(num_bootstraps)
++            .init_uniform(true)
++            .summary_stat(summary_stat)
++            .dump_eq(false)
++            .resolution(if fractional {
++                ResolutionStrategy::CellRangerLikeEm
++            } else {
++                ResolutionStrategy::CellRangerLike
++            })
++            .pug_exact_umi(false)
++            .sa_model(SplicedAmbiguityModel::WinnerTakeAll)
++            .small_thresh(if fractional { 0 } else { 100 })
++            .large_graph_thresh(0)
++            .filter_list(filter)
++            .cmdline("streaming-matrix-market-test")
++            .version(env!("CARGO_PKG_VERSION"))
++            .log(&log)
++            .build(),
++    )
++}
++
++fn read_output(output: &Path) -> (HashSet<String>, Entries) {
++    read_matrix_output(output, "quants_mat.mtx", &["gene0", "gene1", "gene2"])
++}
++
++fn read_matrix_output(
++    output: &Path,
++    filename: &str,
++    expected_cols: &[&str],
++) -> (HashSet<String>, Entries) {
++    let dir = output.join("alevin");
++    let rows_text = fs::read_to_string(dir.join("quants_mat_rows.txt")).unwrap();
++    let cols_text = fs::read_to_string(dir.join("quants_mat_cols.txt")).unwrap();
++    let rows: Vec<_> = rows_text.lines().collect();
++    let cols: Vec<_> = cols_text.lines().collect();
++    let matrix = sprs::io::read_matrix_market::<f32, u32, _>(dir.join(filename))
++        .expect("quant output must be accepted by a MatrixMarket reader");
++    assert_eq!(matrix.shape(), (rows.len(), cols.len()));
++    assert_eq!(cols, expected_cols);
++    let unique_rows: HashSet<_> = rows.iter().map(|s| s.to_string()).collect();
++    assert_eq!(unique_rows.len(), rows.len());
++
++    let mut entries = Entries::new();
++    for (&value, (row, col)) in matrix.triplet_iter() {
++        assert!(value > 0.0);
++        let key = (
++            rows[row as usize].to_string(),
++            cols[col as usize].to_string(),
++        );
++        assert!(entries.insert(key, value).is_none(), "duplicate coordinate");
++    }
++    assert_eq!(matrix.nnz(), entries.len());
++    // sprs permits extra body lines; independently check that nnz is exact.
++    let text = fs::read_to_string(dir.join(filename)).unwrap();
++    let body: Vec<_> = text.lines().filter(|line| !line.starts_with('%')).collect();
++    assert_eq!(body.len(), matrix.nnz() + 1);
++    assert_eq!(body[0].split_whitespace().count(), 3);
++    (unique_rows, entries)
++}
++
++fn assert_no_bootstrap_files(output: &Path) {
++    for filename in ["bootstraps_mean.mtx", "bootstraps_var.mtx"] {
++        assert!(
++            !output.join("alevin").join(filename).exists(),
++            "unexpected {filename}"
++        );
++    }
++}
++
++#[test]
++fn streamed_matrix_matches_every_barcode_and_gene_with_multiple_workers() {
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 2048, false);
++    // More than several 524208-byte RAD meta chunks: the multiworker case can
++    // actually distribute work instead of handing a tiny fixture to one worker.
++    assert!(
++        fs::metadata(fixture.input.join("map.collated.rad"))
++            .unwrap()
++            .len()
++            > 2_000_000
++    );
++    for threads in [1, 5] {
++        let output = tmp.path().join(format!("quant-{threads}"));
++        run_quant(&fixture, &output, threads, false, None).unwrap();
++        let (rows, entries) = read_output(&output);
++        assert_eq!(rows, fixture.rows);
++        assert_eq!(entries, fixture.entries);
++        assert_no_bootstrap_files(&output);
++    }
++}
++
++#[test]
++fn streamed_matrix_round_trips_zero_nonzeros_and_fractional_values() {
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 4, true);
++    for fractional in [false, true] {
++        let output = tmp.path().join(format!("quant-{fractional}"));
++        run_quant(&fixture, &output, 5, fractional, None).unwrap();
++        let (rows, entries) = read_output(&output);
++        assert_eq!(rows, fixture.rows);
++        let expected: Entries = if fractional {
++            fixture
++                .rows
++                .iter()
++                .flat_map(|row| {
++                    [(row.clone(), "gene0".into()), (row.clone(), "gene1".into())]
++                        .into_iter()
++                        .map(|key| (key, 0.5))
++                })
++                .collect()
++        } else {
++            Entries::new()
++        };
++        assert_eq!(entries, expected);
++        assert_no_bootstrap_files(&output);
++    }
++}
++
++#[test]
++fn shared_barcode_filter_cannot_succeed_with_out_of_bounds_matrix_rows() {
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 2, false);
++    let filter = tmp.path().join("filter.txt");
++    fs::write(&filter, format!("{}\n", barcode_label(1))).unwrap();
++    let output = tmp.path().join("filtered");
++    // The filter has one barcode, but it selects a distinct cell in each of
++    // two samples. Returning an error is acceptable until filters support this
++    // case; reporting success with a one-row matrix containing row 2 is not.
++    if run_quant(&fixture, &output, 1, false, Some(&filter)).is_ok() {
++        let (rows, entries) = read_output(&output);
++        let expected_rows = fixture
++            .rows
++            .iter()
++            .filter(|row| row.ends_with(&barcode_label(1)))
++            .cloned()
++            .collect();
++        assert_eq!(rows, expected_rows);
++        assert_eq!(entries, fixture.entries);
++    }
++}
++
++#[test]
++fn streamed_bootstrap_matrices_preserve_rows_and_statistics_in_both_modes() {
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 2048, false);
++    // With all references assigned to one gene, every cell has one bootstrap
++    // category. Resampling cannot change its molecule count, so the expected
++    // mean and zero variance are deterministic without controlling an RNG.
++    fs::write(&fixture.tg_map, "tx0\tgene0\ntx1\tgene0\ntx2\tgene0\n").unwrap();
++    let expected: Entries = fixture
++        .rows
++        .iter()
++        .map(|row| {
++            let total: f32 = fixture
++                .entries
++                .range((row.clone(), String::new())..)
++                .take_while(|((barcode, _), _)| barcode == row)
++                .map(|(_, value)| *value)
++                .sum();
++            // A previously gene-ambiguous row now has one unique molecule.
++            ((row.clone(), "gene0".into()), total.max(1.0))
++        })
++        .collect();
++    for summary_stat in [false, true] {
++        let output = tmp.path().join(format!("bootstrap-{summary_stat}"));
++        run_quant_with_bootstraps(&fixture, &output, 5, true, None, 3, summary_stat).unwrap();
++        let (rows, counts) = read_matrix_output(&output, "quants_mat.mtx", &["gene0"]);
++        assert_eq!(rows, fixture.rows);
++        assert_eq!(counts, expected);
++        let (mean_rows, means) = read_matrix_output(&output, "bootstraps_mean.mtx", &["gene0"]);
++        assert_eq!(mean_rows, fixture.rows);
++        assert_eq!(means, expected);
++        let (variance_rows, variances) =
++            read_matrix_output(&output, "bootstraps_var.mtx", &["gene0"]);
++        assert_eq!(variance_rows, fixture.rows);
++        assert!(variances.is_empty());
++    }
++}
++
++#[test]
++fn no_bootstrap_files_are_kept_when_no_cells_produce_bootstrap_means() {
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 0, false);
++    for summary_stat in [false, true] {
++        let output = tmp.path().join(format!("empty-{summary_stat}"));
++        run_quant_with_bootstraps(&fixture, &output, 5, true, None, 3, summary_stat).unwrap();
++        let (rows, entries) = read_output(&output);
++        assert!(rows.is_empty());
++        assert!(entries.is_empty());
++        assert_no_bootstrap_files(&output);
++    }
++}
++
++#[test]
++fn streamed_usa_matrix_preserves_spliced_unspliced_and_ambiguous_columns() {
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 2, false);
++    fs::write(
++        &fixture.tg_map,
++        "tx0\tgene0\tS\ntx1\tgene0\tU\ntx2\tgene1\tS\n",
++    )
++    .unwrap();
++    let output = tmp.path().join("usa");
++    run_quant(&fixture, &output, 5, false, None).unwrap();
++    let cols = ["gene0", "gene1", "gene0-U", "gene1-U", "gene0-A", "gene1-A"];
++    let (rows, entries) = read_matrix_output(&output, "quants_mat.mtx", &cols);
++    assert_eq!(rows, fixture.rows);
++    let mut expected = Entries::new();
++    for sample in 0..2 {
++        expected.insert(
++            (
++                format!("sample{sample}_{}", barcode_label(0)),
++                "gene0-A".into(),
++            ),
++            1.0,
++        );
++        let row = format!("sample{sample}_{}", barcode_label(1));
++        expected.insert((row.clone(), "gene0".into()), 2.0);
++        expected.insert((row, "gene0-U".into()), (2 + 7 * sample) as f32);
++    }
++    assert_eq!(entries, expected);
++    assert_no_bootstrap_files(&output);
++}
++
++// Run failures in a subprocess: a queue-draining regression must fail with a
++// deadline rather than leave the test runner blocked behind a full queue.
++fn wait_for_child(child: &mut std::process::Child, description: &str) -> std::process::ExitStatus {
++    use std::time::{Duration, Instant};
++
++    let deadline = Instant::now() + Duration::from_secs(30);
++    loop {
++        if let Some(status) = child.try_wait().unwrap() {
++            return status;
++        }
++        if Instant::now() >= deadline {
++            child.kill().unwrap();
++            child.wait().unwrap();
++            panic!("{description} blocked quantification for 30 seconds");
++        }
++        std::thread::sleep(Duration::from_millis(25));
++    }
++}
++
++#[cfg(target_os = "linux")]
++#[test]
++fn output_write_errors_return_without_panicking_or_blocking_the_producer() {
++    use std::os::unix::fs::symlink;
++    use std::process::{Command, Stdio};
++
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 20_000, false);
++    fs::write(&fixture.tg_map, "tx0\tgene0\ntx1\tgene0\ntx2\tgene0\n").unwrap();
++    // A single worker has a queue of four 524208-byte meta chunks. This leaves
++    // many chunks unconsumed when any ordinary output buffer first fills.
++    assert!(
++        fs::metadata(fixture.input.join("map.collated.rad"))
++            .unwrap()
++            .len()
++            > 20_000_000
++    );
++    for (name, failing_path, bootstraps) in [
++        ("matrix", "alevin/quants_mat.mtx", false),
++        ("barcodes", "alevin/quants_mat_rows.txt", false),
++        ("features", "featureDump.txt", false),
++        ("bootstrap-mean", "alevin/bootstraps_mean.mtx", true),
++        ("bootstrap-variance", "alevin/bootstraps_var.mtx", true),
++    ] {
++        let output = tmp.path().join(name);
++        fs::create_dir_all(output.join("alevin")).unwrap();
++        symlink("/dev/full", output.join(failing_path)).unwrap();
++        let log_path = output.join("child.log");
++        let log = File::create(&log_path).unwrap();
++        let mut child = Command::new(std::env::current_exe().unwrap())
++            .args([
++                "--exact",
++                "output_write_failure_child",
++                "--ignored",
++                "--nocapture",
++            ])
++            .env("AF_WRITE_FAILURE_FIXTURE", tmp.path())
++            .env("AF_WRITE_FAILURE_OUTPUT", &output)
++            .env(
++                "AF_WRITE_FAILURE_BOOTSTRAPS",
++                if bootstraps { "3" } else { "0" },
++            )
++            .stdout(Stdio::from(log.try_clone().unwrap()))
++            .stderr(Stdio::from(log))
++            .spawn()
++            .unwrap();
++        let status = wait_for_child(&mut child, &format!("{name} output failure"));
++        assert!(
++            status.success(),
++            "{name} output failure did not return Err normally:\n{}",
++            fs::read_to_string(&log_path).unwrap()
++        );
++        assert!(!output.join("quant.json").exists());
++    }
++}
++
++#[cfg(target_os = "linux")]
++#[test]
++#[ignore = "subprocess helper for output_write_errors_return_without_panicking_or_blocking_the_producer"]
++fn output_write_failure_child() {
++    let root = PathBuf::from(std::env::var_os("AF_WRITE_FAILURE_FIXTURE").unwrap());
++    let output = PathBuf::from(std::env::var_os("AF_WRITE_FAILURE_OUTPUT").unwrap());
++    let num_bootstraps = std::env::var("AF_WRITE_FAILURE_BOOTSTRAPS")
++        .unwrap()
++        .parse()
++        .unwrap();
++    let fixture = Fixture {
++        input: root.join("input"),
++        tg_map: root.join("tg_map.tsv"),
++        rows: HashSet::new(),
++        entries: Entries::new(),
++    };
++    // One worker forces an erroring consumer to drain its queue correctly;
++    // an unwinding panic fails this child test, and a deadlock hits the parent's
++    // deadline. No catch_unwind hides either failure mode.
++    let error = run_quant_with_bootstraps(
++        &fixture,
++        &output,
++        1,
++        num_bootstraps > 0,
++        None,
++        num_bootstraps,
++        true,
++    )
++    .expect_err("writing to /dev/full must fail");
++    eprintln!("quantification returned its output error: {error:#}");
++}
++
++#[cfg(target_os = "linux")]
++#[test]
++fn quant_cli_reports_output_error_with_context_and_exit_code_one() {
++    use std::os::unix::fs::symlink;
++    use std::process::{Command, Stdio};
++
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 2, false);
++    fs::write(
++        fixture.input.join("generate_permit_list.json"),
++        r#"{"velo_mode":false}"#,
++    )
++    .unwrap();
++    let output = tmp.path().join("cli-error");
++    fs::create_dir_all(output.join("alevin")).unwrap();
++    symlink("/dev/full", output.join("alevin/quants_mat.mtx")).unwrap();
++    let log_path = output.join("cli.log");
++    let log = File::create(&log_path).unwrap();
++    let mut child = Command::new(env!("CARGO_BIN_EXE_alevin-fry"))
++        .arg("quant")
++        .arg("-i")
++        .arg(&fixture.input)
++        .arg("-m")
++        .arg(&fixture.tg_map)
++        .arg("-o")
++        .arg(&output)
++        .args(["-t", "2", "-r", "cr-like"])
++        .stdout(Stdio::from(log.try_clone().unwrap()))
++        .stderr(Stdio::from(log))
++        .spawn()
++        .unwrap();
++    let status = wait_for_child(&mut child, "CLI matrix output error");
++    let diagnostic = fs::read_to_string(log_path).unwrap();
++    assert_eq!(status.code(), Some(1), "{diagnostic}");
++    assert!(
++        diagnostic.contains("could not finalize count matrix"),
++        "{diagnostic}"
++    );
++    assert!(diagnostic.contains("os error 28"), "{diagnostic}");
++    assert!(!diagnostic.contains("panicked at"), "{diagnostic}");
++    assert!(!output.join("quant.json").exists());
++}
++
++#[test]
++fn truncated_collated_input_returns_error_and_joins_waiting_workers() {
++    use std::process::{Command, Stdio};
++
++    let tmp = tempfile::tempdir().unwrap();
++    let fixture = fixture(tmp.path(), 32, false);
++    let path = fixture.input.join("map.collated.rad");
++    let length = fs::metadata(&path).unwrap().len();
++    // Preserve the valid prelude and chunk headers, but interrupt the final
++    // record body. Workers waiting on the producer must still be released.
++    fs::OpenOptions::new()
++        .write(true)
++        .open(path)
++        .unwrap()
++        .set_len(length - 3)
++        .unwrap();
++    let output = tmp.path().join("truncated");
++    fs::create_dir_all(&output).unwrap();
++    let log_path = output.join("child.log");
++    let log = File::create(&log_path).unwrap();
++    let mut child = Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "truncated_input_failure_child",
++            "--ignored",
++            "--nocapture",
++        ])
++        .env("AF_TRUNCATED_INPUT_FIXTURE", tmp.path())
++        .env("AF_TRUNCATED_INPUT_OUTPUT", &output)
++        .stdout(Stdio::from(log.try_clone().unwrap()))
++        .stderr(Stdio::from(log))
++        .spawn()
++        .unwrap();
++    let status = wait_for_child(&mut child, "truncated input");
++    assert!(
++        status.success(),
++        "{}",
++        fs::read_to_string(log_path).unwrap()
++    );
++    assert!(!output.join("quant.json").exists());
++}
++
++#[test]
++#[ignore = "subprocess helper for truncated_collated_input_returns_error_and_joins_waiting_workers"]
++fn truncated_input_failure_child() {
++    let root = PathBuf::from(std::env::var_os("AF_TRUNCATED_INPUT_FIXTURE").unwrap());
++    let output = PathBuf::from(std::env::var_os("AF_TRUNCATED_INPUT_OUTPUT").unwrap());
++    let fixture = Fixture {
++        input: root.join("input"),
++        tg_map: root.join("tg_map.tsv"),
++        rows: HashSet::new(),
++        entries: Entries::new(),
++    };
++    let error = run_quant(&fixture, &output, 5, false, None)
++        .expect_err("truncated RAD body must not produce successful output");
++    assert!(
++        format!("{error:#}").contains("could not read collated RAD input"),
++        "{error:#}"
++    );
++}

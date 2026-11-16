@@ -1,0 +1,745 @@
+diff --git a/omicverse/pl/_ccc.py b/omicverse/pl/_ccc.py
+index f1a29d396..1b249e3d7 100644
+--- a/omicverse/pl/_ccc.py
++++ b/omicverse/pl/_ccc.py
+@@ -81,6 +81,25 @@ def _is_comm_adata(adata: anndata.AnnData) -> bool:
+     return has_obs and has_layers
+ 
+ 
++def _has_relevance_support(adata: anndata.AnnData) -> bool:
++    return (
++        adata.uns.get("support_kind") == "relevance"
++        and "relevance" in adata.layers
++    )
++
++
++def _validate_support_semantics(
++    adata: anndata.AnnData,
++    *,
++    color_by: Literal["score", "pvalue"],
++) -> None:
++    if _has_relevance_support(adata) and color_by == "pvalue":
++        raise ValueError(
++            "CellPhoneDB Method 3 does not provide statistical p-values; it "
++            "provides DEG relevance. Use `color_by='score'`."
++        )
++
++
+ def _resolve_comm_adata(
+     adata: anndata.AnnData,
+     *,
+@@ -208,6 +227,13 @@ def _communication_long_table(
+ 
+     means = pd.DataFrame(_to_dense(adata.layers["means"]), index=adata.obs_names, columns=adata.var_names)
+     pvalues = pd.DataFrame(_to_dense(adata.layers["pvalues"]), index=adata.obs_names, columns=adata.var_names)
++    relevance = None
++    if _has_relevance_support(adata):
++        relevance = pd.DataFrame(
++            _to_dense(adata.layers["relevance"]).astype(bool),
++            index=adata.obs_names,
++            columns=adata.var_names,
++        )
+ 
+     obs_meta = adata.obs.loc[:, ["sender", "receiver"]].copy()
+     obs_meta["sender"] = obs_meta["sender"].astype(str)
+@@ -254,8 +280,12 @@ def _communication_long_table(
+     long_df["interaction_display"] = long_df["interaction"].map(_display_interaction_label)
+     long_df["ligand_display"] = long_df["ligand"].map(_display_gene_label)
+     long_df["receptor_display"] = long_df["receptor"].map(_display_gene_label)
+-    long_df["significant"] = long_df["pvalue"].astype(float) < float(pvalue_threshold)
+-    long_df["neglog10_pvalue"] = -np.log10(np.clip(long_df["pvalue"].astype(float), 1e-300, 1.0))
++    if relevance is None:
++        long_df["significant"] = long_df["pvalue"].astype(float) < float(pvalue_threshold)
++        long_df["neglog10_pvalue"] = -np.log10(np.clip(long_df["pvalue"].astype(float), 1e-300, 1.0))
++    else:
++        long_df["significant"] = relevance.stack(future_stack=True).to_numpy()
++        long_df["neglog10_pvalue"] = np.nan
+ 
+     if sender_use is not None:
+         long_df = long_df.loc[long_df["sender"].isin(sender_use)]
+@@ -2960,6 +2990,7 @@ def ccc_heatmap(
+         classification_reference=classification_reference,
+         classification_fallback=classification_fallback,
+     )
++    _validate_support_semantics(adata, color_by=color_by)
+     if comparison_adata is not None:
+         comparison_adata = _resolve_comm_adata(
+             comparison_adata,
+@@ -2973,6 +3004,7 @@ def ccc_heatmap(
+             classification_reference=classification_reference,
+             classification_fallback=classification_fallback,
+         )
++        _validate_support_semantics(comparison_adata, color_by=color_by)
+     default_top_bar = top_anno == "bar"
+     default_left_bar = left_anno == "bar"
+     default_bottom_cell = bottom_anno == "cell"
+@@ -3221,7 +3253,7 @@ def ccc_heatmap(
+                 pvalue_threshold=pvalue_threshold,
+                 mean_threshold=min_expression,
+                 top_interactions=None if auto_selected_pathways else top_n,
+-                show_pvalue=True,
++                show_pvalue=not _has_relevance_support(adata),
+                 show_mean=True,
+                 show_count=(value == "count"),
+                 add_violin=add_violin,
+@@ -3275,7 +3307,7 @@ def ccc_heatmap(
+             pvalue_threshold=max(float(pvalue_threshold), 0.0),
+             mean_threshold=min_expression,
+             show_all_pairs=True,
+-            show_pvalue=True,
++            show_pvalue=not _has_relevance_support(adata),
+             show_mean=True,
+             show_count=(value == "count"),
+             add_violin=add_violin,
+diff --git a/omicverse/single/_comm.py b/omicverse/single/_comm.py
+index 83f35e88c..95b990110 100644
+--- a/omicverse/single/_comm.py
++++ b/omicverse/single/_comm.py
+@@ -31,8 +31,11 @@ def _looks_like_liana_results(value) -> bool:
+ def _looks_like_cpdb_results(value) -> bool:
+     if not isinstance(value, Mapping):
+         return False
+-    return {"means", "pvalues"}.issubset(value.keys()) and all(
+-        isinstance(value[key], pd.DataFrame) for key in ("means", "pvalues")
++    if not isinstance(value.get("means"), pd.DataFrame):
++        return False
++    return any(
++        isinstance(value.get(key), pd.DataFrame)
++        for key in ("pvalues", "relevant_interactions")
+     )
+ 
+ 
+diff --git a/omicverse/single/_cpdb.py b/omicverse/single/_cpdb.py
+index decf16339..bca9e45df 100644
+--- a/omicverse/single/_cpdb.py
++++ b/omicverse/single/_cpdb.py
+@@ -18,15 +18,65 @@
+ _cpdb_scoring_lock = RLock()
+ 
+ 
+-def _call_cpdb_statistical_analysis(
+-    cpdb_statistical_analysis_method,
++def _normalize_cpdb_method(method):
++    aliases = {
++        "2": "statistical",
++        "method2": "statistical",
++        "statistical": "statistical",
++        "3": "degs",
++        "method3": "degs",
++        "degs": "degs",
++    }
++    normalized = aliases.get(str(method).lower())
++    if normalized is None:
++        raise ValueError(
++            "`method` must identify CellPhoneDB Method 2 ('statistical') "
++            "or Method 3 ('degs')."
++        )
++    return normalized
++
++
++def _validate_degs_file(method, degs_file_path):
++    if method == "degs":
++        if degs_file_path is None:
++            raise ValueError("`degs_file_path` is required when method='degs'.")
++        from pathlib import Path
++
++        if not Path(degs_file_path).is_file():
++            raise FileNotFoundError(f"DEGs file not found: {degs_file_path}")
++        return str(degs_file_path)
++    if degs_file_path is not None:
++        raise ValueError("`degs_file_path` is only used when method='degs'.")
++    return None
++
++
++def _cpdb_results_for_uns(cpdb_results):
++    """Return an H5AD-safe copy of CellPhoneDB result tables."""
++    stored = {}
++    for key, value in cpdb_results.items():
++        # CellPhoneDB returns the DataFrame class when optional CellSign
++        # inputs are absent. It is not a result table and is not serializable.
++        if value is pd.DataFrame:
++            continue
++        if not isinstance(value, pd.DataFrame):
++            stored[key] = value
++            continue
++        table = value.copy()
++        for column in table.select_dtypes(include=['object', 'string']).columns:
++            table[column] = table[column].astype('string').fillna('').astype(str)
++        stored[key] = table
++    return stored
++
++
++def _call_cpdb_analysis(
++    cpdb_analysis_method,
+     analysis_params,
+ ):
+-    """Call CellPhoneDB with unique gene names in its scoring matrix."""
+-    scoring_utils = getattr(cpdb_statistical_analysis_method, "scoring_utils", None)
++    """Call a CellPhoneDB method with unique genes in its scoring matrix."""
++    scoring_utils = getattr(cpdb_analysis_method, "scoring_utils", None)
+     scorer_name = "heteromer_geometric_expression_per_cell_type"
+     if scoring_utils is None or not hasattr(scoring_utils, scorer_name):
+-        return cpdb_statistical_analysis_method.call(**analysis_params)
++        return cpdb_analysis_method.call(**analysis_params)
+ 
+     with _cpdb_scoring_lock:
+         original = getattr(scoring_utils, scorer_name)
+@@ -40,7 +90,7 @@ def unique_gene_rows(*args, **kwargs):
+ 
+         setattr(scoring_utils, scorer_name, unique_gene_rows)
+         try:
+-            return cpdb_statistical_analysis_method.call(**analysis_params)
++            return cpdb_analysis_method.call(**analysis_params)
+         finally:
+             setattr(scoring_utils, scorer_name, original)
+ 
+@@ -539,7 +589,7 @@ def cellphonedb_v5(adata,
+         Raw CellPhoneDB result dict and formatted communication AnnData. The
+         same objects are also written to ``adata.uns[results_key]`` and
+         ``adata.uns[comm_key]`` so downstream ``ov.pl.ccc_*`` plots can work
+-        directly on the original ``adata``.
++    directly on the original ``adata``.
+     """
+     import os
+     import tempfile
+@@ -547,7 +597,7 @@ def cellphonedb_v5(adata,
+     from pathlib import Path
+     import pandas as pd
+     import scanpy as sc
+-    
++
+     # Validate inputs
+     if celltype_key not in adata.obs.columns:
+         raise ValueError(f"celltype_key '{celltype_key}' not found in adata.obs")
+@@ -687,7 +737,7 @@ def cellphonedb_v5(adata,
+         analysis_params.update(kwargs)
+         
+         # Run analysis
+-        cpdb_results = _call_cpdb_statistical_analysis(
++        cpdb_results = _call_cpdb_analysis(
+             cpdb_statistical_analysis_method,
+             analysis_params,
+         )
+@@ -698,7 +748,7 @@ def cellphonedb_v5(adata,
+         print("   - Formatting results for visualization...")
+         
+         adata_cpdb = format_cpdb_results(cpdb_results, separator=separator)
+-        adata.uns[results_key] = cpdb_results
++        adata.uns[results_key] = _cpdb_results_for_uns(cpdb_results)
+         adata.uns[comm_key] = adata_cpdb
+         
+         print(f"   - Created visualization AnnData: {adata_cpdb.shape}")
+@@ -728,7 +778,8 @@ def format_cpdb_results(cpdb_results, separator='|'):
+     Parameters
+     ----------
+     cpdb_results:dict
+-        Result dictionary returned by CellPhoneDB statistical analysis.
++        Result dictionary returned by CellPhoneDB statistical (Method 2) or
++        DEGs-based (Method 3) analysis.
+     separator:str
+         Separator used in sender|receiver pair column names.
+ 
+@@ -740,9 +791,7 @@ def format_cpdb_results(cpdb_results, separator='|'):
+     import pandas as pd
+     import scanpy as sc
+     
+-    # Extract results
+     means_df = cpdb_results['means']
+-    pvalues_df = cpdb_results['pvalues']
+     
+     # Identify cell type pair columns (usually start after column 12 or 13)
+     info_cols = []
+@@ -759,6 +808,40 @@ def format_cpdb_results(cpdb_results, separator='|'):
+     if len(pair_cols) == 0:
+         raise ValueError(f"No cell type pair columns found with separator '{separator}'")
+     
++    if 'pvalues' in cpdb_results:
++        method = 'statistical'
++        support_kind = 'pvalue'
++        pvalues_df = cpdb_results['pvalues']
++        relevance_df = None
++    elif 'relevant_interactions' in cpdb_results:
++        method = 'degs'
++        support_kind = 'relevance'
++        relevant = cpdb_results['relevant_interactions']
++        relevance_df = pd.DataFrame(False, index=means_df.index, columns=pair_cols)
++        if 'id_cp_interaction' not in means_df or 'id_cp_interaction' not in relevant:
++            raise ValueError(
++                "Method 3 results require 'id_cp_interaction' in both "
++                "'means' and 'relevant_interactions'."
++            )
++        relevant_by_id = relevant.drop_duplicates('id_cp_interaction').set_index(
++            'id_cp_interaction'
++        )
++        mean_ids = means_df['id_cp_interaction']
++        for col in pair_cols:
++            if col in relevant_by_id:
++                relevance_df[col] = (
++                    mean_ids.map(relevant_by_id[col])
++                    .fillna(False)
++                    .astype(bool)
++                    .to_numpy()
++                )
++        pvalues_df = (~relevance_df).astype(float)
++    else:
++        raise ValueError(
++            "CellPhoneDB results must contain either 'pvalues' (Method 2) "
++            "or 'relevant_interactions' (Method 3)."
++        )
++
+     # Create AnnData object
+     # X matrix: cell pairs (obs) x L-R interactions (vars)
+     X_data = means_df[pair_cols].T  # Transpose so pairs are observations
+@@ -768,6 +851,8 @@ def format_cpdb_results(cpdb_results, separator='|'):
+     # Add layers
+     adata_cpdb.layers['means'] = means_df[pair_cols].T
+     adata_cpdb.layers['pvalues'] = pvalues_df[pair_cols].T
++    if relevance_df is not None:
++        adata_cpdb.layers['relevance'] = relevance_df[pair_cols].T
+     
+     # Add variable (L-R pair) information
+     adata_cpdb.var = means_df[info_cols].copy()
+@@ -782,6 +867,9 @@ def format_cpdb_results(cpdb_results, separator='|'):
+         print(f"   - Found {adata_cpdb.var['classification'].nunique()} pathway classifications")
+     adata_cpdb.uns["comm_source"] = "cellphonedb"
+     adata_cpdb.uns["cpdb_separator"] = separator
++    adata_cpdb.uns["cellphonedb_method"] = method
++    adata_cpdb.uns["support_kind"] = support_kind
++    adata_cpdb.uns["pvalues_are_statistical"] = method == 'statistical'
+     return adata_cpdb
+ 
+ 
+@@ -970,16 +1058,19 @@ def validate_cpdb_database(cpdb_file_path):
+ @register_function(
+     aliases=['CellPhoneDB 分析', 'run_cellphonedb_v5', 'cell-cell communication v5'],
+     category="single",
+-    description="Run CellPhoneDB v5 statistical ligand-receptor analysis to identify significant cell-cell communication pairs.",
++    description="Run CellPhoneDB v5 statistical or DEGs-based ligand-receptor analysis.",
+     prerequisites={'optional_functions': ['pp.qc', 'pp.preprocess']},
+     requires={'obs': ['celltype labels'], 'var': ['gene symbols']},
+     produces={
+-        'layers': ['means', 'pvalues'],
++        'layers': ['means', 'pvalues', 'relevance'],
+         'obs': ['sender', 'receiver'],
+         'var': ['interaction metadata'],
+     },
+     auto_fix='escalate',
+-    examples=['ov.single.run_cellphonedb_v5(adata, cpdb_file_path="./cellphonedb.zip", celltype_key="cell_labels", iterations=1000, pvalue=0.05)'],
++    examples=[
++        'ov.single.run_cellphonedb_v5(adata, cpdb_file_path="./cellphonedb.zip", celltype_key="cell_labels")',
++        'ov.single.run_cellphonedb_v5(adata, cpdb_file_path="./cellphonedb.zip", method=3, degs_file_path="./DEGs.tsv")',
++    ],
+     related=['pl.CellChatViz', 'single.pathway_enrichment']
+ )
+ def run_cellphonedb_v5(adata, 
+@@ -999,9 +1090,12 @@ def run_cellphonedb_v5(adata,
+                            separator='|',
+                            results_key: str = 'cpdb_results',
+                            comm_key: str = 'cpdb_comm',
++                           method='statistical',
++                           degs_file_path=None,
++                           score_interactions=True,
+                            **kwargs):
+     """
+-    Run CellPhoneDB statistical analysis with automatic database download
++    Run CellPhoneDB statistical or DEGs-based analysis.
+     
+     Parameters
+     ----------
+@@ -1036,8 +1130,16 @@ def run_cellphonedb_v5(adata,
+         Saves all intermediate tables employed during the analysis
+     separator:str
+         String to employ to separate cells in the results dataframes
++    method:{2, 3, 'statistical', 'degs'}
++        CellPhoneDB method to run. Method 2 / ``'statistical'`` is the
++        historical permutation-based default. Method 3 / ``'degs'`` runs the
++        DEGs-based analysis.
++    degs_file_path:str or None
++        CellPhoneDB DEG input file. Required when ``method='degs'``.
++    score_interactions:bool
++        Whether CellPhoneDB should calculate interaction scores.
+     **kwargs:dict
+-        Additional parameters forwarded to ``cpdb_statistical_analysis_method.call``.
++        Additional parameters forwarded to the selected CellPhoneDB method.
+ 
+     Returns
+     -------
+@@ -1050,14 +1152,14 @@ def run_cellphonedb_v5(adata,
+     Examples
+     --------
+     # Basic usage - will download database automatically if needed
+-    cpdb_results, adata_cpdb = run_cellphonedb_analysis(
++    cpdb_results, adata_cpdb = run_cellphonedb_v5(
+         adata, 
+         cpdb_file_path='./cellphonedb.zip',
+         celltype_key='celltype_minor'
+     )
+     
+     # Advanced usage
+-    cpdb_results, adata_cpdb = run_cellphonedb_analysis(
++    cpdb_results, adata_cpdb = run_cellphonedb_v5(
+         adata,
+         cpdb_file_path='/path/to/cellphonedb.zip',
+         celltype_key='celltype_minor',
+@@ -1069,9 +1171,11 @@ def run_cellphonedb_v5(adata,
+     import os
+     import tempfile
+     import shutil
+-    from pathlib import Path
+     import pandas as pd
+     import scanpy as sc
++
++    method = _normalize_cpdb_method(method)
++    degs_file_path = _validate_degs_file(method, degs_file_path)
+     
+     # Step 1: Validate and download database if necessary
+     print("🔬 Starting CellPhoneDB analysis...")
+@@ -1154,14 +1258,19 @@ def run_cellphonedb_v5(adata,
+         
+         # Step 6: Run CellPhoneDB analysis
+         try:
+-            from cellphonedb.src.core.methods import cpdb_statistical_analysis_method
++            if method == "statistical":
++                from cellphonedb.src.core.methods import cpdb_statistical_analysis_method
++                cpdb_analysis_method = cpdb_statistical_analysis_method
++            else:
++                from cellphonedb.src.core.methods import cpdb_degs_analysis_method
++                cpdb_analysis_method = cpdb_degs_analysis_method
+         except ImportError:
+             raise ImportError(
+                 "CellPhoneDB not installed. Please install with: "
+                 "pip install cellphonedb"
+             )
+         
+-        print("   - Running CellPhoneDB statistical analysis...")
++        print(f"   - Running CellPhoneDB {method} analysis...")
+         
+         # Prepare parameters
+         analysis_params = {
+@@ -1171,29 +1280,34 @@ def run_cellphonedb_v5(adata,
+             'counts_data': 'hgnc_symbol',
+             'active_tfs_file_path': None,
+             'microenvs_file_path': None,
+-            'score_interactions': True,
+-            'iterations': iterations,
++            'score_interactions': score_interactions,
+             'threshold': threshold,
+             'threads': threads,
+-            'debug_seed': 42,
+             'result_precision': 3,
+-            'pvalue': pvalue,
+-            'subsampling': False,
+-            'subsampling_log': False,
+-            'subsampling_num_pc': 100,
+-            'subsampling_num_cells': 1000,
+             'separator': separator,
+             'debug': debug,
+             'output_path': output_dir,
+             'output_suffix': None
+         }
++        if method == "statistical":
++            analysis_params.update({
++                'iterations': iterations,
++                'debug_seed': 42,
++                'pvalue': pvalue,
++                'subsampling': False,
++                'subsampling_log': False,
++                'subsampling_num_pc': 100,
++                'subsampling_num_cells': 1000,
++            })
++        else:
++            analysis_params['degs_file_path'] = degs_file_path
+         
+         # Update with any additional kwargs
+         analysis_params.update(kwargs)
+         
+         # Run analysis
+-        cpdb_results = _call_cpdb_statistical_analysis(
+-            cpdb_statistical_analysis_method,
++        cpdb_results = _call_cpdb_analysis(
++            cpdb_analysis_method,
+             analysis_params,
+         )
+         
+@@ -1203,7 +1317,7 @@ def run_cellphonedb_v5(adata,
+         print("   - Formatting results for visualization...")
+         
+         adata_cpdb = format_cpdb_results(cpdb_results, separator=separator)
+-        adata.uns[results_key] = cpdb_results
++        adata.uns[results_key] = _cpdb_results_for_uns(cpdb_results)
+         adata.uns[comm_key] = adata_cpdb
+         
+         print(f"   - Created visualization AnnData: {adata_cpdb.shape}")
+diff --git a/tests/single/test_comm_adapter.py b/tests/single/test_comm_adapter.py
+index e71ed6160..9518b7acd 100644
+--- a/tests/single/test_comm_adapter.py
++++ b/tests/single/test_comm_adapter.py
+@@ -39,6 +39,19 @@ def cpdb_results() -> dict[str, pd.DataFrame]:
+     return {"means": means, "pvalues": pvalues}
+ 
+ 
++@pytest.fixture()
++def cpdb_degs_results(cpdb_results: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
++    means = cpdb_results["means"]
++    relevant = means.iloc[[1, 0]].copy()
++    relevant["B|T"] = [0, 1]
++    relevant["T|B"] = [1, 0]
++    return {
++        "means": means,
++        "relevant_interactions": relevant,
++        "significant_means": means.copy(),
++    }
++
++
+ def test_format_liana_results_alias_matches_backward_compatible_name() -> None:
+     liana_res = pd.DataFrame(
+         {
+@@ -75,3 +88,49 @@ def test_to_comm_adata_extracts_cpdb_results_from_uns(cpdb_results: dict[str, pd
+     extracted = ov.single.extract_comm_adata(adata, result_uns_key="cpdb_results")
+     assert comm_adata.shape == extracted.shape == (2, 2)
+     assert float(comm_adata.layers["means"][0, 0]) == pytest.approx(0.8)
++
++
++def test_method3_relevance(
++    cpdb_degs_results: dict[str, pd.DataFrame],
++) -> None:
++    comm_adata = ov.single.format_cpdb_results(cpdb_degs_results)
++
++    assert comm_adata.uns["cellphonedb_method"] == "degs"
++    assert comm_adata.uns["support_kind"] == "relevance"
++    assert not comm_adata.uns["pvalues_are_statistical"]
++    assert comm_adata.layers["relevance"].tolist() == [
++        [True, False],
++        [False, True],
++    ]
++    assert comm_adata.layers["pvalues"].tolist() == [
++        [0.0, 1.0],
++        [1.0, 0.0],
++    ]
++
++
++def test_method3_adapter(
++    cpdb_degs_results: dict[str, pd.DataFrame],
++) -> None:
++    comm_adata = ov.single.to_comm_adata(data=cpdb_degs_results)
++    assert comm_adata.uns["support_kind"] == "relevance"
++
++
++def test_method3_filtering(
++    cpdb_degs_results: dict[str, pd.DataFrame],
++) -> None:
++    from omicverse.pl._ccc import _communication_long_table
++
++    comm_adata = ov.single.format_cpdb_results(cpdb_degs_results)
++    strict = _communication_long_table(comm_adata, pvalue_threshold=0.0)
++    permissive = _communication_long_table(comm_adata, pvalue_threshold=2.0)
++
++    assert len(strict) == len(permissive) == 2
++    assert set(strict["pair_lr"]) == {"CXCL13_CXCR5", "TNF_TNFRSF1A"}
++
++
++def test_method3_rejects_pvalue_color(
++    cpdb_degs_results: dict[str, pd.DataFrame],
++) -> None:
++    comm_adata = ov.single.format_cpdb_results(cpdb_degs_results)
++    with pytest.raises(ValueError, match="does not provide statistical p-values"):
++        ov.pl.ccc_heatmap(comm_adata, color_by="pvalue", show=False)
+diff --git a/tests/single/test_cpdb_method_dispatch.py b/tests/single/test_cpdb_method_dispatch.py
+new file mode 100644
+index 000000000..a8492a93e
+--- /dev/null
++++ b/tests/single/test_cpdb_method_dispatch.py
+@@ -0,0 +1,162 @@
++from pathlib import Path
++from types import ModuleType, SimpleNamespace
++import sys
++
++import numpy as np
++import pandas as pd
++import pytest
++from anndata import AnnData, read_h5ad
++
++from omicverse.single._cpdb import format_cpdb_results, run_cellphonedb_v5
++
++
++def _degs_results() -> dict[str, pd.DataFrame]:
++    means = pd.DataFrame(
++        {
++            "id_cp_interaction": [1],
++            "interacting_pair": ["CXCL13_CXCR5"],
++            "gene_a": ["CXCL13"],
++            "gene_b": ["CXCR5"],
++            "B|T": [0.8],
++        }
++    )
++    relevant = means.copy()
++    relevant["B|T"] = 1
++    return {
++        "means": means,
++        "relevant_interactions": relevant,
++        "deconvoluted": pd.DataFrame(
++            {"complex_name": ["CXCL13_CXCR5", np.nan]}
++        ),
++        "CellSign_active_interactions": pd.DataFrame,
++    }
++
++
++def _statistical_results() -> dict[str, pd.DataFrame]:
++    results = _degs_results()
++    results.pop("relevant_interactions")
++    results["pvalues"] = results["means"].assign(**{"B|T": [0.01]})
++    return results
++
++
++def _install_fake_cpdb(monkeypatch, *, degs_call, statistical_call) -> None:
++    cellphonedb = ModuleType("cellphonedb")
++    src = ModuleType("cellphonedb.src")
++    core = ModuleType("cellphonedb.src.core")
++    methods = ModuleType("cellphonedb.src.core.methods")
++    methods.cpdb_degs_analysis_method = SimpleNamespace(call=degs_call)
++    methods.cpdb_statistical_analysis_method = SimpleNamespace(call=statistical_call)
++    monkeypatch.setitem(sys.modules, "cellphonedb", cellphonedb)
++    monkeypatch.setitem(sys.modules, "cellphonedb.src", src)
++    monkeypatch.setitem(sys.modules, "cellphonedb.src.core", core)
++    monkeypatch.setitem(sys.modules, "cellphonedb.src.core.methods", methods)
++
++
++def test_method3_dispatch(monkeypatch, tmp_path: Path) -> None:
++    received = {}
++
++    def degs_call(**kwargs):
++        received.update(kwargs)
++        return _degs_results()
++
++    def statistical_call(**kwargs):  # pragma: no cover - failure sentinel
++        raise AssertionError("statistical method should not be called")
++
++    _install_fake_cpdb(
++        monkeypatch,
++        degs_call=degs_call,
++        statistical_call=statistical_call,
++    )
++    monkeypatch.setattr(
++        "omicverse.single._cpdb.validate_cpdb_database",
++        lambda path: str(path),
++    )
++
++    degs_file = tmp_path / "degs.tsv"
++    degs_file.write_text("cluster\tgene\nB\tCXCL13\n")
++    adata = AnnData(
++        X=np.ones((2, 2)),
++        obs=pd.DataFrame({"celltype": ["B", "T"]}, index=["b", "t"]),
++        var=pd.DataFrame(index=["CXCL13", "CXCR5"]),
++    )
++
++    results, comm = run_cellphonedb_v5(
++        adata,
++        cpdb_file_path=tmp_path / "cellphonedb.zip",
++        method=3,
++        degs_file_path=degs_file,
++        min_genes=0,
++        min_cells=0,
++        temp_dir=tmp_path / "temp",
++        output_dir=tmp_path / "output",
++    )
++
++    assert results["means"].shape[0] == 1
++    assert comm.uns["cellphonedb_method"] == "degs"
++    assert received["degs_file_path"] == str(degs_file)
++    assert "iterations" not in received
++    assert "pvalue" not in received
++    saved = tmp_path / "method3.h5ad"
++    adata.write_h5ad(saved)
++    restored = read_h5ad(saved)
++    restored_comm = format_cpdb_results(restored.uns["cpdb_results"])
++    assert "CellSign_active_interactions" not in restored.uns["cpdb_results"]
++    assert restored_comm.uns["support_kind"] == "relevance"
++    assert restored.uns["cpdb_results"]["deconvoluted"]["complex_name"].tolist() == [
++        "CXCL13_CXCR5",
++        "",
++    ]
++
++
++def test_method3_requires_degs(tmp_path: Path) -> None:
++    adata = AnnData(
++        X=np.ones((1, 1)),
++        obs=pd.DataFrame({"celltype": ["B"]}, index=["b"]),
++        var=pd.DataFrame(index=["CXCL13"]),
++    )
++    with pytest.raises(ValueError, match="degs_file_path"):
++        run_cellphonedb_v5(
++            adata,
++            cpdb_file_path=tmp_path / "cellphonedb.zip",
++            method="degs",
++        )
++
++
++def test_method2_default(monkeypatch, tmp_path: Path) -> None:
++    received = {}
++
++    def statistical_call(**kwargs):
++        received.update(kwargs)
++        return _statistical_results()
++
++    def degs_call(**kwargs):  # pragma: no cover - failure sentinel
++        raise AssertionError("DEGs method should not be called")
++
++    _install_fake_cpdb(
++        monkeypatch,
++        degs_call=degs_call,
++        statistical_call=statistical_call,
++    )
++    monkeypatch.setattr(
++        "omicverse.single._cpdb.validate_cpdb_database",
++        lambda path: str(path),
++    )
++    adata = AnnData(
++        X=np.ones((2, 2)),
++        obs=pd.DataFrame({"celltype": ["B", "T"]}, index=["b", "t"]),
++        var=pd.DataFrame(index=["CXCL13", "CXCR5"]),
++    )
++
++    _, comm = run_cellphonedb_v5(
++        adata,
++        cpdb_file_path=tmp_path / "cellphonedb.zip",
++        min_genes=0,
++        min_cells=0,
++        temp_dir=tmp_path / "temp",
++        output_dir=tmp_path / "output",
++    )
++
++    assert comm.uns["cellphonedb_method"] == "statistical"
++    assert received["iterations"] == 1000
++    assert received["pvalue"] == pytest.approx(0.05)
++    assert "degs_file_path" not in received
+diff --git a/tests/single/test_cpdb_scoring_compat.py b/tests/single/test_cpdb_scoring_compat.py
+index bf2b31e81..2fa3f6bcc 100644
+--- a/tests/single/test_cpdb_scoring_compat.py
++++ b/tests/single/test_cpdb_scoring_compat.py
+@@ -3,7 +3,7 @@
+ import pandas as pd
+ import pytest
+ 
+-from omicverse.single._cpdb import _call_cpdb_statistical_analysis
++from omicverse.single._cpdb import _call_cpdb_analysis
+ 
+ 
+ def test_cpdb_scoring_deduplicates_genes() -> None:
+@@ -28,7 +28,7 @@ def call(**kwargs):
+ 
+     analysis_method = SimpleNamespace(scoring_utils=scoring_utils, call=call)
+ 
+-    result = _call_cpdb_statistical_analysis(analysis_method, {})
++    result = _call_cpdb_analysis(analysis_method, {})
+ 
+     assert result.index.tolist() == ["NRXN1", "CXCL12"]
+     assert result.loc["NRXN1"].tolist() == [1.0, 2.0]
+@@ -53,7 +53,7 @@ def call(**kwargs):
+     analysis_method = SimpleNamespace(scoring_utils=scoring_utils, call=call)
+ 
+     with pytest.raises(RuntimeError, match="analysis failed"):
+-        _call_cpdb_statistical_analysis(analysis_method, {})
++        _call_cpdb_analysis(analysis_method, {})
+ 
+     assert (
+         scoring_utils.heteromer_geometric_expression_per_cell_type is original

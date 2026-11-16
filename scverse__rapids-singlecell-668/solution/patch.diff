@@ -1,0 +1,774 @@
+diff --git a/docs/release-notes/0.15.1.md b/docs/release-notes/0.15.1.md
+index 9927cd301..4db6c9c91 100644
+--- a/docs/release-notes/0.15.1.md
++++ b/docs/release-notes/0.15.1.md
+@@ -13,6 +13,7 @@
+ * Fixes `tl.rank_genes_groups` returning NaN/zero `logfoldchanges`/`pvals` with `groups=[subset]` and `reference='rest'` {pr}`651` {smaller}`S Dicks`
+ * Fixes `pp.bbknn` connectivities diverging from upstream `bbknn`: per-batch neighbours are now sorted by distance before `fuzzy_simplicial_set` (so weights no longer collapse near 1.0), and the default `trim` matches upstream (`10 * neighbors_within_batch * n_batches`). Trimming kernel no longer crashes for large `trim`, and a new block-cooperative sort kernel is auto-dispatched for large `trim` for substantial speedups {pr}`659` {smaller}`S Dicks`
+ * Fixes float64 precision loss in `pp.normalize_pearson_residuals` on CSR/CSC input {pr}`658` {smaller}`A Mikaeili & S Dicks`
++* Fixes Harmony CUDA kernels to avoid misaligned vector loads on odd-PC or offset-contiguous inputs and prevent a shared-memory race in column-sum reductions. {pr}`668` {smaller}`S Dicks`
+ 
+ ```{rubric} Misc
+ ```
+diff --git a/src/rapids_singlecell/_cuda/harmony/clustering/clustering.cu b/src/rapids_singlecell/_cuda/harmony/clustering/clustering.cu
+index 8a81e300c..16406c0ff 100644
+--- a/src/rapids_singlecell/_cuda/harmony/clustering/clustering.cu
++++ b/src/rapids_singlecell/_cuda/harmony/clustering/clustering.cu
+@@ -2,6 +2,7 @@
+ #include <cuda_runtime.h>
+ 
+ #include <algorithm>
++#include <climits>
+ #include <cmath>
+ #include <vector>
+ 
+@@ -29,9 +30,10 @@ constexpr int SCATTER_SHARED_CELLS_PER_BLOCK = 64;
+ // ---------- Launch helpers ----------
+ 
+ // 1D grid size capped at BLOCKS_PER_SM blocks/SM
+-static inline int grid_1d(int n, int n_sm) {
+-    return std::min(n_sm * BLOCKS_PER_SM,
+-                    (n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D);
++static inline int grid_1d(long long n, int n_sm) {
++    long long blocks = (n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D;
++    return std::max(1, std::min(n_sm * BLOCKS_PER_SM,
++                                (int)std::min<long long>(blocks, INT_MAX)));
+ }
+ 
+ // Block dim rounded up to nearest warp, capped at MAX_BLOCK_DIM
+@@ -47,8 +49,12 @@ static size_t get_cub_sort_temp_bytes(int n_cells) {
+     size_t bytes = 0;
+     auto* du = reinterpret_cast<unsigned int*>(1);
+     auto* di = reinterpret_cast<int*>(1);
+-    cub::DeviceRadixSort::SortPairs(nullptr, bytes, du, du, di, di, n_cells, 0,
+-                                    32);
++    cudaError_t status = cub::DeviceRadixSort::SortPairs(
++        nullptr, bytes, du, du, di, di, n_cells, 0, 32);
++    if (status != cudaSuccess) {
++        throw std::runtime_error(std::string("cub sort temp query failed: ") +
++                                 cudaGetErrorString(status));
++    }
+     return bytes;
+ }
+ 
+@@ -123,9 +129,9 @@ static inline void scatter_add_to_O(const T* R_buf, const int* cats_in,
+     } else {
+         size_t N = (size_t)current_bs * n_clusters;
+         scatter_add_kernel<T>
+-            <<<(int)((N + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+-               stream>>>(R_buf, cats_in, (size_t)current_bs, (size_t)n_clusters,
+-                         (size_t)switcher, O);
++            <<<grid_1d((long long)N, n_sm), BLOCK_DIM_1D, 0, stream>>>(
++                R_buf, cats_in, (size_t)current_bs, (size_t)n_clusters,
++                (size_t)switcher, O);
+         CUDA_CHECK_LAST_ERROR(scatter_add_kernel);
+     }
+ }
+@@ -197,7 +203,7 @@ static T compute_objective_impl(const T* R, const T* similarities, const T* O,
+     {
+         size_t n = (size_t)n_cells * n_clusters;
+         kmeans_err_kernel<T>
+-            <<<grid_1d((int)n, n_sm), BLOCK_DIM_1D, 0, stream>>>(
++            <<<grid_1d((long long)n, n_sm), BLOCK_DIM_1D, 0, stream>>>(
+                 R, similarities, n, obj_scalar);
+         CUDA_CHECK_LAST_ERROR(kmeans_err_kernel);
+     }
+@@ -290,9 +296,13 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
+             a.idx_list, a.n_cells);
+         CUDA_CHECK_LAST_ERROR(iota_kernel);
+ 
+-        cub::DeviceRadixSort::SortPairs(
++        cudaError_t sort_status = cub::DeviceRadixSort::SortPairs(
+             a.cub_temp, cub_temp_bytes, a.sort_keys, a.sort_keys_alt,
+             a.idx_list, a.idx_list_alt, a.n_cells, 0, 32, a.stream);
++        if (sort_status != cudaSuccess) {
++            throw std::runtime_error(std::string("cub radix sort failed: ") +
++                                     cudaGetErrorString(sort_status));
++        }
+ 
+         // ---- Block loop: update R in mini-batches ----
+         for (int pos = 0; pos < a.n_cells; pos += a.block_size) {
+@@ -300,7 +310,7 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
+             const int* block_idx = a.idx_list_alt + pos;
+ 
+             // Gather block: R[idx] -> R_out_buffer, cats[idx] -> cats_in
+-            gather_rows_kernel<T><<<grid_1d(bs * a.n_clusters, n_sm),
++            gather_rows_kernel<T><<<grid_1d((long long)bs * a.n_clusters, n_sm),
+                                     BLOCK_DIM_1D, 0, a.stream>>>(
+                 a.R, block_idx, a.R_out_buffer, bs, a.n_clusters);
+             CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+@@ -343,9 +353,10 @@ static void clustering_loop_impl(const ClusteringArgs<T>& a) {
+ 
+             // Write back and add new contribution: O += scatter(R_out), E +=
+             // Pr_b @ R_out_sum
+-            scatter_rows_kernel<T><<<grid_1d(bs * a.n_clusters, n_sm),
+-                                     BLOCK_DIM_1D, 0, a.stream>>>(
+-                a.R_out_buffer, block_idx, a.R, bs, a.n_clusters);
++            scatter_rows_kernel<T>
++                <<<grid_1d((long long)bs * a.n_clusters, n_sm), BLOCK_DIM_1D, 0,
++                   a.stream>>>(a.R_out_buffer, block_idx, a.R, bs,
++                               a.n_clusters);
+             CUDA_CHECK_LAST_ERROR(scatter_rows_kernel);
+             colsum_dispatch<T>(a.colsum_algo, handle, a.R_out_buffer,
+                                a.R_out_sum, a.ones_vec, bs, a.n_clusters, n_sm,
+diff --git a/src/rapids_singlecell/_cuda/harmony/colsum/kernels_colsum.cuh b/src/rapids_singlecell/_cuda/harmony/colsum/kernels_colsum.cuh
+index 7de299397..b809e2022 100644
+--- a/src/rapids_singlecell/_cuda/harmony/colsum/kernels_colsum.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/colsum/kernels_colsum.cuh
+@@ -2,6 +2,8 @@
+ 
+ #include <cuda_runtime.h>
+ 
++static constexpr int COLSUM_ATOMIC_TILE_COLS = 32;
++
+ template <typename T>
+ __global__ void colsum_kernel(const T* __restrict__ A, T* __restrict__ out,
+                               size_t rows, size_t cols) {
+@@ -24,6 +26,7 @@ __global__ void colsum_kernel(const T* __restrict__ A, T* __restrict__ out,
+                 val += __shfl_down_sync(0xffffffff, val, off);
+             if (threadIdx.x == 0) out[col] = val;
+         }
++        __syncthreads();
+     }
+ }
+ 
+@@ -34,15 +37,16 @@ template <typename T>
+ __global__ void colsum_atomic_kernel(const T* __restrict__ A,
+                                      T* __restrict__ out, size_t rows,
+                                      size_t cols, size_t rows_per_tile) {
+-    __shared__ T col_sums[32];
++    __shared__ T col_sums[COLSUM_ATOMIC_TILE_COLS];
+ 
+-    size_t col = blockIdx.x * 32 + threadIdx.y;
++    size_t col = blockIdx.x * COLSUM_ATOMIC_TILE_COLS + threadIdx.y;
+     size_t start_row = blockIdx.y * rows_per_tile;
+     size_t end_row = start_row + rows_per_tile;
+     if (end_row > rows) end_row = rows;
+ 
+     // Initialize shared memory
+-    if (threadIdx.x < 32) col_sums[threadIdx.x] = (T)0;
++    if (threadIdx.y == 0 && threadIdx.x < COLSUM_ATOMIC_TILE_COLS)
++        col_sums[threadIdx.x] = (T)0;
+     __syncthreads();
+ 
+     // Each thread accumulates multiple rows
+@@ -60,13 +64,13 @@ __global__ void colsum_atomic_kernel(const T* __restrict__ A,
+         acc += __shfl_down_sync(0xffffffff, acc, off);
+ 
+     // Lane 0 of each warp accumulates into shared memory
+-    if (threadIdx.x == 0 && threadIdx.y < 32)
++    if (threadIdx.x == 0 && threadIdx.y < COLSUM_ATOMIC_TILE_COLS)
+         atomicAdd(&col_sums[threadIdx.y], acc);
+     __syncthreads();
+ 
+     // First warp writes to global memory (one atomic per column)
+-    if (threadIdx.x == 0 && threadIdx.y < 32) {
+-        size_t out_col = blockIdx.x * 32 + threadIdx.y;
++    if (threadIdx.x == 0 && threadIdx.y < COLSUM_ATOMIC_TILE_COLS) {
++        size_t out_col = blockIdx.x * COLSUM_ATOMIC_TILE_COLS + threadIdx.y;
+         if (out_col < cols && col_sums[threadIdx.y] != (T)0)
+             atomicAdd(&out[out_col], col_sums[threadIdx.y]);
+     }
+diff --git a/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu b/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu
+index acfee16a9..dc322a7ae 100644
+--- a/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu
++++ b/src/rapids_singlecell/_cuda/harmony/correction/correction_batched.cu
+@@ -62,13 +62,13 @@ static void correction_batched_impl(
+     {
+         size_t n_x = (size_t)n_cells * n_pcs;
+         gather_rows_kernel<T>
+-            <<<(int)((n_x + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
++            <<<strided_grid((long long)n_x, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+                stream>>>(X, cell_indices, X_sorted, n_cells, n_pcs);
+         CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+ 
+         size_t n_r = (size_t)n_cells * n_clusters;
+         gather_rows_kernel<T>
+-            <<<(int)((n_r + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
++            <<<strided_grid((long long)n_r, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+                stream>>>(R, cell_indices, R_sorted, n_cells, n_clusters);
+         CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+     }
+@@ -123,8 +123,8 @@ static void correction_batched_impl(
+     {
+         size_t n_total = (size_t)n_cells * n_pcs;
+         batched_correction_kernel<T>
+-            <<<(int)((n_total + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D,
+-               0, stream>>>(Z, W_all, cats, R, n_cells, n_pcs, n_clusters, nb1);
++            <<<strided_grid((long long)n_total, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
++               stream>>>(Z, W_all, cats, R, n_cells, n_pcs, n_clusters, nb1);
+         CUDA_CHECK_LAST_ERROR(batched_correction_kernel);
+     }
+ }
+diff --git a/src/rapids_singlecell/_cuda/harmony/correction/correction_fast.cu b/src/rapids_singlecell/_cuda/harmony/correction/correction_fast.cu
+index a5025fc52..9d8a6d5df 100644
+--- a/src/rapids_singlecell/_cuda/harmony/correction/correction_fast.cu
++++ b/src/rapids_singlecell/_cuda/harmony/correction/correction_fast.cu
+@@ -50,8 +50,8 @@ static void correction_fast_impl(
+ 
+         // R_col = R[:, k]
+         gather_column_kernel<T>
+-            <<<(n_cells + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D, BLOCK_DIM_1D, 0,
+-               stream>>>(R, R_col, k, n_cells, n_clusters);
++            <<<strided_grid(n_cells, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
++                R, R_col, k, n_cells, n_clusters);
+         CUDA_CHECK_LAST_ERROR(gather_column_kernel);
+ 
+         // Zero Phi_t_diag_R_X
+@@ -101,8 +101,8 @@ static void correction_fast_impl(
+         {
+             long long n = (long long)n_cells * n_pcs;
+             harmony_correction_kernel<T>
+-                <<<(n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D, BLOCK_DIM_1D, 0,
+-                   stream>>>(Z, W, cats, R_col, n_cells, n_pcs);
++                <<<strided_grid(n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
++                    Z, W, cats, R_col, n_cells, n_pcs);
+             CUDA_CHECK_LAST_ERROR(harmony_correction_kernel);
+         }
+     }
+diff --git a/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_fast.cuh b/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_fast.cuh
+index efa9325b6..83a5a682d 100644
+--- a/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_fast.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/correction/kernels_correction_fast.cuh
+@@ -128,7 +128,8 @@ template <typename T>
+ __global__ void gather_column_kernel(const T* __restrict__ src,
+                                      T* __restrict__ dst, int col, int n_rows,
+                                      int n_cols) {
+-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (i >= n_rows) return;
+-    dst[i] = src[(size_t)i * n_cols + col];
++    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++         i < n_rows; i += (long long)blockDim.x * gridDim.x) {
++        dst[i] = src[(size_t)i * n_cols + col];
++    }
+ }
+diff --git a/src/rapids_singlecell/_cuda/harmony/kmeans/kernels_kmeans.cuh b/src/rapids_singlecell/_cuda/harmony/kmeans/kernels_kmeans.cuh
+index 46826aa4e..cede14391 100644
+--- a/src/rapids_singlecell/_cuda/harmony/kmeans/kernels_kmeans.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/kmeans/kernels_kmeans.cuh
+@@ -1,33 +1,83 @@
+ #pragma once
+ 
+ #include <cuda_runtime.h>
+-#include <type_traits>
++#include <stdint.h>
++
++template <typename T>
++struct kmeans_err_vec_traits;
++
++template <>
++struct kmeans_err_vec_traits<float> {
++    using Vec = float4;
++    static constexpr size_t width = 4;
++    static __device__ __forceinline__ float accumulate(const Vec& r,
++                                                       const Vec& dot) {
++        return r.x * 2.f * (1.f - dot.x) + r.y * 2.f * (1.f - dot.y) +
++               r.z * 2.f * (1.f - dot.z) + r.w * 2.f * (1.f - dot.w);
++    }
++};
++
++template <>
++struct kmeans_err_vec_traits<double> {
++    using Vec = double2;
++    static constexpr size_t width = 2;
++    static __device__ __forceinline__ double accumulate(const Vec& r,
++                                                        const Vec& dot) {
++        return r.x * 2.0 * (1.0 - dot.x) + r.y * 2.0 * (1.0 - dot.y);
++    }
++};
+ 
+ template <typename T>
+ __global__ void kmeans_err_kernel(const T* __restrict__ r,
+                                   const T* __restrict__ dot, size_t n,
+                                   T* __restrict__ out) {
+     T acc = (T)0;
+-    using Vec = typename std::conditional<std::is_same<T, float>::value, float4,
+-                                          double4>::type;
+-
+-    size_t i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+-    const size_t stride = gridDim.x * blockDim.x * 4;
+-
+-    while (i + 3 < n) {
+-        Vec r4 = *(const Vec*)(r + i);
+-        Vec dot4 = *(const Vec*)(dot + i);
+-        acc += ((T*)&r4)[0] * (T)2 * ((T)1 - ((T*)&dot4)[0]);
+-        acc += ((T*)&r4)[1] * (T)2 * ((T)1 - ((T*)&dot4)[1]);
+-        acc += ((T*)&r4)[2] * (T)2 * ((T)1 - ((T*)&dot4)[2]);
+-        acc += ((T*)&r4)[3] * (T)2 * ((T)1 - ((T*)&dot4)[3]);
+-        i += stride;
+-    }
+-    while (i < n) {
+-        T rv = r[i];
+-        T dotv = dot[i];
+-        acc += rv * (T)2 * ((T)1 - dotv);
+-        i++;
++    using VecTraits = kmeans_err_vec_traits<T>;
++    using Vec = typename VecTraits::Vec;
++
++    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
++    const size_t scalar_stride = gridDim.x * blockDim.x;
++    const size_t vec_width = VecTraits::width;
++    const size_t vec_align = sizeof(Vec);
++    const uintptr_t r_addr = (uintptr_t)r;
++    const uintptr_t dot_addr = (uintptr_t)dot;
++    const bool has_common_vector_alignment =
++        ((r_addr ^ dot_addr) & (vec_align - 1)) == 0;
++
++    if (!has_common_vector_alignment) {
++        for (size_t i = tid; i < n; i += scalar_stride) {
++            T rv = r[i];
++            T dotv = dot[i];
++            acc += rv * (T)2 * ((T)1 - dotv);
++        }
++    } else {
++        size_t prefix = 0;
++        size_t misalignment = r_addr & (vec_align - 1);
++        if (misalignment != 0) prefix = (vec_align - misalignment) / sizeof(T);
++        if (prefix > n) prefix = n;
++
++        for (size_t i = tid; i < prefix; i += scalar_stride) {
++            T rv = r[i];
++            T dotv = dot[i];
++            acc += rv * (T)2 * ((T)1 - dotv);
++        }
++
++        size_t vector_elements = ((n - prefix) / vec_width) * vec_width;
++        size_t vector_chunks = vector_elements / vec_width;
++        for (size_t chunk = tid; chunk < vector_chunks;
++             chunk += scalar_stride) {
++            size_t i = prefix + chunk * vec_width;
++            Vec rv = *(const Vec*)(r + i);
++            Vec dotv = *(const Vec*)(dot + i);
++            acc += VecTraits::accumulate(rv, dotv);
++        }
++
++        size_t tail = prefix + vector_elements;
++        for (size_t i = tail + tid; i < n; i += scalar_stride) {
++            T rv = r[i];
++            T dotv = dot[i];
++            acc += rv * (T)2 * ((T)1 - dotv);
++        }
+     }
+ 
+ #pragma unroll
+diff --git a/src/rapids_singlecell/_cuda/harmony/kmeans/kmeans.cu b/src/rapids_singlecell/_cuda/harmony/kmeans/kmeans.cu
+index b3e9291bf..cbae07e74 100644
+--- a/src/rapids_singlecell/_cuda/harmony/kmeans/kmeans.cu
++++ b/src/rapids_singlecell/_cuda/harmony/kmeans/kmeans.cu
+@@ -15,8 +15,9 @@ static inline void launch_kmeans_err(const T* r, const T* dot, size_t n, T* out,
+ 
+     constexpr int BLOCK_SIZE = 256;
+     constexpr int BLOCKS_PER_SM = 8;
+-    int blocks = std::min((int)((n + BLOCK_SIZE - 1) / BLOCK_SIZE),
+-                          prop.multiProcessorCount * BLOCKS_PER_SM);
++    int blocks =
++        std::max(1, std::min((int)((n + BLOCK_SIZE - 1) / BLOCK_SIZE),
++                             prop.multiProcessorCount * BLOCKS_PER_SM));
+     kmeans_err_kernel<T><<<blocks, BLOCK_SIZE, 0, stream>>>(r, dot, n, out);
+     CUDA_CHECK_LAST_ERROR(kmeans_err_kernel);
+ }
+diff --git a/src/rapids_singlecell/_cuda/harmony/outer/kernels_outer.cuh b/src/rapids_singlecell/_cuda/harmony/outer/kernels_outer.cuh
+index e0fb41ac1..bf9c4f53c 100644
+--- a/src/rapids_singlecell/_cuda/harmony/outer/kernels_outer.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/outer/kernels_outer.cuh
+@@ -6,15 +6,16 @@ template <typename T>
+ __global__ void outer_kernel(T* __restrict__ E, const T* __restrict__ Pr_b,
+                              const T* __restrict__ R_sum, long long n_cats,
+                              long long n_pcs, long long switcher) {
+-    long long i = blockIdx.x * blockDim.x + threadIdx.x;
+     long long N = n_cats * n_pcs;
+-    if (i >= N) return;
+-    long long row = i / n_pcs;
+-    long long col = i % n_pcs;
+-    if (switcher == 0)
+-        E[i] -= (Pr_b[row] * R_sum[col]);
+-    else
+-        E[i] += (Pr_b[row] * R_sum[col]);
++    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < N;
++         i += (long long)blockDim.x * gridDim.x) {
++        long long row = i / n_pcs;
++        long long col = i % n_pcs;
++        if (switcher == 0)
++            E[i] -= (Pr_b[row] * R_sum[col]);
++        else
++            E[i] += (Pr_b[row] * R_sum[col]);
++    }
+ }
+ 
+ template <typename T>
+@@ -23,13 +24,15 @@ __global__ void harmony_correction_kernel(T* __restrict__ Z,
+                                           const int* __restrict__ cats,
+                                           const T* __restrict__ R,
+                                           long long n_cells, long long n_pcs) {
+-    long long i = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (i >= n_cells * n_pcs) return;
+-    long long cell_idx = i / n_pcs;
+-    long long pc_idx = i % n_pcs;
+-    int cat = cats[cell_idx];
+-    T correction = W[(cat + 1) * n_pcs + pc_idx] * R[cell_idx];
+-    Z[i] -= correction;
++    long long N = n_cells * n_pcs;
++    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < N;
++         i += (long long)blockDim.x * gridDim.x) {
++        long long cell_idx = i / n_pcs;
++        long long pc_idx = i % n_pcs;
++        int cat = cats[cell_idx];
++        T correction = W[(cat + 1) * n_pcs + pc_idx] * R[cell_idx];
++        Z[i] -= correction;
++    }
+ }
+ 
+ // ---------- batched_correction ----------
+@@ -42,20 +45,21 @@ __global__ void batched_correction_kernel(T* __restrict__ Z,
+                                           const T* __restrict__ R, int n_cells,
+                                           int n_pcs, int n_clusters,
+                                           int n_batches_p1) {
+-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+-    if (idx >= (size_t)n_cells * n_pcs) return;
++    size_t N = (size_t)n_cells * n_pcs;
++    for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x; idx < N;
++         idx += (size_t)blockDim.x * gridDim.x) {
++        int cell = (int)(idx / n_pcs);
++        int pc = (int)(idx % n_pcs);
++        int cat = cats[cell];
+ 
+-    int cell = (int)(idx / n_pcs);
+-    int pc = (int)(idx % n_pcs);
+-    int cat = cats[cell];
++        T total_correction = T(0);
++        for (int k = 0; k < n_clusters; k++) {
++            T w_val = W_all[(size_t)k * n_batches_p1 * n_pcs +
++                            (cat + 1) * n_pcs + pc];
++            T r_val = R[(size_t)cell * n_clusters + k];
++            total_correction += w_val * r_val;
++        }
+ 
+-    T total_correction = T(0);
+-    for (int k = 0; k < n_clusters; k++) {
+-        T w_val =
+-            W_all[(size_t)k * n_batches_p1 * n_pcs + (cat + 1) * n_pcs + pc];
+-        T r_val = R[(size_t)cell * n_clusters + k];
+-        total_correction += w_val * r_val;
++        Z[idx] -= total_correction;
+     }
+-
+-    Z[idx] -= total_correction;
+ }
+diff --git a/src/rapids_singlecell/_cuda/harmony/outer/outer.cu b/src/rapids_singlecell/_cuda/harmony/outer/outer.cu
+index 0b316a891..6344b637e 100644
+--- a/src/rapids_singlecell/_cuda/harmony/outer/outer.cu
++++ b/src/rapids_singlecell/_cuda/harmony/outer/outer.cu
+@@ -13,7 +13,7 @@ static inline void launch_outer(T* E, const T* Pr_b, const T* R_sum,
+                                 long long switcher, cudaStream_t stream) {
+     dim3 block(BLOCK_SIZE);
+     long long N = n_cats * n_pcs;
+-    dim3 grid((unsigned)((N + block.x - 1) / block.x));
++    dim3 grid(strided_grid(N, BLOCK_SIZE));
+     outer_kernel<T>
+         <<<grid, block, 0, stream>>>(E, Pr_b, R_sum, n_cats, n_pcs, switcher);
+     CUDA_CHECK_LAST_ERROR(outer_kernel);
+@@ -25,7 +25,7 @@ static inline void launch_harmony_corr(T* Z, const T* W, const int* cats,
+                                        long long n_pcs, cudaStream_t stream) {
+     dim3 block(BLOCK_SIZE);
+     long long N = n_cells * n_pcs;
+-    dim3 grid((unsigned)((N + block.x - 1) / block.x));
++    dim3 grid(strided_grid(N, BLOCK_SIZE));
+     harmony_correction_kernel<T>
+         <<<grid, block, 0, stream>>>(Z, W, cats, R, n_cells, n_pcs);
+     CUDA_CHECK_LAST_ERROR(harmony_correction_kernel);
+@@ -39,7 +39,7 @@ static inline void launch_batched_correction(T* Z, const T* W_all,
+                                              cudaStream_t stream) {
+     dim3 block(BLOCK_SIZE);
+     long long N = (long long)n_cells * n_pcs;
+-    dim3 grid((unsigned)((N + block.x - 1) / block.x));
++    dim3 grid(strided_grid(N, BLOCK_SIZE));
+     batched_correction_kernel<T><<<grid, block, 0, stream>>>(
+         Z, W_all, cats, R, n_cells, n_pcs, n_clusters, n_batches_p1);
+     CUDA_CHECK_LAST_ERROR(batched_correction_kernel);
+diff --git a/src/rapids_singlecell/_cuda/harmony/scatter/kernels_scatter.cuh b/src/rapids_singlecell/_cuda/harmony/scatter/kernels_scatter.cuh
+index ccc8c26f1..41db52bf3 100644
+--- a/src/rapids_singlecell/_cuda/harmony/scatter/kernels_scatter.cuh
++++ b/src/rapids_singlecell/_cuda/harmony/scatter/kernels_scatter.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cuda_runtime.h>
++#include <stdint.h>
+ #include <type_traits>
+ 
+ template <typename T>
+@@ -8,20 +9,20 @@ __global__ void scatter_add_kernel(const T* __restrict__ v,
+                                    const int* __restrict__ cats, size_t n_cells,
+                                    size_t n_pcs, size_t switcher,
+                                    T* __restrict__ a) {
+-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+     size_t N = n_cells * n_pcs;
+-    if (i >= N) return;
+-
+-    size_t row = i / n_pcs;
+-    size_t col = i % n_pcs;
++    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < N;
++         i += (size_t)blockDim.x * gridDim.x) {
++        size_t row = i / n_pcs;
++        size_t col = i % n_pcs;
+ 
+-    size_t cat = static_cast<size_t>(cats[row]);
+-    size_t out_index = cat * n_pcs + col;
++        size_t cat = static_cast<size_t>(cats[row]);
++        size_t out_index = cat * n_pcs + col;
+ 
+-    if (switcher == 0)
+-        atomicAdd(&a[out_index], -v[i]);
+-    else
+-        atomicAdd(&a[out_index], v[i]);
++        if (switcher == 0)
++            atomicAdd(&a[out_index], -v[i]);
++        else
++            atomicAdd(&a[out_index], v[i]);
++    }
+ }
+ 
+ template <typename T>
+@@ -65,10 +66,16 @@ __global__ void scatter_add_kernel_with_bias_cat0(const T* __restrict__ v,
+ 
+     for (int i = start_cell + threadIdx.x; i < end_cell; i += blockDim.x) {
+         size_t base = static_cast<size_t>(i) * n_pcs + pc0;
+-        VecPC vv = *(const VecPC*)(v + base);
++        const T* ptr = v + base;
+         T bb = __ldg(bias + i);
+-        acc0 += (T)vv.x * bb;
+-        if (has_pc1) acc1 += (T)vv.y * bb;
++        if (has_pc1 && (((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0)) {
++            VecPC vv = *(const VecPC*)ptr;
++            acc0 += (T)vv.x * bb;
++            acc1 += (T)vv.y * bb;
++        } else {
++            acc0 += ptr[0] * bb;
++            if (has_pc1) acc1 += ptr[1] * bb;
++        }
+     }
+ 
+ #pragma unroll
+@@ -195,10 +202,16 @@ __global__ void scatter_add_kernel_with_bias_block(
+     for (int i = start_idx + threadIdx.x; i < end_idx; i += blockDim.x) {
+         int cell_idx = cell_indices[i];
+         size_t in_index = static_cast<size_t>(cell_idx) * n_pcs + pc0;
+-        VecPC vv = *(const VecPC*)(v + in_index);
++        const T* ptr = v + in_index;
+         T bb = __ldg(bias + cell_idx);
+-        acc0 += (T)vv.x * bb;
+-        if (has_pc1) acc1 += (T)vv.y * bb;
++        if (has_pc1 && (((uintptr_t)ptr & (sizeof(VecPC) - 1)) == 0)) {
++            VecPC vv = *(const VecPC*)ptr;
++            acc0 += (T)vv.x * bb;
++            acc1 += (T)vv.y * bb;
++        } else {
++            acc0 += ptr[0] * bb;
++            if (has_pc1) acc1 += ptr[1] * bb;
++        }
+     }
+ 
+ #pragma unroll
+@@ -284,7 +297,7 @@ __global__ void scatter_rows_kernel(const T* __restrict__ src,
+ __global__ void gather_int_kernel(const int* __restrict__ src,
+                                   const int* __restrict__ idx,
+                                   int* __restrict__ dst, int n) {
+-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+-         i += blockDim.x * gridDim.x)
++    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
++         i += (long long)blockDim.x * gridDim.x)
+         dst[i] = src[idx[i]];
+ }
+diff --git a/src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu b/src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu
+index d62a3c2f7..1238c74d5 100644
+--- a/src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu
++++ b/src/rapids_singlecell/_cuda/harmony/scatter/scatter.cu
+@@ -18,7 +18,7 @@ static inline void launch_scatter_add(const T* v, const int* cats,
+                                       cudaStream_t stream) {
+     dim3 block(BLOCK_DIM_1D);
+     size_t N = n_cells * n_pcs;
+-    dim3 grid((unsigned)((N + block.x - 1) / block.x));
++    dim3 grid(strided_grid((long long)N, BLOCK_DIM_1D));
+     scatter_add_kernel<T>
+         <<<grid, block, 0, stream>>>(v, cats, n_cells, n_pcs, switcher, a);
+     CUDA_CHECK_LAST_ERROR(scatter_add_kernel);
+@@ -79,8 +79,8 @@ static inline void launch_gather_rows(const T* src, const int* idx, T* dst,
+                                       cudaStream_t stream) {
+     size_t n = (size_t)n_rows * n_cols;
+     gather_rows_kernel<T>
+-        <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+-           stream>>>(src, idx, dst, n_rows, n_cols);
++        <<<strided_grid((long long)n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
++            src, idx, dst, n_rows, n_cols);
+     CUDA_CHECK_LAST_ERROR(gather_rows_kernel);
+ }
+ 
+@@ -90,14 +90,14 @@ static inline void launch_scatter_rows(const T* src, const int* idx, T* dst,
+                                        cudaStream_t stream) {
+     size_t n = (size_t)n_rows * n_cols;
+     scatter_rows_kernel<T>
+-        <<<(int)((n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+-           stream>>>(src, idx, dst, n_rows, n_cols);
++        <<<strided_grid((long long)n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0, stream>>>(
++            src, idx, dst, n_rows, n_cols);
+     CUDA_CHECK_LAST_ERROR(scatter_rows_kernel);
+ }
+ 
+ static inline void launch_gather_int(const int* src, const int* idx, int* dst,
+                                      int n, cudaStream_t stream) {
+-    gather_int_kernel<<<(n + BLOCK_DIM_1D - 1) / BLOCK_DIM_1D, BLOCK_DIM_1D, 0,
++    gather_int_kernel<<<strided_grid(n, BLOCK_DIM_1D), BLOCK_DIM_1D, 0,
+                         stream>>>(src, idx, dst, n);
+     CUDA_CHECK_LAST_ERROR(gather_int_kernel);
+ }
+diff --git a/tests/test_harmony.py b/tests/test_harmony.py
+index 914c2af2e..1b1c388a6 100644
+--- a/tests/test_harmony.py
++++ b/tests/test_harmony.py
+@@ -10,6 +10,7 @@
+ from scipy.stats import pearsonr
+ 
+ import rapids_singlecell as rsc
++from rapids_singlecell._utils import _create_category_index_mapping
+ from rapids_singlecell.preprocessing._harmony import (
+     _SUPPRESS_PENALTY,
+     _compute_lambda_kb,
+@@ -19,6 +20,7 @@
+     _choose_colsum_algo_heuristic,
+     _colsum_heuristic,
+     _scatter_add_cp,
++    _scatter_add_cp_bias_csr,
+ )
+ 
+ 
+@@ -298,6 +300,45 @@ def test_scatter_add_shared_vs_optimized(n_cells, n_pcs, n_batches, switcher):
+     cp.testing.assert_array_equal(out_optimized, out_shared)
+ 
+ 
++@pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
++@pytest.mark.parametrize("n_pcs", [3, 4, 5])
++@pytest.mark.parametrize("offset", [0, 1])
++@pytest.mark.parametrize("n_cells", [0, 1, 23, 1024])
++def test_scatter_add_bias_csr_alignment(dtype, n_pcs, offset, n_cells):
++    rng = np.random.default_rng(42)
++    n_batches = 4
++    X_base_np = rng.normal(size=n_cells * n_pcs + offset).astype(np.dtype(dtype))
++    X_np = X_base_np[offset:].reshape(n_cells, n_pcs)
++    bias_np = rng.random(n_cells).astype(np.dtype(dtype))
++    cats_np = rng.integers(0, n_batches, size=n_cells, dtype=np.int32)
++
++    X_base = cp.asarray(X_base_np)
++    X = X_base[offset:].reshape(n_cells, n_pcs)
++    bias = cp.asarray(bias_np)
++    cats = cp.asarray(cats_np)
++    cat_offsets, cell_indices = _create_category_index_mapping(cats, n_batches)
++
++    out = cp.zeros((n_batches + 1, n_pcs), dtype=dtype)
++    _scatter_add_cp_bias_csr(
++        X,
++        out,
++        cat_offsets=cat_offsets,
++        cell_indices=cell_indices,
++        bias=bias,
++        n_batches=n_batches,
++    )
++    cp.cuda.Device().synchronize()
++
++    expected_np = np.zeros((n_batches + 1, n_pcs), dtype=np.dtype(dtype))
++    expected_np[0] = X_np.T @ bias_np
++    for batch in range(n_batches):
++        mask = cats_np == batch
++        expected_np[batch + 1] = X_np[mask].T @ bias_np[mask]
++
++    atol = 1e-5 if dtype == cp.float32 else 1e-12
++    cp.testing.assert_allclose(out, cp.asarray(expected_np), atol=atol, rtol=atol)
++
++
+ @pytest.mark.parametrize("dtype", [cp.float32, cp.float64])
+ def test_compute_lambda_kb_pruning(dtype):
+     """_compute_lambda_kb suppresses correction for N_b==0 and below-threshold pairs."""
+diff --git a/tests/test_harmony_kernels.py b/tests/test_harmony_kernels.py
+index 90616ec08..4cd771a07 100644
+--- a/tests/test_harmony_kernels.py
++++ b/tests/test_harmony_kernels.py
+@@ -9,9 +9,15 @@
+ from rapids_singlecell._cuda import (
+     _harmony_clustering_cuda as _cl,
+ )
++from rapids_singlecell._cuda import (
++    _harmony_colsum_cuda as _colsum,
++)
+ from rapids_singlecell._cuda import (
+     _harmony_correction_cuda as _corr,
+ )
++from rapids_singlecell._cuda import (
++    _harmony_kmeans_cuda as _km,
++)
+ from rapids_singlecell._cuda import (
+     _harmony_normalize_cuda as _norm,
+ )
+@@ -23,7 +29,13 @@
+ )
+ 
+ pytestmark = pytest.mark.skipif(
+-    _norm is None or _pen is None or _scatter is None,
++    _norm is None
++    or _pen is None
++    or _scatter is None
++    or _colsum is None
++    or _km is None
++    or _cl is None
++    or _corr is None,
+     reason="Harmony CUDA modules not available",
+ )
+ 
+@@ -235,6 +247,49 @@ def test_gather_int(n):
+     cp.testing.assert_array_equal(dst, expected)
+ 
+ 
++# ---------- colsum ----------
++
++
++@pytest.mark.parametrize("dtype", DTYPES)
++@pytest.mark.parametrize("rows", [0, 1, 257, 4096])
++def test_colsum_columns_multiple_cols_per_block(dtype, rows):
++    rng = cp.random.default_rng(123)
++    n_sm = cp.cuda.Device().attributes["MultiProcessorCount"]
++    cols = n_sm * 8 + 17
++    x = rng.standard_normal((rows, cols), dtype=dtype)
++    out = cp.zeros(cols, dtype=dtype)
++
++    _colsum.colsum(x, out=out, rows=rows, cols=cols)
++    cp.cuda.Device().synchronize()
++
++    atol = 5e-4 if dtype == np.float32 else 1e-12
++    rtol = 1e-4 if dtype == np.float32 else 1e-5
++    expected_np = cp.asnumpy(x).sum(axis=0)
++    cp.testing.assert_allclose(out, cp.asarray(expected_np), atol=atol, rtol=rtol)
++
++
++# ---------- kmeans_err ----------
++
++
++@pytest.mark.parametrize("dtype", DTYPES)
++@pytest.mark.parametrize("n", [0, 1, 257, 8192])
++def test_kmeans_err_offset_contiguous(dtype, n):
++    r_base = cp.arange(n + 1, dtype=dtype)
++    dot_base = cp.linspace(dtype(0.1), dtype(0.9), n + 1, dtype=dtype)
++    r = r_base[1:]
++    dot = dot_base[1:]
++    out = cp.zeros(1, dtype=dtype)
++
++    _km.kmeans_err(r, dot=dot, n=n, out=out)
++    cp.cuda.Device().synchronize()
++
++    r_np = cp.asnumpy(r)
++    dot_np = cp.asnumpy(dot)
++    expected_np = np.sum(r_np * dtype(2) * (dtype(1) - dot_np), dtype=dtype)
++    atol = 1e-4 if dtype == np.float32 else 1e-10
++    cp.testing.assert_allclose(out[0], dtype(expected_np), atol=atol, rtol=1e-5)
++
++
+ # ---------- compute_objective ----------
+ 
+ 

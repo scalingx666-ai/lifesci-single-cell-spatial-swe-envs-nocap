@@ -1,0 +1,1522 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 590e7353d..40c56c54a 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -47,6 +47,10 @@ Imports:
+     utils,
+     uwot
+ Suggests:
++    GenomeInfoDb,
++    hdf5r,
++    Rsamtools,
++    fastmatch,
+     AnnotationDbi,
+     arrow,
+     AUCell,
+diff --git a/NAMESPACE b/NAMESPACE
+index 5da21fdb6..0d0fc4f41 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -111,6 +111,7 @@ export(CellScoring)
+ export(CellScoringPlot)
+ export(CellStatPlot)
+ export(CellTypistModels)
++export(CheckATACData)
+ export(CheckDataList)
+ export(CheckDataMerge)
+ export(CheckDataType)
+@@ -222,6 +223,8 @@ export(ProjectionPlot)
+ export(ProportionTestPlot)
+ export(PseudotimeProjectionPlot)
+ export(RPCA_integrate)
++export(ReadATACData)
++export(ReadMultiomeData)
+ export(ReadSpatialData)
+ export(RecoverCounts)
+ export(RemoveEnv)
+diff --git a/NEWS.md b/NEWS.md
+index 74dde0533..06a300e86 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,5 +1,9 @@
+ # scop (development version)
+ 
++* **fix**: `CheckATACData()` determines fragment readiness from resources mapped to the selected assay cells, preserving inactive resources in its report after native subsetting.
++
++* **feature**: `ReadATACData()` and `ReadMultiomeData()` import existing raw peak and paired RNA counts through Signac/Seurat, preserving explicit feature and barcode alignment. `CheckATACData()` reports matrix/reference validity and external fragment availability without altering the object.
++
+ * **fix**: Document all SingleR marker selection and reference aggregation arguments without relying on optional-package documentation inheritance.
+ 
+ * **fix**: Require thisutils 0.5.3 for the local verbosity API used by database preparation. Keep communication database delegation tests independent of Ensembl availability and verify Presto calls without replacing same-named Seurat methods.
+diff --git a/R/CheckATACData.R b/R/CheckATACData.R
+new file mode 100644
+index 000000000..7d36d63ee
+--- /dev/null
++++ b/R/CheckATACData.R
+@@ -0,0 +1,151 @@
++#' Check an ATAC object without changing it
++#'
++#' @md
++#' @description
++#' Report raw-count, peak-coordinate, cell/metadata and reference alignment for
++#' an existing Seurat `ChromatinAssay`. Fragment path/index availability is
++#' reported separately, so an otherwise valid matrix can be analysed without
++#' fragments. This check does not install packages, retrieve resources, modify
++#' the object, or inspect dependencies of downstream optional analyses.
++#'
++#' @param object A Seurat object with a Signac `ChromatinAssay`.
++#' @param assay Assay to check; defaults to the object's default assay.
++#' @param genome Optional expected genome label. Unknown references are
++#'   reported, never inferred from chromosome spelling.
++#' @param sample.by Optional metadata column containing sample IDs. This checks
++#'   complete labels, not whether samples are independent biological replicates.
++#'
++#' @return A list with `valid`, `errors`, `warnings`, `assay`, `n_cells`,
++#'   `n_peaks`, `genome`, `samples`, a `fragments` resource table, and
++#'   `fragments_ready`. `valid` describes the matrix contract. Fragment readiness
++#'   checks local file/index existence and cell mapping for resources with cells
++#'   in the selected assay. The resource table retains all attached files; its
++#'   `active` column identifies those required for this assay. Empty mappings
++#'   left by native subsetting do not block readiness. It does not hash files,
++#'   scan their contents, or guarantee fragment-dependent computation will pass.
++#'   Use Signac's `ValidateFragments()` for content validation when required.
++#' @seealso [ReadATACData()], [RunStandardWorkflow()]
++#' @export
++#' @examples
++#' counts <- Matrix::sparseMatrix(
++#'   i = c(1, 2), j = c(1, 2), x = c(2, 3), dims = c(2, 2),
++#'   dimnames = list(c("p1", "p2"), c("cell1", "cell2"))
++#' )
++#' ranges <- GenomicRanges::GRanges(c("chr1:1-50", "chr1:101-150"))
++#' object <- ReadATACData(counts, ranges = ranges, genome = "hg38")
++#' report <- CheckATACData(object)
++#' report$valid
++#' report$fragments_ready
++CheckATACData <- function(object, assay = NULL, genome = NULL, sample.by = NULL) {
++  report <- list(
++    valid = FALSE, errors = character(), warnings = character(), assay = assay,
++    n_cells = NA_integer_, n_peaks = NA_integer_, genome = character(),
++    samples = NULL,
++    fragments = data.frame(
++      path = character(), index = character(),
++      file_exists = logical(), index_exists = logical(), n_cells = integer(),
++      active = logical()
++    ),
++    fragments_ready = FALSE
++  )
++  if (!inherits(object, "Seurat")) {
++    report$errors <- "object must be a Seurat object."
++    return(report)
++  }
++  if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
++  report$assay <- assay
++  if (!is.character(assay) || length(assay) != 1L || is.na(assay) ||
++    !assay %in% SeuratObject::Assays(object) || !inherits(object[[assay]], "ChromatinAssay")) {
++    report$errors <- "assay must identify a Signac ChromatinAssay."
++    return(report)
++  }
++  chromatin <- object[[assay]]
++  counts <- SeuratObject::GetAssayData(chromatin, layer = "counts")
++  ranges <- Signac::granges(chromatin)
++  report$n_cells <- ncol(counts)
++  report$n_peaks <- nrow(counts)
++  report$errors <- c(atac_counts_problems(counts), atac_ranges_problems(ranges))
++  if (length(ranges) != nrow(counts) ||
++    !identical(as.vector(atac_range_ids(ranges)), as.vector(rownames(counts)))) {
++    report$errors <- c(report$errors, "Matrix peak IDs and genomic intervals are not aligned.")
++  }
++  cells <- colnames(counts)
++  metadata <- object[[]]
++  if (!atac_unique_ids(rownames(metadata)) || !all(cells %in% rownames(metadata))) {
++    report$errors <- c(report$errors, "Object metadata does not cover the assay cell IDs uniquely.")
++  } else if (!is.null(sample.by)) {
++    if (!is.character(sample.by) || length(sample.by) != 1L || is.na(sample.by) ||
++      !sample.by %in% colnames(metadata)) {
++      report$errors <- c(report$errors, "sample.by must name an existing metadata column.")
++    } else {
++      samples <- as.character(metadata[cells, sample.by])
++      if (anyNA(samples) || any(!nzchar(samples))) {
++        report$errors <- c(report$errors, "Sample labels must be present for every assay cell.")
++      } else {
++        report$samples <- table(samples)
++      }
++    }
++  }
++  get_genome <- atac_backend_fun("GenomeInfoDb", "genome")
++  labels <- unique(c(as.character(get_genome(ranges)), as.character(get_genome(chromatin))))
++  labels <- labels[!is.na(labels) & nzchar(labels)]
++  report$genome <- labels
++  annotation <- Signac::Annotation(chromatin)
++  annotation_labels <- if (length(annotation)) unique(as.character(get_genome(annotation))) else character()
++  annotation_labels <- annotation_labels[!is.na(annotation_labels) & nzchar(annotation_labels)]
++  if (length(unique(c(labels, annotation_labels))) > 1L) {
++    report$errors <- c(report$errors, "Assay seqinfo, ranges and annotation contain conflicting genome labels.")
++  }
++  assay_lengths <- atac_backend_fun("GenomeInfoDb", "seqlengths")(chromatin)
++  range_chromosomes <- as.character(GenomicRanges::seqnames(ranges))
++  if (any(GenomicRanges::end(ranges) > assay_lengths[range_chromosomes], na.rm = TRUE)) {
++    report$errors <- c(report$errors, "Ranges exceed chromosome lengths in the assay seqinfo.")
++  }
++  if (!is.null(genome)) {
++    if (!is.character(genome) || length(genome) != 1L || is.na(genome) || !nzchar(genome)) {
++      report$errors <- c(report$errors, "genome must be one non-empty expected reference label.")
++    } else if (length(labels) != 1L || !identical(labels, genome)) {
++      report$errors <- c(report$errors, "The expected genome is missing or differs from the assay reference.")
++    }
++  } else if (!length(labels)) {
++    report$warnings <- c(report$warnings, "The assay genome is unknown; supply verified reference information before sequence analysis.")
++  }
++  fragment_objects <- Signac::Fragments(chromatin)
++  if (length(fragment_objects)) {
++    report$fragments <- do.call(rbind, lapply(fragment_objects, function(fragment) {
++      path <- Signac::GetFragmentData(fragment, slot = "path")
++      candidates <- paste0(path, c(".tbi", ".csi"))
++      index <- candidates[file.exists(candidates)][1L]
++      if (is.na(index)) index <- candidates[1L]
++      data.frame(
++        path = path, index = index,
++        file_exists = file.exists(path), index_exists = file.exists(index),
++        n_cells = length(Signac::GetFragmentData(fragment, slot = "cells")),
++        active = any(names(Signac::GetFragmentData(fragment, slot = "cells")) %in% cells)
++      )
++    }))
++    mappings <- lapply(fragment_objects, Signac::GetFragmentData, slot = "cells")
++    mappings <- lapply(mappings, function(x) x[names(x) %in% cells])
++    mappings <- mappings[report$fragments$active]
++    mapped_cells <- unlist(lapply(mappings, names), use.names = FALSE)
++    mapping_ok <- all(vapply(mappings, function(x) {
++      atac_unique_ids(x) && atac_unique_ids(names(x))
++    }, logical(1))) && !anyDuplicated(mapped_cells) && all(cells %in% mapped_cells)
++    resources_ready <- all((report$fragments$file_exists & report$fragments$index_exists)[report$fragments$active])
++    report$fragments_ready <- resources_ready && mapping_ok
++    if (!mapping_ok) {
++      report$warnings <- c(
++        report$warnings,
++        "Fragment mappings require unique non-empty barcodes per file and unique coverage of assay cells."
++      )
++    }
++    if (!resources_ready) {
++      report$warnings <- c(report$warnings, "External fragment files or indexes are missing; matrix-only analysis remains available.")
++    }
++  } else {
++    report$warnings <- c(report$warnings, "No fragments are attached; only matrix-supported analyses are available.")
++  }
++  report$valid <- !length(report$errors)
++  report$fragments_ready <- report$valid && report$fragments_ready
++  report
++}
+diff --git a/R/ReadATACData.R b/R/ReadATACData.R
+new file mode 100644
+index 000000000..219477519
+--- /dev/null
++++ b/R/ReadATACData.R
+@@ -0,0 +1,407 @@
++#' Read raw ATAC counts into a ChromatinAssay
++#'
++#' @md
++#' @description
++#' Import one explicitly shared peak universe from a sparse matrix and genomic
++#' ranges, a 10x ATAC/ARC H5 file, or Matrix Market/peaks BED/barcodes files.
++#' SCOP checks and aligns identifiers; Signac creates the native assay. No cells
++#' or peaks are filtered, and no resources are downloaded or installed.
++#'
++#' @param object A numeric sparse peak-by-cell matrix, a local 10x ATAC/ARC
++#'   H5 path, or a local Matrix Market path. Separate matrices with different peak
++#'   universes must be recounted before combining; this function never fills
++#'   unmeasured peaks with zeros.
++#'   The supported Signac constructor requires at least two cells and two peaks.
++#' @param ranges A `GRanges` in 1-based closed coordinates, required with
++#'   a sparse matrix. Named ranges are aligned to the matrix row names; unnamed ranges
++#'   explicitly use matrix row order. Duplicate genomic intervals are rejected.
++#' @param metadata Optional data frame with unique row names matching the input
++#'   matrix cell IDs exactly. Rows are reordered by ID, never by position.
++#'   Supplied `nCount_<assay>`/`nFeature_<assay>` columns must agree with the
++#'   raw matrix; conflicting QC metadata is rejected.
++#' @param peaks.file,barcodes.file Three-column peaks BED and one-column
++#'   barcode paths, both required when `object` is a Matrix Market path.
++#'   Gzip compression is supported. Without companion files a path is read as
++#'   H5, importing only the explicitly declared `Peaks` modality from its
++#'   standard feature table; H5 requires optional `hdf5r`.
++#'   BED and 10x H5 peak IDs use 0-based half-open coordinates, converted to
++#'   1-based closed `GRanges` (start + 1, end unchanged).
++#' @param cell.names Optional unique final cell IDs, in input column order.
++#'   For example, explicitly prefix barcodes from separate captures. Suffixes
++#'   are never removed or guessed.
++#' @param sample Optional single sample ID, or a named character vector keyed
++#'   by input cell IDs, stored as `sample` metadata. A sample label does not
++#'   establish biological replication; retain donor/condition/capture metadata.
++#' @param genome Optional genome label such as `"hg38"`, checked against known
++#'   labels on `ranges` and `annotation`. This sets a label, not a reference
++#'   download. Supply seqlengths in `ranges` for chromosome-bound checks.
++#' @param annotation Optional Signac-compatible gene annotation `GRanges`.
++#' @param fragments Optional local fragment path(s). Files must be bgzip
++#'   compressed and indexed. Signac validates the paths and barcode membership.
++#' @param fragment.cells Explicit fragment barcode mapping: a named character
++#'   vector for one file, or a list of vectors in `fragments` order. Vector
++#'   names are final object cell IDs; values are exact barcodes in that file.
++#'   Multiple files require disjoint mappings covering every imported cell.
++#'   With one file and no mapping, input matrix barcodes are used unchanged.
++#' @param assay Name of the new chromatin assay.
++#' @param project Project name passed to `CreateSeuratObject()`.
++#' @param verbose Whether Signac prints progress messages.
++#'
++#' @details
++#' Signac uses genomic coordinates as feature names. Original matrix feature
++#' IDs are retained in assay feature metadata `input_peak_id`; input barcodes
++#' are retained as cell metadata `input_barcode`. Import provenance is stored
++#' next to the data in `Misc(object[[assay]], "scop_atac_input")`.
++#'
++#' Fragment files remain external references. `saveRDS()` does not copy them.
++#' After `readRDS()`, use [CheckATACData()] to inspect their availability and
++#' export its `fragments` table as a resource manifest. Missing external files
++#' do not invalidate otherwise valid matrix-only analysis. Update moved paths
++#' explicitly using Signac's `UpdatePath()`; paths are never repaired silently.
++#'
++#' @return A Seurat object containing a Signac `ChromatinAssay` with raw counts.
++#' @seealso [CheckATACData()], [RunStandardWorkflow()]
++#' @export
++#' @examples
++#' peaks <- GenomicRanges::makeGRangesFromDataFrame(data.frame(
++#'   seqnames = c("chr1", "chr1", "chr2"),
++#'   start = c(1L, 101L, 201L), end = c(50L, 150L, 250L)
++#' ))
++#' counts <- Matrix::sparseMatrix(
++#'   i = c(1, 3, 2, 3), j = c(1, 1, 2, 2), x = c(2, 1, 3, 1),
++#'   dims = c(3, 2), dimnames = list(c("p1", "p2", "p3"), c("AA-1", "BB-1"))
++#' )
++#' atac <- ReadATACData(counts, ranges = peaks, genome = "hg38", sample = "S1")
++#' CheckATACData(atac)$valid
++ReadATACData <- function(
++  object,
++  ranges = NULL,
++  metadata = NULL,
++  peaks.file = NULL,
++  barcodes.file = NULL,
++  cell.names = NULL,
++  sample = NULL,
++  genome = NULL,
++  annotation = NULL,
++  fragments = NULL,
++  fragment.cells = NULL,
++  assay = "peaks",
++  project = "ATAC",
++  verbose = TRUE
++) {
++  counts <- object
++  h5 <- matrix.file <- NULL
++  if (is.character(object)) {
++    if (!is.null(peaks.file) || !is.null(barcodes.file)) {
++      matrix.file <- object
++    } else {
++      h5 <- object
++    }
++  }
++  if (!is.character(assay) || length(assay) != 1L || is.na(assay) || !nzchar(assay)) {
++    log_message("assay must be one non-empty name.", message_type = "error")
++  }
++  source <- "sparse_matrix"
++  input_files <- character()
++  if (!is.null(h5)) {
++    if (!is.null(ranges) || !is.null(peaks.file) || !is.null(barcodes.file)) {
++      log_message("h5 already defines peaks and barcodes; do not supply ranges or companion files.", message_type = "error")
++    }
++    h5 <- atac_input_path(h5, "h5")
++    atac_backend_fun("hdf5r", "h5version")
++    h5_file <- hdf5r::H5File$new(h5, mode = "r")
++    feature_types <- tryCatch(
++      {
++        if (!h5_file$exists("matrix/features/feature_type")) {
++          log_message("H5 requires a standard matrix/features/feature_type table declaring Peaks.", message_type = "error")
++        }
++        h5_file[["matrix/features/feature_type"]][]
++      },
++      finally = h5_file$close_all()
++    )
++    if (!"Peaks" %in% feature_types) {
++      log_message("H5 must explicitly declare a Peaks modality; coordinate-like IDs alone are insufficient.", message_type = "error")
++    }
++    counts <- Seurat::Read10X_h5(h5, use.names = FALSE, unique.features = FALSE)
++    if (is.list(counts)) {
++      if (!"Peaks" %in% names(counts)) {
++        log_message("H5 must contain one Peaks matrix; multi-genome lists are not supported.", message_type = "error")
++      }
++      counts <- counts[["Peaks"]]
++    }
++    ids <- rownames(counts)
++    matched <- regmatches(ids, regexec("^(.+):([0-9]+)-([0-9]+)$", ids))
++    if (length(matched) == 0L || any(lengths(matched) != 4L)) {
++      log_message("H5 peak IDs must use 10x BED coordinates: chromosome:start-end.", message_type = "error")
++    }
++    bed <- as.data.frame(do.call(rbind, lapply(matched, `[`, 2:4)), stringsAsFactors = FALSE)
++    ranges <- atac_bed_ranges(bed)
++    names(ranges) <- ids
++    source <- "10x_h5"
++    input_files <- c(h5 = h5)
++  } else if (!is.null(matrix.file)) {
++    if (!is.null(ranges) || is.null(peaks.file) || is.null(barcodes.file)) {
++      log_message("A Matrix Market path requires peaks.file and barcodes.file, without ranges.", message_type = "error")
++    }
++    input_files <- c(
++      matrix = atac_input_path(matrix.file, "matrix.file"),
++      peaks = atac_input_path(peaks.file, "peaks.file"),
++      barcodes = atac_input_path(barcodes.file, "barcodes.file")
++    )
++    con <- gzfile(input_files[["matrix"]], open = "rt")
++    counts <- tryCatch(Matrix::readMM(con), finally = close(con))
++    bed <- utils::read.delim(input_files[["peaks"]], header = FALSE, colClasses = "character")
++    barcodes <- utils::read.delim(input_files[["barcodes"]], header = FALSE, colClasses = "character")
++    if (ncol(bed) != 3L || ncol(barcodes) != 1L ||
++      nrow(bed) != nrow(counts) || nrow(barcodes) != ncol(counts)) {
++      log_message("Matrix dimensions must match three-column peaks BED and one-column barcodes.", message_type = "error")
++    }
++    ranges <- atac_bed_ranges(bed)
++    rownames(counts) <- paste0(bed[[1]], ":", bed[[2]], "-", bed[[3]])
++    colnames(counts) <- barcodes[[1]]
++    names(ranges) <- rownames(counts)
++    source <- "matrix_market_bed"
++  } else if (!is.null(peaks.file) || !is.null(barcodes.file)) {
++    log_message("peaks.file and barcodes.file are only used with a Matrix Market path.", message_type = "error")
++  }
++
++  problems <- atac_counts_problems(counts)
++  if (length(problems)) log_message(paste(problems, collapse = " "), message_type = "error")
++  if (any(dim(counts) < 2L)) {
++    log_message("ReadATACData requires at least two cells and two peaks with the supported Signac constructor.", message_type = "error")
++  }
++  problems <- atac_ranges_problems(ranges)
++  if (length(problems)) log_message(paste(problems, collapse = " "), message_type = "error")
++  if (length(ranges) != nrow(counts)) {
++    log_message("ranges must have one interval per matrix row.", message_type = "error")
++  }
++  input_peak_ids <- rownames(counts)
++  if (!is.null(names(ranges))) {
++    if (!atac_unique_ids(names(ranges)) || !setequal(names(ranges), input_peak_ids)) {
++      log_message("Named ranges must match matrix peak IDs exactly.", message_type = "error")
++    }
++    ranges <- ranges[match(input_peak_ids, names(ranges))]
++  }
++  ranges <- atac_set_genome(ranges, genome, annotation)
++  peak_ids <- atac_range_ids(ranges)
++  if (anyDuplicated(peak_ids)) {
++    log_message("Genomic intervals collide after native Seurat feature-name conversion.", message_type = "error")
++  }
++  input_cells <- as.vector(colnames(counts))
++  if (is.null(cell.names)) cell.names <- input_cells
++  if (!atac_unique_ids(cell.names) || length(cell.names) != length(input_cells)) {
++    log_message("cell.names must contain one unique non-empty ID per matrix column.", message_type = "error")
++  }
++  if (is.null(metadata)) metadata <- data.frame(row.names = input_cells)
++  if (!is.data.frame(metadata) || !atac_unique_ids(rownames(metadata)) ||
++    !setequal(rownames(metadata), input_cells) ||
++    (ncol(metadata) > 0L && !atac_unique_ids(colnames(metadata)))) {
++    log_message("metadata must be a data frame with unique rows matching input cell IDs exactly.", message_type = "error")
++  }
++  metadata <- metadata[input_cells, , drop = FALSE]
++  qc_columns <- paste0(c("nCount_", "nFeature_"), assay)
++  for (column in intersect(qc_columns, colnames(metadata))) {
++    expected <- if (identical(column, qc_columns[[1L]])) {
++      Matrix::colSums(counts)
++    } else {
++      Matrix::colSums(counts > 0)
++    }
++    if (!is.numeric(metadata[[column]]) ||
++      !identical(as.numeric(metadata[[column]]), as.numeric(expected))) {
++      log_message("Metadata {column} conflicts with the imported raw count matrix.", message_type = "error")
++    }
++  }
++  if ("input_barcode" %in% names(metadata) &&
++    !identical(as.character(metadata$input_barcode), input_cells)) {
++    log_message("metadata input_barcode conflicts with matrix cell IDs.", message_type = "error")
++  }
++  metadata$input_barcode <- input_cells
++  if (!is.null(sample)) {
++    if (!is.character(sample) || anyNA(sample) || any(!nzchar(sample))) {
++      log_message("sample must contain non-empty character labels.", message_type = "error")
++    }
++    if (length(sample) == 1L && is.null(names(sample))) {
++      sample <- rep(sample, length(input_cells))
++    } else {
++      if (!atac_unique_ids(names(sample)) || !setequal(names(sample), input_cells)) {
++        log_message("A per-cell sample vector must be named by all input cell IDs.", message_type = "error")
++      }
++      sample <- unname(sample[input_cells])
++    }
++    if ("sample" %in% names(metadata) && !identical(as.character(metadata$sample), sample)) {
++      log_message("sample conflicts with metadata$sample.", message_type = "error")
++    }
++    metadata$sample <- sample
++  }
++  rownames(metadata) <- cell.names
++  colnames(counts) <- cell.names
++  fragment_objects <- atac_import_fragments(fragments, fragment.cells, input_cells, cell.names, verbose)
++  chromatin <- Signac::CreateChromatinAssay(
++    counts = counts, ranges = ranges,
++    genome = atac_backend_fun("GenomeInfoDb", "seqinfo")(ranges),
++    annotation = annotation, fragments = fragment_objects,
++    min.cells = 0, min.features = 0, verbose = verbose
++  )
++  # Native fragment lookup can attach separate fastmatch cache pointers to
++  # otherwise identical ID vectors. Compare the ordered identifiers, not caches.
++  if (!identical(as.vector(rownames(chromatin)), as.vector(peak_ids)) ||
++    !identical(as.vector(colnames(chromatin)), as.vector(cell.names))) {
++    log_message("Signac changed the expected feature or cell alignment during import.", message_type = "error")
++  }
++  chromatin <- SeuratObject::AddMetaData(chromatin, data.frame(
++    input_peak_id = input_peak_ids, row.names = rownames(chromatin)
++  ))
++  SeuratObject::Misc(chromatin, "scop_atac_input") <- list(
++    source = source, files = input_files, assay = assay,
++    coordinate_system = "1-based closed",
++    input_coordinate_system = if (source == "sparse_matrix") "1-based closed" else "0-based half-open",
++    backend_versions = vapply(
++      c("Signac", "Seurat", "SeuratObject"),
++      function(x) as.character(utils::packageVersion(x)), character(1)
++    )
++  )
++  result <- SeuratObject::CreateSeuratObject(
++    counts = chromatin, assay = assay,
++    meta.data = metadata, project = project
++  )
++  # Fragment barcode lookup may attach a fastmatch cache to the shared ID vector.
++  rownames(metadata) <- as.vector(rownames(metadata))
++  if (!all(colnames(metadata) %in% colnames(result[[]])) ||
++    !identical(result[[]][, colnames(metadata), drop = FALSE], metadata)) {
++    log_message("Native object creation changed or omitted supplied metadata.", message_type = "error")
++  }
++  result
++}
++
++atac_backend_fun <- function(package, fun) {
++  available <- check_r(package, install = FALSE, verbose = FALSE)
++  if (!isTRUE(all(unlist(available, use.names = FALSE)))) {
++    log_message(sprintf("Package '%s' is required; install it separately before ATAC analysis.", package), message_type = "error")
++  }
++  resolved <- getExportedValue(package, fun)
++  if (!is.function(resolved)) {
++    log_message(sprintf("Function '%s' is not available in package '%s'.", fun, package), message_type = "error")
++  }
++  resolved
++}
++
++atac_unique_ids <- function(x) {
++  is.character(x) && length(x) > 0L && !anyNA(x) && all(nzchar(x)) && !anyDuplicated(x)
++}
++
++atac_input_path <- function(path, label) {
++  if (!is.character(path) || length(path) != 1L || is.na(path) ||
++    !file.exists(path) || dir.exists(path)) {
++    log_message(sprintf("%s must be an existing local file.", label), message_type = "error")
++  }
++  normalizePath(path, mustWork = TRUE)
++}
++
++atac_counts_problems <- function(counts) {
++  if (!inherits(counts, "sparseMatrix") || !"x" %in% methods::slotNames(counts) ||
++    !is.numeric(counts@x)) {
++    return("counts must be a numeric sparse matrix of raw counts.")
++  }
++  errors <- character()
++  if (any(dim(counts) == 0L)) errors <- c(errors, "counts must contain cells and peaks.")
++  if (!atac_unique_ids(rownames(counts))) errors <- c(errors, "Peak IDs must be unique and non-empty.")
++  if (!atac_unique_ids(colnames(counts))) errors <- c(errors, "Cell IDs must be unique and non-empty.")
++  if (any(!is.finite(counts@x) | counts@x < 0 | counts@x %% 1 != 0)) {
++    errors <- c(errors, "counts must contain finite, non-negative integers; normalized values are not raw counts.")
++  }
++  errors
++}
++
++atac_ranges_problems <- function(ranges) {
++  if (!inherits(ranges, "GRanges")) {
++    return("ranges must be a GRanges object.")
++  }
++  start <- GenomicRanges::start(ranges)
++  end <- GenomicRanges::end(ranges)
++  seqnames <- as.character(atac_backend_fun("GenomeInfoDb", "seqnames")(ranges))
++  lengths <- atac_backend_fun("GenomeInfoDb", "seqlengths")(ranges)[seqnames]
++  errors <- character()
++  if (any(start < 1L | end < start) || any(!nzchar(seqnames))) {
++    errors <- c(errors, "Ranges require positive 1-based starts and non-empty closed intervals.")
++  }
++  if (any(end > lengths, na.rm = TRUE)) errors <- c(errors, "Ranges exceed known chromosome lengths.")
++  if (anyDuplicated(paste(seqnames, start, end, sep = ":"))) {
++    errors <- c(errors, "Duplicate genomic intervals are not allowed.")
++  }
++  errors
++}
++
++atac_range_ids <- function(ranges) {
++  gsub("[_|]", "-", Signac::GRangesToString(ranges, sep = c("-", "-")))
++}
++
++atac_bed_ranges <- function(bed) {
++  start <- suppressWarnings(as.numeric(bed[[2]]))
++  end <- suppressWarnings(as.numeric(bed[[3]]))
++  if (anyNA(bed[[1]]) || any(!nzchar(bed[[1]])) ||
++    any(!is.finite(start) | !is.finite(end) | start < 0 | end <= start |
++      start %% 1 != 0 | end %% 1 != 0 | end > .Machine$integer.max)) {
++    log_message("BED requires chromosome, non-negative integer start, and end greater than start.", message_type = "error")
++  }
++  atac_backend_fun("GenomicRanges", "makeGRangesFromDataFrame")(
++    data.frame(seqnames = bed[[1]], start = start, end = end), starts.in.df.are.0based = TRUE
++  )
++}
++
++atac_set_genome <- function(ranges, genome, annotation) {
++  get_genome <- atac_backend_fun("GenomeInfoDb", "genome")
++  known <- unique(as.character(get_genome(ranges)))
++  if (!is.null(annotation)) {
++    if (!inherits(annotation, "GRanges")) log_message("annotation must be a GRanges object.", message_type = "error")
++    known <- unique(c(known, as.character(get_genome(annotation))))
++  }
++  known <- known[!is.na(known) & nzchar(known)]
++  if (length(known) > 1L || (!is.null(genome) &&
++    (!is.character(genome) || length(genome) != 1L || is.na(genome) || !nzchar(genome) ||
++      (length(known) && !identical(known, genome))))) {
++    log_message("Genome labels on ranges, annotation, and genome must agree.", message_type = "error")
++  }
++  if (!is.null(genome)) {
++    ranges <- atac_backend_fun("GenomeInfoDb", "genome<-")(ranges, value = genome)
++  }
++  ranges
++}
++
++atac_import_fragments <- function(paths, mappings, input_cells, cells, verbose) {
++  if (is.null(paths)) {
++    if (!is.null(mappings)) log_message("fragment.cells requires fragments.", message_type = "error")
++    return(NULL)
++  }
++  if (!is.character(paths) || !length(paths) || anyNA(paths) || anyDuplicated(paths)) {
++    log_message("fragments must be unique local fragment file paths.", message_type = "error")
++  }
++  paths <- vapply(paths, atac_input_path, character(1), label = "fragments")
++  if (anyDuplicated(paths)) {
++    log_message("fragments must identify different files after resolving local paths.", message_type = "error")
++  }
++  if (is.null(mappings) && length(paths) == 1L) mappings <- stats::setNames(input_cells, cells)
++  if (is.character(mappings) && length(paths) == 1L) mappings <- list(mappings)
++  if (!is.list(mappings) || length(mappings) != length(paths) ||
++    !all(vapply(mappings, function(x) atac_unique_ids(x) && atac_unique_ids(names(x)), logical(1)))) {
++    log_message("Provide one explicit named barcode mapping per fragment file.", message_type = "error")
++  }
++  mapped_cells <- unlist(lapply(mappings, names), use.names = FALSE)
++  if (anyDuplicated(mapped_cells) || !setequal(mapped_cells, cells)) {
++    log_message("Fragment mappings must cover every object cell exactly once across files.", message_type = "error")
++  }
++  lapply(seq_along(paths), function(i) {
++    Signac::CreateFragmentObject(
++      path = paths[[i]], cells = mappings[[i]], validate.fragments = TRUE,
++      tolerance = 0, max.lines = NULL, verbose = verbose
++    )
++  })
++}
++
++atac_new_assay_name <- function(object, name) {
++  if (!atac_unique_ids(name) || length(name) != 1L ||
++    !identical(make.names(name), name) || name %in% c(names(object), colnames(object[[]])) ||
++    any(paste0(c("nCount_", "nFeature_"), name) %in% colnames(object[[]]))) {
++    log_message("new.assay must be a syntactically valid unused name without assay, object or QC metadata collisions.", message_type = "error")
++  }
++  invisible(name)
++}
+diff --git a/R/ReadMultiomeData.R b/R/ReadMultiomeData.R
+new file mode 100644
+index 000000000..604365d20
+--- /dev/null
++++ b/R/ReadMultiomeData.R
+@@ -0,0 +1,130 @@
++#' Read paired 10x RNA and ATAC counts
++#'
++#' @md
++#' @description Import both measured modalities from one local 10x ARC count
++#' matrix without dropping cells, normalizing counts, or inferring RNA from ATAC.
++#'
++#' @param object Path to one 10x ARC H5 file or one matrix directory containing
++#'   `matrix.mtx.gz`, `features.tsv.gz` and `barcodes.tsv.gz`. The input must
++#'   contain exactly the `Gene Expression` and `Peaks` modalities. H5 input
++#'   requires at least two features per modality and two cells because the
++#'   native Seurat H5 reader otherwise drops matrix dimensions.
++#' @param metadata,cell.names,sample,genome,annotation,fragments,fragment.cells,project,verbose
++#'   Passed to [ReadATACData()]. Metadata and sample vectors use original
++#'   barcodes; fragment mappings use final cell names.
++#' @param assay Name of the chromatin assay, default `"peaks"`.
++#' @param rna.assay Name of the measured RNA assay, default `"RNA"`.
++#'
++#' @details
++#' Gene IDs, rather than potentially duplicated gene symbols, identify RNA
++#' features. Both modalities must contain the same unique barcodes. Their counts
++#' are explicitly aligned to the ATAC barcode order. Peak coordinates in 10x
++#' files are 0-based half-open and are converted to 1-based closed coordinates.
++#' No barcode suffixes are removed and no absent modality is zero-filled.
++#' H5 input requires the optional hdf5r package. Fragment files remain external
++#' references, as described in [ReadATACData()].
++#'
++#' @return A Seurat object with a `ChromatinAssay` and a measured RNA `Assay`,
++#'   both containing raw counts for the same ordered cells. The active assay is
++#'   `assay`. Provenance is stored in `Misc(object, "scop_multiome_input")` and
++#'   in the native ATAC import receipt. Native assay initialization also copies
++#'   raw counts to the data layer; this is not normalized expression.
++#' @seealso [ReadATACData()], [CheckATACData()]
++#' @export
++#' @examples
++#' \dontrun{
++#' multiome <- ReadMultiomeData("filtered_feature_bc_matrix.h5", genome = "hg38")
++#' }
++ReadMultiomeData <- function(
++  object, metadata = NULL, cell.names = NULL,
++  sample = NULL, genome = NULL, annotation = NULL, fragments = NULL,
++  fragment.cells = NULL, assay = "peaks", rna.assay = "RNA",
++  project = "Multiome", verbose = TRUE
++) {
++  if (!is.character(object) || length(object) != 1L || is.na(object) || !file.exists(object)) {
++    log_message("object must identify one existing local 10x ARC file or directory.", message_type = "error")
++  }
++  if (!atac_unique_ids(rna.assay) || length(rna.assay) != 1L ||
++    !identical(make.names(rna.assay), rna.assay) || identical(rna.assay, assay)) {
++    log_message("rna.assay must be one syntactically valid name distinct from assay.", message_type = "error")
++  }
++  path <- normalizePath(object, mustWork = TRUE)
++  log_message("Reading paired 10x RNA and ATAC counts...", message_type = "running", verbose = verbose)
++  if (dir.exists(path)) {
++    files <- file.path(path, c("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz"))
++    if (!all(file.exists(files))) {
++      log_message("A 10x ARC directory requires matrix.mtx.gz, features.tsv.gz and barcodes.tsv.gz.", message_type = "error")
++    }
++    features <- utils::read.delim(files[[2L]], header = FALSE, colClasses = "character")
++    if (ncol(features) < 3L || !atac_unique_ids(features[[1L]]) ||
++      !setequal(unique(features[[3L]]), c("Gene Expression", "Peaks"))) {
++      log_message("features.tsv.gz must contain unique feature IDs and exactly Gene Expression and Peaks modalities.", message_type = "error")
++    }
++    matrices <- Seurat::Read10X(
++      data.dir = unname(path), gene.column = 1L,
++      unique.features = TRUE, strip.suffix = FALSE
++    )
++    source <- "10x_arc_matrix_market"
++  } else {
++    atac_backend_fun("hdf5r", "h5version")
++    matrices <- Seurat::Read10X_h5(filename = path, use.names = FALSE, unique.features = FALSE)
++    files <- path
++    source <- "10x_arc_h5"
++  }
++  if (!is.list(matrices) || !setequal(names(matrices), c("Gene Expression", "Peaks")) ||
++    length(matrices) != 2L) {
++    log_message("The source must contain exactly one Gene Expression and one Peaks matrix.", message_type = "error")
++  }
++  peaks <- matrices[["Peaks"]]
++  rna <- matrices[["Gene Expression"]]
++  if (source == "10x_arc_h5" && (is.null(dim(peaks)) || is.null(dim(rna)))) {
++    log_message("The native Seurat H5 reader dropped matrix dimensions; H5 input requires at least two features per modality and two cells.", message_type = "error")
++  }
++  for (counts in list(peaks, rna)) {
++    problems <- atac_counts_problems(counts)
++    if (length(problems)) log_message(paste(problems, collapse = " "), message_type = "error")
++  }
++  if (!setequal(colnames(peaks), colnames(rna))) {
++    log_message("RNA and ATAC barcodes must match exactly; cells cannot be silently intersected or filled.", message_type = "error")
++  }
++  rna <- rna[, colnames(peaks), drop = FALSE]
++  ids <- rownames(peaks)
++  fields <- regmatches(ids, regexec("^(.+):([0-9]+)-([0-9]+)$", ids))
++  if (any(lengths(fields) != 4L)) {
++    log_message("10x peak IDs must use chromosome:start-end BED coordinates.", message_type = "error")
++  }
++  ranges <- atac_bed_ranges(as.data.frame(do.call(rbind, lapply(fields, `[`, 2:4)),
++    stringsAsFactors = FALSE
++  ))
++  names(ranges) <- ids
++  result <- ReadATACData(peaks,
++    ranges = ranges, metadata = metadata,
++    cell.names = cell.names, sample = sample, genome = genome, annotation = annotation,
++    fragments = fragments, fragment.cells = fragment.cells, assay = assay,
++    project = project, verbose = verbose
++  )
++  atac_new_assay_name(result, rna.assay)
++  colnames(rna) <- colnames(result[[assay]])
++  rna_object <- SeuratObject::CreateAssayObject(counts = rna)
++  if (!identical(as.vector(rownames(rna_object)), as.vector(rownames(rna)))) {
++    log_message("Native RNA assay creation changed gene IDs; provide IDs supported by Seurat.", message_type = "error")
++  }
++  result[[rna.assay]] <- rna_object
++  receipt <- SeuratObject::Misc(result[[assay]], "scop_atac_input")
++  receipt$source <- source
++  receipt$files <- files
++  receipt$input_coordinate_system <- "0-based half-open"
++  result[[assay]]@misc$scop_atac_input <- receipt
++  SeuratObject::Misc(result, "scop_multiome_input") <- list(
++    source = source,
++    files = files, peak_assay = assay, expression_assay = rna.assay,
++    cells = colnames(result[[assay]]), input_barcodes = colnames(peaks),
++    genes = rownames(rna), peaks = rownames(result[[assay]]),
++    expression_source = "measured Gene Expression counts from the same 10x ARC matrix",
++    backend = c(
++      Seurat = as.character(utils::packageVersion("Seurat")),
++      Signac = as.character(utils::packageVersion("Signac"))
++    )
++  )
++  result
++}
+diff --git a/_pkgdown.yml b/_pkgdown.yml
+index 19f9b4c35..3ac46789a 100644
+--- a/_pkgdown.yml
++++ b/_pkgdown.yml
+@@ -97,6 +97,12 @@ reference:
+   - theme_scop
+   - theme_spatial
+ 
++- subtitle: "ATAC Input"
++- contents:
++  - ReadATACData
++  - ReadMultiomeData
++  - CheckATACData
++
+ - subtitle: "Quality Control"
+ - contents:
+   - RunDoubletDetection
+diff --git a/man/CheckATACData.Rd b/man/CheckATACData.Rd
+new file mode 100644
+index 000000000..fad0e6c93
+--- /dev/null
++++ b/man/CheckATACData.Rd
+@@ -0,0 +1,51 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/CheckATACData.R
++\name{CheckATACData}
++\alias{CheckATACData}
++\title{Check an ATAC object without changing it}
++\usage{
++CheckATACData(object, assay = NULL, genome = NULL, sample.by = NULL)
++}
++\arguments{
++\item{object}{A Seurat object with a Signac \code{ChromatinAssay}.}
++
++\item{assay}{Assay to check; defaults to the object's default assay.}
++
++\item{genome}{Optional expected genome label. Unknown references are
++reported, never inferred from chromosome spelling.}
++
++\item{sample.by}{Optional metadata column containing sample IDs. This checks
++complete labels, not whether samples are independent biological replicates.}
++}
++\value{
++A list with \code{valid}, \code{errors}, \code{warnings}, \code{assay}, \code{n_cells},
++\code{n_peaks}, \code{genome}, \code{samples}, a \code{fragments} resource table, and
++\code{fragments_ready}. \code{valid} describes the matrix contract. Fragment readiness
++checks local file/index existence and cell mapping for resources with cells
++in the selected assay. The resource table retains all attached files; its
++\code{active} column identifies those required for this assay. Empty mappings
++left by native subsetting do not block readiness. It does not hash files,
++scan their contents, or guarantee fragment-dependent computation will pass.
++Use Signac's \code{ValidateFragments()} for content validation when required.
++}
++\description{
++Report raw-count, peak-coordinate, cell/metadata and reference alignment for
++an existing Seurat \code{ChromatinAssay}. Fragment path/index availability is
++reported separately, so an otherwise valid matrix can be analysed without
++fragments. This check does not install packages, retrieve resources, modify
++the object, or inspect dependencies of downstream optional analyses.
++}
++\examples{
++counts <- Matrix::sparseMatrix(
++  i = c(1, 2), j = c(1, 2), x = c(2, 3), dims = c(2, 2),
++  dimnames = list(c("p1", "p2"), c("cell1", "cell2"))
++)
++ranges <- GenomicRanges::GRanges(c("chr1:1-50", "chr1:101-150"))
++object <- ReadATACData(counts, ranges = ranges, genome = "hg38")
++report <- CheckATACData(object)
++report$valid
++report$fragments_ready
++}
++\seealso{
++\code{\link[=ReadATACData]{ReadATACData()}}, \code{\link[=RunStandardWorkflow]{RunStandardWorkflow()}}
++}
+diff --git a/man/ReadATACData.Rd b/man/ReadATACData.Rd
+new file mode 100644
+index 000000000..38dc8b566
+--- /dev/null
++++ b/man/ReadATACData.Rd
+@@ -0,0 +1,112 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/ReadATACData.R
++\name{ReadATACData}
++\alias{ReadATACData}
++\title{Read raw ATAC counts into a ChromatinAssay}
++\usage{
++ReadATACData(
++  object,
++  ranges = NULL,
++  metadata = NULL,
++  peaks.file = NULL,
++  barcodes.file = NULL,
++  cell.names = NULL,
++  sample = NULL,
++  genome = NULL,
++  annotation = NULL,
++  fragments = NULL,
++  fragment.cells = NULL,
++  assay = "peaks",
++  project = "ATAC",
++  verbose = TRUE
++)
++}
++\arguments{
++\item{object}{A numeric sparse peak-by-cell matrix, a local 10x ATAC/ARC
++H5 path, or a local Matrix Market path. Separate matrices with different peak
++universes must be recounted before combining; this function never fills
++unmeasured peaks with zeros.
++The supported Signac constructor requires at least two cells and two peaks.}
++
++\item{ranges}{A \code{GRanges} in 1-based closed coordinates, required with
++a sparse matrix. Named ranges are aligned to the matrix row names; unnamed ranges
++explicitly use matrix row order. Duplicate genomic intervals are rejected.}
++
++\item{metadata}{Optional data frame with unique row names matching the input
++matrix cell IDs exactly. Rows are reordered by ID, never by position.
++Supplied \verb{nCount_<assay>}/\verb{nFeature_<assay>} columns must agree with the
++raw matrix; conflicting QC metadata is rejected.}
++
++\item{peaks.file, barcodes.file}{Three-column peaks BED and one-column
++barcode paths, both required when \code{object} is a Matrix Market path.
++Gzip compression is supported. Without companion files a path is read as
++H5, importing only the explicitly declared \code{Peaks} modality from its
++standard feature table; H5 requires optional \code{hdf5r}.
++BED and 10x H5 peak IDs use 0-based half-open coordinates, converted to
++1-based closed \code{GRanges} (start + 1, end unchanged).}
++
++\item{cell.names}{Optional unique final cell IDs, in input column order.
++For example, explicitly prefix barcodes from separate captures. Suffixes
++are never removed or guessed.}
++
++\item{sample}{Optional single sample ID, or a named character vector keyed
++by input cell IDs, stored as \code{sample} metadata. A sample label does not
++establish biological replication; retain donor/condition/capture metadata.}
++
++\item{genome}{Optional genome label such as \code{"hg38"}, checked against known
++labels on \code{ranges} and \code{annotation}. This sets a label, not a reference
++download. Supply seqlengths in \code{ranges} for chromosome-bound checks.}
++
++\item{annotation}{Optional Signac-compatible gene annotation \code{GRanges}.}
++
++\item{fragments}{Optional local fragment path(s). Files must be bgzip
++compressed and indexed. Signac validates the paths and barcode membership.}
++
++\item{fragment.cells}{Explicit fragment barcode mapping: a named character
++vector for one file, or a list of vectors in \code{fragments} order. Vector
++names are final object cell IDs; values are exact barcodes in that file.
++Multiple files require disjoint mappings covering every imported cell.
++With one file and no mapping, input matrix barcodes are used unchanged.}
++
++\item{assay}{Name of the new chromatin assay.}
++
++\item{project}{Project name passed to \code{CreateSeuratObject()}.}
++
++\item{verbose}{Whether Signac prints progress messages.}
++}
++\value{
++A Seurat object containing a Signac \code{ChromatinAssay} with raw counts.
++}
++\description{
++Import one explicitly shared peak universe from a sparse matrix and genomic
++ranges, a 10x ATAC/ARC H5 file, or Matrix Market/peaks BED/barcodes files.
++SCOP checks and aligns identifiers; Signac creates the native assay. No cells
++or peaks are filtered, and no resources are downloaded or installed.
++}
++\details{
++Signac uses genomic coordinates as feature names. Original matrix feature
++IDs are retained in assay feature metadata \code{input_peak_id}; input barcodes
++are retained as cell metadata \code{input_barcode}. Import provenance is stored
++next to the data in \code{Misc(object[[assay]], "scop_atac_input")}.
++
++Fragment files remain external references. \code{saveRDS()} does not copy them.
++After \code{readRDS()}, use \code{\link[=CheckATACData]{CheckATACData()}} to inspect their availability and
++export its \code{fragments} table as a resource manifest. Missing external files
++do not invalidate otherwise valid matrix-only analysis. Update moved paths
++explicitly using Signac's \code{UpdatePath()}; paths are never repaired silently.
++}
++\examples{
++peaks <- GenomicRanges::makeGRangesFromDataFrame(data.frame(
++  seqnames = c("chr1", "chr1", "chr2"),
++  start = c(1L, 101L, 201L), end = c(50L, 150L, 250L)
++))
++counts <- Matrix::sparseMatrix(
++  i = c(1, 3, 2, 3), j = c(1, 1, 2, 2), x = c(2, 1, 3, 1),
++  dims = c(3, 2), dimnames = list(c("p1", "p2", "p3"), c("AA-1", "BB-1"))
++)
++atac <- ReadATACData(counts, ranges = peaks, genome = "hg38", sample = "S1")
++CheckATACData(atac)$valid
++}
++\seealso{
++\code{\link[=CheckATACData]{CheckATACData()}}, \code{\link[=RunStandardWorkflow]{RunStandardWorkflow()}}
++}
+diff --git a/man/ReadMultiomeData.Rd b/man/ReadMultiomeData.Rd
+new file mode 100644
+index 000000000..e78e996e8
+--- /dev/null
++++ b/man/ReadMultiomeData.Rd
+@@ -0,0 +1,63 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/ReadMultiomeData.R
++\name{ReadMultiomeData}
++\alias{ReadMultiomeData}
++\title{Read paired 10x RNA and ATAC counts}
++\usage{
++ReadMultiomeData(
++  object,
++  metadata = NULL,
++  cell.names = NULL,
++  sample = NULL,
++  genome = NULL,
++  annotation = NULL,
++  fragments = NULL,
++  fragment.cells = NULL,
++  assay = "peaks",
++  rna.assay = "RNA",
++  project = "Multiome",
++  verbose = TRUE
++)
++}
++\arguments{
++\item{object}{Path to one 10x ARC H5 file or one matrix directory containing
++\code{matrix.mtx.gz}, \code{features.tsv.gz} and \code{barcodes.tsv.gz}. The input must
++contain exactly the \verb{Gene Expression} and \code{Peaks} modalities. H5 input
++requires at least two features per modality and two cells because the
++native Seurat H5 reader otherwise drops matrix dimensions.}
++
++\item{metadata, cell.names, sample, genome, annotation, fragments, fragment.cells, project, verbose}{Passed to \code{\link[=ReadATACData]{ReadATACData()}}. Metadata and sample vectors use original
++barcodes; fragment mappings use final cell names.}
++
++\item{assay}{Name of the chromatin assay, default \code{"peaks"}.}
++
++\item{rna.assay}{Name of the measured RNA assay, default \code{"RNA"}.}
++}
++\value{
++A Seurat object with a \code{ChromatinAssay} and a measured RNA \code{Assay},
++both containing raw counts for the same ordered cells. The active assay is
++\code{assay}. Provenance is stored in \code{Misc(object, "scop_multiome_input")} and
++in the native ATAC import receipt. Native assay initialization also copies
++raw counts to the data layer; this is not normalized expression.
++}
++\description{
++Import both measured modalities from one local 10x ARC count
++matrix without dropping cells, normalizing counts, or inferring RNA from ATAC.
++}
++\details{
++Gene IDs, rather than potentially duplicated gene symbols, identify RNA
++features. Both modalities must contain the same unique barcodes. Their counts
++are explicitly aligned to the ATAC barcode order. Peak coordinates in 10x
++files are 0-based half-open and are converted to 1-based closed coordinates.
++No barcode suffixes are removed and no absent modality is zero-filled.
++H5 input requires the optional hdf5r package. Fragment files remain external
++references, as described in \code{\link[=ReadATACData]{ReadATACData()}}.
++}
++\examples{
++\dontrun{
++multiome <- ReadMultiomeData("filtered_feature_bc_matrix.h5", genome = "hg38")
++}
++}
++\seealso{
++\code{\link[=ReadATACData]{ReadATACData()}}, \code{\link[=CheckATACData]{CheckATACData()}}
++}
+diff --git a/tests/testthat/test-atac-input.R b/tests/testthat/test-atac-input.R
+new file mode 100644
+index 000000000..b25fa0d69
+--- /dev/null
++++ b/tests/testthat/test-atac-input.R
+@@ -0,0 +1,371 @@
++make_atac_input <- function() {
++  counts <- Matrix::sparseMatrix(
++    i = c(1L, 3L, 2L, 3L, 1L), j = c(1L, 1L, 2L, 2L, 3L),
++    x = c(2, 1, 3, 1, 4), dims = c(3L, 3L),
++    dimnames = list(c("peak1", "peak2", "peak3"), c("AA-1", "BB-1", "CC-1"))
++  )
++  ranges <- GenomicRanges::makeGRangesFromDataFrame(data.frame(
++    seqnames = c("chr1", "chr1", "chr2"),
++    start = c(1L, 101L, 201L), end = c(50L, 150L, 250L)
++  ))
++  names(ranges) <- rownames(counts)
++  list(counts = counts, ranges = ranges)
++}
++
++test_that("ATAC imports preserve raw counts and explicitly align peaks, cells and samples", {
++  x <- make_atac_input()
++  meta <- data.frame(condition = c("stim", "ctrl", "ctrl"), row.names = c("CC-1", "AA-1", "BB-1"))
++  samples <- c("CC-1" = "D2", "BB-1" = "D1", "AA-1" = "D1")
++  object <- ReadATACData(x$counts,
++    ranges = x$ranges[c(3, 1, 2)], metadata = meta,
++    cell.names = paste0("capture1_", colnames(x$counts)), sample = samples, genome = "hg38"
++  )
++  expect_s4_class(object[["peaks"]], "ChromatinAssay")
++  actual <- SeuratObject::GetAssayData(object, assay = "peaks", layer = "counts")
++  expect_equal(unname(actual), unname(x$counts))
++  expect_identical(rownames(actual), c("chr1-1-50", "chr1-101-150", "chr2-201-250"))
++  expect_identical(unname(object$input_barcode), colnames(x$counts))
++  expect_identical(unname(object$sample), c("D1", "D1", "D2"))
++  expect_identical(unname(object$condition), c("ctrl", "ctrl", "stim"))
++  expect_identical(object[["peaks"]][[]]$input_peak_id, rownames(x$counts))
++  before <- serialize(object, NULL)
++  report <- CheckATACData(object, assay = "peaks", genome = "hg38", sample.by = "sample")
++  expect_true(report$valid)
++  expect_false(report$fragments_ready)
++  expect_equal(as.integer(report$samples), c(2L, 1L))
++  expect_identical(before, serialize(object, NULL))
++  expect_false(CheckATACData(object, genome = "hg19")$valid)
++  zero_counts <- x$counts
++  zero_counts[1, ] <- 0
++  zero_counts[, 1] <- 0
++  zeros <- ReadATACData(zero_counts, ranges = x$ranges)
++  expect_identical(dim(zeros), dim(x$counts))
++  expect_equal(sum(SeuratObject::GetAssayData(zeros, layer = "counts")), sum(zero_counts))
++})
++
++test_that("ATAC import rejects ambiguous IDs and non-raw counts", {
++  x <- make_atac_input()
++  for (value in c(-1, 0.5, Inf, NA_real_)) {
++    bad <- x$counts
++    bad@x[1] <- value
++    expect_error(ReadATACData(bad, ranges = x$ranges), "non-negative integers")
++  }
++  expect_error(ReadATACData(as.matrix(x$counts), ranges = x$ranges), "sparse matrix")
++  expect_error(ReadATACData(list(x$counts, x$counts), ranges = x$ranges), "sparse matrix")
++  expect_error(ReadATACData(x$counts[, 1, drop = FALSE], ranges = x$ranges), "at least two cells")
++  expect_error(ReadATACData(x$counts[1, , drop = FALSE], ranges = x$ranges[1]), "two peaks")
++  bad <- x$counts
++  colnames(bad)[2] <- colnames(bad)[1]
++  expect_error(ReadATACData(bad, ranges = x$ranges), "Cell IDs")
++  bad <- x$counts
++  rownames(bad)[2] <- rownames(bad)[1]
++  expect_error(ReadATACData(bad, ranges = x$ranges), "Peak IDs")
++  bad_ranges <- x$ranges
++  names(bad_ranges)[1] <- "other_peak"
++  expect_error(ReadATACData(x$counts, ranges = bad_ranges), "Named ranges")
++  expect_error(ReadATACData(x$counts, ranges = x$ranges[1:2]), "one interval")
++  bad_ranges <- x$ranges[c(1, 1, 3)]
++  expect_error(ReadATACData(x$counts, ranges = bad_ranges), "Duplicate genomic")
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, sample = c("S1", "S2", "S2")), "named by all")
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, metadata = data.frame(a = 1:3)), "matching input cell")
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, cell.names = c("A", "A", "B")), "unique non-empty")
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, fragment.cells = c(a = "AA-1")), "requires fragments")
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, peaks.file = "anything"), "only used with a Matrix Market path")
++})
++
++test_that("ATAC import handles reference labels and chromosome boundaries without downloads", {
++  x <- make_atac_input()
++  GenomeInfoDb::genome(x$ranges) <- "hg38"
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, genome = "hg19"), "Genome labels")
++  annotation <- x$ranges
++  GenomeInfoDb::genome(annotation) <- "hg19"
++  expect_error(ReadATACData(x$counts, ranges = x$ranges, annotation = annotation), "Genome labels")
++  bad <- x$ranges
++  suppressWarnings(GenomeInfoDb::seqlengths(bad) <- c(chr1 = 100L, chr2 = 500L))
++  expect_error(ReadATACData(x$counts, ranges = bad), "chromosome lengths")
++  bad <- x$ranges
++  GenomicRanges::start(bad)[1] <- 0L
++  expect_error(ReadATACData(x$counts, ranges = bad), "positive 1-based")
++  x$ranges <- unname(x$ranges)
++  object <- ReadATACData(x$counts, ranges = x$ranges)
++  expect_true(CheckATACData(object, genome = "hg38")$valid)
++})
++
++test_that("BED imports convert zero-based starts and retain all cells and peaks", {
++  x <- make_atac_input()
++  directory <- tempfile("atac_mtx_")
++  dir.create(directory)
++  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
++  Matrix::writeMM(x$counts, file.path(directory, "matrix.mtx"))
++  writeLines(c("chr1\t0\t50", "chr1\t100\t150", "chr2\t200\t250"), file.path(directory, "peaks.bed"))
++  writeLines(colnames(x$counts), file.path(directory, "barcodes.tsv"))
++  for (file in c("matrix.mtx", "peaks.bed", "barcodes.tsv")) {
++    input <- readBin(file.path(directory, file), what = "raw", n = file.info(file.path(directory, file))$size)
++    con <- gzfile(file.path(directory, paste0(file, ".gz")), "wb")
++    writeBin(input, con)
++    close(con)
++  }
++  object <- ReadATACData(file.path(directory, "matrix.mtx.gz"),
++    peaks.file = file.path(directory, "peaks.bed.gz"), barcodes.file = file.path(directory, "barcodes.tsv.gz")
++  )
++  expect_identical(GenomicRanges::start(Signac::granges(object[["peaks"]])), c(1L, 101L, 201L))
++  expect_equal(unname(SeuratObject::GetAssayData(object, layer = "counts")), unname(x$counts))
++  expect_identical(object[["peaks"]][[]]$input_peak_id, c("chr1:0-50", "chr1:100-150", "chr2:200-250"))
++  expect_identical(dim(object), c(3L, 3L))
++  writeLines(c("chr1\t50\t50", "chr1\t100\t150", "chr2\t200\t250"), file.path(directory, "peaks.bed"))
++  expect_error(ReadATACData(file.path(directory, "matrix.mtx"),
++    peaks.file = file.path(directory, "peaks.bed"), barcodes.file = file.path(directory, "barcodes.tsv")
++  ), "end greater")
++})
++
++test_that("H5 import uses the real Seurat reader and selects only the Peaks modality", {
++  skip_if_not_installed("hdf5r")
++  x <- make_atac_input()
++  path <- tempfile(fileext = ".h5")
++  on.exit(unlink(path), add = TRUE)
++  h5 <- hdf5r::H5File$new(path, mode = "w")
++  matrix <- h5$create_group("matrix")
++  features <- matrix$create_group("features")
++  counts <- rbind(x$counts, Matrix::Matrix(c(5, 0, 8), nrow = 1L, sparse = TRUE))
++  matrix[["data"]] <- counts@x
++  matrix[["indices"]] <- counts@i
++  matrix[["indptr"]] <- counts@p
++  matrix[["shape"]] <- dim(counts)
++  matrix[["barcodes"]] <- colnames(counts)
++  features[["id"]] <- c("chr1:0-50", "chr1:100-150", "chr2:200-250", "ENSG1")
++  features[["name"]] <- c("chr1:0-50", "chr1:100-150", "chr2:200-250", "GENE1")
++  features[["feature_type"]] <- c("Peaks", "Peaks", "Peaks", "Gene Expression")
++  h5$close_all()
++  object <- suppressMessages(ReadATACData(path, genome = "hg38"))
++  expect_true(CheckATACData(object, genome = "hg38")$valid)
++  expect_identical(dim(object), c(3L, 3L))
++  expect_equal(unname(SeuratObject::GetAssayData(object, layer = "counts")), unname(x$counts))
++  expect_identical(GenomicRanges::start(Signac::granges(object[["peaks"]])), c(1L, 101L, 201L))
++})
++
++test_that("fragment mappings distinguish repeated barcodes across captures and survive reload", {
++  skip_if_not_installed("Rsamtools")
++  x <- make_atac_input()
++  counts <- cbind(x$counts[, 1:2], x$counts[, 1:2])
++  colnames(counts) <- c("S1_AA-1", "S1_BB-1", "S2_AA-1", "S2_BB-1")
++  directory <- tempfile("atac_fragments_")
++  dir.create(directory)
++  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
++  paths <- file.path(directory, c("s1.tsv.gz", "s2.tsv.gz"))
++  for (path in paths) {
++    plain <- sub(".gz$", "", path)
++    writeLines(c("chr1\t0\t50\tAA-1\t1", "chr1\t100\t150\tBB-1\t2"), plain)
++    Rsamtools::bgzip(plain, dest = path, overwrite = TRUE)
++    Rsamtools::indexTabix(path, format = "bed")
++  }
++  maps <- list(
++    c("S1_AA-1" = "AA-1", "S1_BB-1" = "BB-1"),
++    c("S2_AA-1" = "AA-1", "S2_BB-1" = "BB-1")
++  )
++  expect_error(ReadATACData(counts,
++    ranges = x$ranges,
++    fragments = c(paths[1], file.path(directory, ".", "s1.tsv.gz")),
++    fragment.cells = maps
++  ), "different files")
++  expect_error(ReadATACData(counts, ranges = x$ranges, fragments = paths), "explicit named")
++  expect_error(ReadATACData(counts,
++    ranges = x$ranges, fragments = paths,
++    fragment.cells = list(maps[[1]], maps[[1]])
++  ), "exactly once")
++  absent <- maps
++  absent[[2]][1] <- "NOT_IN_FILE-1"
++  expect_error(ReadATACData(counts,
++    ranges = x$ranges, fragments = paths,
++    fragment.cells = absent, verbose = FALSE
++  ), "[Cc]ells")
++  renamed <- ReadATACData(x$counts[, 1:2],
++    ranges = x$ranges,
++    cell.names = names(maps[[1]]), fragments = paths[1], verbose = FALSE
++  )
++  renamed_map <- Signac::GetFragmentData(Signac::Fragments(renamed[["peaks"]])[[1]], "cells")
++  expect_identical(unname(renamed_map), unname(maps[[1]]))
++  expect_identical(as.character(names(renamed_map)), as.character(names(maps[[1]])))
++  object <- ReadATACData(counts, ranges = x$ranges, fragments = paths, fragment.cells = maps, verbose = FALSE)
++  report <- CheckATACData(object)
++  expect_true(report$valid)
++  expect_true(report$fragments_ready)
++  expect_equal(report$fragments$n_cells, c(2L, 2L))
++  expect_identical(Signac::GetFragmentData(Signac::Fragments(object[["peaks"]])[[2]], "cells"), maps[[2]])
++  saveRDS(object, file.path(directory, "object.rds"))
++  restored <- readRDS(file.path(directory, "object.rds"))
++  expect_equal(CheckATACData(restored), report)
++  bad <- restored
++  bad[["peaks"]]@fragments[[1]]@cells[] <- "AA-1"
++  expect_true(CheckATACData(bad)$valid)
++  expect_false(CheckATACData(bad)$fragments_ready)
++  capture <- subset(restored, cells = names(maps[[1]]))
++  capture_report <- CheckATACData(capture)
++  expect_true(capture_report$fragments_ready)
++  expect_identical(capture_report$fragments$active, c(TRUE, FALSE))
++  expect_equal(capture_report$fragments$n_cells, c(2L, 0L))
++  incomplete <- capture
++  incomplete[["peaks"]]@fragments[[1]]@cells <- maps[[1]][1L]
++  expect_false(CheckATACData(incomplete)$fragments_ready)
++  unlink(paths[2])
++  inactive_missing <- CheckATACData(capture)
++  expect_true(inactive_missing$fragments_ready)
++  expect_false(inactive_missing$fragments$file_exists[2L])
++  expect_identical(inactive_missing$warnings, capture_report$warnings)
++  unlink(paths[1])
++  expect_false(CheckATACData(capture)$fragments_ready)
++  missing <- CheckATACData(restored)
++  expect_true(missing$valid)
++  expect_false(missing$fragments_ready)
++  expect_match(paste(missing$warnings, collapse = " "), "missing")
++  expect_equal(unname(SeuratObject::GetAssayData(restored, layer = "counts")), unname(counts))
++})
++
++test_that("ATAC checks return useful invalid reports without altering existing objects", {
++  expect_false(CheckATACData(matrix(0, 2, 2))$valid)
++  x <- make_atac_input()
++  object <- ReadATACData(x$counts, ranges = x$ranges)
++  expect_false(CheckATACData(object, assay = "missing")$valid)
++  expect_false(CheckATACData(object, sample.by = "absent")$valid)
++  object$sample <- c("A", NA, "B")
++  expect_false(CheckATACData(object, sample.by = "sample")$valid)
++  object[["peaks"]]@ranges <- object[["peaks"]]@ranges[c(3, 1, 2)]
++  report <- CheckATACData(object)
++  expect_false(report$valid)
++  expect_match(paste(report$errors, collapse = " "), "not aligned")
++})
++
++test_that("existing native assay seqinfo contributes reference and bounds checks", {
++  x <- make_atac_input()
++  seqinfo <- GenomeInfoDb::Seqinfo(
++    seqnames = c("chr1", "chr2"),
++    seqlengths = c(1000L, 1000L), genome = "hg38"
++  )
++  chromatin <- Signac::CreateChromatinAssay(counts = x$counts, ranges = x$ranges, genome = seqinfo)
++  object <- SeuratObject::CreateSeuratObject(chromatin, assay = "peaks")
++  expect_true(CheckATACData(object, genome = "hg38")$valid)
++  GenomeInfoDb::genome(object[["peaks"]]@ranges) <- "hg19"
++  expect_false(CheckATACData(object)$valid)
++  GenomeInfoDb::genome(object[["peaks"]]@ranges) <- NA_character_
++  GenomeInfoDb::seqlengths(object[["peaks"]]@seqinfo) <- c(100L, 1000L)
++  expect_false(CheckATACData(object)$valid)
++  expect_match(paste(CheckATACData(object)$errors, collapse = " "), "assay seqinfo")
++})
++
++test_that("optional ATAC backends are checked without installation", {
++  testthat::local_mocked_bindings(check_r = function(pkg, install, verbose) {
++    expect_false(install)
++    expect_false(verbose)
++    FALSE
++  }, .package = "scop")
++  expect_error(scop:::atac_backend_fun("missing_atac_backend", "fun"), "install it separately")
++})
++
++test_that("native ID cache attributes do not masquerade as an alignment change", {
++  skip_if_not_installed("fastmatch")
++  ranges <- GenomicRanges::makeGRangesFromDataFrame(data.frame(
++    seqnames = "chr1",
++    start = c(1L, 101L), end = c(50L, 150L)
++  ))
++  counts <- Matrix::Matrix(matrix(c(1L, 0L, 0L, 2L), 2L, 2L,
++    dimnames = list(c("p1", "p2"), c("cell1", "cell2"))
++  ), sparse = TRUE)
++  cells <- c("A-1", "B-1")
++  fastmatch::fmatch("A-1", cells)
++  expect_false(is.null(attr(cells, ".match.hash")))
++  object <- ReadATACData(counts,
++    ranges = ranges, cell.names = cells,
++    genome = "hg38", verbose = FALSE
++  )
++  expect_identical(as.vector(colnames(object)), c("A-1", "B-1"))
++  expect_identical(rownames(object), c("chr1-1-50", "chr1-101-150"))
++  peak_ids <- rownames(object)
++  fastmatch::fmatch(peak_ids[[1]], peak_ids)
++  expect_false(is.null(attr(peak_ids, ".match.hash")))
++  object[["peaks"]]@counts@Dimnames[[1L]] <- peak_ids
++  expect_true(CheckATACData(object)$valid)
++  object@assays[["peaks"]]@counts@Dimnames[[1L]] <- rev(as.vector(peak_ids))
++  expect_false(CheckATACData(object)$valid)
++})
++
++
++test_that("imported QC metadata cannot silently contradict the raw matrix", {
++  x <- make_atac_input()
++  metadata <- data.frame(
++    nCount_peaks = Matrix::colSums(x$counts),
++    nFeature_peaks = Matrix::colSums(x$counts > 0), row.names = colnames(x$counts)
++  )
++  object <- ReadATACData(x$counts, ranges = x$ranges, metadata = metadata, verbose = FALSE)
++  expect_identical(object[[]][, names(metadata)], metadata)
++  metadata$nCount_peaks[1] <- 0
++  expect_error(
++    ReadATACData(x$counts, ranges = x$ranges, metadata = metadata, verbose = FALSE),
++    "conflicts with the imported raw count matrix"
++  )
++  names(metadata)[1] <- ""
++  expect_error(
++    ReadATACData(x$counts, ranges = x$ranges, metadata = metadata, verbose = FALSE),
++    "[Mm]etadata must be a data frame"
++  )
++})
++
++
++test_that("single-modality H5 requires explicit Peaks rather than coordinate-like RNA IDs", {
++  skip_if_not_installed("hdf5r")
++  counts <- Matrix::sparseMatrix(
++    i = c(1, 2), j = c(1, 2), x = c(2, 3),
++    dims = c(2, 2), dimnames = list(c("chr1:0-50", "chr1:100-150"), c("A-1", "B-1"))
++  )
++  path <- tempfile(fileext = ".h5")
++  on.exit(unlink(path), add = TRUE)
++  file <- hdf5r::H5File$new(path, mode = "w")
++  matrix <- file$create_group("matrix")
++  features <- matrix$create_group("features")
++  matrix[["data"]] <- counts@x
++  matrix[["indices"]] <- counts@i
++  matrix[["indptr"]] <- counts@p
++  matrix[["shape"]] <- dim(counts)
++  matrix[["barcodes"]] <- colnames(counts)
++  features[["id"]] <- rownames(counts)
++  features[["name"]] <- rownames(counts)
++  features[["feature_type"]] <- rep("Gene Expression", 2)
++  file$close_all()
++  expect_error(ReadATACData(path, verbose = FALSE), "explicitly declare a Peaks modality")
++  file <- hdf5r::H5File$new(path, mode = "r+")
++  file$link_delete("matrix/features/feature_type")
++  file$close_all()
++  expect_error(ReadATACData(path, verbose = FALSE), "feature_type table")
++})
++
++
++test_that("native barcode caches are not imported as metadata identity", {
++  skip_if_not_installed("fastmatch")
++  x <- make_atac_input()
++  fastmatch::fmatch(colnames(x$counts), colnames(x$counts))
++  expect_false(is.null(attr(colnames(x$counts), ".match.hash")))
++  metadata <- data.frame(group = c("A", "B", "B"), row.names = as.vector(colnames(x$counts)))
++  object <- ReadATACData(x$counts, ranges = x$ranges, metadata = metadata, verbose = FALSE)
++  expect_identical(unname(object$group), metadata$group)
++  expect_identical(as.vector(object$input_barcode), as.vector(colnames(x$counts)))
++})
++
++test_that("ATAC backends resolve public re-exported genomic accessors", {
++  for (fun in c("seqnames", "seqinfo", "start")) {
++    expect_identical(
++      scop:::atac_backend_fun("GenomicRanges", fun),
++      getExportedValue("GenomicRanges", fun)
++    )
++  }
++  for (fun in c("seqnames", "seqinfo", "genome", "genome<-", "seqlengths")) {
++    expect_identical(
++      scop:::atac_backend_fun("GenomeInfoDb", fun),
++      getExportedValue("GenomeInfoDb", fun)
++    )
++  }
++})
++
++test_that("ATAC backends report a missing public function", {
++  expect_error(
++    scop:::atac_backend_fun("GenomicRanges", "missing_atac_function"),
++    "not an exported object"
++  )
++})
+diff --git a/tests/testthat/test-atac-multiome-input.R b/tests/testthat/test-atac-multiome-input.R
+new file mode 100644
+index 000000000..84e4edfd0
+--- /dev/null
++++ b/tests/testthat/test-atac-multiome-input.R
+@@ -0,0 +1,122 @@
++make_multiome_input_fixture <- function() {
++  skip_if_not_installed("Signac")
++  skip_if_not_installed("GenomicRanges")
++  counts <- Matrix::Matrix(matrix(c(
++    1, 0, 2, 5, 0, 3, 1, 0, 2, 6, 7, 1,
++    0, 3, 4, 2, 1, 8
++  ), nrow = 6L), sparse = TRUE)
++  rownames(counts) <- c("chr1:0-50", "chr1:100-150", "chr2:200-250", "ENSG1", "ENSG2", "ENSG3")
++  colnames(counts) <- c("AA-1", "BB-1", "CC-1")
++  list(counts = counts, type = rep(c("Peaks", "Gene Expression"), each = 3L))
++}
++
++test_that("paired 10x H5 ingestion retains both actual native count modalities", {
++  skip_if_not_installed("hdf5r")
++  x <- make_multiome_input_fixture()
++  path <- tempfile(fileext = ".h5")
++  on.exit(unlink(path), add = TRUE)
++  h5 <- hdf5r::H5File$new(path, mode = "w")
++  matrix <- h5$create_group("matrix")
++  features <- matrix$create_group("features")
++  matrix[["data"]] <- x$counts@x
++  matrix[["indices"]] <- x$counts@i
++  matrix[["indptr"]] <- x$counts@p
++  matrix[["shape"]] <- dim(x$counts)
++  matrix[["barcodes"]] <- colnames(x$counts)
++  features[["id"]] <- rownames(x$counts)
++  features[["name"]] <- c(rownames(x$counts)[1:3], "DUP", "DUP", "GENE3")
++  features[["feature_type"]] <- x$type
++  h5$close_all()
++  native <- suppressMessages(Seurat::Read10X_h5(path, use.names = FALSE, unique.features = FALSE))
++  object <- suppressMessages(ReadMultiomeData(path,
++    genome = "hg38", sample = "capture1",
++    cell.names = paste0("capture1_", colnames(x$counts)), verbose = FALSE
++  ))
++  expect_s4_class(object[["peaks"]], "ChromatinAssay")
++  expect_s4_class(object[["RNA"]], "Assay")
++  expect_equal(unname(SeuratObject::GetAssayData(object, assay = "peaks", layer = "counts")), unname(native$Peaks))
++  expect_equal(unname(SeuratObject::GetAssayData(object, assay = "RNA", layer = "counts")), unname(native[["Gene Expression"]]))
++  expect_identical(rownames(object[["RNA"]]), c("ENSG1", "ENSG2", "ENSG3"))
++  expect_identical(as.vector(colnames(object[["RNA"]])), as.vector(colnames(object[["peaks"]])))
++  expect_identical(GenomicRanges::start(Signac::granges(object[["peaks"]])), c(1L, 101L, 201L))
++  expect_identical(SeuratObject::DefaultAssay(object), "peaks")
++  expect_identical(SeuratObject::Misc(object[["peaks"]], "scop_atac_input")$input_coordinate_system, "0-based half-open")
++  receipt <- SeuratObject::Misc(object, "scop_multiome_input")
++  expect_identical(receipt$expression_assay, "RNA")
++  expect_identical(receipt$input_barcodes, colnames(x$counts))
++  expect_identical(as.vector(object$sample), rep("capture1", 3))
++})
++
++test_that("paired compressed Matrix Market imports preserve feature IDs and barcodes", {
++  x <- make_multiome_input_fixture()
++  directory <- tempfile("multiome_mtx_")
++  dir.create(directory)
++  on.exit(unlink(directory, recursive = TRUE), add = TRUE)
++  Matrix::writeMM(x$counts, file.path(directory, "matrix.mtx"))
++  writeLines(colnames(x$counts), file.path(directory, "barcodes.tsv"))
++  features <- data.frame(id = rownames(x$counts), name = rownames(x$counts), type = x$type)
++  utils::write.table(features, file.path(directory, "features.tsv"),
++    sep = "\t", quote = FALSE,
++    row.names = FALSE, col.names = FALSE
++  )
++  for (file in c("matrix.mtx", "features.tsv", "barcodes.tsv")) {
++    input <- readBin(file.path(directory, file), "raw", n = file.info(file.path(directory, file))$size)
++    con <- gzfile(file.path(directory, paste0(file, ".gz")), "wb")
++    writeBin(input, con)
++    close(con)
++  }
++  object <- suppressMessages(ReadMultiomeData(directory, genome = "hg38", verbose = FALSE))
++  expect_equal(unname(SeuratObject::GetAssayData(object, assay = "RNA", layer = "counts")), unname(x$counts[4:6, ]))
++  expect_equal(unname(SeuratObject::GetAssayData(object, assay = "peaks", layer = "counts")), unname(x$counts[1:3, ]))
++  expect_identical(as.vector(colnames(object)), colnames(x$counts))
++  expect_identical(SeuratObject::Misc(object, "scop_multiome_input")$source, "10x_arc_matrix_market")
++  expect_error(ReadMultiomeData(directory, rna.assay = "peaks"), "distinct")
++  con <- gzfile(file.path(directory, "features.tsv.gz"), "wt")
++  features$id[5] <- features$id[4]
++  utils::write.table(features, con, sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
++  close(con)
++  expect_error(ReadMultiomeData(directory, verbose = FALSE), "unique feature IDs")
++})
++
++test_that("multiome input rejects absent or unpaired modalities rather than inventing RNA", {
++  x <- make_multiome_input_fixture()
++  path <- tempfile()
++  writeLines("contract-test placeholder", path)
++  on.exit(unlink(path), add = TRUE)
++  testthat::local_mocked_bindings(atac_backend_fun = function(package, fun) identity, .package = "scop")
++  testthat::local_mocked_bindings(Read10X_h5 = function(filename, use.names, unique.features) {
++    list(Peaks = x$counts[1:3, ])
++  }, .package = "Seurat")
++  expect_error(ReadMultiomeData(path, verbose = FALSE), "one Gene Expression and one Peaks")
++  testthat::local_mocked_bindings(Read10X_h5 = function(filename, use.names, unique.features) {
++    rna <- x$counts[4:6, ]
++    colnames(rna)[3] <- "OTHER-1"
++    list(Peaks = x$counts[1:3, ], "Gene Expression" = rna)
++  }, .package = "Seurat")
++  expect_error(ReadMultiomeData(path, verbose = FALSE), "barcodes must match exactly")
++})
++
++
++test_that("a real H5 with one RNA feature reports the native reader limitation", {
++  skip_if_not_installed("hdf5r")
++  x <- make_multiome_input_fixture()
++  counts <- x$counts[1:4, , drop = FALSE]
++  path <- tempfile(fileext = ".h5")
++  on.exit(unlink(path), add = TRUE)
++  h5 <- hdf5r::H5File$new(path, mode = "w")
++  matrix <- h5$create_group("matrix")
++  features <- matrix$create_group("features")
++  matrix[["data"]] <- counts@x
++  matrix[["indices"]] <- counts@i
++  matrix[["indptr"]] <- counts@p
++  matrix[["shape"]] <- dim(counts)
++  matrix[["barcodes"]] <- colnames(counts)
++  features[["id"]] <- rownames(counts)
++  features[["name"]] <- rownames(counts)
++  features[["feature_type"]] <- x$type[1:4]
++  h5$close_all()
++  expect_error(
++    suppressMessages(ReadMultiomeData(path, genome = "hg38", verbose = FALSE)),
++    "native Seurat H5 reader dropped matrix dimensions.*two features per modality"
++  )
++})

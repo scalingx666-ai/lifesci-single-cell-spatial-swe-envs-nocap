@@ -1,0 +1,344 @@
+diff --git a/omicverse/pp/_highly_variable_genes.py b/omicverse/pp/_highly_variable_genes.py
+index d3e0c67f6..31fb25151 100644
+--- a/omicverse/pp/_highly_variable_genes.py
++++ b/omicverse/pp/_highly_variable_genes.py
+@@ -782,6 +782,37 @@ def highly_variable_genes(  # noqa: PLR0913
+     if batch_key is not None:
+         print(f"   {Colors.CYAN}Batch key: {Colors.BOLD}{batch_key}{Colors.ENDC}")
+ 
++    from .._oom_compat import is_oom as _is_oom
++    if _is_oom(adata):
++        # Out-of-core HVG: honour the requested flavour and dispatch to a
++        # fully-chunked selector (never materialise the matrix).
++        #   seurat / cell_ranger -> dispersion-based (expm1 + per-bin z-score)
++        #   anything else        -> Pearson-residual variance ranking
++        # Both touch the matrix in a single chunked pass.
++        if flavor in ("seurat", "cell_ranger"):
++            from anndataoom import chunked_highly_variable_genes_dispersion
++            chunked_highly_variable_genes_dispersion(
++                adata, flavor=flavor, n_top_genes=n_top_genes, n_bins=n_bins,
++                layer=layer, min_mean=min_mean, max_mean=max_mean,
++                min_disp=min_disp, max_disp=max_disp,
++            )
++            _hvg_note = f"{flavor} dispersion"
++        else:
++            from anndataoom import chunked_highly_variable_genes_pearson
++            chunked_highly_variable_genes_pearson(
++                adata, n_top_genes=(n_top_genes or 2000),
++                batch_key=batch_key, layer=layer,
++            )
++            _hvg_note = "Pearson residuals"
++        if ("highly_variable" not in adata.var
++                and "highly_variable_features" in adata.var):
++            adata.var["highly_variable"] = adata.var["highly_variable_features"].values
++        if subset:
++            adata._inplace_subset_var(adata.var["highly_variable"].values)
++        print(f"   {Colors.GREEN}{EMOJI['done']} {int(adata.var['highly_variable'].sum())} "
++              f"HVGs (chunked {_hvg_note}, out-of-core){Colors.ENDC}")
++        return None if inplace else adata.var
++
+     if not isinstance(adata, AnnData):
+         msg = (
+             "`pp.highly_variable_genes` expects an `AnnData` argument, "
+diff --git a/omicverse/pp/_normalization.py b/omicverse/pp/_normalization.py
+index 989f9665c..67964df46 100644
+--- a/omicverse/pp/_normalization.py
++++ b/omicverse/pp/_normalization.py
+@@ -11,6 +11,10 @@
+ 
+ from .._settings import settings, EMOJI, Colors
+ from .._registry import register_function
++# Out-of-core (AnnDataOOM) dispatch: lazy chunked building blocks are imported
++# inside the function bodies so omicverse imports cleanly without anndataoom
++# (the shim's is_oom is always False then).
++from .._oom_compat import is_oom as _is_oom
+ from ._compat import CSBase, CSCBase, CSRBase, DaskArray, old_positionals
+ 
+ # Import local implementations from _scale.py
+@@ -524,9 +528,25 @@ def log1p(
+     adata = adata.copy() if copy else adata
+     view_to_actual(adata)
+ 
++    # ── Out-of-core path: wrap X in a lazy TransformedBackedArray ─────
++    # Files are read-only, so we never write log values back to disk; the
++    # log1p is applied on-the-fly during chunked reads. Composes with a
++    # prior chunked_normalize_total into a single lazy wrapper.
++    if _is_oom(adata):
++        if layer is not None or obsm is not None:
++            raise NotImplementedError(
++                "Out-of-core log1p only supports adata.X (layer/obsm not supported)."
++            )
++        from anndataoom import chunked_log1p as _chunked_log1p
++        _chunked_log1p(adata)
++        adata.uns["log1p"] = {"base": float(np.e) if base is None else base}
++        if copy:
++            return adata
++        return None
++
+     from ._qc import _is_rust_backend
+     is_rust = _is_rust_backend(adata)
+-    
++
+     if chunked:
+         if (layer is not None) or (obsm is not None):
+             msg = (
+@@ -735,6 +755,34 @@ def normalize_total(
+         msg = "Choose max_fraction between 0 and 1."
+         raise ValueError(msg)
+ 
++    # ── Out-of-core path: lazy per-cell normalization over X ──────────
++    # Wraps adata.X in a TransformedBackedArray (norm applied on chunked
++    # reads); stashes raw counts in layers['counts'] and the per-cell
++    # divisor in obs['_norm_factor'] without materialising the matrix.
++    if _is_oom(adata):
++        if layer is not None or layers is not None or layer_norm is not None:
++            raise NotImplementedError(
++                "Out-of-core normalize_total only supports adata.X "
++                "(layer/layers/layer_norm not supported)."
++            )
++        if not inplace:
++            raise NotImplementedError(
++                "Out-of-core normalize_total only supports inplace=True."
++            )
++        from anndataoom import chunked_normalize_total as _chunked_normalize_total
++        _ts = float(target_sum) if target_sum is not None else None
++        _chunked_normalize_total(
++            adata,
++            target_sum=_ts,
++            exclude_highly_expressed=exclude_highly_expressed,
++            max_fraction=max_fraction,
++        )
++        if key_added is not None:
++            adata.obs[key_added] = adata.obs["_norm_factor"]
++        if copy:
++            return adata
++        return None
++
+     # Deprecated features
+     if layers is not None:
+         warn(
+diff --git a/omicverse/pp/_preprocess.py b/omicverse/pp/_preprocess.py
+index 6ffcf4339..c5bf63911 100644
+--- a/omicverse/pp/_preprocess.py
++++ b/omicverse/pp/_preprocess.py
+@@ -403,6 +403,27 @@ def highly_variable_features(
+         Updates ``data.var['highly_variable_features']`` and ranking fields.
+     """
+ 
++    from ._qc import _is_oom
++    if _is_oom(data):
++        if flavor != "pegasus":
++            raise NotImplementedError(
++                f"highly_variable_features flavor {flavor!r} is not supported "
++                "for the OOM backend; use flavor='pegasus' or switch to "
++                "mode='cpu'."
++            )
++        if batch is not None:
++            raise NotImplementedError(
++                "Batch-aware pegasus HVF selection is not supported for the "
++                "OOM backend; pass batch=None or switch to mode='cpu'."
++            )
++        from anndataoom import chunked_highly_variable_features_pegasus
++        chunked_highly_variable_features_pegasus(data, n_top=n_top, span=span)
++        print(
++            f"{int(data.var['highly_variable_features'].sum())} "
++            "highly variable features have been selected."
++        )
++        return
++
+     if flavor == "pegasus":
+         select_hvf_pegasus(data, batch, n_top=n_top, span=span)
+     else:
+@@ -942,6 +963,23 @@ def normalize_pearson_residuals(
+     None
+         Updates ``adata.X`` in place with Pearson residuals.
+     """
++    from ._qc import _is_oom
++    if _is_oom(adata):
++        # Out-of-core: never materialise the dense residual matrix. Wrap X
++        # (or `layer`) in a lazy PearsonResidualBackedArray that stores only
++        # the per-cell/per-gene count sums and computes residuals per chunk
++        # on read. Peak RAM is bounded by chunk_size, not cell count.
++        if copy:
++            raise NotImplementedError(
++                "normalize_pearson_residuals(copy=True) is not available for "
++                "the OOM backend; use inplace=True (the lazy residual array "
++                "is assigned to adata.X / the given layer)."
++            )
++        from anndataoom import chunked_normalize_pearson_residuals
++        chunked_normalize_pearson_residuals(
++            adata, theta=theta, clip=clip, layer=layer, inplace=inplace,
++        )
++        return None
+     sc.experimental.pp.normalize_pearson_residuals(
+         adata, theta=theta, clip=clip, check_values=check_values,
+         layer=layer, inplace=inplace, copy=copy, **kwargs,
+@@ -1259,6 +1297,18 @@ def regress(adata, *, keys: Optional[List[str]] = None, layer=None, n_jobs=8, **
+     if layer is not None:
+         kwargs.setdefault("layer", layer)
+     kwargs.setdefault("n_jobs", n_jobs)
++    from ._qc import _is_oom
++    if _is_oom(adata):
++        # Out-of-core regress-out: fit per-gene OLS of expression on the
++        # covariate design [ones, *keys] in ONE chunked pass, then install a
++        # lazy RegressedBackedArray (stores only betas + the tiny design
++        # matrix) in layers['regressed']. Never materialises the full residual
++        # matrix. Uses the same `keys` (resolved + validated above) as the
++        # in-memory branch, so custom covariates are honoured.
++        from anndataoom import chunked_regress
++        chunked_regress(adata, keys=tuple(keys))
++        add_reference(adata, 'scanpy', 'regressing out covariates with scanpy')
++        return
+     if settings.mode == 'cpu' or settings.mode == 'cpu-gpu-mixed':
+         kwargs.setdefault("copy", True)
+         adata_mock = sc.pp.regress_out(adata, keys, **kwargs)
+diff --git a/omicverse/pp/_qc.py b/omicverse/pp/_qc.py
+index 9a7e7fb8d..0b2b9dbe7 100644
+--- a/omicverse/pp/_qc.py
++++ b/omicverse/pp/_qc.py
+@@ -26,6 +26,32 @@
+ 
+ 
+ # Local implementations to replace scanpy filtering functions
++def _oom_axis_stats(X, axis):
++    """Per-row (axis=1) or per-column (axis=0) sum and nnz of a backed
++    matrix in ONE chunked pass — no densification, no materialisation.
++    Used by the out-of-core filter paths so AnnDataOOM never loads X."""
++    from scipy.sparse import issparse
++    n_obs, n_vars = X.shape
++    n = n_obs if axis == 1 else n_vars
++    s = np.zeros(n, dtype=np.float64)
++    nnz = np.zeros(n, dtype=np.int64)
++    for start, end, chunk in X.chunked():
++        if issparse(chunk):
++            if axis == 1:
++                s[start:end] = np.asarray(chunk.sum(axis=1)).ravel()
++                nnz[start:end] = chunk.getnnz(axis=1)
++            else:
++                s += np.asarray(chunk.sum(axis=0)).ravel()
++                nnz += chunk.getnnz(axis=0)
++        else:
++            chunk = np.asarray(chunk)
++            if axis == 1:
++                s[start:end] = chunk.sum(axis=1); nnz[start:end] = (chunk > 0).sum(axis=1)
++            else:
++                s += chunk.sum(axis=0); nnz += (chunk > 0).sum(axis=0)
++    return s, nnz
++
++
+ def _filter_cells_impl(
+     adata,
+     min_counts=None,
+@@ -36,11 +62,14 @@ def _filter_cells_impl(
+ ):
+     """Internal implementation of cell filtering."""
+     X = adata.X
+-    n_counts = np.asarray(X.sum(axis=1)).flatten() if sparse.issparse(X) else X.sum(axis=1)
+-
+-    if sparse.issparse(X):
++    if _is_oom(adata):
++        # out-of-core: one chunked pass over X, never densify/materialise.
++        n_counts, n_genes = _oom_axis_stats(X, axis=1)
++    elif sparse.issparse(X):
++        n_counts = np.asarray(X.sum(axis=1)).flatten()
+         n_genes = np.asarray((X > 0).sum(axis=1)).flatten()
+     else:
++        n_counts = X.sum(axis=1)
+         n_genes = (X > 0).sum(axis=1)
+ 
+     cell_subset = np.ones(adata.n_obs, dtype=bool)
+@@ -71,11 +100,13 @@ def _filter_genes_impl(
+ ):
+     """Internal implementation of gene filtering."""
+     X = adata.X
+-    n_counts = np.asarray(X.sum(axis=0)).flatten() if sparse.issparse(X) else X.sum(axis=0)
+-
+-    if sparse.issparse(X):
++    if _is_oom(adata):
++        n_counts, n_cells = _oom_axis_stats(X, axis=0)
++    elif sparse.issparse(X):
++        n_counts = np.asarray(X.sum(axis=0)).flatten()
+         n_cells = np.asarray((X > 0).sum(axis=0)).flatten()
+     else:
++        n_counts = X.sum(axis=0)
+         n_cells = (X > 0).sum(axis=0)
+ 
+     gene_subset = np.ones(adata.n_vars, dtype=bool)
+diff --git a/omicverse/pp/_scrublet.py b/omicverse/pp/_scrublet.py
+index b702e73f3..ab5dda8c1 100644
+--- a/omicverse/pp/_scrublet.py
++++ b/omicverse/pp/_scrublet.py
+@@ -165,6 +165,73 @@ def scrublet(
+     print(f"\n{Colors.HEADER}{Colors.BOLD}{EMOJI['start']} Running Scrublet Doublet Detection:{Colors.ENDC}")
+     print(f"   {Colors.CYAN}Mode: {Colors.BOLD}{settings.mode}{Colors.ENDC}")
+     print(f"   {Colors.CYAN}Computing doublet prediction using Scrublet algorithm{Colors.ENDC}")
++
++    # --- Out-of-core / bounded-memory path for AnnDataOOM backends ---------
++    # Scrublet's doublet simulation + KNN need an in-memory matrix, but only
++    # the HVG-subset of raw counts (n_obs x n_HVG), never the full gene
++    # matrix. The default code path below would call adata.to_memory(), which
++    # densifies the WHOLE matrix; intercept first and materialise only the
++    # bounded HVG subset out-of-core.
++    from .._oom_compat import is_oom as _is_oom
++    if _is_oom(adata) and adata_sim is None and batch_key is None:
++        from anndataoom import chunked_scrublet_prepare
++        print(f"   {Colors.GREEN}{EMOJI['start']} Out-of-core scrublet: chunked HVG selection + bounded materialisation...{Colors.ENDC}")
++        ad_obs, hvg_mask, n_hvg = chunked_scrublet_prepare(adata, min_cells=3, min_genes=3)
++        print(f"   {Colors.CYAN}Bounded subset: {Colors.BOLD}{ad_obs.n_obs:,} cells x {n_hvg:,} HVGs{Colors.ENDC}")
++
++        # Mirror the in-memory _run_scrublet tail, but HVG is ALREADY selected
++        # out-of-core, so do NOT re-run highly_variable_genes (that would
++        # double-select genes and degrade the scores).
++        ad_obs.layers["raw"] = ad_obs.X.copy()
++        normalize_total(ad_obs)
++        ad_sim = scrublet_simulate_doublets(
++            ad_obs,
++            layer="raw",
++            sim_doublet_ratio=sim_doublet_ratio,
++            synthetic_doublet_umi_subsampling=synthetic_doublet_umi_subsampling,
++            random_seed=random_state,
++        )
++        del ad_obs.layers["raw"]
++        if log_transform:
++            log1p(ad_obs)
++            log1p(ad_sim)
++        normalize_total(ad_obs, target_sum=1e6)
++        normalize_total(ad_sim, target_sum=1e6)
++        ad_obs = _scrublet_call_doublets(
++            adata_obs=ad_obs,
++            adata_sim=ad_sim,
++            n_neighbors=n_neighbors,
++            expected_doublet_rate=expected_doublet_rate,
++            stdev_doublet_rate=stdev_doublet_rate,
++            mean_center=mean_center,
++            normalize_variance=normalize_variance,
++            n_prin_comps=n_prin_comps,
++            use_approx_neighbors=use_approx_neighbors,
++            knn_dist_metric=knn_dist_metric,
++            get_doublet_neighbor_parents=get_doublet_neighbor_parents,
++            threshold=threshold,
++            random_state=random_state,
++            verbose=verbose,
++            use_gpu=use_gpu,
++        )
++        # Write results back to the (possibly cell-filtered) original adata,
++        # aligned by obs name; cells dropped by the gene/cell filter get NaN /
++        # False so downstream predicted_doublet==False filtering is safe.
++        score = np.full(adata.n_obs, np.nan)
++        pred = np.zeros(adata.n_obs, dtype=bool)
++        _pos = {n: i for i, n in enumerate(np.asarray(adata.obs_names))}
++        _idx = np.array([_pos[n] for n in ad_obs.obs_names], dtype=int)
++        score[_idx] = np.asarray(ad_obs.obs["doublet_score"].values)
++        pred[_idx] = np.asarray(ad_obs.obs["predicted_doublet"].values, dtype=bool)
++        adata.obs["doublet_score"] = score
++        adata.obs["predicted_doublet"] = pred
++        adata.uns["scrublet"] = ad_obs.uns["scrublet"]
++        print(f"\n{Colors.GREEN}{EMOJI['done']} Scrublet Analysis Completed Successfully! (out-of-core, bounded to {n_hvg:,} HVGs){Colors.ENDC}")
++        note(backend=f"scrublet-oom{'(gpu)' if use_gpu else ''}",
++             viz=([{"function": "ov.pl.doublet_score_histogram", "kwargs": {}}]
++                   if "doublet_score" in adata.obs.columns else []))
++        return adata if copy else None
++
+     from ._qc import _is_rust_backend
+     is_rust = _is_rust_backend(adata)
+     if is_rust:

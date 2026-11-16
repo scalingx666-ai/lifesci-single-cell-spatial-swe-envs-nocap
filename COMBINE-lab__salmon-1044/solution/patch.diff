@@ -1,0 +1,658 @@
+diff --git a/crates/salmon-align/src/lib.rs b/crates/salmon-align/src/lib.rs
+index 698731772..11f08f2e3 100644
+--- a/crates/salmon-align/src/lib.rs
++++ b/crates/salmon-align/src/lib.rs
+@@ -203,6 +203,19 @@ pub struct AlignQuantResult {
+     /// posterior samples (bootstrap or Gibbs), one abundance vector each; empty
+     /// when neither was requested. Length is `num_refs`, matching `quant.sf` rows.
+     pub bootstraps: Vec<Vec<f64>>,
++    /// EM/VBEM convergence: iterations run and whether the relative-difference
++    /// criterion was met before `max_iter`
++    pub em_iters: u32,
++    pub em_converged: bool,
++    /// library format observed for these alignments (baked/auto-detected), for
++    /// provenance and the strandedness sanity check; `None` if not observed
++    pub detected_library_type: Option<String>,
++    /// total wall-clock seconds for the quantification call
++    pub total_seconds: f64,
++    /// peak resident set size in KiB (Linux `VmHWM`); 0 if unavailable
++    pub peak_rss_kb: u64,
++    /// structured run diagnostics / bad-input warnings (also emitted to the log)
++    pub diagnostics: Vec<salmon_core::Diagnostic>,
+ }
+ 
+ /// Current local time as an asctime-style string, matching salmon's timestamps.
+@@ -1445,6 +1458,7 @@ fn apply_bias_correction(
+ /// Run alignment-based quantification end-to-end.
+ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult> {
+     let start_time = asctime_now();
++    let run_timer = std::time::Instant::now();
+     let header = read_alignment_header(&opts.bam)?;
+ 
+     // Reject coordinate-sorted input up front (header-only check, no per-record cost):
+@@ -1695,6 +1709,7 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+         em = optimize(&collapsed, num_refs, &opts.em, Some(&eff_lengths));
+     }
+     let inference_truncated_mass = em.dropped_mass;
++    let (em_iters, em_converged) = (em.iters, em.converged);
+     let counts = em.alphas;
+ 
+     let rates: Vec<f64> = (0..num_refs)
+@@ -1721,6 +1736,25 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+     let length_classes =
+         salmon_model::compute_length_quantiles(&lengths, salmon_model::NUM_LENGTH_CLASSES);
+ 
++    // Run diagnostics from end-of-run aggregates. The transcriptomic-BAM online
++    // path has no aggregate observed-format estimate (per-fragment only), so the
++    // library-type mismatch check is `--rad`-only; the mapping-rate / empty-input
++    // checks still apply here.
++    let diagnostics = salmon_core::input_diagnostics(
++        num_processed,
++        num_mapped,
++        LibraryFormat::is_auto(&opts.lib_type),
++        &opts.lib_type,
++        None,
++    );
++    for d in &diagnostics {
++        if d.severity == "error" {
++            tracing::error!("{}", d.message);
++        } else {
++            tracing::warn!("{}", d.message);
++        }
++    }
++
+     // Posterior uncertainty (bootstrap / Gibbs) + ambiguity. The packed CSR
+     // layout is identical to reads mode — alignment mode simply feeds it from the
+     // BAM-derived eq-classes — so the same `salmon_infer` samplers apply. Bootstrap
+@@ -1766,6 +1800,12 @@ pub fn quantify_alignments(opts: &AlignQuantOptions) -> Result<AlignQuantResult>
+         bias_dump,
+         ambig,
+         bootstraps,
++        em_iters,
++        em_converged,
++        detected_library_type: None,
++        total_seconds: run_timer.elapsed().as_secs_f64(),
++        peak_rss_kb: salmon_core::peak_rss_kb(),
++        diagnostics,
+     };
+     write_outputs(opts, &result)?;
+     Ok(result)
+@@ -1806,6 +1846,7 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         frag_length_sd: f64,
+         seq_bias_correct: bool,
+         gc_bias_correct: bool,
++        pos_bias_correct: bool,
+         num_bias_bins: usize,
+         mapping_type: String,
+         // index hashes are empty in alignment mode (no salmon index)
+@@ -1830,6 +1871,13 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         num_decoy_fragments: u64,
+         inference_truncated_mass: f64,
+         num_bootstraps: u32,
++        range_factorization_bins: u32,
++        num_em_iterations: u32,
++        em_converged: bool,
++        detected_library_type: Option<String>,
++        total_time_seconds: f64,
++        peak_rss_kb: u64,
++        diagnostics: Vec<salmon_core::Diagnostic>,
+         call: String,
+         start_time: String,
+         end_time: String,
+@@ -1856,6 +1904,7 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         frag_length_sd: res.frag_len_sd,
+         seq_bias_correct: opts.seq_bias,
+         gc_bias_correct: opts.gc_bias,
++        pos_bias_correct: opts.pos_bias,
+         num_bias_bins: 0,
+         mapping_type: "alignment".to_string(),
+         index_seq_hash: String::new(),
+@@ -1879,6 +1928,13 @@ fn write_outputs(opts: &AlignQuantOptions, res: &AlignQuantResult) -> Result<()>
+         num_decoy_fragments: 0,
+         inference_truncated_mass: res.inference_truncated_mass,
+         num_bootstraps: res.bootstraps.len() as u32,
++        range_factorization_bins: opts.range_factorization_bins,
++        num_em_iterations: res.em_iters,
++        em_converged: res.em_converged,
++        detected_library_type: res.detected_library_type.clone(),
++        total_time_seconds: res.total_seconds,
++        peak_rss_kb: res.peak_rss_kb,
++        diagnostics: res.diagnostics.clone(),
+         call: "quant".to_string(),
+         start_time: res.start_time.clone(),
+         end_time: asctime_now(),
+diff --git a/crates/salmon-align/src/rad.rs b/crates/salmon-align/src/rad.rs
+index 5552c9a61..d927058fd 100644
+--- a/crates/salmon-align/src/rad.rs
++++ b/crates/salmon-align/src/rad.rs
+@@ -999,6 +999,7 @@ where
+ /// Quantify from a RAD file (`salmon quant --rad`).
+ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQuantResult> {
+     let start_time = asctime_now();
++    let run_timer = std::time::Instant::now();
+ 
+     // Bias correction is computed from the REFERENCE sequence at each fragment's
+     // RAD position (never the read bases). seq/GC need the reference bases;
+@@ -1425,6 +1426,7 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+         em
+     };
+     let inference_truncated_mass = em.dropped_mass;
++    let (em_iters, em_converged) = (em.iters, em.converged);
+     let counts = em.alphas;
+ 
+     let rates: Vec<f64> = (0..num_refs)
+@@ -1474,6 +1476,31 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+         Vec::new()
+     };
+ 
++    // Run diagnostics from end-of-run aggregates (no per-fragment cost): the
++    // observed (baked/auto-detected) library format powers the strandedness
++    // sanity check, gated on `-l A` so an explicit `-l` is never contradicted.
++    let detected_library_type = detected_fmt
++        .or(baked_libfmt)
++        .map(|f| f.canonical().to_string());
++    let auto_detect = LibraryFormat::is_auto(&opts.lib_type);
++    let requested_lib = LibraryFormat::parse(&opts.lib_type)
++        .map(|f| f.canonical().to_string())
++        .unwrap_or_else(|_| opts.lib_type.clone());
++    let diagnostics = salmon_core::input_diagnostics(
++        num_processed,
++        num_mapped,
++        auto_detect,
++        &requested_lib,
++        detected_library_type.as_deref(),
++    );
++    for d in &diagnostics {
++        if d.severity == "error" {
++            tracing::error!("{}", d.message);
++        } else {
++            tracing::warn!("{}", d.message);
++        }
++    }
++
+     let result = AlignQuantResult {
+         names,
+         lengths,
+@@ -1492,6 +1519,12 @@ pub fn quantify_rad(opts: &AlignQuantOptions, rad_path: &Path) -> Result<AlignQu
+         bias_dump,
+         ambig,
+         bootstraps,
++        em_iters,
++        em_converged,
++        detected_library_type,
++        total_seconds: run_timer.elapsed().as_secs_f64(),
++        peak_rss_kb: salmon_core::peak_rss_kb(),
++        diagnostics,
+     };
+     crate::write_outputs(opts, &result)?;
+     Ok(result)
+diff --git a/crates/salmon-core/src/diagnostics.rs b/crates/salmon-core/src/diagnostics.rs
+new file mode 100644
+index 000000000..58ea20d34
+--- /dev/null
++++ b/crates/salmon-core/src/diagnostics.rs
+@@ -0,0 +1,103 @@
++//! Shared run diagnostics: bad-input red flags derived from end-of-run
++//! aggregates (never per-fragment), surfaced to the log and to
++//! `meta_info.json`'s `diagnostics` array by both the reads and alignment
++//! quantification paths.
++
++use serde::Serialize;
++
++/// A structured run diagnostic. `code` is a stable, machine-readable identifier
++/// (snake_case) so downstream tools can key on it (e.g. `low_mapping_rate`,
++/// `no_fragments_mapped`, `library_type_mismatch`). `severity` is one of
++/// `"warning"` | `"error"` | `"info"`.
++#[derive(Debug, Clone, Serialize)]
++pub struct Diagnostic {
++    pub code: String,
++    pub severity: String,
++    pub message: String,
++}
++
++impl Diagnostic {
++    fn new(code: &str, severity: &str, message: String) -> Self {
++        Self {
++            code: code.to_string(),
++            severity: severity.to_string(),
++            message,
++        }
++    }
++}
++
++/// Build the standard bad-input diagnostics from already-computed aggregates.
++/// Pure (no logging) so it is dependency-light; callers log the returned list.
++///
++/// - `num_processed` / `num_mapped`: fragment tallies.
++/// - `auto_detect`: whether the library type was auto-detected (`-l A`); the
++///   mismatch check only fires under an explicit `-l`.
++/// - `requested_lib_type`: the resolved (used) library-type string.
++/// - `detected_lib_type`: the format the detector observed (if any).
++pub fn input_diagnostics(
++    num_processed: u64,
++    num_mapped: u64,
++    auto_detect: bool,
++    requested_lib_type: &str,
++    detected_lib_type: Option<&str>,
++) -> Vec<Diagnostic> {
++    let mut d = Vec::new();
++    if num_processed == 0 {
++        d.push(Diagnostic::new(
++            "no_input_fragments",
++            "error",
++            "no input fragments were processed — check that the input is non-empty and readable"
++                .to_string(),
++        ));
++    } else if num_mapped == 0 {
++        d.push(Diagnostic::new(
++            "no_fragments_mapped",
++            "error",
++            "0 fragments mapped — the reference almost certainly does not match these reads (wrong reference/organism)"
++                .to_string(),
++        ));
++    } else {
++        let pct = 100.0 * num_mapped as f64 / num_processed as f64;
++        if pct < 10.0 {
++            d.push(Diagnostic::new(
++                "very_low_mapping_rate",
++                "warning",
++                format!("very low mapping rate ({pct:.1}%): the reference likely does not match these reads (wrong reference/organism or heavy contamination)"),
++            ));
++        } else if pct < 30.0 {
++            d.push(Diagnostic::new(
++                "low_mapping_rate",
++                "warning",
++                format!("low mapping rate ({pct:.1}%): verify the reference matches the sample and that adapter/quality trimming was applied"),
++            ));
++        }
++    }
++    // Strandedness sanity: an explicit `-l` disagreeing with the observed format.
++    if !auto_detect {
++        if let Some(det) = detected_lib_type {
++            if det != requested_lib_type {
++                d.push(Diagnostic::new(
++                    "library_type_mismatch",
++                    "warning",
++                    format!("specified library type '{requested_lib_type}' disagrees with the observed format '{det}' — check the -l strandedness setting"),
++                ));
++            }
++        }
++    }
++    d
++}
++
++/// Peak resident set size in KiB from `/proc/self/status` (`VmHWM`); 0 if
++/// unavailable (non-Linux or parse failure). Read once at end of run.
++pub fn peak_rss_kb() -> u64 {
++    std::fs::read_to_string("/proc/self/status")
++        .ok()
++        .and_then(|s| {
++            s.lines().find_map(|l| {
++                l.strip_prefix("VmHWM:")
++                    .and_then(|v| v.split_whitespace().next())
++                    .and_then(|n| n.parse::<u64>().ok())
++            })
++        })
++        .unwrap_or(0)
++}
+diff --git a/crates/salmon-core/src/lib.rs b/crates/salmon-core/src/lib.rs
+index d891a1077..7ecaeeb11 100644
+--- a/crates/salmon-core/src/lib.rs
++++ b/crates/salmon-core/src/lib.rs
+@@ -7,6 +7,7 @@
+ //! dependencies so every other crate can depend on it cheaply.
+ 
+ pub mod atomic;
++pub mod diagnostics;
+ pub mod error;
+ pub mod genemap;
+ pub mod libtype;
+@@ -18,6 +19,7 @@ pub mod refprovider;
+ pub mod transcript;
+ 
+ pub use atomic::AtomicF64;
++pub use diagnostics::{input_diagnostics, peak_rss_kb, Diagnostic};
+ pub use libtype::{compatible_paired, compatible_single, is_compatible, observed_paired_format};
+ pub use progress::ProgressCounters;
+ pub use refprovider::RefProvider;
+diff --git a/crates/salmon-map/src/extend.rs b/crates/salmon-map/src/extend.rs
+index 43f8a7534..2203aeeae 100644
+--- a/crates/salmon-map/src/extend.rs
++++ b/crates/salmon-map/src/extend.rs
+@@ -174,8 +174,69 @@ thread_local! {
+     /// target/orientation instead of a per-read `HashMap`), a per-group anchor
+     /// buffer, and the merged-anchor output buffer. Mirrors `collect`'s
+     /// `PROJ_SCRATCH`, eliminating the per-read map + per-group `HashSet`.
+-    static UNIMEM_SCRATCH: std::cell::RefCell<(Vec<(u32, bool, Mem)>, Vec<Mem>, Vec<Mem>)> =
+-        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
++    #[allow(clippy::type_complexity)]
++    static UNIMEM_SCRATCH: std::cell::RefCell<(
++        Vec<(u32, bool, Mem)>,
++        Vec<Mem>,
++        Vec<Mem>,
++        Vec<(u32, bool, Mem)>,
++    )> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
++}
++
++/// Key ordering `(tid, is_fw)` as a single `u32` (tid dominant, `is_fw` in bit 0
++/// with `false < true`) — identical ordering to the `(tid, fw)` tuple.
++#[inline]
++fn tidfw_key(tid: u32, fw: bool) -> u32 {
++    (tid << 1) | fw as u32
++}
++
++/// Radix threshold: below this, `sort_unstable_by_key` wins (its overhead is
++/// lower for short lists); at/above it, the O(N) radix pays off. The hot,
++/// cost-dominant reads (repetitive, many hits across many targets) are large.
++const RADIX_THRESHOLD: usize = 256;
++
++/// LSD radix sort of `flat` by the `(tid, is_fw)` key — same ascending grouping
++/// as `sort_unstable_by_key(|&(tid,fw,_)| (tid,fw))` (within-key order differs
++/// but is irrelevant: `merge_same_diagonal` re-sorts each group by diagonal).
++/// O(N) and independent of the number of distinct targets, unlike a comparison
++/// sort's O(N log N). `tmp` is reused ping-pong scratch; result ends in `flat`.
++fn radix_sort_tidfw(flat: &mut Vec<(u32, bool, Mem)>, tmp: &mut Vec<(u32, bool, Mem)>) {
++    let n = flat.len();
++    if n < 2 {
++        return;
++    }
++    let maxk = flat
++        .iter()
++        .map(|&(t, f, _)| tidfw_key(t, f))
++        .max()
++        .unwrap_or(0);
++    let npass = if maxk == 0 {
++        1
++    } else {
++        (32 - maxk.leading_zeros()).div_ceil(8) as usize
++    };
++    tmp.clear();
++    tmp.resize(n, (0, false, Mem::new(0, 0, 0)));
++    let mut cnt = [0u32; 256];
++    for p in 0..npass {
++        let shift = (p * 8) as u32;
++        cnt.fill(0);
++        for &(t, f, _) in flat.iter() {
++            cnt[((tidfw_key(t, f) >> shift) & 0xff) as usize] += 1;
++        }
++        let mut sum = 0u32;
++        for c in cnt.iter_mut() {
++            let v = *c;
++            *c = sum;
++            sum += v;
++        }
++        for &e in flat.iter() {
++            let b = ((tidfw_key(e.0, e.1) >> shift) & 0xff) as usize;
++            tmp[cnt[b] as usize] = e;
++            cnt[b] += 1;
++        }
++        std::mem::swap(flat, tmp);
++    }
+ }
+ 
+ /// Collapse same-diagonal overlapping/abutting uni-MEMs into maximal anchors.
+@@ -231,7 +292,7 @@ pub fn candidates_from_raw_hits_true_unimems<R: RefProvider>(
+     chain_cfg.seed_len = k;
+ 
+     UNIMEM_SCRATCH.with(|cell| {
+-        let (flat, group, merged) = &mut *cell.borrow_mut();
++        let (flat, group, merged, radix_tmp) = &mut *cell.borrow_mut();
+         flat.clear();
+         // For each queried k-mer (one `ProjectedHits` = one unitig + all its
+         // reference occurrences), extend the seed to its uni-MEM AT MOST ONCE PER
+@@ -283,7 +344,14 @@ pub fn candidates_from_raw_hits_true_unimems<R: RefProvider>(
+                 flat.push((tid, rp.is_fw, Mem::new(read_start, base_pos + crel, len)));
+             }
+         }
+-        flat.sort_unstable_by_key(|&(tid, fw, _)| (tid, fw));
++        // Group by (tid, is_fw): radix (O(N), target-count-independent) for the
++        // large repetitive reads where this sort's cost lives; comparison sort
++        // for short lists where its overhead is lower.
++        if flat.len() >= RADIX_THRESHOLD {
++            radix_sort_tidfw(flat, radix_tmp);
++        } else {
++            flat.sort_unstable_by_key(|&(tid, fw, _)| (tid, fw));
++        }
+ 
+         let mut candidates = Vec::new();
+         let mut i = 0;
+diff --git a/crates/salmon-quant/src/lib.rs b/crates/salmon-quant/src/lib.rs
+index 25d952185..0369c66f3 100644
+--- a/crates/salmon-quant/src/lib.rs
++++ b/crates/salmon-quant/src/lib.rs
+@@ -222,6 +222,8 @@ impl QuantOptions {
+     }
+ }
+ 
++pub use salmon_core::Diagnostic;
++
+ /// Quantification results (also written to disk by [`write_outputs`]).
+ #[derive(Debug, Clone)]
+ pub struct QuantResult {
+@@ -287,11 +289,26 @@ pub struct QuantResult {
+     /// observed/expected bias-model tables for the aux dumps; each component is
+     /// empty unless the corresponding `--seqBias`/`--gcBias`/`--posBias` ran
+     pub bias_dump: BiasDump,
++    /// EM/VBEM convergence: iterations actually run and whether the
++    /// relative-difference criterion was met before `max_iter`
++    pub em_iters: u32,
++    pub em_converged: bool,
++    /// total wall-clock seconds for the quantification call
++    pub total_seconds: f64,
++    /// peak resident set size in KiB (Linux `VmHWM`); 0 if unavailable
++    pub peak_rss_kb: u64,
++    /// library format observed by the auto-detector (when it ran with enough
++    /// samples), for provenance and the strandedness sanity check; `None` when
++    /// detection did not run or saw too few samples
++    pub detected_library_type: Option<String>,
++    /// structured run diagnostics / bad-input warnings (also emitted to the log)
++    pub diagnostics: Vec<Diagnostic>,
+ }
+ 
+ /// Run quantification end-to-end, writing outputs and returning the results.
+ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     let start_time = asctime_now();
++    let run_timer = std::time::Instant::now();
+     // The raw reference nucleotides are only needed for selective-alignment
+     // extension (non-sketch mapping) and for sequence-dependent bias correction
+     // (seq/GC; positional bias is sequence-free). In sketch mode without seq/GC
+@@ -378,7 +395,13 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     } else {
+         ReadType::SingleEnd
+     };
+-    let detector = auto_detect.then(|| LibraryTypeDetector::new(read_type));
++    // Run the library-type detector ALWAYS (not just under `-l A`): under an
++    // explicit `-l` it still observes the true orientation distribution (sampled
++    // pre-strand-filter in `processor::record`), which powers the
++    // `library_type_mismatch` diagnostic. It never overrides an explicit `-l` —
++    // the resolution below gates its format on `auto_detect`. The cost is bounded
++    // (sampling stops after the detector locks in) → effectively free.
++    let detector = Some(LibraryTypeDetector::new(read_type));
+ 
+     // `--deterministic`: an order-independent FLD / library-format accumulator,
+     // populated during the mapping pass instead of the online FLD + prefix
+@@ -590,8 +613,14 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     // no usable samples.
+     let library_type = if let Some(f) = det_fmt {
+         f.canonical().to_string()
+-    } else if let Some(det) = &detector {
+-        det.final_format().canonical().to_string()
++    } else if auto_detect {
++        // Auto mode only: adopt the prefix detector's format. Under an explicit
++        // `-l` the (now always-on) detector is used purely for the mismatch
++        // diagnostic and must NOT override the user's choice.
++        match &detector {
++            Some(det) => det.final_format().canonical().to_string(),
++            None => opts.lib_type.clone(),
++        }
+     } else {
+         opts.lib_type.clone()
+     };
+@@ -868,6 +897,7 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+     // eq-class co-members, so `counts` already sum to `total_count` minus only the
+     // mass in fully-truncated classes (`dropped_mass`, normally 0). No rescale.
+     let inference_truncated_mass = em.dropped_mass;
++    let (em_iters, em_converged) = (em.iters, em.converged);
+     let counts = em.alphas;
+ 
+     // Finalize RAD output now that the FLD and abundances are known: bake the
+@@ -952,6 +982,35 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         })
+         .collect();
+ 
++    // ---- run diagnostics: bad-input red flags from already-computed aggregates
++    // (evaluated once here → no per-fragment cost). Emitted to the log AND to
++    // meta_info.json's `diagnostics` array for machine-readable consumption.
++    let np = num_processed.load(Ordering::Relaxed);
++    let nm = num_mapped.load(Ordering::Relaxed);
++    let detected_library_type = det_fmt
++        .as_ref()
++        .map(|f| f.canonical().to_string())
++        .or_else(|| {
++            detector
++                .as_ref()
++                .filter(|d| d.can_guess())
++                .map(|d| d.final_format().canonical().to_string())
++        });
++    let diagnostics = salmon_core::input_diagnostics(
++        np,
++        nm,
++        auto_detect,
++        &library_type,
++        detected_library_type.as_deref(),
++    );
++    for d in &diagnostics {
++        if d.severity == "error" {
++            tracing::error!("{}", d.message);
++        } else {
++            tracing::warn!("{}", d.message);
++        }
++    }
++
+     let result = QuantResult {
+         names: (0..num_refs)
+             .map(|i| salmon.ref_name(i).to_string())
+@@ -993,6 +1052,12 @@ pub fn quantify(opts: &QuantOptions) -> Result<QuantResult> {
+         bootstraps,
+         ambig,
+         bias_dump,
++        em_iters,
++        em_converged,
++        total_seconds: run_timer.elapsed().as_secs_f64(),
++        peak_rss_kb: salmon_core::peak_rss_kb(),
++        detected_library_type,
++        diagnostics,
+     };
+ 
+     tracing::info!("writing results to {}", opts.output_dir.display());
+diff --git a/crates/salmon-quant/src/output.rs b/crates/salmon-quant/src/output.rs
+index 0c68ad8d9..98c950774 100644
+--- a/crates/salmon-quant/src/output.rs
++++ b/crates/salmon-quant/src/output.rs
+@@ -285,6 +285,7 @@ struct MetaInfo {
+     frag_length_sd: f64,
+     seq_bias_correct: bool,
+     gc_bias_correct: bool,
++    pos_bias_correct: bool,
+     num_bias_bins: usize,
+     mapping_type: String,
+     keep_duplicates: bool,
+@@ -311,6 +312,20 @@ struct MetaInfo {
+     /// of an equivalence class truncated); normally 0.
+     inference_truncated_mass: f64,
+     num_bootstraps: u32,
++    /// mapped fragments placed as orphans (only one mate mapped)
++    num_orphan: u64,
++    /// range-factorization bins used for equivalence classes (0 = disabled)
++    range_factorization_bins: u32,
++    /// EM/VBEM convergence
++    num_em_iterations: u32,
++    em_converged: bool,
++    /// library format observed by the auto-detector (null if not observed)
++    detected_library_type: Option<String>,
++    /// total wall-clock seconds and peak resident set size (KiB, Linux)
++    total_time_seconds: f64,
++    peak_rss_kb: u64,
++    /// machine-readable run diagnostics / bad-input warnings
++    diagnostics: Vec<crate::Diagnostic>,
+     call: String,
+     start_time: String,
+     end_time: String,
+@@ -347,6 +362,7 @@ fn write_meta_info(path: &Path, opts: &QuantOptions, res: &QuantResult) -> Resul
+         frag_length_sd: res.frag_len_sd,
+         seq_bias_correct: opts.seq_bias,
+         gc_bias_correct: opts.gc_bias,
++        pos_bias_correct: opts.pos_bias,
+         num_bias_bins: 0,
+         mapping_type: if opts.sketch { "pseudo" } else { "mapping" }.to_string(),
+         keep_duplicates: res.keep_duplicates,
+@@ -385,6 +401,14 @@ fn write_meta_info(path: &Path, opts: &QuantOptions, res: &QuantResult) -> Resul
+         num_decoy_fragments: res.num_decoy_fragments,
+         inference_truncated_mass: res.inference_truncated_mass,
+         num_bootstraps: res.bootstraps.len() as u32,
++        num_orphan: res.num_orphan,
++        range_factorization_bins: opts.range_factorization_bins,
++        num_em_iterations: res.em_iters,
++        em_converged: res.em_converged,
++        detected_library_type: res.detected_library_type.clone(),
++        total_time_seconds: res.total_seconds,
++        peak_rss_kb: res.peak_rss_kb,
++        diagnostics: res.diagnostics.clone(),
+         call: "quant".to_string(),
+         start_time: res.start_time.clone(),
+         end_time: crate::asctime_now(),
+diff --git a/website/src/content/docs/reference/output-formats.md b/website/src/content/docs/reference/output-formats.md
+index c14fbfb19..a0d54ce9a 100644
+--- a/website/src/content/docs/reference/output-formats.md
++++ b/website/src/content/docs/reference/output-formats.md
+@@ -82,7 +82,7 @@ Pretty-printed JSON. tximport keys off several fields (`num_bootstraps`,
+ | `library_types` | string[] | detected/declared library type(s) |
+ | `frag_dist_length` | int | number of FLD length bins |
+ | `frag_length_mean` / `frag_length_sd` | float | observed fragment length stats |
+-| `seq_bias_correct` / `gc_bias_correct` | bool | bias correction enabled |
++| `seq_bias_correct` / `gc_bias_correct` / `pos_bias_correct` | bool | bias correction enabled (`--seqBias` / `--gcBias` / `--posBias`) |
+ | `mapping_type` | string | `"mapping"` (SA) or `"pseudo"` (sketch) |
+ | `keep_duplicates` | bool | index built with `--keepDuplicates` |
+ | `index_seq_hash` / `index_name_hash` | string | SHA-256 (hex) of reference seqs / names |
+@@ -103,6 +103,41 @@ Pretty-printed JSON. tximport keys off several fields (`num_bootstraps`,
+ `num_dovetail_fragments`, `num_fragments_filtered_vm`,
+ `num_alignments_below_threshold_for_mapped_fragments_vm`, and `call`.)
+ 
++#### salmon-rs extensions (beyond the C++ field set)
++
++These fields are added by the Rust implementation; downstream tools that only
++know the C++ schema simply ignore them. All are computed from end-of-run
++aggregates (no per-fragment cost) and are emitted for every mode — reads,
++`-a` alignment, and `--rad`.
++
++| Field | Type | Meaning |
++| --- | --- | --- |
++| `num_orphan` | int | mapped fragments placed as orphans (one mate only); reads mode |
++| `range_factorization_bins` | int | range-factorization bins used (0 = disabled) |
++| `num_em_iterations` | int | EM/VBEM iterations actually run |
++| `em_converged` | bool | whether the relative-difference criterion was met before the iteration cap |
++| `detected_library_type` | string \| null | library format observed by the auto-detector (reads / `--rad`); `null` if not observed (e.g. `-a` transcriptomic BAM) |
++| `total_time_seconds` | float | wall-clock seconds for the quantification call |
++| `peak_rss_kb` | int | peak resident set size in KiB (Linux `VmHWM`; 0 elsewhere) |
++| `diagnostics` | object[] | structured run diagnostics (see below) |
++
++##### `diagnostics` — machine-readable run warnings
++
++An array of `{ "code", "severity", "message" }` objects surfacing likely
++bad-input conditions, so pipelines can gate on `code`/`severity` rather than
++scraping the log (the same messages are also written to
++`logs/salmon_quant.log`). `severity` is `"error"` or `"warning"`. Codes:
++
++| `code` | severity | fires when |
++| --- | --- | --- |
++| `no_input_fragments` | error | zero fragments were processed (empty/unreadable input) |
++| `no_fragments_mapped` | error | zero fragments mapped (reference almost certainly wrong) |
++| `very_low_mapping_rate` | warning | < 10% of fragments mapped |
++| `low_mapping_rate` | warning | < 30% of fragments mapped |
++| `library_type_mismatch` | warning | an explicit `-l` disagrees with the observed library format (reads / `--rad`) |
++
++An empty array means no red flags were detected.
++
+ ### `aux_info/ambig_info.tsv` — per-transcript read partition (TSV)
+ 
+ Header `UniqueCount<TAB>AmbigCount`, then one row per quantified transcript in

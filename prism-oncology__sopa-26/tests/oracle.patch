@@ -1,0 +1,576 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b8698fd6..ff10b7ea 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,4 +1,7 @@
+-## [1.0.4] - tbd
++## [1.0.4] - 2024-02-14
++
++### Fix
++- Missing transcript count in cells due to concurrent writing processes (#20)
+ 
+ ### Changed
+ - Explorer images should have a higher contrast (not clipping values anymore)
+diff --git a/docs/api/embedding.md b/docs/api/embedding.md
+new file mode 100644
+index 00000000..ab496d60
+--- /dev/null
++++ b/docs/api/embedding.md
+@@ -0,0 +1,3 @@
++::: sopa.embedding.embed_wsi_patches
++    options:
++      show_root_heading: true
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 2bdc072f..bca13ca6 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -39,6 +39,7 @@ nav:
+       - sopa.utils.data: api/utils/data.md
+       - sopa.utils.image: api/utils/image.md
+       - sopa.utils.polygon_crop: api/utils/polygon_crop.md
++    - sopa.embedding: api/embedding.md
+     - sopa._sdata: api/_sdata.md
+   - Frequently asked questions: faq.md
+   - Cite us: cite_us.md
+diff --git a/pyproject.toml b/pyproject.toml
+index 1b4cf642..2ddc7a24 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [tool.poetry]
+ name = "sopa"
+-version = "1.0.3"
++version = "1.0.4"
+ description = "Spatial-omics pipeline and analysis"
+ documentation = "https://gustaveroussy.github.io/sopa"
+ homepage = "https://gustaveroussy.github.io/sopa"
+diff --git a/sopa/embedding/__init__.py b/sopa/embedding/__init__.py
+new file mode 100644
+index 00000000..cb80efaa
+--- /dev/null
++++ b/sopa/embedding/__init__.py
+@@ -0,0 +1 @@
++from .patches import embed_wsi_patches
+diff --git a/sopa/embedding/models/__init__.py b/sopa/embedding/models/__init__.py
+new file mode 100644
+index 00000000..a1755c1f
+--- /dev/null
++++ b/sopa/embedding/models/__init__.py
+@@ -0,0 +1,5 @@
++from .resnet import Resnet50Features
++from .histo_ssl import HistoSSLFeatures
++from .dinov2 import DINOv2Features
++
++__all__ = ["Resnet50Features", "HistoSSLFeatures", "DINOv2Features"]
+diff --git a/sopa/embedding/models/dinov2.py b/sopa/embedding/models/dinov2.py
+new file mode 100644
+index 00000000..ba26f662
+--- /dev/null
++++ b/sopa/embedding/models/dinov2.py
+@@ -0,0 +1,13 @@
++import torch
++from torch import nn
++
++
++class DINOv2Features(nn.Module):
++    def __init__(self, model="dinov2_vitl14"):
++        super().__init__()
++        self.dinov2_vitl14 = torch.hub.load("facebookresearch/dinov2", model)
++        self.output_dim = 1024
++
++    def forward(self, x):
++        feats = self.dinov2_vitl14.forward_features(x)
++        return feats["x_norm_clstoken"]
+diff --git a/sopa/embedding/models/histo_ssl.py b/sopa/embedding/models/histo_ssl.py
+new file mode 100644
+index 00000000..6b5ffda4
+--- /dev/null
++++ b/sopa/embedding/models/histo_ssl.py
+@@ -0,0 +1,14 @@
++import torch
++
++
++class HistoSSLFeatures(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        # weights retrieved from https://github.com/ozanciga/self-supervised-histopathology
++        url = "https://nextcloud.centralesupelec.fr/s/Kn4zEGMdWgnj2ac/download/tenpercent_resnet12.pth"
++        self.model = torch.hub.load_state_dict_from_url(url)
++        self.model.fc = torch.nn.Sequential()
++        self.output_dim = 512
++
++    def forward(self, x):
++        return self.model(x)
+diff --git a/sopa/embedding/models/resnet.py b/sopa/embedding/models/resnet.py
+new file mode 100644
+index 00000000..aea9c830
+--- /dev/null
++++ b/sopa/embedding/models/resnet.py
+@@ -0,0 +1,34 @@
++from torch import nn
++
++
++class Resnet50Features(nn.Module):
++    def __init__(self):
++        super().__init__()
++
++        from torchvision import transforms
++        from torchvision.models import resnet50
++
++        # Using IMAGENET1K_V1 to be compatible with CLAM feats
++        resnet = resnet50(weights="IMAGENET1K_V2")
++
++        self.features = nn.Sequential(
++            resnet.conv1,
++            resnet.bn1,
++            resnet.relu,
++            resnet.maxpool,
++            resnet.layer1,
++            resnet.layer2,
++            resnet.layer3,
++            nn.AdaptiveAvgPool2d(1),
++            nn.Flatten(start_dim=1),
++        )
++
++        self.t = transforms.Compose(
++            [transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))]
++        )
++
++        self.output_dim = 1024
++
++    def __call__(self, x):
++        x = self.features(self.t(x))
++        return x
+diff --git a/sopa/embedding/patches.py b/sopa/embedding/patches.py
+new file mode 100644
+index 00000000..fdf3d245
+--- /dev/null
++++ b/sopa/embedding/patches.py
+@@ -0,0 +1,183 @@
++import logging
++from typing import Callable
++
++import dask as da
++import numpy as np
++import tqdm
++from multiscale_spatial_image import MultiscaleSpatialImage
++from spatial_image import SpatialImage
++from spatialdata import SpatialData, bounding_box_query
++from spatialdata.models import Image2DModel
++from spatialdata.transformations import Scale
++
++from sopa._sdata import get_intrinsic_cs, get_key
++from sopa.segmentation import Patches2D
++
++log = logging.getLogger(__name__)
++
++
++def _get_best_level_for_downsample(
++    level_downsamples: list[float], downsample: float, epsilon: float = 0.01
++) -> int:
++    """Return the best level for a given downsampling factor"""
++    if downsample <= 1.0:
++        return 0
++    for level, ds in enumerate(level_downsamples):
++        if ds > downsample + epsilon:
++            return level - 1
++    return len(level_downsamples) - 1
++
++
++def _get_extraction_parameters(
++    tiff_metadata: dict, magnification: int, patch_width: int
++) -> tuple[int, int, int, bool]:
++    """
++    Given the metadata for the slide, a target magnification and a patch width,
++    it returns the best scale to get it from (level), a resize factor (resize_factor)
++    and the corresponding patch size at scale0 (patch_width)
++    """
++    if tiff_metadata["properties"].get("tiffslide.objective-power"):
++        objective_power = int(tiff_metadata["properties"].get("tiffslide.objective-power"))
++        downsample = objective_power / magnification
++
++    elif tiff_metadata["properties"].get("tiffslide.mpp-x"):
++        mppx = float(tiff_metadata["properties"].get("tiffslide.mpp-x"))
++
++        mpp_objective = min([80, 40, 20, 10, 5], key=lambda obj: abs(10 / obj - mppx))
++        downsample = mpp_objective / magnification
++    else:
++        return None, None, None, False
++
++    level = _get_best_level_for_downsample(tiff_metadata["level_downsamples"], downsample)
++    resize_factor = tiff_metadata["level_downsamples"][level] / downsample
++    patch_width = int(patch_width * downsample)
++
++    return level, resize_factor, patch_width, True
++
++
++def _numpy_patch(
++    image: MultiscaleSpatialImage,
++    box: tuple[int, int, int, int],
++    level: int,
++    resize_factor: float,
++    coordinate_system: str,
++) -> np.ndarray:
++    """Extract a numpy patch from the MultiscaleSpatialImage given a bounding box"""
++    import cv2
++
++    multiscale_patch = bounding_box_query(
++        image, ("y", "x"), box[:2][::-1], box[2:][::-1], coordinate_system
++    )
++    patch = np.array(
++        next(iter(multiscale_patch[f"scale{level}"].values())).transpose("y", "x", "c")
++    )
++
++    if resize_factor != 1:
++        dim = (int(patch.shape[0] * resize_factor), int(patch.shape[1] * resize_factor))
++        patch = cv2.resize(patch, dim)
++
++    return patch.transpose(2, 0, 1)
++
++
++def embed_batch(model_name: str, device: str) -> tuple[Callable, int]:
++    import torch
++
++    import sopa.embedding.models as models
++
++    assert hasattr(
++        models, model_name
++    ), f"'{model_name}' is not a valid model name under `sopa.embedding.models`. Valid names are: {', '.join(models.__all__)}"
++
++    model: torch.nn.Module = getattr(models, model_name)()
++    model.eval().to(device)
++
++    def _(patch: np.ndarray):
++        torch_patch = torch.tensor(patch / 255.0, dtype=torch.float32)
++        if len(torch_patch.shape) == 3:
++            torch_patch = torch_patch.unsqueeze(0)
++        with torch.no_grad():
++            embedding = model(torch_patch.to(device)).squeeze()
++        return embedding.cpu()
++
++    return _, model.output_dim
++
++
++def embed_wsi_patches(
++    sdata: SpatialData,
++    model_name: str,
++    magnification: int,
++    patch_width: int,
++    image_key: str | None = None,
++    batch_size: int = 32,
++    num_workers: int = 1,
++    device: str = "cpu",
++) -> bool:
++    """Create an image made of patch embeddings of a WSI image.
++
++    !!! info
++        The image will be saved into the `SpatialData` object with the key `sopa_{model_name}` (see the argument below).
++
++    Args:
++        sdata: A `SpatialData` object
++        model_name: Name of the computer vision model to be used. One of `Resnet50Features`, `HistoSSLFeatures`, or `DINOv2Features`.
++        magnification: The target magnification.
++        patch_width: Width of the patches for which the embeddings will be computed.
++        image_key: Optional image key of the WSI image, unecessary if there is only one image.
++        batch_size: Mini-batch size used during inference.
++        num_workers: Number of workers used to extract patches.
++        device: Device used for the computer vision model.
++
++    Returns:
++        `True` if the embedding was successful, else `False`
++    """
++    image_key = get_key(sdata, "images", image_key)
++    image = sdata.images[image_key]
++
++    assert isinstance(
++        image, MultiscaleSpatialImage
++    ), "Only `MultiscaleSpatialImage` images are supported"
++
++    tiff_metadata = image.attrs["metadata"]
++    coordinate_system = get_intrinsic_cs(sdata, image)
++
++    embedder, output_dim = embed_batch(model_name=model_name, device=device)
++
++    level, resize_factor, patch_width, success = _get_extraction_parameters(
++        tiff_metadata, magnification, patch_width
++    )
++    if not success:
++        log.error(f"Error retrieving the mpp for {image_key}, skipping tile embedding.")
++        return False
++
++    patches = Patches2D(sdata, image_key, patch_width, 0)
++    embedding_image = np.zeros((output_dim, *patches.shape), dtype=np.float32)
++
++    log.info(f"Computing {len(patches)} embeddings at level {level}")
++
++    for i in tqdm.tqdm(range(0, len(patches), batch_size)):
++        patch_boxes = patches[i : i + batch_size]
++
++        get_batches = [
++            da.delayed(_numpy_patch)(image, box, level, resize_factor, coordinate_system)
++            for box in patch_boxes
++        ]
++        batch = da.compute(*get_batches, num_workers=num_workers)
++        embedding = embedder(np.stack(batch))
++
++        loc_x, loc_y = np.array([patches.patch_iloc(k) for k in range(i, i + len(batch))]).T
++        embedding_image[:, loc_y, loc_x] = embedding.T
++
++    embedding_image = SpatialImage(embedding_image, dims=("c", "y", "x"))
++    embedding_image = Image2DModel.parse(
++        embedding_image,
++        transformations={coordinate_system: Scale([patch_width, patch_width], axes=("x", "y"))},
++    )
++    embedding_image.coords["y"] = patch_width * embedding_image.coords["y"]
++    embedding_image.coords["x"] = patch_width * embedding_image.coords["x"]
++
++    embedding_key = f"sopa_{model_name}"
++    sdata.add_image(embedding_key, embedding_image)
++
++    log.info(f"WSI embeddings saved as an image in sdata['{embedding_key}']")
++
++    return True
+diff --git a/sopa/io/histopathology.py b/sopa/io/histopathology.py
+index 2ec0e459..98e87247 100644
+--- a/sopa/io/histopathology.py
++++ b/sopa/io/histopathology.py
+@@ -99,7 +99,7 @@ def _default_image_models_kwargs(image_models_kwargs: dict | None) -> dict:
+ def _open_wsi(path: str | Path) -> tuple[str, xarray.Dataset, Any, dict]:
+     import tiffslide
+ 
+-    image_name = Path(path).absolute().name.split(".")[0]
++    image_name = Path(path).stem
+ 
+     tiff = tiffslide.open_slide(path)
+     img = xarray.open_zarr(
+diff --git a/sopa/segmentation/aggregate.py b/sopa/segmentation/aggregate.py
+index 0c5f152b..f9feb537 100644
+--- a/sopa/segmentation/aggregate.py
++++ b/sopa/segmentation/aggregate.py
+@@ -313,18 +313,23 @@ def _count_transcripts_aligned(
+ 
+     geo_df = geo_df.reset_index()
+ 
++    X_partitions = []
++
+     with ProgressBar():
+         points.map_partitions(
+-            partial(_add_coo, adata, geo_df, gene_column=value_key, gene_names=gene_names),
++            partial(_add_coo, X_partitions, geo_df, gene_column=value_key, gene_names=gene_names),
+             meta=(),
+         ).compute()
+ 
++    for X_partition in X_partitions:
++        adata.X += X_partition
++
+     adata.X = adata.X.tocsr()
+     return adata
+ 
+ 
+ def _add_coo(
+-    adata: AnnData,
++    X_partitions: list[coo_matrix],
+     geo_df: gpd.GeoDataFrame,
+     partition: pd.DataFrame,
+     gene_column: list[str],
+@@ -336,7 +341,9 @@ def _add_coo(
+     joined = geo_df.sjoin(points_gdf)
+     cells_indices, column_indices = joined.index, joined[gene_column].cat.codes
+ 
+-    adata.X += coo_matrix(
++    X_partition = coo_matrix(
+         (np.full(len(cells_indices), 1), (cells_indices, column_indices)),
+         shape=(len(geo_df), len(gene_names)),
+     )
++
++    X_partitions.append(X_partition)
+diff --git a/sopa/segmentation/baysor/resolve.py b/sopa/segmentation/baysor/resolve.py
+index b70d2ea9..d3643fc6 100644
+--- a/sopa/segmentation/baysor/resolve.py
++++ b/sopa/segmentation/baysor/resolve.py
+@@ -8,7 +8,6 @@
+ import pandas as pd
+ from anndata import AnnData
+ from shapely.geometry import Polygon, shape
+-from shapely.validation import make_valid
+ from spatialdata import SpatialData
+ from spatialdata.models import ShapesModel, TableModel
+ from spatialdata.transformations import get_transformation
+@@ -45,7 +44,7 @@ def read_baysor(
+         index=cells_num.index, geometry=[shape(polygons_dict[cell_num]) for cell_num in cells_num]
+     )
+ 
+-    gdf.geometry = gdf.geometry.map(lambda cell: shapes._ensure_polygon(make_valid(cell)))
++    gdf.geometry = gdf.geometry.map(lambda cell: shapes._ensure_polygon(cell))
+     gdf = gdf[~gdf.geometry.isna()]
+ 
+     ratio_filtered = (gdf.area <= min_area).mean()
+diff --git a/sopa/segmentation/patching.py b/sopa/segmentation/patching.py
+index bc4596ac..ae0b3033 100644
+--- a/sopa/segmentation/patching.py
++++ b/sopa/segmentation/patching.py
+@@ -8,7 +8,7 @@
+ import pandas as pd
+ from dask.diagnostics import ProgressBar
+ from multiscale_spatial_image import MultiscaleSpatialImage
+-from shapely.geometry import MultiPolygon, Polygon, box
++from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
+ from spatial_image import SpatialImage
+ from spatialdata import SpatialData
+ from spatialdata.models import ShapesModel
+@@ -107,16 +107,42 @@ def __init__(
+             else:
+                 self.roi = MultiPolygon(list(geo_df.geometry))
+ 
+-        self._ilocs = []
+-
++        self._ilocs, self._polygons = [], []
+         for i in range(self.patch_x._count * self.patch_y._count):
+-            ix, iy = self.pair_indices(i)
+-            bounds = self.iloc(ix, iy)
+-            patch = box(*bounds)
+-            if self.roi is None or self.roi.intersects(patch):
+-                self._ilocs.append((ix, iy))
++            self._register_patch(i)
++
++    def _register_patch(self, i: int):
++        """Check that the patch is valid, and, if valid, register it"""
++        iy, ix = divmod(i, self.patch_x._count)
++        bounds = self.iloc(ix, iy)
++        patch = box(*bounds)
++
++        if self.roi is not None and not self.roi.intersects(patch):
++            return
++
++        patch = patch if self.roi is None else patch.intersection(self.roi)
++
++        if isinstance(patch, GeometryCollection):
++            geoms = [geom for geom in patch.geoms if isinstance(geom, Polygon)]
++            if not geoms:
++                return
++            patch = max(geoms, key=lambda polygon: polygon.area)
++
++        if not isinstance(patch, Polygon) and not isinstance(patch, MultiPolygon):
++            return
+ 
+-    def pair_indices(self, i: int) -> tuple[int, int]:
++        self._polygons.append(patch)
++        self._ilocs.append((ix, iy))
++
++    @property
++    def polygons(self) -> list[Polygon]:
++        return self._polygons
++
++    @property
++    def shape(self) -> tuple[int, int]:
++        return (self.patch_y._count, self.patch_x._count)
++
++    def patch_iloc(self, i: int) -> tuple[int, int]:
+         """Index localization of one patch
+ 
+         Args:
+@@ -125,8 +151,7 @@ def pair_indices(self, i: int) -> tuple[int, int]:
+         Returns:
+             A tuple `(index_x, index_y)` representing the 2D localization of the patch
+         """
+-        iy, ix = divmod(i, self.patch_x._count)
+-        return ix, iy
++        return self._ilocs[i]
+ 
+     def iloc(self, ix: int, iy: int) -> list[int]:
+         """Coordinates of the rectangle bounding box of the patch at the given indices
+@@ -143,12 +168,12 @@ def iloc(self, ix: int, iy: int) -> list[int]:
+         return [xmin, ymin, xmax, ymax]
+ 
+     def __getitem__(self, i) -> tuple[int, int, int, int]:
+-        """One patche bounding box: (xmin, ymin, xmax, ymax)"""
++        """One patch bounding box: (xmin, ymin, xmax, ymax)"""
+         if isinstance(i, slice):
+             start, stop, step = i.indices(len(self))
+             return [self[i] for i in range(start, stop, step)]
+ 
+-        return self.iloc(*self._ilocs[i])
++        return self.iloc(*self.patch_iloc(i))
+ 
+     def __len__(self):
+         """Number of patches"""
+@@ -159,42 +184,25 @@ def __iter__(self):
+         for i in range(len(self)):
+             yield self[i]
+ 
+-    def polygon(self, i: int) -> Polygon | MultiPolygon:
+-        """One patch as a shapely polygon. The polygon may not be just a square, if a ROI has been previously selected.
+-
+-        Args:
+-            i: Patch index
+-
+-        Returns:
+-            Polygon or MultiPolygon representing the patch
+-        """
+-        rectangle = box(*self[i])
+-        return rectangle if self.roi is None else rectangle.intersection(self.roi)
+-
+-    @property
+-    def polygons(self) -> list[Polygon | MultiPolygon]:
+-        """All the patches as polygons
+-
+-        Returns:
+-            List of `shapely` polygons
+-        """
+-        return [self.polygon(i) for i in range(len(self))]
+-
+-    def write(self, overwrite: bool = True):
+-        """Save patches in `sdata.shapes["sopa_patches"]`
++    def write(self, overwrite: bool = True, shapes_key: str | None = None):
++        """Save patches in `sdata.shapes["sopa_patches"]` (or by the key specified)
+ 
+         Args:
+             overwrite: Whether to overwrite patches if existing
++            shapes_key: Optional name of the shapes to be saved. By default, uses "sopa_patches".
+         """
++        shapes_key = SopaKeys.PATCHES if shapes_key is None else shapes_key
++
+         geo_df = gpd.GeoDataFrame(
+             {"geometry": self.polygons, SopaKeys.BOUNDS: [self[i] for i in range(len(self))]}
+         )
+         geo_df = ShapesModel.parse(
+             geo_df, transformations=get_transformation(self.element, get_all=True)
+         )
+-        self.sdata.add_shapes(SopaKeys.PATCHES, geo_df, overwrite=overwrite)
+ 
+-        log.info(f"{len(geo_df)} patches were saved in sdata['{SopaKeys.PATCHES}']")
++        self.sdata.add_shapes(shapes_key, geo_df, overwrite=overwrite)
++
++        log.info(f"{len(geo_df)} patches were saved in sdata['{shapes_key}']")
+ 
+     def patchify_transcripts(
+         self,
+diff --git a/sopa/segmentation/stainings.py b/sopa/segmentation/stainings.py
+index 71af765a..6b6b3477 100644
+--- a/sopa/segmentation/stainings.py
++++ b/sopa/segmentation/stainings.py
+@@ -27,6 +27,7 @@ def __init__(
+         sdata: SpatialData,
+         method: Callable,
+         channels: list[str] | str,
++        image_key: str | None = None,
+         min_area: float = 0,
+         clip_limit: float = 0.2,
+         gaussian_sigma: float = 1,
+@@ -64,6 +65,7 @@ def __init__(
+             sdata: A `SpatialData` object
+             method: A segmentation `callable` whose input is an image of shape `(C, Y, X)` and output is a cell mask of shape `(Y, X)`. Each mask value `>0` represent a unique cell ID. Such callables can be found in `sopa.segmentation.methods`.
+             channels: One or a list of channel names used for segmentation. If only one channel is provided, the image given to the `method` will be of shape `(1, Y, X)`.
++            image_key: Optional key of `sdata` containing the image (no needed if there is only one image)
+             min_area: Minimum area (in pixels^2) for a cell to be kept
+             clip_limit: Parameter for skimage.exposure.equalize_adapthist (applied before running cellpose)
+             gaussian_sigma: Parameter for scipy gaussian_filter (applied before running cellpose)
+@@ -76,7 +78,7 @@ def __init__(
+         self.clip_limit = clip_limit
+         self.gaussian_sigma = gaussian_sigma
+ 
+-        self.image_key, self.image = get_spatial_image(sdata, return_key=True)
++        self.image_key, self.image = get_spatial_image(sdata, key=image_key, return_key=True)
+ 
+         image_channels = self.image.coords["c"].values
+         assert np.isin(

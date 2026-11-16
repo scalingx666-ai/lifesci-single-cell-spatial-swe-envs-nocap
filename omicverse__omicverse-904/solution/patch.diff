@@ -1,0 +1,1580 @@
+diff --git a/omicverse/alignment/__init__.py b/omicverse/alignment/__init__.py
+index 06aa658db..fe2df9f61 100644
+--- a/omicverse/alignment/__init__.py
++++ b/omicverse/alignment/__init__.py
+@@ -5,6 +5,8 @@
+ - Alignment with kb-python (bulk / scRNA-seq)
+ - RNA velocity analysis with kb-python
+ - SRA download / conversion / QC / alignment / counting wrappers
++- Sanger .ab1: basecall / align-to-reference / mixed-trace decomposition / construct verification (tracy)
++- Homology search: DIAMOND / NCBI BLAST+ (`homology_search`, `reciprocal_best_hits`)
+ - 16S amplicon pipeline: cutadapt + vsearch (merge / filter / derep / UNOISE3 / uchime3 / SINTAX / usearch_global)
+ """
+ 
+@@ -23,6 +25,13 @@
+ from .amplicon_16s import amplicon_16s_pipeline, build_amplicon_anndata
+ from ._db import fetch_sintax_ref, fetch_silva, fetch_rdp
+ 
++# Sanger sequencing (.ab1) — basecall / align / decompose / verify
++from .sanger import (SangerTrace, read_ab1, basecall, align_to_reference,
++                     decompose_trace, verify_construct)
++
++# Homology search (DIAMOND / NCBI BLAST+)
++from ._homology import homology_search, reciprocal_best_hits, BLAST_TAB_COLUMNS
++
+ # Phylogeny (MSA + tree inference)
+ from .mafft import mafft
+ from .fasttree import fasttree
+@@ -33,6 +42,15 @@
+ from .dada2 import dada2_pipeline
+ 
+ __all__ = [
++    "SangerTrace",
++    "read_ab1",
++    "basecall",
++    "align_to_reference",
++    "decompose_trace",
++    "verify_construct",
++    "homology_search",
++    "reciprocal_best_hits",
++    "BLAST_TAB_COLUMNS",
+     "single",
+     "ref",
+     "count",
+diff --git a/omicverse/alignment/_cli_utils.py b/omicverse/alignment/_cli_utils.py
+index 8535ca366..9f9eb5bc8 100644
+--- a/omicverse/alignment/_cli_utils.py
++++ b/omicverse/alignment/_cli_utils.py
+@@ -23,6 +23,14 @@
+     "gzip": "conda install -c conda-forge -y gzip",
+     "vsearch": "conda install -c bioconda -y vsearch",
+     "cutadapt": "pip install cutadapt",
++    "diamond": "conda install -c bioconda -y diamond",
++    "blastp": "conda install -c bioconda -y blast",
++    "blastn": "conda install -c bioconda -y blast",
++    "blastx": "conda install -c bioconda -y blast",
++    "tblastn": "conda install -c bioconda -y blast",
++    "tblastx": "conda install -c bioconda -y blast",
++    "makeblastdb": "conda install -c bioconda -y blast",
++    "tracy": "conda install -c bioconda -y tracy",
+     "emu": "pip install emu",
+     "Rscript": "conda install -c conda-forge -y r-base bioconductor-dada2",
+     "mafft": "conda install -c bioconda -y mafft",
+@@ -46,6 +54,18 @@
+     "mafft": ["mafft", "-c", "bioconda"],
+     "FastTree": ["fasttree", "-c", "bioconda"],
+     "FastTreeMP": ["fasttree", "-c", "bioconda"],
++    # `_INSTALL_HINTS` is only the message shown when a tool is missing; this is
++    # the dict `_install_tool` actually dispatches on. A tool listed in one but
++    # not the other makes `auto_install=True` a silent no-op that still ends in
++    # FileNotFoundError, so the two must be kept in step.
++    "diamond": ["diamond", "-c", "bioconda"],
++    "blastp": ["blast", "-c", "bioconda"],
++    "blastn": ["blast", "-c", "bioconda"],
++    "blastx": ["blast", "-c", "bioconda"],
++    "tblastn": ["blast", "-c", "bioconda"],
++    "tblastx": ["blast", "-c", "bioconda"],
++    "makeblastdb": ["blast", "-c", "bioconda"],
++    "tracy": ["tracy", "-c", "bioconda"],
+ }
+ 
+ 
+diff --git a/omicverse/alignment/_homology.py b/omicverse/alignment/_homology.py
+new file mode 100644
+index 000000000..9f89deacb
+--- /dev/null
++++ b/omicverse/alignment/_homology.py
+@@ -0,0 +1,386 @@
++r"""Sequence homology search — DIAMOND and NCBI BLAST+ behind one API.
++
++Why this module exists
++----------------------
++The fast path was already in the codebase, but it was trapped: SAMap's
++``build_blast_maps`` (``omicverse/external/samap/_run.py``) drove DIAMOND with
++an ``auto``-detect and a concurrent two-direction run, ~100-1000x faster than
++NCBI ``blastp``. Nothing outside SAMap could reach it and it carried no
++``@register_function``, so an agent could not discover it either.
++
++This lifts that capability to a first-class, registered API and generalises it:
++``method`` selects the *program*, and the engine follows from it — DIAMOND for
++its two supported programs, NCBI BLAST+ for the five it uniquely covers.
++
++Both engines emit BLAST tabular ``outfmt 6`` with **identical columns**, which
++is what makes one DataFrame contract possible.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++import tempfile
++from concurrent.futures import ThreadPoolExecutor
++from typing import Any, Dict, Optional, Sequence, Union
++
++from .._registry import register_function
++from ._cli_utils import build_env, resolve_executable
++
++__all__ = ["homology_search", "reciprocal_best_hits", "BLAST_TAB_COLUMNS"]
++
++#: The 12 columns of BLAST tabular ``outfmt 6`` — DIAMOND's ``--outfmt 6``
++#: is column-identical, which is why both engines share one parser.
++BLAST_TAB_COLUMNS = [
++    "qseqid", "sseqid", "pident", "length", "mismatch", "gapopen",
++    "qstart", "qend", "sstart", "send", "evalue", "bitscore",
++]
++
++#: program -> (engine, query molecule, subject molecule).
++#: DIAMOND implements protein-database search only (``blastp``/``blastx``);
++#: the nucleotide-database programs exist solely in NCBI BLAST+.
++_PROGRAMS: Dict[str, Dict[str, Any]] = {
++    "diamond":         {"engine": "diamond", "program": "blastp",  "db": "prot"},
++    "diamond-blastp":  {"engine": "diamond", "program": "blastp",  "db": "prot"},
++    "diamond-blastx":  {"engine": "diamond", "program": "blastx",  "db": "prot"},
++    "blastp":          {"engine": "blast",   "program": "blastp",  "db": "prot"},
++    "blastx":          {"engine": "blast",   "program": "blastx",  "db": "prot"},
++    "blastn":          {"engine": "blast",   "program": "blastn",  "db": "nucl"},
++    "tblastn":         {"engine": "blast",   "program": "tblastn", "db": "nucl"},
++    "tblastx":         {"engine": "blast",   "program": "tblastx", "db": "nucl"},
++}
++
++# Every one of these is a real DIAMOND mode flag, verified against DIAMOND
++# 2.2.4 by invoking it. `fast` in particular IS a distinct mode and not merely
++# the default — dropping its flag would silently run a different search than the
++# caller asked for, which is worse than erroring on an ancient build that
++# predates it (the aligner's own stderr is surfaced either way).
++_DIAMOND_SENSITIVITY = {
++    "faster", "fast", "mid-sensitive", "sensitive", "more-sensitive",
++    "very-sensitive", "ultra-sensitive",
++}
++
++
++def _which(name: str, env: Optional[dict] = None) -> Optional[str]:
++    path = (env or os.environ).get("PATH")
++    return shutil.which(name, path=path)
++
++
++def resolve_method(method: str = "auto", env: Optional[dict] = None) -> str:
++    """Resolve ``method='auto'`` to a concrete program name.
++
++    ``'auto'`` means protein-protein search with whichever engine is installed,
++    preferring DIAMOND. Any explicit method is returned unchanged (after
++    validation) so a caller can pin the engine for reproducibility.
++    """
++    if method != "auto":
++        if method not in _PROGRAMS:
++            raise ValueError(
++                f"unknown method {method!r}. Choose one of: "
++                + ", ".join(sorted(_PROGRAMS)) + ", or 'auto'."
++            )
++        return method
++    return "diamond" if _which("diamond", env) else "blastp"
++
++
++def _read_hits(path: str):
++    """Parse an ``outfmt 6`` table into a DataFrame (empty table -> empty frame)."""
++    import pandas as pd
++
++    if not os.path.exists(path) or os.path.getsize(path) == 0:
++        return pd.DataFrame(columns=BLAST_TAB_COLUMNS)
++    # Sequence IDs stay STRINGS. Left to pandas, an all-numeric FASTA header
++    # ("12345", common in NCBI GI and in generated proteomes) is inferred as
++    # int64 — and when the two directions of a reciprocal run happen to infer
++    # different dtypes for the same column, the merge in `reciprocal_best_hits`
++    # dies with a pandas dtype ValueError on data that is perfectly valid.
++    df = pd.read_csv(path, sep="\t", header=None, names=BLAST_TAB_COLUMNS,
++                     dtype={"qseqid": str, "sseqid": str})
++    for col in ("pident", "evalue", "bitscore"):
++        df[col] = pd.to_numeric(df[col], errors="coerce")
++    for col in ("length", "mismatch", "gapopen", "qstart", "qend", "sstart", "send"):
++        df[col] = pd.to_numeric(df[col], errors="coerce", downcast="integer")
++    return df
++
++
++def _run(cmd: Sequence[str], env: dict, quiet: bool = True) -> None:
++    """Run an aligner, surfacing its stderr on failure.
++
++    ``subprocess.run(check=True)`` alone would raise with an empty message and
++    the actual cause (a malformed FASTA, a missing db) would be lost.
++    """
++    proc = subprocess.run(
++        list(cmd), env=env,
++        stdout=subprocess.DEVNULL if quiet else None,
++        stderr=subprocess.PIPE,
++    )
++    if proc.returncode != 0:
++        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
++        raise RuntimeError(
++            f"`{cmd[0]} {cmd[1] if len(cmd) > 1 else ''}` failed "
++            f"(exit {proc.returncode}): {err or '<no stderr>'}"
++        )
++
++
++def _build_db(engine: str, fasta: str, db_prefix: str, dbtype: str,
++              threads: int, env: dict, exe: Dict[str, str]) -> None:
++    if engine == "diamond":
++        _run([exe["diamond"], "makedb", "--in", fasta, "--db", db_prefix,
++              "--threads", str(threads), "--quiet"], env)
++    else:
++        _run([exe["makeblastdb"], "-in", fasta, "-dbtype", dbtype,
++              "-out", db_prefix], env)
++
++
++def _align_cmd(spec: Dict[str, Any], *, exe: Dict[str, str], query: str,
++               db_prefix: str, out_path: str, evalue: float,
++               max_target_seqs: int, threads: int, sensitivity: str,
++               extra_args: Optional[Sequence[str]]) -> list:
++    if spec["engine"] == "diamond":
++        cmd = [exe["diamond"], spec["program"], "--query", query, "--db", db_prefix,
++               "--outfmt", "6", "--evalue", str(evalue),
++               "--max-target-seqs", str(max_target_seqs),
++               "--threads", str(threads), "--quiet", "--out", out_path]
++        if sensitivity:
++            if sensitivity not in _DIAMOND_SENSITIVITY:
++                raise ValueError(
++                    f"unknown DIAMOND sensitivity {sensitivity!r}; choose from "
++                    + ", ".join(sorted(_DIAMOND_SENSITIVITY))
++                )
++            cmd.append(f"--{sensitivity}")
++    else:
++        cmd = [exe[spec["program"]], "-query", query, "-db", db_prefix,
++               "-outfmt", "6", "-evalue", str(evalue), "-max_hsps", "1",
++               "-max_target_seqs", str(max_target_seqs),
++               "-num_threads", str(threads), "-out", out_path]
++    if extra_args:
++        cmd.extend(str(a) for a in extra_args)
++    return cmd
++
++
++def _resolve_binaries(spec: Dict[str, Any], *, bin_dir: str, auto_install: bool,
++                      env: dict) -> Dict[str, str]:
++    """Resolve each binary to an absolute path, honouring ``bin_dir`` FIRST.
++
++    `resolve_executable` searches the ambient ``PATH`` and the interpreter's own
++    ``env/bin`` — it has no idea about ``bin_dir``. SAMap's ``build_blast_maps``
++    used to prepend its ``blast_bin`` to ``env["PATH"]`` and then run a bare
++    ``diamond``, so a DIAMOND installed ONLY in ``blast_bin`` worked. Resolving
++    through `resolve_executable` alone would drop that and raise
++    FileNotFoundError where the previous implementation succeeded, so
++    ``bin_dir`` gets first refusal here.
++    """
++    def _find(name: str) -> str:
++        found = _which(name, env)
++        if found:
++            return found
++        return resolve_executable(name, auto_install=auto_install)
++
++    exe: Dict[str, str] = {}
++    if spec["engine"] == "diamond":
++        exe["diamond"] = _find("diamond")
++    else:
++        exe[spec["program"]] = _find(spec["program"])
++        exe["makeblastdb"] = _find("makeblastdb")
++    return exe
++
++
++@register_function(
++    aliases=["homology_search", "同源搜索", "blast", "blastp", "diamond",
++             "sequence_search", "序列比对", "homology"],
++    category="alignment",
++    description=(
++        "Search a query FASTA against a subject FASTA with DIAMOND or NCBI "
++        "BLAST+ and return the hits as a tidy DataFrame (BLAST tabular "
++        "outfmt-6 columns). `method` picks the program: 'auto' (DIAMOND if "
++        "installed, else blastp), 'diamond' / 'diamond-blastx', or any NCBI "
++        "program — 'blastp', 'blastx', 'blastn', 'tblastn', 'tblastx'. DIAMOND "
++        "is ~100-1000x faster than blastp at comparable sensitivity, so it is "
++        "the default whenever the search is protein-vs-protein."
++    ),
++    examples=[
++        "hits = ov.alignment.homology_search('query.faa', 'subject.faa')",
++        "hits = ov.alignment.homology_search('q.faa', 's.faa', method='diamond', sensitivity='ultra-sensitive')",
++        "hits = ov.alignment.homology_search('genes.fna', 'genome.fna', method='blastn')",
++        "hits = ov.alignment.homology_search('contigs.fna', 'proteins.faa', method='diamond-blastx')",
++    ],
++    related=["alignment.reciprocal_best_hits", "alignment.mafft", "single.get_orthologs"],
++)
++def homology_search(
++    query: str,
++    subject: str,
++    *,
++    method: str = "auto",
++    evalue: float = 1e-5,
++    max_target_seqs: int = 10,
++    threads: int = 8,
++    sensitivity: str = "sensitive",
++    out: Optional[str] = None,
++    extra_args: Optional[Sequence[str]] = None,
++    bin_dir: str = "",
++    auto_install: bool = False,
++):
++    r"""Align ``query`` against ``subject`` and return the hit table.
++
++    Arguments
++    ---------
++    query, subject
++        Paths to FASTA files. ``subject`` is turned into a search database
++        (DIAMOND ``makedb`` or NCBI ``makeblastdb``) in a temporary directory,
++        unless ``out`` is given, in which case the database is kept beside it.
++    method
++        ``'auto'`` | ``'diamond'`` | ``'diamond-blastp'`` | ``'diamond-blastx'``
++        | ``'blastp'`` | ``'blastx'`` | ``'blastn'`` | ``'tblastn'`` |
++        ``'tblastx'``. ``'auto'`` runs protein-protein search with DIAMOND when
++        it is on ``PATH``, else ``blastp``. Pin an explicit method when you need
++        a reproducible engine.
++    evalue, max_target_seqs, threads
++        Shared alignment parameters.
++    sensitivity
++        DIAMOND sensitivity mode (``fast`` | ``mid-sensitive`` | ``sensitive`` |
++        ``more-sensitive`` | ``very-sensitive`` | ``ultra-sensitive``). Ignored
++        by the NCBI engine.
++    out
++        Where to write the ``outfmt 6`` table. Omit to use a temporary file
++        (the DataFrame is still returned).
++    extra_args
++        Raw flags appended to the aligner command, for anything this wrapper
++        does not model.
++    bin_dir
++        Directory holding the aligner binaries, prepended to ``PATH``.
++    auto_install
++        Try to install a missing aligner (conda/bioconda) before failing.
++
++    Returns
++    -------
++    pandas.DataFrame
++        One row per HSP with the 12 ``outfmt 6`` columns
++        (:data:`BLAST_TAB_COLUMNS`), sorted by ``evalue`` then descending
++        ``bitscore``. Empty when nothing passed the threshold.
++
++    Examples
++    --------
++    >>> import omicverse as ov
++    >>> hits = ov.alignment.homology_search("designed.faa", "uniprot_sprot.faa")
++    >>> hits.head()
++    """
++    for label, path in (("query", query), ("subject", subject)):
++        if not os.path.exists(path):
++            raise FileNotFoundError(f"{label} FASTA not found: {path}")
++
++    env = build_env(extra_paths=[bin_dir] if bin_dir else None)
++    resolved = resolve_method(method, env)
++    spec = _PROGRAMS[resolved]
++    exe = _resolve_binaries(spec, bin_dir=bin_dir, auto_install=auto_install, env=env)
++
++    # The search database is an intermediate artifact and ALWAYS lives in a
++    # private temp dir — never beside `out`. Putting it next to `out` with a
++    # fixed name made two concurrent searches writing into the same directory
++    # (exactly what a reciprocal run does) clobber each other's database, so one
++    # direction silently searched against the wrong subject.
++    tmp = tempfile.TemporaryDirectory(prefix="ov_homology_")
++    if out:
++        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
++        out_path = out
++    else:
++        out_path = os.path.join(tmp.name, "hits.tsv")
++
++    try:
++        db_prefix = os.path.join(tmp.name, "subjectdb")
++        _build_db(spec["engine"], subject, db_prefix, spec["db"], threads, env, exe)
++        _run(_align_cmd(spec, exe=exe, query=query, db_prefix=db_prefix,
++                        out_path=out_path, evalue=evalue,
++                        max_target_seqs=max_target_seqs, threads=threads,
++                        sensitivity=sensitivity, extra_args=extra_args), env)
++        hits = _read_hits(out_path)
++    finally:
++        tmp.cleanup()
++
++    if len(hits):
++        hits = hits.sort_values(["evalue", "bitscore"], ascending=[True, False],
++                                kind="mergesort").reset_index(drop=True)
++    hits.attrs["method"] = resolved
++    hits.attrs["engine"] = spec["engine"]
++    return hits
++
++
++@register_function(
++    aliases=["reciprocal_best_hits", "RBH", "双向最佳匹配", "rbh", "ortholog_rbh"],
++    category="alignment",
++    description=(
++        "Reciprocal best hits between two FASTAs — the standard operational "
++        "definition of a one-to-one ortholog pair when no curated orthology "
++        "table exists. Runs both directions concurrently (DIAMOND by default) "
++        "and keeps pairs that are each other's top hit."
++    ),
++    examples=[
++        "rbh = ov.alignment.reciprocal_best_hits('speciesA.faa', 'speciesB.faa')",
++        "rbh = ov.alignment.reciprocal_best_hits('a.faa', 'b.faa', method='blastp', threads=16)",
++    ],
++    related=["alignment.homology_search", "single.get_orthologs", "tl.cross_species_align"],
++)
++def reciprocal_best_hits(
++    fasta_a: str,
++    fasta_b: str,
++    *,
++    method: str = "auto",
++    evalue: float = 1e-5,
++    threads: int = 8,
++    sensitivity: str = "sensitive",
++    max_target_seqs: int = 5,
++    bin_dir: str = "",
++    auto_install: bool = False,
++):
++    r"""Reciprocal best hits (RBH) between two FASTA files.
++
++    A pair ``(a, b)`` is kept when ``b`` is the best hit for ``a`` in the
++    A->B search **and** ``a`` is the best hit for ``b`` in B->A. "Best" is the
++    lowest e-value, ties broken by the higher bitscore.
++
++    Note
++    ----
++    For species with curated Ensembl orthology, prefer
++    :func:`omicverse.single.get_orthologs` — looking up a precomputed
++    one-to-one table is both faster and better curated than re-deriving it.
++    RBH is for the cases that lookup cannot serve: unannotated assemblies,
++    distant species, or your own designed sequences.
++
++    Returns
++    -------
++    pandas.DataFrame
++        Columns ``a``, ``b``, ``evalue_ab``, ``bitscore_ab``, ``pident_ab``,
++        ``evalue_ba``, ``bitscore_ba``, ``pident_ba``.
++    """
++    import pandas as pd
++
++    def _best(df):
++        if not len(df):
++            return df.assign(_k=[]).iloc[0:0]
++        ranked = df.sort_values(["qseqid", "evalue", "bitscore"],
++                                ascending=[True, True, False], kind="mergesort")
++        return ranked.groupby("qseqid", as_index=False, sort=False).head(1)
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        fwd_f = pool.submit(homology_search, fasta_a, fasta_b, method=method,
++                            evalue=evalue, threads=threads, sensitivity=sensitivity,
++                            max_target_seqs=max_target_seqs, bin_dir=bin_dir,
++                            auto_install=auto_install)
++        rev_f = pool.submit(homology_search, fasta_b, fasta_a, method=method,
++                            evalue=evalue, threads=threads, sensitivity=sensitivity,
++                            max_target_seqs=max_target_seqs, bin_dir=bin_dir,
++                            auto_install=auto_install)
++        fwd, rev = _best(fwd_f.result()), _best(rev_f.result())
++
++    if not len(fwd) or not len(rev):
++        return pd.DataFrame(columns=["a", "b", "evalue_ab", "bitscore_ab", "pident_ab",
++                                     "evalue_ba", "bitscore_ba", "pident_ba"])
++
++    ab = fwd.rename(columns={"qseqid": "a", "sseqid": "b", "evalue": "evalue_ab",
++                             "bitscore": "bitscore_ab", "pident": "pident_ab"})
++    ba = rev.rename(columns={"qseqid": "b", "sseqid": "a", "evalue": "evalue_ba",
++                             "bitscore": "bitscore_ba", "pident": "pident_ba"})
++    merged = ab[["a", "b", "evalue_ab", "bitscore_ab", "pident_ab"]].merge(
++        ba[["a", "b", "evalue_ba", "bitscore_ba", "pident_ba"]], on=["a", "b"], how="inner")
++    return merged.sort_values(["evalue_ab", "bitscore_ab"],
++                              ascending=[True, False], kind="mergesort").reset_index(drop=True)
+diff --git a/omicverse/alignment/sanger.py b/omicverse/alignment/sanger.py
+new file mode 100644
+index 000000000..71ba76c62
+--- /dev/null
++++ b/omicverse/alignment/sanger.py
+@@ -0,0 +1,529 @@
++r"""Sanger sequencing (.ab1) — basecalling, reference alignment, and the
++construct-verification loop.
++
++Why this lives in ``ov.alignment``
++---------------------------------
++Reading a chromatogram is a sequence-alignment job that shells out to an
++external binary — exactly the shape this module already has for ``mafft`` /
++``fastp`` / ``STAR`` (see :func:`omicverse.alignment._cli_utils.resolve_executable`).
++It also closes a loop the rest of omicverse opens: ``ov.synbio`` designs a
++construct and writes its GenBank, and this is where the sequencing that came
++back gets checked against it.
++
++Engine
++------
++`tracy <https://github.com/gear-genomics/tracy>`_ (EMBL Heidelberg, BSD) does
++the heavy lifting: peak-ratio basecalling, kmer-anchored alignment to a
++reference, and — the part nothing else open-source does well — **decomposition
++of a mixed trace**, which is how a heterozygous variant or a CRISPR-edited
++allele is read off a single overlapping chromatogram.
++
++``read_ab1`` alone works without tracy (Biopython's ABI parser), so a caller can
++always at least load a trace.
++"""
++
++from __future__ import annotations
++
++import glob
++import json
++import os
++import shutil
++import subprocess
++import tempfile
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
++
++from .._registry import register_function
++from ._cli_utils import build_env, resolve_executable
++
++__all__ = ["SangerTrace", "read_ab1", "basecall", "align_to_reference",
++           "decompose_trace", "verify_construct"]
++
++_TRACY_HINT = (
++    "tracy is required for this step. Install it with "
++    "`conda install -c bioconda tracy` (or set `tracy_path=`)."
++)
++
++
++@dataclass
++class SangerTrace:
++    """One chromatogram: the called sequence plus the four dye channels."""
++
++    path: str
++    #: Primary basecall (the sequence you would submit).
++    sequence: str = ""
++    #: Secondary basecall — where it differs from :attr:`sequence` the trace is
++    #: mixed (two alleles, or a poor read).
++    secondary: str = ""
++    #: Per-base quality; empty when the engine did not report it.
++    quality: List[int] = field(default_factory=list)
++    #: Trace sample index of each called base (x-position for a viewer).
++    basecall_pos: List[int] = field(default_factory=list)
++    #: Raw dye channels, ``{'A': [...], 'C': [...], 'G': [...], 'T': [...]}``.
++    peaks: Dict[str, List[float]] = field(default_factory=dict)
++
++    def __len__(self) -> int:            # noqa: D105
++        return len(self.sequence)
++
++    def __repr__(self) -> str:           # noqa: D105
++        return (f"SangerTrace({os.path.basename(self.path)!r}, "
++                f"{len(self.sequence)} bp, {len(self.peaks)} channels)")
++
++    @property
++    def mixed_positions(self) -> List[int]:
++        """0-based positions where primary and secondary basecalls disagree.
++
++        A run of these is the signature of a heterozygous site or an edited
++        pool; :func:`decompose_trace` is what resolves them into alleles.
++        """
++        return [i for i, (p, s) in enumerate(zip(self.sequence, self.secondary))
++                if s and p != s and s != "N" and p != "N"]
++
++    def to_fasta(self, path: str, name: Optional[str] = None) -> str:
++        """Write the primary basecall as FASTA and return the path."""
++        name = name or os.path.splitext(os.path.basename(self.path))[0]
++        with open(path, "w") as fh:
++            fh.write(f">{name}\n")
++            for i in range(0, len(self.sequence), 60):
++                fh.write(self.sequence[i:i + 60] + "\n")
++        return path
++
++
++def _tracy(tracy_path: str = "", auto_install: bool = False) -> str:
++    try:
++        return resolve_executable("tracy", explicit=tracy_path or None,
++                                  auto_install=auto_install)
++    except FileNotFoundError as exc:
++        raise FileNotFoundError(f"{exc}\n{_TRACY_HINT}") from exc
++
++
++def _run(cmd: List[str], env: dict) -> None:
++    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    if proc.returncode != 0:
++        err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip()
++        raise RuntimeError(f"`tracy {cmd[1] if len(cmd) > 1 else ''}` failed "
++                           f"(exit {proc.returncode}): {err or '<no stderr>'}")
++
++
++def _trace_from_tracy_json(path: str, doc: Dict[str, Any]) -> SangerTrace:
++    """Build a :class:`SangerTrace` from ``tracy basecall -f json`` output.
++
++    Keys verified against tracy 0.8.1: ``pos``, ``peakA/C/G/T``,
++    ``basecallPos``, ``basecallQual``, ``basecalls``, ``primarySeq``,
++    ``secondarySeq``.
++    """
++    return SangerTrace(
++        path=path,
++        sequence=doc.get("primarySeq", "") or "",
++        secondary=doc.get("secondarySeq", "") or "",
++        quality=[int(q) for q in doc.get("basecallQual", []) or []],
++        basecall_pos=[int(p) for p in doc.get("basecallPos", []) or []],
++        peaks={b: list(doc.get(f"peak{b}", []) or []) for b in "ACGT"},
++    )
++
++
++@register_function(
++    aliases=["read_ab1", "sanger", "chromatogram", "读取ab1", "测序峰图", "abi"],
++    category="alignment",
++    description=(
++        "Read a Sanger .ab1/.abi chromatogram into a SangerTrace: primary and "
++        "secondary basecalls, per-base quality, and the four dye channels for "
++        "plotting. Uses tracy when available (it also reports the secondary "
++        "basecall that reveals a mixed trace) and falls back to Biopython's ABI "
++        "parser so a trace can always be loaded."
++    ),
++    examples=[
++        "tr = ov.alignment.read_ab1('clone_A.ab1')",
++        "tr.sequence[:60]; tr.mixed_positions",
++    ],
++    related=["alignment.verify_construct", "alignment.decompose_trace", "synbio.write_genbank"],
++)
++def read_ab1(path: str, *, engine: str = "auto", pratio: float = 0.33,
++             tracy_path: str = "", auto_install: bool = False) -> SangerTrace:
++    r"""Load a chromatogram.
++
++    Arguments
++    ---------
++    path
++        ``.ab1`` / ``.abi`` file.
++    engine
++        ``'auto'`` (tracy when installed, else Biopython), ``'tracy'``, or
++        ``'biopython'``. Only tracy reports the **secondary** basecall, so
++        :attr:`SangerTrace.mixed_positions` is empty under Biopython.
++    pratio
++        tracy's peak ratio for calling a base.
++    """
++    if not os.path.exists(path):
++        raise FileNotFoundError(f"trace not found: {path}")
++    if engine not in ("auto", "tracy", "biopython"):
++        raise ValueError("engine must be 'auto', 'tracy' or 'biopython'")
++
++    # Resolve with the SAME rule the rest of the module uses. `shutil.which`
++    # alone only looks at PATH, so a tracy sitting in the interpreter's own
++    # env bin (where `resolve_executable` finds it) was missed and `auto`
++    # silently degraded to Biopython — no secondary basecall, no dye channels,
++    # and no warning that the trace had been read the lesser way.
++    exe = None
++    if engine in ("auto", "tracy"):
++        try:
++            exe = _tracy(tracy_path, auto_install)
++        except FileNotFoundError:
++            # Falling back is only correct when tracy was merely ABSENT. If the
++            # caller named a path, a typo in it must not degrade silently to the
++            # lesser reader — they asked for a specific binary.
++            if engine == "tracy" or tracy_path:
++                raise
++    if exe:
++        env = build_env()
++        with tempfile.TemporaryDirectory(prefix="ov_sanger_") as tmp:
++            out = os.path.join(tmp, "bc.json")
++            _run([exe, "basecall", "-f", "json", "-p", str(pratio), "-o", out, path], env)
++            with open(out) as fh:
++                return _trace_from_tracy_json(path, json.load(fh))
++
++    try:
++        from Bio import SeqIO
++    except ImportError as exc:                                    # pragma: no cover
++        raise ImportError(
++            "reading .ab1 without tracy needs Biopython (`pip install biopython`), "
++            f"or install tracy. {_TRACY_HINT}"
++        ) from exc
++    rec = SeqIO.read(path, "abi")
++    quals = list(rec.letter_annotations.get("phred_quality", []))
++
++    # Pull the dye channels and basecall positions out of the raw ABIF
++    # directories too. An earlier cut returned only the sequence and quality,
++    # which made this path look like a success while handing every caller an
++    # unplottable trace — a viewer drew a blank canvas with no error to explain
++    # it. Only the SECONDARY basecall genuinely needs tracy (it comes from
++    # tracy's peak-ratio calling), so that stays empty and `mixed_positions`
++    # stays correctly empty with it.
++    #
++    # DATA9-12 are the processed (baseline-corrected, mobility-shifted) traces;
++    # DATA1-4 are the raw ones. FWO_1 is the filter-wheel order — the string
++    # that says which channel is which base, e.g. b"GATC" means DATA9 is G.
++    # PLOC2 is the edited peak location per base, PLOC1 the original.
++    raw = rec.annotations.get("abif_raw", {}) or {}
++    order = raw.get("FWO_1") or b"GATC"
++    if isinstance(order, str):
++        order = order.encode()
++    peaks: Dict[str, List[float]] = {}
++    for i, base in enumerate(order.decode("ascii", "replace")[:4]):
++        channel = raw.get(f"DATA{9 + i}")
++        if channel is not None and base in "ACGT":
++            peaks[base] = [float(v) for v in channel]
++    positions = raw.get("PLOC2")
++    if positions is None:
++        positions = raw.get("PLOC1")
++
++    return SangerTrace(
++        path=path,
++        sequence=str(rec.seq),
++        secondary="",
++        quality=quals,
++        basecall_pos=[int(p) for p in (positions or [])],
++        peaks=peaks,
++    )
++
++
++@register_function(
++    aliases=["basecall", "碱基识别", "sanger_basecall"],
++    category="alignment",
++    description=(
++        "Basecall a Sanger .ab1 trace with tracy and return the sequence "
++        "(optionally writing FASTA/FASTQ). Trimming stringency and peak ratio "
++        "are exposed because a raw trace's ends are usually unusable."
++    ),
++    examples=[
++        "seq = ov.alignment.basecall('clone_A.ab1', trim=5)",
++        "ov.alignment.basecall('clone_A.ab1', out='clone_A.fasta', fmt='fasta')",
++    ],
++    related=["alignment.read_ab1", "alignment.align_to_reference"],
++)
++def basecall(path: str, *, fmt: str = "fasta", out: Optional[str] = None,
++             otype: str = "primary", trim: int = 0, pratio: float = 0.33,
++             tracy_path: str = "", auto_install: bool = False) -> str:
++    r"""Basecall a trace; returns the sequence (and writes ``out`` when given).
++
++    ``fmt`` is ``fasta`` | ``fastq`` | ``tsv`` | ``json``; ``otype`` selects
++    ``primary`` | ``secondary`` | ``consensus``. ``trim`` is tracy's stringency
++    (1-9, 0 = no automatic trimming).
++    """
++    if fmt not in ("fasta", "fastq", "tsv", "json"):
++        raise ValueError("fmt must be 'fasta', 'fastq', 'tsv' or 'json'")
++    exe = _tracy(tracy_path, auto_install)
++    env = build_env()
++    with tempfile.TemporaryDirectory(prefix="ov_sanger_") as tmp:
++        target = out or os.path.join(tmp, f"bc.{fmt}")
++        if out:
++            os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
++        _run([exe, "basecall", "-f", fmt, "-y", otype, "-t", str(trim),
++              "-p", str(pratio), "-o", target, path], env)
++        text = open(target).read()
++    if fmt == "fasta":
++        return "".join(l.strip() for l in text.splitlines() if not l.startswith(">"))
++    if fmt == "fastq":
++        lines = text.splitlines()
++        return lines[1] if len(lines) > 1 else ""
++    return text
++
++
++@register_function(
++    aliases=["align_to_reference", "sanger_align", "比对参考", "trace_align"],
++    category="alignment",
++    description=(
++        "Align a Sanger trace to a reference (FASTA, or a wild-type .ab1) with "
++        "tracy and return the alignment: reference/trace rows, identity, and "
++        "the per-position differences. This is how a clone is checked against "
++        "the sequence it was supposed to be."
++    ),
++    examples=[
++        "aln = ov.alignment.align_to_reference('clone_A.ab1', 'expected.fa')",
++        "aln['identity'], aln['differences'][:5]",
++    ],
++    related=["alignment.verify_construct", "alignment.decompose_trace"],
++)
++def align_to_reference(trace: str, reference: str, *, trim_left: int = 50,
++                       trim_right: int = 50, pratio: float = 0.33,
++                       edge_margin: int = 50, out_prefix: Optional[str] = None,
++                       tracy_path: str = "",
++                       auto_install: bool = False) -> Dict[str, Any]:
++    r"""Align ``trace`` to ``reference``.
++
++    Returns
++    -------
++    dict
++        ``ref_align`` / ``alt_align`` (the two gapped rows), ``identity`` (0-1
++        over aligned columns), ``aligned`` (column count), ``differences``
++        (``[{pos, ref, alt}]``, 0-based over the alignment), ``forward``
++        (whether the trace matched the forward strand), and ``files`` (tracy's
++        outputs when ``out_prefix`` was given).
++    """
++    for label, p in (("trace", trace), ("reference", reference)):
++        if not os.path.exists(p):
++            raise FileNotFoundError(f"{label} not found: {p}")
++    exe = _tracy(tracy_path, auto_install)
++    env = build_env()
++
++    tmp = tempfile.TemporaryDirectory(prefix="ov_sanger_")
++    try:
++        prefix = out_prefix or os.path.join(tmp.name, "aln")
++        if out_prefix:
++            os.makedirs(os.path.dirname(os.path.abspath(prefix)) or ".", exist_ok=True)
++        _run([exe, "align", "-r", reference, "-o", prefix,
++              "-q", str(trim_left), "-u", str(trim_right), "-p", str(pratio), trace], env)
++        with open(f"{prefix}.json") as fh:
++            doc = json.load(fh)
++        files = sorted(glob.glob(f"{prefix}*")) if out_prefix else []
++    finally:
++        # The JSON is read inside the `try` above, so the directory is only
++        # needed until here in both cases. (An earlier cut had two identical
++        # branches and a dead `payload = None` guarding a lifetime concern that
++        # does not exist.)
++        tmp.cleanup()
++
++    def _identity(diffs, span):
++        return (span - len(diffs)) / span if span > 0 else 0.0
++
++    ref_row = doc.get("refalign", "") or ""
++    alt_row = doc.get("altalign", "") or ""
++    diffs = [{"pos": i, "ref": r, "alt": a}
++             for i, (r, a) in enumerate(zip(ref_row, alt_row)) if r != a]
++    aligned = min(len(ref_row), len(alt_row))
++    # A Sanger read decays at both ends: the last ~50 bases are routinely all
++    # gaps against a perfectly correct clone. Judging a construct on whole-read
++    # identity therefore fails good clones, so report BOTH — `identity` over
++    # everything, and `identity_core` over the trustworthy middle, which is what
++    # `verify_construct` actually decides on.
++    core_lo, core_hi = edge_margin, aligned - edge_margin
++    core_span = max(0, core_hi - core_lo)
++    core_diffs = [d for d in diffs if core_lo <= d["pos"] < core_hi]
++    # A short read (or a large `edge_margin`) can leave NO core at all. That is
++    # "cannot be judged", not "0% identity" — reporting 0.0 made
++    # `verify_construct` fail a perfect clone while handing back an empty
++    # `core_differences`, i.e. a rejection with no evidence. `None` forces the
++    # caller (and the agent reading it) to say so instead.
++    return {
++        "ref_align": ref_row,
++        "alt_align": alt_row,
++        "aligned": aligned,
++        "identity": _identity(diffs, aligned),
++        "identity_core": _identity(core_diffs, core_span) if core_span else None,
++        "core_span": core_span,
++        "edge_margin": edge_margin,
++        "differences": diffs,
++        "core_differences": core_diffs,
++        "forward": bool(doc.get("forward", True)),
++        "ref_chrom": doc.get("refchr", ""),
++        "ref_pos": doc.get("refpos", None),
++        "files": files,
++    }
++
++
++@register_function(
++    aliases=["decompose_trace", "峰图解卷积", "trace_decompose", "heterozygous",
++             "crispr_edit_readout"],
++    category="alignment",
++    description=(
++        "Decompose a MIXED Sanger trace against a reference — the way a "
++        "heterozygous variant or a CRISPR-edited allele is read off a single "
++        "overlapping chromatogram. Wraps `tracy decompose`, which is the only "
++        "well-maintained open implementation of this."
++    ),
++    examples=[
++        "res = ov.alignment.decompose_trace('edited.ab1', 'wildtype.fa')",
++        "res['variants']",
++    ],
++    related=["alignment.align_to_reference", "synbio.design_grnas"],
++)
++def decompose_trace(trace: str, reference: str, *, call_variants: bool = True,
++                    max_indel: int = 1000, pratio: float = 0.33,
++                    out_prefix: Optional[str] = None, tracy_path: str = "",
++                    auto_install: bool = False) -> Dict[str, Any]:
++    r"""Deconvolute a mixed trace into its alleles.
++
++    Returns a dict with ``variants`` (whatever tracy called), the raw
++    ``report`` document, and ``files`` when ``out_prefix`` was given.
++    """
++    for label, p in (("trace", trace), ("reference", reference)):
++        if not os.path.exists(p):
++            raise FileNotFoundError(f"{label} not found: {p}")
++    exe = _tracy(tracy_path, auto_install)
++    env = build_env()
++
++    with tempfile.TemporaryDirectory(prefix="ov_sanger_") as tmp:
++        prefix = out_prefix or os.path.join(tmp, "dec")
++        if out_prefix:
++            os.makedirs(os.path.dirname(os.path.abspath(prefix)) or ".", exist_ok=True)
++        cmd = [exe, "decompose", "-r", reference, "-o", prefix,
++               "-i", str(max_indel), "-p", str(pratio)]
++        if call_variants:
++            cmd.append("-v")
++        cmd.append(trace)
++        _run(cmd, env)
++        doc: Dict[str, Any] = {}
++        jpath = f"{prefix}.json"
++        if os.path.exists(jpath):
++            with open(jpath) as fh:
++                doc = json.load(fh)
++        files = sorted(glob.glob(f"{prefix}*")) if out_prefix else []
++
++    variants = doc.get("variants", doc.get("variant", []))
++    return {"variants": variants, "report": doc, "files": files}
++
++
++@register_function(
++    aliases=["verify_construct", "construct_verification", "克隆验证",
++             "sanger_verify", "验证构建体"],
++    category="alignment",
++    description=(
++        "Verify a cloned construct against the sequence it was designed to be: "
++        "align one or more Sanger traces to the expected reference (FASTA or "
++        "GenBank, e.g. the output of ov.synbio.write_genbank) and report "
++        "pass/fail with the exact mismatches. Closes the design->build->verify "
++        "loop."
++    ),
++    examples=[
++        "rep = ov.alignment.verify_construct(['fwd.ab1','rev.ab1'], 'pUC19_insert.gb')",
++        "rep['ok'], rep['traces'][0]['identity'], rep['traces'][0]['differences']",
++    ],
++    related=["synbio.write_genbank", "synbio.design_primers", "alignment.align_to_reference"],
++)
++def verify_construct(traces, reference: str, *, min_identity: float = 0.995,
++                     trim_left: int = 50, trim_right: int = 50,
++                     edge_margin: int = 50, tracy_path: str = "",
++                     auto_install: bool = False) -> Dict[str, Any]:
++    r"""Check sequencing reads against the construct that was designed.
++
++    Arguments
++    ---------
++    traces
++        One ``.ab1`` path or a list of them (e.g. forward and reverse reads).
++    reference
++        Expected sequence — FASTA, or **GenBank** (``.gb``/``.gbk``, which is
++        what :func:`omicverse.synbio.write_genbank` produces; it is converted to
++        FASTA internally via Biopython).
++    min_identity
++        Identity required to pass, measured over the **core** region (the
++        alignment minus ``edge_margin`` on each side).
++    edge_margin
++        Bases excluded from the verdict at each end. Sanger reads decay at both
++        ends, so a perfectly correct clone routinely shows gap-only differences
++        there; counting them would fail good clones.
++
++    Returns
++    -------
++    dict
++        ``ok`` (all traces passed), ``min_identity``, and ``traces`` — one entry
++        per read with ``trace``, ``identity`` (whole read), ``identity_core``,
++        ``aligned``, ``core_span``, ``differences``, ``core_differences``,
++        ``forward`` and ``passed``.
++
++    Note
++    ----
++    For a construct you intend to USE, require ``core_differences == []``
++    rather than trusting ``ok`` alone: a single substitution in a ~1 kb read is
++    still ~0.999 identity and will clear the default threshold, yet a
++    single base is exactly what breaks a coding sequence.
++
++        rep = ov.alignment.verify_construct("clone.ab1", "expected.gb")
++        clean = rep["ok"] and not any(t["core_differences"] for t in rep["traces"])
++    """
++    if isinstance(traces, (str, os.PathLike)):
++        traces = [str(traces)]
++    traces = [str(t) for t in traces]
++    if not traces:
++        raise ValueError("no traces given")
++    if not os.path.exists(reference):
++        raise FileNotFoundError(f"reference not found: {reference}")
++
++    tmp = tempfile.TemporaryDirectory(prefix="ov_sanger_ref_")
++    try:
++        ref_fa = reference
++        if os.path.splitext(reference)[1].lower() in (".gb", ".gbk", ".genbank"):
++            try:
++                from Bio import SeqIO
++            except ImportError as exc:                            # pragma: no cover
++                raise ImportError(
++                    "a GenBank reference needs Biopython (`pip install biopython`); "
++                    "pass a FASTA instead."
++                ) from exc
++            ref_fa = os.path.join(tmp.name, "reference.fa")
++            SeqIO.convert(reference, "genbank", ref_fa, "fasta")
++
++        results = []
++        for t in traces:
++            aln = align_to_reference(t, ref_fa, trim_left=trim_left,
++                                     trim_right=trim_right, edge_margin=edge_margin,
++                                     tracy_path=tracy_path, auto_install=auto_install)
++            # Judge on the CORE region. A correct clone routinely shows dozens
++            # of gap-only differences in the last ~50 bases (Sanger end decay);
++            # judging on whole-read identity would fail it. Whole-read numbers
++            # are still returned so the caller can see everything.
++            results.append({
++                "trace": t,
++                "identity": aln["identity"],
++                "identity_core": aln["identity_core"],
++                "aligned": aln["aligned"],
++                "core_span": aln["core_span"],
++                "differences": aln["differences"],
++                "core_differences": aln["core_differences"],
++                "forward": aln["forward"],
++                # `identity_core is None` means the alignment was not longer
++                # than 2*edge_margin, so there is no trustworthy middle to judge
++                # on. That is UNJUDGEABLE, not a failure — but it must not
++                # silently pass either, so it fails with `unjudged` set and the
++                # caller is told to lower `edge_margin` or get a longer read.
++                "unjudged": aln["identity_core"] is None,
++                "passed": aln["identity_core"] is not None
++                          and aln["identity_core"] >= min_identity,
++            })
++    finally:
++        tmp.cleanup()
++
++    return {
++        "ok": all(r["passed"] for r in results),
++        "min_identity": min_identity,
++        "reference": reference,
++        "traces": results,
++    }
+diff --git a/omicverse/external/samap/_run.py b/omicverse/external/samap/_run.py
+index e6bc5b196..92c2ed19e 100644
+--- a/omicverse/external/samap/_run.py
++++ b/omicverse/external/samap/_run.py
+@@ -80,29 +80,21 @@ def _run(cmd):
+         subprocess.run(cmd, check=True, env=env,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ 
+-    if engine == "diamond":
+-        for sid in (a, b):
+-            _run(["diamond", "makedb", "--in", proteomes[sid],
+-                  "--db", os.path.join(sub, f"{sid}db"), "--threads", str(threads)])
+-
+-        def _align(pair):
+-            qid, db = pair
+-            _run(["diamond", "blastp", "--query", proteomes[qid],
+-                  "--db", os.path.join(sub, f"{db}db"), "--outfmt", "6",
+-                  "--evalue", str(evalue), "--max-target-seqs", str(max_target_seqs),
+-                  f"--{sensitivity}", "--threads", str(threads), "--quiet",
+-                  "--out", os.path.join(sub, f"{qid}_to_{db}.txt")])
+-    else:  # blastp — reproduces SAMap's map_genes.sh (adds max_target_seqs cap)
+-        for sid in (a, b):
+-            _run(["makeblastdb", "-in", proteomes[sid], "-dbtype", "prot",
+-                  "-out", os.path.join(sub, f"{sid}db")])
+-
+-        def _align(pair):
+-            qid, db = pair
+-            _run(["blastp", "-query", proteomes[qid], "-db", os.path.join(sub, f"{db}db"),
+-                  "-outfmt", "6", "-evalue", str(evalue), "-max_hsps", "1",
+-                  "-max_target_seqs", str(max_target_seqs), "-num_threads", str(threads),
+-                  "-out", os.path.join(sub, f"{qid}_to_{db}.txt")])
++    # The engine plumbing lives in `ov.alignment.homology_search` — one home for
++    # the DIAMOND/BLAST+ command construction instead of a private copy here.
++    # SAMap needs the raw outfmt-6 FILES (its loader reads `maps/`), so we ask
++    # for `out=` and ignore the returned frame.
++    from ...alignment._homology import homology_search
++
++    def _align(pair):
++        qid, db = pair
++        homology_search(
++            proteomes[qid], proteomes[db],
++            method="diamond" if engine == "diamond" else "blastp",
++            evalue=evalue, max_target_seqs=max_target_seqs, threads=threads,
++            sensitivity=sensitivity, bin_dir=blast_bin,
++            out=os.path.join(sub, f"{qid}_to_{db}.txt"),
++        )
+ 
+     # Run the two directions concurrently (independent BLAST/DIAMOND jobs).
+     with ThreadPoolExecutor(max_workers=2) as pool:
+diff --git a/tests/test_homology_search.py b/tests/test_homology_search.py
+new file mode 100644
+index 000000000..d9f863aff
+--- /dev/null
++++ b/tests/test_homology_search.py
+@@ -0,0 +1,298 @@
++"""Tests for ``ov.alignment.homology_search`` / ``reciprocal_best_hits``.
++
++The command-construction and parsing tests run everywhere. The end-to-end
++tests need DIAMOND or NCBI BLAST+ on PATH and skip cleanly when absent — a
++skip is reported, never silently passed.
++"""
++from __future__ import annotations
++
++import shutil
++import textwrap
++
++import pytest
++
++from omicverse.alignment._homology import (
++    BLAST_TAB_COLUMNS,
++    _align_cmd,
++    _DIAMOND_SENSITIVITY,
++    _PROGRAMS,
++    _read_hits,
++    _resolve_binaries,
++    homology_search,
++    reciprocal_best_hits,
++    resolve_method,
++)
++
++HAS_DIAMOND = shutil.which("diamond") is not None
++HAS_BLAST = shutil.which("blastp") is not None and shutil.which("makeblastdb") is not None
++
++# Real orthologs, trimmed: the pair must come out as a reciprocal best hit.
++HUMAN = textwrap.dedent("""\
++    >hs_GAPDH
++    MGKVKVGVNGFGRIGRLVTRAAFNSGKVDIVAINDPFIDLNYMVYMFQYDSTHGKFHGTVKAENGKLVIN
++    GNPITIFQERDPSKIKWGDAGAEYVVESTGVFTTMEKAGAHLQGGAKRVIISAPSADAPMFVMGVNHEKY
++    DNSLKIISNASCTTNCLAPLAKVIHDNFGIVEGLMTTVHAITATQKTVDGPSGKLWRDGRGALQNIIPAS
++    TGAAKAVGKVIPELNGKLTGMAFRVPTANVSVVDLTCRLEKPAKYDDIKKVVKQASEGPLKGILGYTEHQ
++    >hs_TP53
++    MEEPQSDPSVEPPLSQETFSDLWKLLPENNVLSPLPSQAMDDLMLSPDDIEQWFTEDPGPDEAPRMPEAA
++    PPVAPAPAAPTPAAPAPAPSWPLSSSVPSQKTYQGSYGFRLGFLHSGTAKSVTCTYSPALNKMFCQLAKT
++    CPVQLWVDSTPPPGTRVRAMAIYKQSQHMTEVVRRCPHHERCSDSDGLAPPQHLIRVEGNLRVEYLDDRN
++    """)
++MOUSE = textwrap.dedent("""\
++    >mm_Gapdh
++    MVKVGVNGFGRIGRLVTRAAFSCGKVDVVAINDPFIDLHYMVYMFQYDSTHGKFNGTVKAENGKLVINGK
++    AITIFQERDPANIKWGDAGATYVVESTGVFTTMEKAGAHLKGGAKRVIISAPSADAPMFVMGVNHEKYDN
++    SLKIVSNASCTTNCLAPLAKVIHDNFGIVEGLMTTVHAITATQKTVDGPSGKLWRDGRGAAQNIIPASTG
++    AAKAVGKVIPELNGKLTGMAFRVPTPNVSVVDLTCRLEKAAKYDDIKKVVKQASEGPLKGILGYTEDQVV
++    >mm_Trp53
++    MTAMEESQSDISLELPLSQETFSGLWKLLPPEDILPSPHCMDDLLLPQDVEEFFEGPSEALRVSGAPAAQ
++    DPVTETPGPVAPAPATPWPLSSFVPSQKTYQGNYGFHLGFLQSGTAKSVMCTYSPPLNKLFCQLAKTCPV
++    QLWVSATPPAGSRVRAMAIYKKSQHMTEVVRRCPHHERCSDGDGLAPPQHLIRVEGNLYPEYLEDRQTFR
++    """)
++
++
++@pytest.fixture
++def fastas(tmp_path):
++    a, b = tmp_path / "human.faa", tmp_path / "mouse.faa"
++    a.write_text(HUMAN)
++    b.write_text(MOUSE)
++    return str(a), str(b)
++
++
++# ── method resolution ────────────────────────────────────────────────────────
++
++def test_auto_prefers_diamond_when_present(monkeypatch):
++    monkeypatch.setattr("omicverse.alignment._homology._which",
++                        lambda name, env=None: "/usr/bin/diamond" if name == "diamond" else None)
++    assert resolve_method("auto") == "diamond"
++
++
++def test_auto_falls_back_to_blastp_without_diamond(monkeypatch):
++    monkeypatch.setattr("omicverse.alignment._homology._which", lambda name, env=None: None)
++    assert resolve_method("auto") == "blastp"
++
++
++@pytest.mark.parametrize("method", sorted(_PROGRAMS))
++def test_every_advertised_method_resolves(method):
++    """`method` is the user-facing knob — every documented value must work."""
++    assert resolve_method(method) == method
++
++
++def test_unknown_method_is_rejected_with_the_valid_list():
++    with pytest.raises(ValueError, match="unknown method"):
++        resolve_method("bowtie2")
++
++
++def test_nucleotide_programs_use_blast_and_a_nucl_db():
++    """DIAMOND has no nucleotide-database mode; those must route to BLAST+."""
++    for m in ("blastn", "tblastn", "tblastx"):
++        assert _PROGRAMS[m]["engine"] == "blast"
++    assert _PROGRAMS["blastn"]["db"] == "nucl"
++    assert _PROGRAMS["diamond-blastx"]["engine"] == "diamond"
++    assert _PROGRAMS["diamond-blastx"]["db"] == "prot"
++
++
++# ── command construction (no binaries needed) ────────────────────────────────
++
++def _cmd(method, **kw):
++    spec = _PROGRAMS[method]
++    exe = {"diamond": "diamond", "makeblastdb": "makeblastdb",
++           spec["program"]: spec["program"]}
++    kw.setdefault("query", "q.faa"); kw.setdefault("db_prefix", "db")
++    kw.setdefault("out_path", "o.tsv"); kw.setdefault("evalue", 1e-5)
++    kw.setdefault("max_target_seqs", 10); kw.setdefault("threads", 4)
++    kw.setdefault("sensitivity", "sensitive"); kw.setdefault("extra_args", None)
++    return _align_cmd(spec, exe=exe, **kw)
++
++
++def test_diamond_command_shape():
++    cmd = _cmd("diamond")
++    assert cmd[:2] == ["diamond", "blastp"]
++    assert "--outfmt" in cmd and cmd[cmd.index("--outfmt") + 1] == "6"
++    assert "--sensitive" in cmd            # sensitivity becomes a flag
++    assert "--quiet" in cmd
++
++
++@pytest.mark.parametrize("mode", sorted(_DIAMOND_SENSITIVITY))
++def test_every_sensitivity_is_passed_through_as_its_flag(mode):
++    """Silently dropping a mode runs a different search than the caller asked for.
++
++    An earlier cut swallowed `--fast` on the belief that it was merely DIAMOND's
++    default and not a real flag. It is a real, distinct mode: verified by
++    invoking DIAMOND 2.2.4, which accepts `--fast` and `--faster` and rejects
++    `--bogus-mode`.
++    """
++    assert f"--{mode}" in _cmd("diamond", sensitivity=mode)
++
++
++def test_blast_command_shape_and_ignores_sensitivity():
++    cmd = _cmd("blastp", sensitivity="ultra-sensitive")
++    assert cmd[0] == "blastp"
++    assert "-outfmt" in cmd and cmd[cmd.index("-outfmt") + 1] == "6"
++    assert "-max_hsps" in cmd
++    assert not any(str(a).startswith("--ultra") for a in cmd)
++
++
++def test_bad_sensitivity_is_rejected():
++    with pytest.raises(ValueError, match="sensitivity"):
++        _cmd("diamond", sensitivity="turbo")
++
++
++def test_extra_args_are_appended():
++    assert _cmd("blastp", extra_args=["-seg", "no"])[-2:] == ["-seg", "no"]
++
++
++# ── parsing ─────────────────────────────────────────────────────────────────
++
++def test_empty_result_yields_an_empty_frame_with_the_right_columns(tmp_path):
++    p = tmp_path / "empty.tsv"; p.write_text("")
++    df = _read_hits(str(p))
++    assert len(df) == 0 and list(df.columns) == BLAST_TAB_COLUMNS
++
++
++def test_outfmt6_is_parsed_and_typed(tmp_path):
++    p = tmp_path / "hits.tsv"
++    p.write_text("qA\tsB\t93.7\t120\t7\t0\t1\t120\t1\t120\t8.7e-233\t623\n")
++    df = _read_hits(str(p))
++    assert list(df.columns) == BLAST_TAB_COLUMNS
++    assert df.loc[0, "qseqid"] == "qA" and df.loc[0, "sseqid"] == "sB"
++    assert df.loc[0, "pident"] == pytest.approx(93.7)
++    assert df.loc[0, "evalue"] == pytest.approx(8.7e-233)
++    assert float(df.loc[0, "bitscore"]) == 623.0
++
++
++def test_missing_input_fails_loudly(tmp_path):
++    with pytest.raises(FileNotFoundError, match="query FASTA"):
++        homology_search(str(tmp_path / "nope.faa"), str(tmp_path / "also_nope.faa"))
++
++
++# ── end-to-end (needs the real aligners) ────────────────────────────────────
++
++@pytest.mark.skipif(not (HAS_DIAMOND or HAS_BLAST), reason="no aligner on PATH")
++def test_end_to_end_finds_the_orthologs(fastas):
++    human, mouse = fastas
++    hits = homology_search(human, mouse, threads=2)
++    assert len(hits), "GAPDH/TP53 must hit their mouse orthologs"
++    best = hits.groupby("qseqid").head(1).set_index("qseqid")["sseqid"].to_dict()
++    assert best["hs_GAPDH"] == "mm_Gapdh"
++    assert best["hs_TP53"] == "mm_Trp53"
++    assert hits.attrs["engine"] in {"diamond", "blast"}
++
++
++@pytest.mark.skipif(not (HAS_DIAMOND and HAS_BLAST),
++                    reason="needs BOTH engines to cross-check")
++def test_both_engines_agree(fastas):
++    """DIAMOND is an approximation of BLAST — on unambiguous orthologs the two
++    must still call the same pairs at a similar identity."""
++    human, mouse = fastas
++    d = homology_search(human, mouse, method="diamond", threads=2).groupby("qseqid").head(1)
++    b = homology_search(human, mouse, method="blastp", threads=2).groupby("qseqid").head(1)
++    dd = d.set_index("qseqid")[["sseqid", "pident"]]
++    bb = b.set_index("qseqid")[["sseqid", "pident"]]
++    for q in dd.index:
++        assert dd.loc[q, "sseqid"] == bb.loc[q, "sseqid"]
++        assert abs(float(dd.loc[q, "pident"]) - float(bb.loc[q, "pident"])) < 2.0
++
++
++@pytest.mark.skipif(not (HAS_DIAMOND or HAS_BLAST), reason="no aligner on PATH")
++def test_reciprocal_best_hits_pairs_the_orthologs(fastas):
++    human, mouse = fastas
++    rbh = reciprocal_best_hits(human, mouse, threads=2)
++    pairs = set(zip(rbh["a"], rbh["b"]))
++    assert ("hs_GAPDH", "mm_Gapdh") in pairs
++    assert ("hs_TP53", "mm_Trp53") in pairs
++    # RBH is symmetric by construction — one row per pair, no duplicates.
++    assert len(rbh) == len(pairs)
++
++
++@pytest.mark.skipif(not (HAS_DIAMOND or HAS_BLAST), reason="no aligner on PATH")
++def test_out_writes_the_table_the_caller_asked_for(fastas, tmp_path):
++    human, mouse = fastas
++    out = tmp_path / "nested" / "hits.tsv"
++    hits = homology_search(human, mouse, out=str(out), threads=2)
++    assert out.exists() and out.stat().st_size > 0
++    assert len(_read_hits(str(out))) == len(hits)
++
++
++@pytest.mark.skipif(not (HAS_DIAMOND or HAS_BLAST), reason="no aligner on PATH")
++def test_concurrent_searches_into_one_directory_do_not_collide(fastas, tmp_path):
++    """Regression: the search DB must never live beside `out`.
++
++    A reciprocal run fires both directions concurrently with `out=` pointing
++    into the SAME directory. With a fixed db name next to `out`, the two runs
++    clobbered each other's database and one direction silently searched the
++    WRONG subject — it reported mouse-vs-mouse at 100% identity.
++    """
++    from concurrent.futures import ThreadPoolExecutor
++
++    human, mouse = fastas
++    shared = tmp_path / "maps"
++    shared.mkdir()
++
++    def run(pair):
++        q, s, name = pair
++        return homology_search(q, s, out=str(shared / name), threads=2)
++
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        fwd, rev = list(pool.map(run, [(human, mouse, "h_to_m.txt"),
++                                       (mouse, human, "m_to_h.txt")]))
++
++    # Every hit must be cross-species: a query never matches its own file.
++    assert len(fwd) and len(rev)
++    assert all(q.startswith("hs_") and s.startswith("mm_")
++               for q, s in zip(fwd["qseqid"], fwd["sseqid"])), fwd.head().to_dict()
++    assert all(q.startswith("mm_") and s.startswith("hs_")
++               for q, s in zip(rev["qseqid"], rev["sseqid"])), rev.head().to_dict()
++
++
++# ── regressions found in adversarial pre-merge review ───────────────────────
++
++def test_bin_dir_is_actually_used_to_locate_the_binary(tmp_path, monkeypatch):
++    """SAMap's `blast_bin` must keep working after the delegation refactor.
++
++    The previous implementation prepended `blast_bin` to `env["PATH"]` and ran a
++    bare `diamond`, so a DIAMOND installed ONLY there worked. Resolving through
++    `resolve_executable` alone consults the ambient PATH and the interpreter's
++    env/bin — never `bin_dir` — which would raise FileNotFoundError exactly
++    where the old code succeeded.
++    """
++    fake_bin = tmp_path / "private_bin"
++    fake_bin.mkdir()
++    exe = fake_bin / "diamond"
++    exe.write_text("#!/bin/sh\nexit 0\n")
++    exe.chmod(0o755)
++
++    # Nothing on the ambient PATH, and resolve_executable must not rescue us.
++    monkeypatch.setattr("omicverse.alignment._homology.resolve_executable",
++                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("not on PATH")))
++
++    env = {"PATH": str(fake_bin)}
++    resolved = _resolve_binaries(_PROGRAMS["diamond"], bin_dir=str(fake_bin),
++                                 auto_install=False, env=env)
++    assert resolved["diamond"] == str(exe)
++
++
++def test_all_numeric_sequence_ids_stay_strings(tmp_path):
++    """An all-numeric FASTA header must not be inferred as int64.
++
++    NCBI GI numbers and generated proteomes routinely look like this. When the
++    two directions of a reciprocal run infer different dtypes for the same
++    column, the merge in reciprocal_best_hits dies on valid data.
++    """
++    p = tmp_path / "hits.tsv"
++    p.write_text("12345\t67890\t93.7\t120\t7\t0\t1\t120\t1\t120\t8.7e-233\t623\n")
++    df = _read_hits(str(p))
++    assert df["qseqid"].dtype == object and df["sseqid"].dtype == object
++    assert df.loc[0, "qseqid"] == "12345"
++    assert df.loc[0, "sseqid"] == "67890"
++
++
++@pytest.mark.skipif(not (HAS_DIAMOND or HAS_BLAST), reason="no aligner on PATH")
++def test_reciprocal_best_hits_survives_numeric_ids(tmp_path):
++    """The dtype bug above, end to end: the merge must not raise."""
++    a = tmp_path / "a.faa"
++    b = tmp_path / "b.faa"
++    a.write_text(">1\nMGKVKVGVNGFGRIGRLVTRAAFNSGKVDIVAINDPFIDLNYMVYMFQYDSTHGKFHGTVK\n")
++    b.write_text(">2\nMVKVGVNGFGRIGRLVTRAAFSCGKVDVVAINDPFIDLHYMVYMFQYDSTHGKFNGTVKA\n")
++    rbh = reciprocal_best_hits(str(a), str(b), threads=2)
++    assert list(rbh["a"]) == ["1"] and list(rbh["b"]) == ["2"]
+diff --git a/tests/test_sanger.py b/tests/test_sanger.py
+new file mode 100644
+index 000000000..03c2a48f9
+--- /dev/null
++++ b/tests/test_sanger.py
+@@ -0,0 +1,213 @@
++"""Tests for ``ov.alignment.sanger``.
++
++The parsing/verdict logic runs everywhere. Anything that actually reads a
++chromatogram needs `tracy` on PATH and skips cleanly when absent.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++
++import pytest
++
++from omicverse.alignment.sanger import (
++    SangerTrace, _trace_from_tracy_json, read_ab1, align_to_reference,
++    verify_construct,
++)
++
++HAS_TRACY = shutil.which("tracy") is not None
++
++
++def _find_ab1() -> str:
++    """Locate a real chromatogram to test against.
++
++    🔴 CI DOES NOT SHIP ONE, so every test gated on this SKIPS on GitHub Actions
++    — the suite's real-trace coverage is only exercised locally. An earlier cut
++    hard-coded `/tmp/sanger_test/real.ab1`, a path nothing in the repo creates,
++    which made that invisible. Point `OV_TEST_AB1` at a trace, or drop one in
++    `tests/data/`, to actually run them.
++    """
++    env = os.environ.get("OV_TEST_AB1")
++    if env and os.path.exists(env):
++        return env
++    here = os.path.dirname(os.path.abspath(__file__))
++    for candidate in (
++        os.path.join(here, "data", "sample_sanger.ab1"),
++        os.path.join(here, "..", "..", "sample_sanger.ab1"),
++        "/tmp/sanger_test/real.ab1",
++    ):
++        if os.path.exists(candidate):
++            return os.path.abspath(candidate)
++    return ""
++
++
++AB1 = _find_ab1()
++HAS_AB1 = bool(AB1)
++needs_trace = pytest.mark.skipif(not (HAS_TRACY and HAS_AB1),
++                                 reason="needs tracy + a real .ab1 (set OV_TEST_AB1)")
++
++
++@pytest.fixture
++def sample_ab1() -> str:
++    if not (HAS_TRACY and HAS_AB1):
++        pytest.skip("needs tracy + a real .ab1 (set OV_TEST_AB1)")
++    return AB1
++
++
++# ── pure logic ──────────────────────────────────────────────────────────────
++
++def test_tracy_json_maps_onto_the_dataclass():
++    """Keys pinned against tracy 0.8.1 — a rename upstream must fail loudly."""
++    doc = {"primarySeq": "ACGT", "secondarySeq": "ACNT",
++           "basecallQual": [40, 41, 10, 39], "basecallPos": [1, 2, 3, 4],
++           "peakA": [1.0, 2.0], "peakC": [0.0, 1.0], "peakG": [0.0, 0.0],
++           "peakT": [0.0, 0.0]}
++    tr = _trace_from_tracy_json("x.ab1", doc)
++    assert tr.sequence == "ACGT" and tr.secondary == "ACNT"
++    assert tr.quality == [40, 41, 10, 39]
++    assert sorted(tr.peaks) == ["A", "C", "G", "T"] and len(tr.peaks["A"]) == 2
++    assert len(tr) == 4
++
++
++def test_mixed_positions_ignores_N_and_reports_real_disagreement():
++    assert SangerTrace("x", sequence="ACGT", secondary="ACNT").mixed_positions == []
++    assert SangerTrace("x", sequence="ACGT", secondary="AGGT").mixed_positions == [1]
++    assert SangerTrace("x", sequence="ACGT", secondary="").mixed_positions == []
++
++
++def test_to_fasta_wraps_and_names(tmp_path):
++    p = tmp_path / "o.fa"
++    SangerTrace("clone_A.ab1", sequence="A" * 130).to_fasta(str(p))
++    lines = p.read_text().splitlines()
++    assert lines[0] == ">clone_A"
++    assert all(len(l) <= 60 for l in lines[1:])
++    assert "".join(lines[1:]) == "A" * 130
++
++
++def test_missing_files_fail_loudly(tmp_path):
++    with pytest.raises(FileNotFoundError, match="trace not found"):
++        read_ab1(str(tmp_path / "nope.ab1"))
++    with pytest.raises(ValueError, match="engine"):
++        read_ab1(__file__, engine="guess")
++
++
++# ── end-to-end ──────────────────────────────────────────────────────────────
++
++@needs_trace
++def test_read_ab1_returns_four_channels_and_a_sequence():
++    tr = read_ab1(AB1)
++    assert len(tr.sequence) > 100
++    assert sorted(tr.peaks) == ["A", "C", "G", "T"]
++    assert len(tr.peaks["A"]) > len(tr.sequence)      # samples > bases
++    assert len(tr.quality) == len(tr.sequence)
++    assert len(tr.basecall_pos) == len(tr.sequence)
++
++
++@needs_trace
++def test_end_decay_does_not_fail_a_correct_clone(tmp_path):
++    """The regression that motivated `identity_core`.
++
++    A real trace against its own basecall is a PERFECT clone, yet the last ~50
++    bases are all gaps — whole-read identity lands around 0.96 and a
++    whole-read verdict would reject a construct that is exactly right.
++    """
++    tr = read_ab1(AB1)
++    ref = tmp_path / "ref.fa"
++    tr.to_fasta(str(ref), name="ref")
++
++    aln = align_to_reference(AB1, str(ref))
++    assert aln["identity"] < 0.99, "expected end decay in a real trace"
++    assert aln["identity_core"] == pytest.approx(1.0)
++    assert aln["core_differences"] == []
++    # every whole-read difference is an END artifact, and a gap rather than a
++    # real substitution
++    assert all(d["ref"] == "-" or d["alt"] == "-" for d in aln["differences"])
++
++    rep = verify_construct(AB1, str(ref))
++    assert rep["ok"] is True
++
++
++@needs_trace
++def test_a_planted_substitution_is_located(tmp_path):
++    tr = read_ab1(AB1)
++    seq = list(tr.sequence)
++    i = len(seq) // 2
++    seq[i] = "A" if seq[i] != "A" else "T"
++    ref = tmp_path / "mut.fa"
++    ref.write_text(">mut\n" + "".join(seq) + "\n")
++
++    rep = verify_construct(AB1, str(ref))
++    core = rep["traces"][0]["core_differences"]
++    assert len(core) == 1, core
++    assert core[0]["pos"] == i
++    assert core[0]["alt"] == tr.sequence[i]     # the trace holds the original base
++
++    # A single base still clears the identity threshold — which is exactly why
++    # the docstring tells callers to require an empty `core_differences`.
++    clean = rep["ok"] and not any(t["core_differences"] for t in rep["traces"])
++    assert clean is False
++
++
++@needs_trace
++def test_verify_accepts_a_list_of_traces(tmp_path):
++    tr = read_ab1(AB1)
++    ref = tmp_path / "ref.fa"
++    tr.to_fasta(str(ref), name="ref")
++    rep = verify_construct([AB1, AB1], str(ref))
++    assert len(rep["traces"]) == 2 and rep["ok"] is True
++
++
++# ── regressions found in adversarial pre-merge review ───────────────────────
++
++@pytest.mark.skipif(not HAS_TRACY, reason="tracy not installed")
++def test_biopython_fallback_returns_a_PLOTTABLE_trace(sample_ab1):
++    """The fallback must not look like a success while returning an empty shell.
++
++    An earlier cut returned only sequence+quality, so `peaks` and `basecall_pos`
++    were empty. Every consumer that draws a chromatogram then produced a blank
++    canvas with nothing to explain it. Biopython exposes both (DATA9-12 keyed by
++    FWO_1, and PLOC2), so there is no reason to drop them.
++    """
++    bio = read_ab1(sample_ab1, engine="biopython")
++    assert sorted(bio.peaks) == ["A", "C", "G", "T"]
++    assert all(len(bio.peaks[b]) > 0 for b in "ACGT")
++    assert len(bio.basecall_pos) == len(bio.sequence)
++    # Only the SECONDARY basecall genuinely needs tracy.
++    assert bio.secondary == "" and bio.mixed_positions == []
++
++
++@pytest.mark.skipif(not HAS_TRACY, reason="tracy not installed")
++def test_fallback_channels_match_tracy_exactly(sample_ab1):
++    """Pins the FWO_1 channel->base mapping. Getting it wrong would silently
++    swap two dyes, which looks plausible and is completely wrong."""
++    tr = read_ab1(sample_ab1, engine="tracy")
++    bio = read_ab1(sample_ab1, engine="biopython")
++    for base in "ACGT":
++        assert tr.peaks[base] == pytest.approx(bio.peaks[base]), f"channel {base} differs"
++
++
++def test_a_typoed_tracy_path_does_not_silently_degrade(sample_ab1):
++    """`engine='auto'` may fall back when tracy is ABSENT — never when the
++    caller named a specific binary and got the path wrong."""
++    with pytest.raises(FileNotFoundError):
++        read_ab1(sample_ab1, tracy_path="/definitely/not/tracy")
++
++
++@pytest.mark.skipif(not HAS_TRACY, reason="tracy not installed")
++def test_an_unjudgeable_core_is_None_not_zero(sample_ab1, tmp_path):
++    """An edge_margin that eats the whole alignment means "cannot judge".
++
++    Reporting identity_core = 0.0 made verify_construct FAIL a perfect clone
++    while handing back an empty core_differences — a rejection with no evidence.
++    """
++    ref = tmp_path / "ref.fa"
++    tr = read_ab1(sample_ab1)
++    tr.to_fasta(str(ref))
++    aln = align_to_reference(sample_ab1, str(ref), edge_margin=10_000)
++    assert aln["core_span"] == 0
++    assert aln["identity_core"] is None
++    assert aln["identity"] is not None          # the whole-read number still stands
++
++    rep = verify_construct(sample_ab1, str(ref), edge_margin=10_000)
++    assert rep["traces"][0]["unjudged"] is True
++    assert rep["ok"] is False                    # must not silently pass either

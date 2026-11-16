@@ -1,0 +1,3576 @@
+diff --git a/.github/workflows/benchmark.yml b/.github/workflows/benchmark.yml
+new file mode 100644
+index 00000000..58308bff
+--- /dev/null
++++ b/.github/workflows/benchmark.yml
+@@ -0,0 +1,108 @@
++name: Benchmark CellBender
++
++on:
++  workflow_dispatch:
++    inputs:
++      git_ref:
++        description: "Branch, tag, or SHA to benchmark"
++        required: false
++        default: "main"
++      run_note:
++        description: "Optional label for the artifact (e.g. 'v0.3.3 release')"
++        required: false
++      machine_type:
++        description: "GCP machine type (default: n1-highmem-8 = 8 vCPU / 52 GB RAM). Also try: n1-highmem-16."
++        required: false
++        default: "n1-highmem-8"
++      gpu_type:
++        description: "GCP GPU type (default: nvidia-tesla-t4). Also try: nvidia-tesla-k80."
++        required: false
++        default: "nvidia-tesla-t4"
++      cpu_count:
++        description: "CPU count hint — used only when machine_type is cleared (leave blank to use machine_type)."
++        required: false
++      memory_gb:
++        description: "Memory in GB hint — used only when machine_type is cleared (leave blank to use machine_type)."
++        required: false
++
++jobs:
++  benchmark:
++    runs-on: ubuntu-latest
++    timeout-minutes: 360
++    permissions:
++      contents: read
++      id-token: write  # required for Workload Identity Federation
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++        with:
++          ref: ${{ inputs.git_ref }}
++          fetch-depth: 0
++
++      - name: Resolve git SHA
++        id: sha
++        run: |
++          echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
++          echo "full=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
++
++      - name: Authenticate to Google Cloud
++        uses: google-github-actions/auth@v2
++        with:
++          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
++          service_account: ${{ secrets.BENCHMARK_SERVICE_ACCOUNT }}
++
++      - name: Set up Cloud SDK
++        uses: google-github-actions/setup-gcloud@v2
++
++      - name: Set up Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++
++      - name: Install Python dependencies
++        run: |
++          pip install --quiet \
++            google-cloud-batch \
++            papermill \
++            ipykernel \
++            scanpy \
++            colorcet \
++            cellbender
++
++      - name: Submit benchmark jobs and wait for completion
++        # Submits 5 Google Batch GPU jobs in parallel, polls until all succeed,
++        # then writes benchmarking/outputs.json with {sample: gcs_output_dir}.
++        # The full git SHA is passed so the Batch job can clone the exact commit.
++        # cpu_count/memory_gb are only forwarded when machine_type is cleared.
++        run: |
++          EXTRA_HW_ARGS=""
++          if [[ -z "${{ inputs.machine_type }}" ]]; then
++            [[ -n "${{ inputs.cpu_count }}" ]] && EXTRA_HW_ARGS="$EXTRA_HW_ARGS --cpu-count ${{ inputs.cpu_count }}"
++            [[ -n "${{ inputs.memory_gb }}" ]] && EXTRA_HW_ARGS="$EXTRA_HW_ARGS --memory-gb ${{ inputs.memory_gb }}"
++          fi
++          python benchmarking/submit_benchmarks.py \
++            --git-hash "${{ steps.sha.outputs.full }}" \
++            --run-id "${{ github.run_id }}-${{ github.run_attempt }}" \
++            --machine-type "${{ inputs.machine_type }}" \
++            --gpu-type "${{ inputs.gpu_type }}" \
++            $EXTRA_HW_ARGS \
++            --outputs-file benchmarking/outputs.json
++
++      - name: Execute benchmarking notebook
++        # Papermill injects git_commit and outputs_json into the parameters cell,
++        # which triggers GCS downloads and runs all analysis cells.
++        run: |
++          python benchmarking/run_notebook.py \
++            --git-commit "${{ steps.sha.outputs.short }}" \
++            --outputs-file benchmarking/outputs.json \
++            --input-notebook benchmarking/cellbender_benchmarking.ipynb \
++            --output-notebook benchmarking/cellbender_benchmarking_executed.ipynb
++
++      - name: Upload benchmark artifact
++        uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: benchmark-${{ steps.sha.outputs.short }}${{ inputs.run_note != '' && format('-{0}', inputs.run_note) || '' }}
++          path: benchmarking/cellbender_benchmarking_executed.ipynb
++          retention-days: 90
+diff --git a/benchmarking/README.md b/benchmarking/README.md
+new file mode 100644
+index 00000000..04c3729c
+--- /dev/null
++++ b/benchmarking/README.md
+@@ -0,0 +1,104 @@
++# CellBender Benchmarking
++
++End-to-end benchmarking runs CellBender on five real and simulated datasets on
++Google Cloud GPU hardware, then executes a validation notebook that produces
++diagnostic plots. Everything is orchestrated from GitHub Actions — no local
++Cromwell, Terra, or cromshell installation required.
++
++## Quick start: run benchmarks from GitHub
++
++1. Go to **Actions → Benchmark CellBender → Run workflow** in the GitHub UI.
++2. Fill in the inputs (all optional except the branch/SHA):
++
++   | Input | Default | Notes |
++   |---|---|---|
++   | `git_ref` | `main` | Branch, tag, or full SHA to benchmark |
++   | `run_note` | *(blank)* | Label appended to the artifact name, e.g. `v0.3.3-release` |
++   | `machine_type` | `n1-highmem-8` | GCP machine type (8 vCPU / 52 GB RAM). Also try `n1-highmem-16`. |
++   | `gpu_type` | `nvidia-tesla-t4` | GCP GPU. Also try `nvidia-tesla-k80`. |
++   | `cpu_count` | *(blank)* | CPU hint — only used when `machine_type` is cleared |
++   | `memory_gb` | *(blank)* | Memory hint — only used when `machine_type` is cleared |
++
++3. The workflow takes 1–2 hours (jobs run in parallel on Batch). When it
++   finishes, download the artifact from the workflow summary page. The artifact
++   is a fully executed Jupyter notebook (`cellbender_benchmarking_executed.ipynb`)
++   with all plots embedded. Open it in JupyterLab to review results.
++
++## What the workflow does
++
++```
++workflow_dispatch
++    │
++    ├─ Checkout repo at git_ref, resolve full SHA
++    ├─ Authenticate to GCP via Workload Identity Federation
++    │
++    ├─ submit_benchmarks.py
++    │   ├─ Submits 5 Google Batch GPU jobs (one per dataset, all in parallel)
++    │   ├─ Each job: installs CellBender from the exact commit, runs remove-background
++    │   └─ Polls until all jobs SUCCEEDED; writes outputs.json with GCS paths
++    │
++    ├─ run_notebook.py (via Papermill)
++    │   ├─ Injects git_commit and GCS output paths into the notebook
++    │   ├─ Downloads output H5 files from GCS and runs all analysis cells
++    │   └─ Saves executed notebook with embedded plots
++    │
++    └─ Upload executed notebook as a GitHub Actions artifact (90-day retention)
++```
++
++## Benchmark datasets
++
++| Sample | Dataset | FPR | Ground truth |
++|---|---|---|---|
++| `pbmc8k` | 10x PBMC 8k | default | — |
++| `hgmm12k` | 10x HGMM 12k (mixed species) | default | — |
++| `pbmc5k` | 10x PBMC 5k CITE-seq | 0.1 | — |
++| `rat6k` | Broad PCL rat heart 6k | default | — |
++| `s7` | Simulated dataset s7 (hgmm-like) | default | `s7_truth.h5` |
++
++All input files are in `gs://broad-dsde-methods-sfleming/cellbender_test/`.
++Output files are written to
++`gs://broad-dsde-methods-sfleming/cellbender_test/benchmarks/{git_sha}/{sample}/`.
++
++## Running locally (without GitHub Actions)
++
++You can run the submission script directly from a machine authenticated to GCP:
++
++```bash
++gcloud auth application-default login
++
++python benchmarking/submit_benchmarks.py \
++    --git-hash abc1234def \
++    --run-id my-local-run \
++    --outputs-file benchmarking/outputs.json
++```
++
++Then execute the notebook manually:
++
++```bash
++pip install papermill ipykernel scanpy colorcet cellbender
++
++python benchmarking/run_notebook.py \
++    --git-commit abc1234 \
++    --outputs-file benchmarking/outputs.json \
++    --input-notebook benchmarking/cellbender_benchmarking.ipynb \
++    --output-notebook benchmarking/cellbender_benchmarking_executed.ipynb
++```
++
++Or open `cellbender_benchmarking.ipynb` directly in Jupyter and edit the
++`git_commit` and `outputs_json` variables in the **parameters cell** (the first
++code cell, tagged `parameters`) to point at your outputs before running.
++
++## GCP setup (one-time, for maintainers only)
++
++The workflow requires a GCP service account with Workload Identity Federation
++configured for this repository. The setup commands and secret values are
++intentionally not recorded here. Contact the repository maintainer
++(`sfleming@broadinstitute.org`) to get access or to reconstruct the
++infrastructure if needed.
++
++The service account needs the following permissions:
++- `roles/batch.jobsAdmin` on the GCP project
++- `roles/storage.objectAdmin` on the benchmark GCS bucket
++- `roles/iam.serviceAccountUser` on itself (so it can assign itself as the
++  Batch job VM identity)
++- Workload Identity binding for this GitHub repository
+diff --git a/benchmarking/cellbender_benchmarking.ipynb b/benchmarking/cellbender_benchmarking.ipynb
+new file mode 100644
+index 00000000..285e1bc6
+--- /dev/null
++++ b/benchmarking/cellbender_benchmarking.ipynb
+@@ -0,0 +1,2511 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "**CellBender benchmarks**"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Stephen Fleming\n",
++    "\n",
++    "2026/08/11"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Data"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "tags": [
++     "parameters"
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "git_commit = \"main\"  # overridden by papermill\n",
++    "outputs_json = \"{}\"  # JSON string: {sample_name: gcs_output_dir}"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Download files."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import json as _json\n",
++    "import os\n",
++    "import subprocess\n",
++    "\n",
++    "LOCAL_DATA_DIR = \"/tmp/cellbender_benchmark_data\"\n",
++    "os.makedirs(LOCAL_DATA_DIR, exist_ok=True)\n",
++    "\n",
++    "outputs = _json.loads(outputs_json)\n",
++    "\n",
++    "GCS_INPUT_BASE = \"gs://broad-dsde-methods-sfleming/cellbender_test\"\n",
++    "SAMPLE_INPUT_GCS = {\n",
++    "    \"pbmc8k\":  f\"{GCS_INPUT_BASE}/pbmc8k_raw_gene_bc_matrices.h5\",\n",
++    "    \"rat6k\":   f\"{GCS_INPUT_BASE}/PCL_rat_A_LA6_raw_feature_bc_matrix.h5\",\n",
++    "    \"hgmm12k\": f\"{GCS_INPUT_BASE}/hgmm_12k_raw_gene_bc_matrices.h5\",\n",
++    "    \"pbmc5k\":  f\"{GCS_INPUT_BASE}/5k_pbmc_protein_v3_nextgem_raw_feature_bc_matrix.h5\",\n",
++    "}\n",
++    "\n",
++    "def _gcs_download(gcs_path, local_dir):\n",
++    "    os.makedirs(local_dir, exist_ok=True)\n",
++    "    subprocess.run([\"gsutil\", \"cp\", gcs_path, local_dir + \"/\"], check=True)\n",
++    "    return os.path.join(local_dir, os.path.basename(gcs_path))\n",
++    "\n",
++    "for sample, out_dir in outputs.items():\n",
++    "    if sample not in SAMPLE_INPUT_GCS:\n",
++    "        continue\n",
++    "    sample_local = os.path.join(LOCAL_DATA_DIR, sample)\n",
++    "    _gcs_download(SAMPLE_INPUT_GCS[sample], sample_local)\n",
++    "    _gcs_download(f\"{out_dir.rstrip('/')}/{sample}_out.h5\", sample_local)\n",
++    "\n",
++    "pbmc_input = os.path.join(LOCAL_DATA_DIR, \"pbmc8k\", \"pbmc8k_raw_gene_bc_matrices.h5\")\n",
++    "pbmc_output = os.path.join(LOCAL_DATA_DIR, \"pbmc8k\", \"pbmc8k_out.h5\")\n",
++    "\n",
++    "rat_heart_input = os.path.join(LOCAL_DATA_DIR, \"rat6k\", \"PCL_rat_A_LA6_raw_feature_bc_matrix.h5\")\n",
++    "rat_heart_output = os.path.join(LOCAL_DATA_DIR, \"rat6k\", \"rat6k_out.h5\")\n",
++    "\n",
++    "hgmm_input = os.path.join(LOCAL_DATA_DIR, \"hgmm12k\", \"hgmm_12k_raw_gene_bc_matrices.h5\")\n",
++    "hgmm_output = os.path.join(LOCAL_DATA_DIR, \"hgmm12k\", \"hgmm12k_out.h5\")\n",
++    "\n",
++    "citeseq_input = os.path.join(LOCAL_DATA_DIR, \"pbmc5k\", \"5k_pbmc_protein_v3_nextgem_raw_feature_bc_matrix.h5\")\n",
++    "citeseq_output = os.path.join(LOCAL_DATA_DIR, \"pbmc5k\", \"pbmc5k_out.h5\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Imports and helper functions"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import scanpy as sc\n",
++    "from scanpy.plotting._dotplot import DotPlot\n",
++    "\n",
++    "make_scanpy_doplot = DotPlot._dotplot\n",
++    "import os\n",
++    "from typing import List, Optional\n",
++    "\n",
++    "import anndata\n",
++    "import colorcet as cc\n",
++    "import matplotlib.pyplot as plt\n",
++    "import numpy as np\n",
++    "import pandas as pd\n",
++    "from scipy.stats import pearsonr as corr_pearson\n",
++    "\n",
++    "from cellbender.remove_background.downstream import (\n",
++    "    load_anndata_from_input_and_output,\n",
++    "    load_anndata_from_input_and_outputs,\n",
++    ")\n",
++    "\n",
++    "%matplotlib inline"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sc.set_figure_params(fontsize=14, vector_friendly=True)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "print(f'scanpy version is {sc.__version__}')\n",
++    "print(f'anndata version is {anndata.__version__}')"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "def tick_label_str(val):\n",
++    "    if val >= 1e3:\n",
++    "        return f'{(val / 1000):.0f}k'\n",
++    "    else:\n",
++    "        return str(val)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "def qc_and_typical_workflow(adata: anndata.AnnData,\n",
++    "                            layer: str,\n",
++    "                            mito_layer: Optional[str] = 'cellranger',\n",
++    "                            umi_percentile: float = 95,\n",
++    "                            gene_percentile: float = 95,\n",
++    "                            n_gene_min: float = 0,\n",
++    "                            mito_frac_percentile: float = 90,\n",
++    "                            n_pcs: int = 25,\n",
++    "                            leiden_resolution: float = 0.5):\n",
++    "    \"\"\"Do most basic cell QC and a typical scanpy workflow\"\"\"\n",
++    "\n",
++    "    # calculate a few metrics and look at them\n",
++    "    if 'mito_frac' not in adata.obs.keys():\n",
++    "        print('Calculating mito_frac assuming mito genes start with \"MT-\"')\n",
++    "        print(f\"{adata.var_names.str.startswith('MT-').sum()} mito genes\")\n",
++    "        mat = adata.X if mito_layer is None else adata.layers[mito_layer]\n",
++    "        adata.obs['mito_frac'] = np.array(\n",
++    "            mat[:, adata.var_names.str.startswith('MT-')].sum(axis=1)\n",
++    "        ).squeeze() / np.array(mat.sum(axis=1) + 1e-10).squeeze()\n",
++    "        plt.hist(adata.obs['mito_frac'].values.flatten(), bins=100)\n",
++    "        plt.xlabel('mito_frac')\n",
++    "        plt.ylabel('n_cells')\n",
++    "        plt.show()\n",
++    "    adata.obs['n_umi'] = np.array(adata.X.sum(axis=1)).squeeze()\n",
++    "    adata.obs['n_gene'] = np.array((adata.X > 0).sum(axis=1)).squeeze()\n",
++    "\n",
++    "    # get rid of outlier cells\n",
++    "    print(f'{adata.shape[0]} cells before cell QC')\n",
++    "    adata_qc = adata[(adata.obs['n_umi'] < np.percentile(adata.obs['n_umi'], q=umi_percentile))\n",
++    "                     & (adata.obs['n_gene'] < np.percentile(adata.obs['n_gene'], q=gene_percentile))\n",
++    "                     & (adata.obs['mito_frac'] <\n",
++    "                        np.percentile(adata.obs['mito_frac'], q=mito_frac_percentile))\n",
++    "                     & (adata.obs['n_gene'] >= n_gene_min)].copy()\n",
++    "    print(f'{adata_qc.shape[0]} cells after cell QC')\n",
++    "\n",
++    "    # typical scanpy workflow\n",
++    "    adata_qc.X = adata_qc.layers[layer].copy()\n",
++    "    sc.pp.normalize_total(adata_qc)\n",
++    "    sc.pp.log1p(adata_qc)\n",
++    "    sc.pp.highly_variable_genes(adata_qc, layer=layer,\n",
++    "                                n_top_genes=2000, flavor='seurat_v3')\n",
++    "    adata_qc.obsm['hvgX'] = adata_qc.X[:, adata_qc.var['highly_variable']].copy()\n",
++    "    adata_qc.obsm['scaledX'] = sc.pp.scale(adata_qc.obsm['hvgX'],\n",
++    "                                           zero_center=True,\n",
++    "                                           max_value=10.,\n",
++    "                                           copy=True)\n",
++    "    adata_qc.obsm['X_pca'] = sc.tl.pca(adata_qc.obsm['scaledX'])\n",
++    "    sc.pp.neighbors(adata_qc,\n",
++    "                    use_rep='X_pca',\n",
++    "                    n_pcs=n_pcs,\n",
++    "                    method='umap',\n",
++    "                    metric='cosine',\n",
++    "                    n_neighbors=20)\n",
++    "    sc.tl.umap(adata_qc)\n",
++    "    sc.tl.leiden(adata_qc, resolution=leiden_resolution)\n",
++    "\n",
++    "    return adata_qc"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "def annotate_umap(adata, key='leiden', use_rep='X_umap', **kwargs):\n",
++    "    \"\"\"Add annotations on top of a UMAP plot\"\"\"\n",
++    "\n",
++    "    # annotate\n",
++    "    d = adata.obs[[key]].copy()\n",
++    "    d['x'] = adata.obsm[use_rep][:, 0]\n",
++    "    d['y'] = adata.obsm[use_rep][:, 1]\n",
++    "    for r in d.groupby(key).median().iterrows():\n",
++    "        plt.text(r[1][0], r[1][1], r[0], **kwargs)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# PBMC 8k"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Data: \"8k PBMCs from a Healthy Donor\"\n",
++    "\n",
++    "Provenance: 10x Genomics public data, v2 chemistry, CellRanger 2.1.0 analysis\n",
++    "\n",
++    "Link: https://www.10xgenomics.com/resources/datasets/8-k-pbm-cs-from-a-healthy-donor-2-standard-2-1-0"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "pbmc_leiden_resolution = 0.55"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## c, d, e. CellBender data"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata = load_anndata_from_input_and_output(\n",
++    "    input_file=pbmc_input,\n",
++    "    output_file=pbmc_output,\n",
++    ")\n",
++    "adata.var_names_make_unique()\n",
++    "\n",
++    "# eliminate empty droplets as defined by cellbender\n",
++    "cell_prob_key = 'cell_probability'\n",
++    "if cell_prob_key not in adata.obs.keys():\n",
++    "    cell_prob_key = 'latent_cell_probability'\n",
++    "pbmc8k_cell_bcs = adata.obs_names[adata.obs[cell_prob_key] > 0.5]\n",
++    "adata = adata[pbmc8k_cell_bcs].copy()\n",
++    "\n",
++    "adata.layers['cellbender'] = adata.X.copy()\n",
++    "adata"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_qc = qc_and_typical_workflow(adata,\n",
++    "                                   layer='cellbender',\n",
++    "                                   mito_layer='cellranger',\n",
++    "                                   leiden_resolution=pbmc_leiden_resolution,\n",
++    "                                   n_gene_min=100)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sc.pl.embedding(adata_qc, basis='umap', color='leiden', show=False)\n",
++    "annotate_umap(adata_qc, fontsize=18)\n",
++    "plt.axis('off')\n",
++    "plt.title('')\n",
++    "plt.gca().get_legend().remove()\n",
++    "\n",
++    "# savefig('pbmc8k_umap_cellbender.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_qc"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_qc.var['n_cellranger_in_qced_cells'] = np.array(adata_qc.layers['cellranger'].sum(axis=0)).squeeze()\n",
++    "adata_qc.var['n_cellbender_in_qced_cells'] = np.array(adata_qc.layers['cellbender'].sum(axis=0)).squeeze()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "pbmc_markers = {\n",
++    "    'Monoctypes\\n/ Neutrophils': ['S100A8', 'S100A9', 'S100A12'],\n",
++    "    'Monocytes\\n/ pDCs': ['LYZ', 'CST3', 'FCN1'],\n",
++    "    'T': ['IL32', 'TRAC'],\n",
++    "    'T CD4+ Naive / TE': ['CCR7'],\n",
++    "    'Tregs': ['FOXP3'],\n",
++    "    'B': ['IGHD', 'CD79A'],\n",
++    "    'B naive': ['FCER2'],\n",
++    "    'B memory': ['TNFRSF13B'],\n",
++    "    'T CD8+': ['CD8A', 'CD8B'],\n",
++    "    'T Cytotoxic': ['NKG7', 'GNLY'],\n",
++    "    'T gamma delta': ['TRGC1'],\n",
++    "    'MAIT': ['SLC4A10'],\n",
++    "    'NK': ['KLRF1', 'SPON2'],\n",
++    "    'Monocytes NC / I': ['FCGR3A'],\n",
++    "    'Progenitor': ['PPBP'],\n",
++    "    'Baso. / Neutro.\\n/ Progenitor': ['SDPR', 'CLU'],\n",
++    "    'pDCs': ['LILRA4'],\n",
++    "    '(broad expression)': ['PTPRC'],\n",
++    "}"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# overview of the comparison using the cellbender data for clustering\n",
++    "\n",
++    "max_frac = 0.5\n",
++    "\n",
++    "adata_qc.X = adata_qc.layers['cellranger'].copy()\n",
++    "sc.pp.normalize_total(adata_qc)\n",
++    "\n",
++    "sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=pbmc_markers,\n",
++    "    groupby='leiden',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    dot_max=max_frac,\n",
++    ")\n",
++    "\n",
++    "adata_qc.X = adata_qc.layers['cellbender'].copy()\n",
++    "sc.pp.normalize_total(adata_qc)\n",
++    "\n",
++    "sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=pbmc_markers,\n",
++    "    groupby='leiden',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    dot_max=max_frac,\n",
++    ")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Supplementary Table: differential expression"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "cb_clusters_0_4 = adata_qc[adata_qc.obs['leiden'].isin(['0', '4'])].copy()\n",
++    "\n",
++    "cb_clusters_0_4.X = cb_clusters_0_4.layers['cellbender'].copy()\n",
++    "sc.pp.normalize_total(cb_clusters_0_4)\n",
++    "sc.pp.log1p(cb_clusters_0_4)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sc.tl.rank_genes_groups(cb_clusters_0_4, 'leiden', method='wilcoxon')"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "df = sc.get.rank_genes_groups_df(cb_clusters_0_4, group='0')\n",
++    "df[[g in ['LYZ', 'CST3', 'S100A8', 'S100A9', 'PTPRC'] for g in df['names']]]"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "cb_clusters_0_4.X = cb_clusters_0_4.layers['cellranger'].copy()\n",
++    "sc.pp.normalize_total(cb_clusters_0_4)\n",
++    "sc.pp.log1p(cb_clusters_0_4)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sc.tl.rank_genes_groups(cb_clusters_0_4, 'leiden', method='wilcoxon')"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "df_raw = sc.get.rank_genes_groups_df(cb_clusters_0_4, group='0')\n",
++    "df_raw[[g in ['LYZ', 'CST3', 'S100A8', 'S100A9', 'PTPRC'] for g in df_raw['names']]]"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Supplementary:  LYZ violin plots"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Use the CellBender clustering"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# adata_raw_qc.obs['cellbender_leiden'] = adata_qc.obs['leiden'].copy()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "plt.figure(figsize=(5, 6))\n",
++    "\n",
++    "adata_qc.X = adata_qc.layers['cellranger'].copy()\n",
++    "sc.pp.normalize_total(adata_qc)\n",
++    "sc.pp.log1p(adata_qc)\n",
++    "\n",
++    "plt.subplot(2, 1, 1)\n",
++    "sc.pl.violin(adata_qc, keys='LYZ', groupby='leiden', ax=plt.gca(), show=False)\n",
++    "plt.ylabel('Log of normalized counts')\n",
++    "plt.xlabel('')#Leiden 0.5 cluster obtained from CellBender data')\n",
++    "plt.grid(False)\n",
++    "plt.gca().twinx()\n",
++    "plt.ylabel('LYZ raw')\n",
++    "plt.yticks([])\n",
++    "plt.grid(False)\n",
++    "\n",
++    "adata_qc.X = adata_qc.layers['cellbender'].copy()\n",
++    "sc.pp.normalize_total(adata_qc)\n",
++    "sc.pp.log1p(adata_qc)\n",
++    "\n",
++    "plt.subplot(2, 1, 2)\n",
++    "sc.pl.violin(adata_qc, keys='LYZ', groupby='leiden', ax=plt.gca(), show=False)\n",
++    "plt.ylabel('Log of normalized counts')\n",
++    "plt.xlabel('Leiden 0.5 cluster obtained from CellBender data')\n",
++    "plt.grid(False)\n",
++    "plt.gca().twinx()\n",
++    "plt.ylabel('LYZ after cellbender')\n",
++    "plt.yticks([])\n",
++    "plt.grid(False)\n",
++    "\n",
++    "# savefig('supp_pbmc8k_LYZ_violins.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Supplementary: UMAPs of genes"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# pick a few\n",
++    "\n",
++    "top_removed_genes = ['S100A9',\n",
++    " 'S100A8',\n",
++    " 'FCER1G',\n",
++    " 'GNLY', 'NKG7', 'CST3',\n",
++    " 'IGKC',\n",
++    " 'LST1',\n",
++    " 'AIF1',\n",
++    " 'HLA-DRA',\n",
++    " 'FCN1',\n",
++    " 'LYZ']"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "scrolled": false
++   },
++   "outputs": [],
++   "source": [
++    "print('Colorbar axes are truncated at the 80th percentile')\n",
++    "\n",
++    "for g in top_removed_genes:\n",
++    "\n",
++    "    plt.figure(figsize=(6, 3))\n",
++    "    a = 1\n",
++    "\n",
++    "    for layer in ['cellranger', 'cellbender']:\n",
++    "        adata_qc.X = adata_qc.layers[layer].copy()\n",
++    "        sc.pp.normalize_total(adata_qc)\n",
++    "        if 'log1p' in adata_qc.uns.keys():\n",
++    "            del adata_qc.uns['log1p']\n",
++    "        sc.pp.log1p(adata_qc)\n",
++    "        ax = plt.subplot(1, 2, a)\n",
++    "        if a == 1:\n",
++    "            gene_counts = np.array(adata_qc.X[:, adata_qc.var_names == g].todense()).squeeze()\n",
++    "            vmax = max(np.percentile(gene_counts, q=80), 0.5)\n",
++    "        sc.pl.embedding(adata_qc, basis='umap', color=g, color_map='Oranges',\n",
++    "                        show=False, vmin=0, vmax=vmax, ax=ax, edges_width=0)\n",
++    "        plt.title(f'{layer.replace(\"cellranger\", \"Raw data\").replace(\"cellbender\", \"CellBender\")}: {g}')\n",
++    "        a += 1\n",
++    "\n",
++    "    plt.tight_layout()\n",
++    "\n",
++    "#     savefig(f'pbmc8k_removal_umap_{g}.pdf')\n",
++    "\n",
++    "    plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Rat 6k: cell probabilities"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Data: \"10k left atrial cells from a healthy Wistar Rat\"\n",
++    "\n",
++    "Provenance: Precision Cardiology Lab data (Broad Institute, Bayer), v2 chemistry, CellRanger 3.1.0 analysis\n",
++    "\n",
++    "Link: (single cell portal?)\n",
++    "\n",
++    "Data download command (full CellRanger v3):\n",
++    "```bash\n",
++    "tbd {DATASET_DIR}/PCL_rat_A_LA6_raw_feature_bc_matrix.h5\n",
++    "```\n",
++    "\n",
++    "Data download command (cells only, CellRanger v3):\n",
++    "```bash\n",
++    "tbd {DATASET_DIR}/PCL_rat_A_LA6_filtered_feature_bc_matrix_cellranger3.h5\n",
++    "```\n",
++    "\n",
++    "Data download command (cells only, CellRanger v2):\n",
++    "```bash\n",
++    "tbd {DATASET_DIR}/PCL_rat_A_LA6_filtered_gene_bc_matrices_h5_cellranger2.h5\n",
++    "```"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Cellbender data:\n",
++    "\n",
++    "```bash\n",
++    "cellbender remove-background --cuda --input {DATASET_DIR}/PCL_rat_A_LA6_raw_feature_bc_matrix.h5 --output {CELLBENDER_DIR}/PCL_rat_A_LA6_20211021_out.h5 --expected-cells 8000 --total-droplets-included 25000\n",
++    "```"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# load dataset and annotate called cells\n",
++    "\n",
++    "adata = load_anndata_from_input_and_output(\n",
++    "    input_file=rat_heart_input,\n",
++    "    output_file=rat_heart_output,\n",
++    "    input_layer_key='cellranger3',\n",
++    ")\n",
++    "adata.var_names_make_unique()\n",
++    "\n",
++    "# cellbender cell calls\n",
++    "cell_prob_key = 'cell_probability'\n",
++    "if cell_prob_key not in adata.obs.keys():\n",
++    "    cell_prob_key = 'latent_cell_probability'\n",
++    "adata.obs['cell_cellbender'] = (adata.obs[cell_prob_key] > 0.5)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Figure 1f. cell probability image"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# plot UMI curves with cell calls overlaid\n",
++    "\n",
++    "plt.figure(figsize=(4, 4))\n",
++    "\n",
++    "counts = adata.obs['n_cellranger3'].values\n",
++    "order = np.argsort(counts)[::-1]\n",
++    "\n",
++    "# for each cell calling algorithm\n",
++    "for a, key in enumerate(['cellbender']):\n",
++    "\n",
++    "    # UMI curve\n",
++    "    plt.semilogy(counts[order], color='black', lw=5, rasterized=True)\n",
++    "    plt.ylim([30, 25000])\n",
++    "    plt.ylabel('UMI count')\n",
++    "    plt.xlabel('Droplet ranked by count')\n",
++    "    plt.grid(False)\n",
++    "    ta = plt.gca().twinx()\n",
++    "\n",
++    "    # cell probability\n",
++    "    cell_prob_key = 'cell_probability'\n",
++    "    if cell_prob_key not in adata.obs.keys():\n",
++    "        cell_prob_key = 'latent_cell_probability'\n",
++    "    plt.plot(adata.obs[cell_prob_key].values[order],\n",
++    "             '.', color='tab:red', ms=1, rasterized=True)\n",
++    "    plt.ylim([-0.02, 1.02])\n",
++    "    plt.yticks(color='tab:red')\n",
++    "    plt.ylabel('Inferred cell probability', color='tab:red')\n",
++    "\n",
++    "    # labels\n",
++    "    ta.grid(False)\n",
++    "    ta.set_xlim([-1000, 25000])\n",
++    "    xticks = [0, 10000, 20000]\n",
++    "    ta.set_xticks(xticks)\n",
++    "    ta.set_xticklabels([tick_label_str(v) for v in xticks])\n",
++    "\n",
++    "plt.tight_layout()\n",
++    "\n",
++    "# savefig('PCL_rat_A_LA6_cell_probability_thumbnail.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## a. UMI curve"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# plot UMI curves with cell calls overlaid, in a different format\n",
++    "\n",
++    "fig = plt.figure(figsize=(5, 4))\n",
++    "\n",
++    "counts = adata.obs['n_cellranger3'].values\n",
++    "order = np.argsort(counts)[::-1]\n",
++    "bins = 50\n",
++    "key = 'cellbender'\n",
++    "\n",
++    "# UMI curve\n",
++    "plt.semilogy(counts[order], color='black')\n",
++    "plt.grid(False)\n",
++    "twinned_ax = plt.gca().twinx()\n",
++    "\n",
++    "# binned ratio of cells and empties\n",
++    "xbinedges = np.linspace(start=0, stop=adata.shape[0], num=bins, dtype=int)\n",
++    "xbinwidth = xbinedges[1] - xbinedges[0]\n",
++    "n_cells_bin = []\n",
++    "n_empties_bin = []\n",
++    "fraction_cells_bin = []\n",
++    "bin_centers = []\n",
++    "for start, stop in zip(xbinedges[:-1], xbinedges[1:]):\n",
++    "    n_cells = adata.obs[f'cell_{key}'][order][start:stop].sum()\n",
++    "    n_empties = (~adata.obs[f'cell_{key}'][order][start:stop]).sum()\n",
++    "    n_cells_bin.append(n_cells)\n",
++    "    n_empties_bin.append(n_empties)\n",
++    "    fraction_cells_bin.append(n_cells / (n_cells + n_empties))\n",
++    "    bin_centers.append(np.mean([start, stop]))\n",
++    "\n",
++    "twinned_ax.bar(bin_centers, fraction_cells_bin,\n",
++    "                xbinwidth, label='cell', alpha=0.4, color='lightgreen')\n",
++    "twinned_ax.bar(bin_centers, [1. - f for f in fraction_cells_bin],\n",
++    "                xbinwidth, bottom=fraction_cells_bin,\n",
++    "                label='not cell', alpha=0.1, color='lightgray')\n",
++    "twinned_ax.set_ylim([0, 1])\n",
++    "twinned_ax.set_ylabel('Cell fraction', color='green')\n",
++    "twinned_ax.set_yticklabels(labels=[f'{v:.1f}' for v in twinned_ax.get_yticks()],\n",
++    "                            color='green')\n",
++    "twinned_ax.grid(False)\n",
++    "\n",
++    "# labels\n",
++    "plt.text(x=13000, y=10000, s=key)\n",
++    "plt.xlim([-200, 25000])\n",
++    "xticks = [0, 5000, 10000, 15000, 20000, 25000]\n",
++    "plt.xticks(xticks, [tick_label_str(v) for v in xticks])\n",
++    "plt.ylim([50, 25000])\n",
++    "plt.xlabel('Droplet ranked by counts')\n",
++    "plt.ylabel('UMI count')\n",
++    "\n",
++    "plt.tight_layout()\n",
++    "\n",
++    "# savefig('PCL_rat_A_LA6_cell_calling_comparison.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# HGMM 12k"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Data: \"12k 1:1 Mixture of Fresh Frozen Human (HEK293T) and Mouse (NIH3T3) Cells\"\n",
++    "\n",
++    "Provenance: 10x Genomics public data, v2 chemistry, CellRanger 2.1.0 analysis\n",
++    "\n",
++    "Link: https://www.10xgenomics.com/resources/datasets/12-k-1-1-mixture-of-fresh-frozen-human-hek-293-t-and-mouse-nih-3-t-3-cells-2-standard-2-1-0"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# load input file and all the relevant outputs as layers\n",
++    "\n",
++    "adata_hgmm = load_anndata_from_input_and_outputs(\n",
++    "    input_file=hgmm_input,\n",
++    "    output_files={\n",
++    "        'cellbender_0.01': hgmm_output,\n",
++    "    },\n",
++    ")\n",
++    "\n",
++    "# assign species labels to genes\n",
++    "\n",
++    "adata_hgmm.var['species'] = ['human' if g.startswith('hg19_') else 'mouse'\n",
++    "                             for g in adata_hgmm.var['gene_id']]\n",
++    "\n",
++    "adata_hgmm"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "mouse_genes = (adata_hgmm.var['species'] == 'mouse')\n",
++    "human_genes = (adata_hgmm.var['species'] == 'human')\n",
++    "\n",
++    "mouse_counts = np.array(adata_hgmm.layers['cellranger'][:, mouse_genes].sum(axis=1)).squeeze()\n",
++    "human_counts = np.array(adata_hgmm.layers['cellranger'][:, human_genes].sum(axis=1)).squeeze()\n",
++    "\n",
++    "cutoff = 750\n",
++    "\n",
++    "non_doublet_logic = ~((mouse_counts > cutoff)\n",
++    "                      & (human_counts > cutoff))"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     2
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "# calculate stats on cross-species counts in each output\n",
++    "\n",
++    "def get_cross_species_stats(adata, layer, contam_gene_logic):\n",
++    "\n",
++    "    contam_counts_per_cell = np.array(adata.layers[layer][:, contam_gene_logic].sum(axis=1)).squeeze()\n",
++    "    q1 = np.percentile(contam_counts_per_cell, q=25)\n",
++    "    q2 = np.percentile(contam_counts_per_cell, q=50)\n",
++    "    q3 = np.percentile(contam_counts_per_cell, q=75)\n",
++    "\n",
++    "    total_counts_per_cell = np.array(adata.layers[layer].sum(axis=1)).squeeze()\n",
++    "    num_zeros = np.sum(total_counts_per_cell == 0)\n",
++    "    if num_zeros > 0:\n",
++    "        print(f'Warning: {layer} has {num_zeros} zero-count cells (out of {len(total_counts_per_cell)}) that had {cutoff} counts in cellranger')\n",
++    "    nonzeros = (total_counts_per_cell > 0)\n",
++    "    q1_frac = np.percentile(contam_counts_per_cell[nonzeros] / total_counts_per_cell[nonzeros], q=25)\n",
++    "    q2_frac = np.percentile(contam_counts_per_cell[nonzeros] / total_counts_per_cell[nonzeros], q=50)\n",
++    "    q3_frac = np.percentile(contam_counts_per_cell[nonzeros] / total_counts_per_cell[nonzeros], q=75)\n",
++    "\n",
++    "    return {'short': {'count_q1': [q1], 'count_q2': [q2], 'count_q3': [q3],\n",
++    "                      'frac_q1': [q1_frac], 'frac_q2': [q2_frac], 'frac_q3': [q3_frac]},\n",
++    "            'long': {'count': contam_counts_per_cell[nonzeros],\n",
++    "                     'frac': contam_counts_per_cell[nonzeros] / total_counts_per_cell[nonzeros]}}\n",
++    "\n",
++    "df_long = pd.DataFrame(columns=['layer', 'contaminant_species', 'count', 'frac'])\n",
++    "df = pd.DataFrame(columns=['layer', 'contaminant_species',\n",
++    "                           'count_q1', 'count_q2', 'count_q3',\n",
++    "                           'frac_q1', 'frac_q2', 'frac_q3'])\n",
++    "\n",
++    "# layers = ['cellranger', 'cellbender_0.01', 'cellbender_0.05', 'cellbender_0.1', 'decontx']\n",
++    "layers = ['cellranger', 'cellbender_0.01']\n",
++    "\n",
++    "print('mouse cells')\n",
++    "for layer in layers:\n",
++    "    stats = get_cross_species_stats(\n",
++    "        adata_hgmm[non_doublet_logic & (mouse_counts > cutoff)],  # mouse cells\n",
++    "        layer=layer,\n",
++    "        contam_gene_logic=human_genes,\n",
++    "    )\n",
++    "    stats['short'].update({'layer': layer, 'contaminant_species': 'human'})\n",
++    "    stats['long'].update({'layer': np.array([layer] * len(stats['long']['count'])),\n",
++    "                          'contaminant_species': np.array(['human'] * len(stats['long']['count']))})\n",
++    "    df = pd.concat([df, pd.DataFrame(data=stats['short'])], axis=0)\n",
++    "    df_long = pd.concat([df_long, pd.DataFrame(data=stats['long'])], axis=0)\n",
++    "\n",
++    "print('human cells')\n",
++    "for layer in layers:\n",
++    "    stats = get_cross_species_stats(\n",
++    "        adata_hgmm[non_doublet_logic & (human_counts > cutoff)],  # human cells\n",
++    "        layer=layer,\n",
++    "        contam_gene_logic=mouse_genes,\n",
++    "    )\n",
++    "    stats['short'].update({'layer': layer, 'contaminant_species': 'mouse'})\n",
++    "    stats['long'].update({'layer': [layer] * len(stats['long']['count']),\n",
++    "                          'contaminant_species': ['mouse'] * len(stats['long']['count'])})\n",
++    "    df = pd.concat([df, pd.DataFrame(data=stats['short'])], axis=0)\n",
++    "    df_long = pd.concat([df_long, pd.DataFrame(data=stats['long'])], axis=0)\n",
++    "\n",
++    "df"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import seaborn as sns\n",
++    "\n",
++    "plt.figure(figsize=(1.75, 3))\n",
++    "sns.boxplot(data=df_long,\n",
++    "            x='layer',\n",
++    "            y='frac',\n",
++    "            hue='contaminant_species',\n",
++    "            fliersize=0,\n",
++    "            ax=plt.gca(),\n",
++    "            width=0.5)\n",
++    "plt.yscale('log')\n",
++    "plt.xticks(range(2),\n",
++    "           labels=['Raw', 'FPR 0.01'],\n",
++    "           rotation=80)\n",
++    "plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), title='Contaminant')\n",
++    "plt.ylabel('Fraction of cross-species\\ncounts per cell')\n",
++    "plt.xlabel('')\n",
++    "plt.ylim([1e-5, 1e-1])\n",
++    "plt.yticks([1e-5, 1e-4, 1e-3, 1e-2, 1e-1])\n",
++    "\n",
++    "# savefig('hgmm12k_removal_quantification_comparison_frac.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_hgmm.var['n_cellbender'] = np.array(adata_hgmm.layers['cellbender_0.01'].sum(axis=0)).squeeze()\n",
++    "adata_hgmm.var['n_cellranger'] = np.array(adata_hgmm.layers['cellranger'].sum(axis=0)).squeeze()\n",
++    "adata_hgmm.var['frac_remaining'] = adata_hgmm.var['n_cellbender'] / adata_hgmm.var['n_cellranger']\n",
++    "\n",
++    "plt.figure(figsize=(4, 2))\n",
++    "plt.semilogx(adata_hgmm.var['n_cellranger'].values, adata_hgmm.var['frac_remaining'].values, 'k.', ms=2)\n",
++    "val = np.mean(adata_hgmm.var['frac_remaining'].values[adata_hgmm.var['n_cellranger'].values > 1e3])\n",
++    "plt.plot([1e0, 1e7], [val, val], color='red', lw=1)\n",
++    "plt.grid(False)\n",
++    "plt.xlabel('Total raw gene counts')\n",
++    "plt.ylabel('Fraction remaining')\n",
++    "plt.title('Per-gene removal')\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     61
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "# plot the cross-species counts, before and after\n",
++    "\n",
++    "def linear_mixed_species(adata,\n",
++    "                         gene_logic1: np.ndarray,\n",
++    "                         gene_logic2: np.ndarray,\n",
++    "                         layer_keys: List[str],\n",
++    "                         colors: Optional[List] = None,\n",
++    "                         raw_key: str = 'cellranger',\n",
++    "                         raw_color: str = 'k',\n",
++    "                         figsize=(5, 5),\n",
++    "                         add_one: bool = False,\n",
++    "                         show_empties: bool = False):\n",
++    "    \"\"\"Utility for a mixed-species plot\"\"\"\n",
++    "\n",
++    "    cell_prob_key = 'cell_probability'\n",
++    "    if cell_prob_key not in adata.obs.keys():\n",
++    "        cell_prob_key = 'latent_cell_probability'\n",
++    "    cell = (adata.obs[cell_prob_key] > 0.5)\n",
++    "\n",
++    "    val = 1 if add_one else 0\n",
++    "\n",
++    "    plt.figure(figsize=figsize)\n",
++    "\n",
++    "    if show_empties:\n",
++    "        plt.plot(np.array(adata.layers[raw_key]\n",
++    "                          [~cell][:, gene_logic1].sum(axis=1)).squeeze() + val,\n",
++    "                 np.array(adata.layers[raw_key]\n",
++    "                          [~cell][:, gene_logic2].sum(axis=1)).squeeze() + val,\n",
++    "                 '.', color='lightgray', ms=1, label='Raw (empty)', rasterized=True)\n",
++    "\n",
++    "    plt.plot(np.array(adata.layers[raw_key]\n",
++    "                     [cell][:, gene_logic1].sum(axis=1)).squeeze() + val,\n",
++    "             np.array(adata.layers[raw_key]\n",
++    "                     [cell][:, gene_logic2].sum(axis=1)).squeeze() + val,\n",
++    "             '.', color=raw_color, ms=1, label='Raw (non-empty)', rasterized=True)\n",
++    "\n",
++    "    if colors is not None:\n",
++    "        assert len(colors) >= len(layer_keys), 'Need at least as many colors as layers'\n",
++    "        for c, key in zip(colors,\n",
++    "                          layer_keys):\n",
++    "            plt.plot(np.array(adata.layers[key]\n",
++    "                              [cell][:, gene_logic1].sum(axis=1)).squeeze() + val,\n",
++    "                     np.array(adata.layers[key]\n",
++    "                              [cell][:, gene_logic2].sum(axis=1)).squeeze() + val,\n",
++    "                     '.', color=c, ms=1,\n",
++    "                     label=f'CB: FPR {key.split(\"_\")[1]}' if '_' in key else f'{key}',\n",
++    "                     rasterized=True)\n",
++    "    else:\n",
++    "        for key in layer_keys:\n",
++    "            plt.plot(np.array(adata.layers[key]\n",
++    "                              [cell][:, gene_logic1].sum(axis=1)).squeeze() + val,\n",
++    "                     np.array(adata.layers[key]\n",
++    "                              [cell][:, gene_logic2].sum(axis=1)).squeeze() + val,\n",
++    "                     '.', ms=1,\n",
++    "                     label=f'CB: FPR {key.split(\"_\")[1]}' if '_' in key else f'{key}',\n",
++    "                     rasterized=True)\n",
++    "\n",
++    "    # make a legend\n",
++    "    lgnd = plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))\n",
++    "    for h in lgnd.legend_handles:\n",
++    "        h.set_markersize(10)\n",
++    "    plt.grid(False)\n",
++    "\n",
++    "\n",
++    "def marginal_histogram(\n",
++    "    adata,\n",
++    "    gene_logic1: np.ndarray,\n",
++    "    gene_logic2: np.ndarray,\n",
++    "    layer_keys: List[str],\n",
++    "    which_histogram: str,  # 'x' or 'y'\n",
++    "    log_bins: bool = True,\n",
++    "    n_bins: int = 50,\n",
++    "    xxmax: float = 1e5,\n",
++    "    colors: Optional[List] = None,\n",
++    "    raw_key: str = 'cellranger',\n",
++    "    raw_color: str = 'k',\n",
++    "    figsize=(5, 2),\n",
++    "    add_one: bool = True,\n",
++    "    show_empties: bool = False,\n",
++    "):\n",
++    "    \"\"\"Utility for a mixed-species plot's marginal histogram\"\"\"\n",
++    "\n",
++    "    if log_bins:\n",
++    "        assert add_one, 'if log_bins is True, add_one should be also'\n",
++    "\n",
++    "    cell_prob_key = 'cell_probability'\n",
++    "    if cell_prob_key not in adata.obs.keys():\n",
++    "        cell_prob_key = 'latent_cell_probability'\n",
++    "    cell = (adata.obs[cell_prob_key] > 0.5)\n",
++    "\n",
++    "    val = 1 if add_one else 0\n",
++    "\n",
++    "    if which_histogram == 'x':\n",
++    "        gene_logic = gene_logic1\n",
++    "    else:\n",
++    "        assert which_histogram == 'y', 'which_histogram must be in [\"x\", \"y\"]'\n",
++    "        gene_logic = gene_logic2\n",
++    "\n",
++    "    xx = (([0.5, 1.5, 2.5, 3.5, 4.5, 5.5]\n",
++    "           + [a for a in np.logspace(0, np.log10(xxmax), n_bins, base=10)\n",
++    "              if a > 6.5]) if log_bins\n",
++    "          else np.linspace(0, xxmax, n_bins))\n",
++    "\n",
++    "    def _hist(data, color, label):\n",
++    "        plt.hist(data, bins=xx, histtype='step',\n",
++    "                 color=color, label=label, rasterized=True,\n",
++    "                 density=True,\n",
++    "                 lw=2 if ('0.1' in label) else 1,\n",
++    "                 orientation='vertical' if (which_histogram == 'x') else 'horizontal')\n",
++    "\n",
++    "    plt.figure(figsize=figsize)\n",
++    "\n",
++    "    if show_empties:\n",
++    "        _hist(np.array(adata.layers[raw_key]\n",
++    "                       [~cell][:, gene_logic].sum(axis=1)).squeeze() + val,\n",
++    "              color='lightgray', label='Raw (empty)')\n",
++    "\n",
++    "    _hist(np.array(adata.layers[raw_key]\n",
++    "                   [cell][:, gene_logic].sum(axis=1)).squeeze() + val,\n",
++    "          color=raw_color, label='Raw')\n",
++    "\n",
++    "    if colors is not None:\n",
++    "        assert len(colors) >= len(layer_keys), 'Need at least as many colors as layers'\n",
++    "        for c, key in zip(colors,\n",
++    "                          layer_keys):\n",
++    "            _hist(np.array(adata.layers[key]\n",
++    "                           [cell][:, gene_logic].sum(axis=1)).squeeze() + val,\n",
++    "                  color=c,\n",
++    "                  label=f'CB: FPR {key.split(\"_\")[1]}' if '_' in key else f'{key}')\n",
++    "    else:\n",
++    "        for key in layer_keys:\n",
++    "            _hist(np.array(adata.layers[key]\n",
++    "                           [cell][:, gene_logic].sum(axis=1)).squeeze() + val,\n",
++    "                  label=f'CB: FPR {key.split(\"_\")[1]}' if '_' in key else f'{key}')\n",
++    "\n",
++    "    if log_bins:\n",
++    "        if which_histogram == 'x':\n",
++    "            plt.xscale('log')\n",
++    "            plt.xticks(ticks=[1, 2, 10, 1e2, 1e3, 1e4, 1e5],\n",
++    "                       labels=[1, 2, '$10^1$', '$10^2$', '$10^3$', '$10^4$', '$10^5$'])\n",
++    "        else:\n",
++    "            plt.yscale('log')\n",
++    "            plt.yticks(ticks=[1, 2, 10, 1e2, 1e3, 1e4, 1e5],\n",
++    "                       labels=[1, 2, '$10^1$', '$10^2$', '$10^3$', '$10^4$', '$10^5$'])\n",
++    "\n",
++    "    # make a legend\n",
++    "    lgnd = plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))\n",
++    "    plt.grid(False)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# log-log plot for cellbender\n",
++    "\n",
++    "linear_mixed_species(adata_hgmm[non_doublet_logic],\n",
++    "                     human_genes,\n",
++    "                     mouse_genes,\n",
++    "                     layer_keys=['cellbender_0.01'],  # , 'cellbender_0.05', 'cellbender_0.1'],\n",
++    "                     colors=['tab:green', 'tab:orange', 'tab:red'],\n",
++    "                     raw_key='cellranger',\n",
++    "                     raw_color='lightgray',\n",
++    "                     add_one=True,\n",
++    "                     figsize=(4, 4),\n",
++    "                     show_empties=False)\n",
++    "plt.xscale('log')\n",
++    "plt.yscale('log')\n",
++    "plt.xticks([1e0, 1e1, 1e2, 1e3, 1e4, 1e5])\n",
++    "plt.yticks([1e0, 1e1, 1e2, 1e3, 1e4, 1e5])\n",
++    "plt.xlim([0.6, 1e5])\n",
++    "plt.ylim([0.6, 1e5])\n",
++    "plt.xlabel('Human counts + 1')\n",
++    "plt.ylabel('Mouse counts + 1')\n",
++    "lgnd = plt.legend(loc='lower left', fontsize=12, frameon=False)\n",
++    "for h in lgnd.legend_handles:\n",
++    "    h.set_markersize(10)\n",
++    "\n",
++    "# savefig('hgmm12k_species_removal_log.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "marginal_histogram(\n",
++    "    adata_hgmm[non_doublet_logic & (mouse_counts > cutoff)],\n",
++    "    human_genes,\n",
++    "    mouse_genes,\n",
++    "    layer_keys=['cellbender_0.01'],  # , 'cellbender_0.05', 'cellbender_0.1'],\n",
++    "    which_histogram='x',\n",
++    "    colors=['tab:green', 'tab:orange', 'tab:red'],\n",
++    "    raw_key='cellranger',\n",
++    "    raw_color='gray',\n",
++    "    add_one=True,\n",
++    "    figsize=(4, 2),\n",
++    "    show_empties=False,\n",
++    ")\n",
++    "plt.xlim([0.6, 1e5])\n",
++    "plt.gca().xaxis.tick_top()\n",
++    "plt.gca().xaxis.set_label_position('top')\n",
++    "plt.ylabel('Fraction mouse cells')\n",
++    "plt.xlabel('Human counts + 1')\n",
++    "plt.yscale('log')\n",
++    "plt.ylim(bottom=1e-4)\n",
++    "\n",
++    "# savefig('hgmm12k_species_removal_marginal_hist_mousecells.pdf')\n",
++    "\n",
++    "plt.show()\n",
++    "\n",
++    "marginal_histogram(\n",
++    "    adata_hgmm[non_doublet_logic & (human_counts > cutoff)],\n",
++    "    human_genes,\n",
++    "    mouse_genes,\n",
++    "    layer_keys=['cellbender_0.01'],  # , 'cellbender_0.05', 'cellbender_0.1'],\n",
++    "    which_histogram='y',\n",
++    "    colors=['tab:green', 'tab:orange', 'tab:red'],\n",
++    "    raw_key='cellranger',\n",
++    "    raw_color='gray',\n",
++    "    add_one=True,\n",
++    "    figsize=(2, 4),\n",
++    "    show_empties=False,\n",
++    ")\n",
++    "plt.minorticks_off()\n",
++    "plt.ylim([0.6, 1e5])\n",
++    "plt.gca().yaxis.tick_right()\n",
++    "plt.gca().yaxis.set_label_position('right')\n",
++    "plt.gca().get_legend().remove()\n",
++    "plt.xlabel('Fraction human cells')\n",
++    "plt.ylabel('Mouse counts + 1')\n",
++    "plt.xscale('log')\n",
++    "plt.xlim(left=1e-4)\n",
++    "\n",
++    "# savefig('hgmm12k_species_removal_marginal_hist_humancells.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# linear plots for cellbender\n",
++    "\n",
++    "# zoom in on mouse cells\n",
++    "\n",
++    "linear_mixed_species(adata_hgmm[non_doublet_logic & (mouse_counts > cutoff)],\n",
++    "                     human_genes,\n",
++    "                     mouse_genes,\n",
++    "                     layer_keys=['cellbender_0.01'],  # , 'cellbender_0.05', 'cellbender_0.1'],\n",
++    "                     colors=['tab:green', 'tab:orange', 'tab:red'],\n",
++    "                     raw_key='cellranger',\n",
++    "                     raw_color='lightgray',\n",
++    "                     figsize=(3, 4),\n",
++    "                     show_empties=False)\n",
++    "\n",
++    "yticks = [0, 1e4, 2e4, 3e4, 4e4]\n",
++    "plt.yticks(ticks=yticks, labels=[tick_label_str(v) for v in yticks])\n",
++    "plt.xlim([-20, 700])\n",
++    "plt.ylim([-1000, 30000])\n",
++    "plt.xlabel('Human counts')\n",
++    "plt.ylabel('Mouse counts')\n",
++    "plt.title('Mouse cells', color='darkcyan')\n",
++    "for axis_part in ['bottom', 'top', 'left', 'right']:\n",
++    "    plt.gca().spines[axis_part].set_color('darkcyan')\n",
++    "\n",
++    "# savefig('hgmm12k_species_removal_linear_zoom_mouse.pdf')\n",
++    "\n",
++    "plt.show()\n",
++    "\n",
++    "# zoom in on human cells\n",
++    "\n",
++    "linear_mixed_species(adata_hgmm[non_doublet_logic & (human_counts > cutoff)],\n",
++    "                     human_genes,\n",
++    "                     mouse_genes,\n",
++    "                     layer_keys=['cellbender_0.01'],  # , 'cellbender_0.05', 'cellbender_0.1'],\n",
++    "                     colors=['tab:green', 'tab:orange', 'tab:red'],\n",
++    "                     raw_key='cellranger',\n",
++    "                     raw_color='lightgray',\n",
++    "                     figsize=(4, 2.5),\n",
++    "                     show_empties=False)\n",
++    "\n",
++    "xticks = [0, 2e4, 4e4, 6e4]\n",
++    "plt.xticks(ticks=xticks, labels=[tick_label_str(v) for v in xticks])\n",
++    "plt.xlim([-1000, 50000])\n",
++    "plt.ylim([-20, 500])\n",
++    "plt.xlabel('Human counts')\n",
++    "plt.ylabel('Mouse counts')\n",
++    "plt.title('Human cells', color='darkmagenta')\n",
++    "for axis_part in ['bottom', 'top', 'left', 'right']:\n",
++    "    plt.gca().spines[axis_part].set_color('darkmagenta')\n",
++    "\n",
++    "# savefig('hgmm12k_species_removal_linear_zoom_human.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# PBMC 5k: CITE-seq as benchmark"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## PBMC 5k with surface proteins"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Data: \"5k Peripheral blood mononuclear cells (PBMCs) from a healthy donor with cell surface proteins (Next GEM)\"\n",
++    "\n",
++    "Provenance: 10x Genomics public data, v3 Next GEM chemistry, CellRanger 3.1.0 analysis\n",
++    "\n",
++    "Link: https://www.10xgenomics.com/resources/datasets/5-k-peripheral-blood-mononuclear-cells-pbm-cs-from-a-healthy-donor-with-cell-surface-proteins-next-gem-3-1-standard-3-1-0"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "leiden_res_pbmc_5k = 0.6\n",
++    "min_n_gene = 300"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata = load_anndata_from_input_and_output(\n",
++    "    input_file=citeseq_input,\n",
++    "    output_file=citeseq_output,\n",
++    "    input_layer_key='cellranger',\n",
++    ")\n",
++    "adata.var_names_make_unique()\n",
++    "\n",
++    "# eliminate empty droplets as defined by cellbender\n",
++    "cell_prob_key = 'cell_probability'\n",
++    "if cell_prob_key not in adata.obs.keys():\n",
++    "    cell_prob_key = 'latent_cell_probability'\n",
++    "pbmc5k_cell_bcs = adata.obs_names[adata.obs[cell_prob_key] > 0.5]\n",
++    "adata = adata[pbmc5k_cell_bcs].copy()\n",
++    "\n",
++    "adata.layers['cellbender'] = adata.X.copy()\n",
++    "adata"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "len(adata.var[adata.var['feature_type'] == 'Antibody Capture'])"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "def gene_from_antibody(antibody):\n",
++    "    \"\"\"How to translate the antibody names into the \n",
++    "    corresponding gene expression features.\n",
++    "    \"\"\"\n",
++    "\n",
++    "    # looked up manually, mostly on genecards.org\n",
++    "    lookups = {'HLA-DR': 'HLA-DRA',\n",
++    "               'PD-1': 'PDCD1',\n",
++    "               'CD3': 'CD3G',\n",
++    "               'CD11B': 'ITGAM',\n",
++    "               'CD15': 'FUT4',\n",
++    "               'CD16': 'FCGR3A',\n",
++    "               'CD20': 'MS4A1',\n",
++    "               'CD25': 'IL2RA',\n",
++    "               'CD56': 'NCAM1',\n",
++    "               'CD62L': 'SELL',\n",
++    "               'CD127': 'IL7R',\n",
++    "               'CD137': 'TNFRSF9',\n",
++    "               'CD197': 'CCR7',\n",
++    "               'CD278': 'ICOS',\n",
++    "               'CD335': 'NCR1',\n",
++    "               'CD45RA': 'PTPRC',\n",
++    "               'CD45RO': 'PTPRC'}\n",
++    "\n",
++    "    antibody = antibody.upper()\n",
++    "    if antibody in lookups.keys():\n",
++    "        return lookups[antibody]\n",
++    "    elif antibody in adata.var_names:\n",
++    "        return antibody\n",
++    "    elif ((antibody[-1] not in [str(i) for i in range(10)])\n",
++    "        and (antibody[:-1] in adata.var_names)):\n",
++    "        return antibody[:-1]\n",
++    "    elif antibody.startswith('IGG'):\n",
++    "        ab = antibody.replace('IGG', 'IGHG')\n",
++    "        if ab in adata.var_names:\n",
++    "            return ab\n",
++    "        elif ab[:-1] in adata.var_names:\n",
++    "            return ab[:-1]\n",
++    "    raise ValueError(f'{antibody} not present...')\n",
++    "\n",
++    "\n",
++    "for anti in adata.var[adata.var['feature_type'] == 'Antibody Capture']['gene_id']:\n",
++    "    try:\n",
++    "        gene_from_antibody(anti)\n",
++    "    except ValueError:\n",
++    "        print(anti + ' is missing')"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "matched_antibody_features = []\n",
++    "\n",
++    "for ab in adata.var[adata.var['feature_type'] == 'Antibody Capture'].iterrows():\n",
++    "    matched_antibody_features.append(gene_from_antibody(ab[-1]['gene_id']))\n",
++    "    matched_antibody_features.append(ab[0])\n",
++    "# matched_antibody_features"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_qc = qc_and_typical_workflow(adata,\n",
++    "                                   layer='cellbender',\n",
++    "                                   leiden_resolution=leiden_res_pbmc_5k,\n",
++    "                                   n_gene_min=min_n_gene)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# now with surface proteins\n",
++    "\n",
++    "pbmc_markers = {\n",
++    "    'Monoctypes\\n/ Neutrophils': ['S100A8', 'S100A9', 'S100A12', 'CD14', 'CD14_TotalSeqB'],\n",
++    "    'Monocytes\\n/ pDCs': ['LYZ', 'CST3', 'FCN1'],\n",
++    "    'T': ['IL32', 'TRAC'],\n",
++    "    'T CD4+ Naive / TE': ['CCR7'],\n",
++    "    'Tregs': ['FOXP3'],\n",
++    "    'B': ['IGHD', 'CD79A'],\n",
++    "    'B naive': ['FCER2'],\n",
++    "    'B memory': ['TNFRSF13B'],\n",
++    "    'T CD8+': ['CD8A', 'CD8a_TotalSeqB', 'CD8B'],\n",
++    "    'T Cytotoxic': ['NKG7', 'GNLY'],\n",
++    "    'T gamma delta': ['TRGC1'],\n",
++    "    'MAIT': ['SLC4A10'],\n",
++    "    'NK': ['KLRF1', 'SPON2'],\n",
++    "    'Monocytes NC / I': ['FCGR3A', 'CD16_TotalSeqB'],\n",
++    "    'Progenitor': ['PPBP'],\n",
++    "    'Baso. / Neutro.\\n/ Progenitor': ['CAVIN2', 'CLU'],\n",
++    "    'pDCs': ['LILRA4'],\n",
++    "    '(broad expression)': ['PTPRC', 'CD45RA_TotalSeqB', 'CD45RO_TotalSeqB'],\n",
++    "}"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "f = sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=pbmc_markers,\n",
++    "    layer='cellbender',\n",
++    "    groupby='leiden',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    show=False,\n",
++    ")\n",
++    "# for tick in f['mainplot_ax'].get_xticklabels():\n",
++    "#     tick.set_rotation(70)\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "f = sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=pbmc_markers,\n",
++    "    layer='cellranger',\n",
++    "    groupby='leiden',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    show=False,\n",
++    ")\n",
++    "# for tick in f['mainplot_ax'].get_xticklabels():\n",
++    "#     tick.set_rotation(70)\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_raw = sc.read_10x_h5(os.path.join(DATASET_DIR, '5k_pbmc_protein_v3_nextgem_raw_feature_bc_matrix.h5'),\n",
++    "                           gex_only=False)\n",
++    "adata_raw.var_names_make_unique()\n",
++    "\n",
++    "# eliminate empty droplets as defined by cellbender\n",
++    "adata_raw = adata_raw[pbmc5k_cell_bcs].copy()\n",
++    "\n",
++    "adata_raw.layers['cellranger'] = adata_raw.X.copy()\n",
++    "adata_raw"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_raw.X"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_raw_qc = qc_and_typical_workflow(adata_raw,\n",
++    "                                       layer='cellranger',\n",
++    "                                       leiden_resolution=leiden_res_pbmc_5k,\n",
++    "                                       n_gene_min=min_n_gene)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "f = sc.pl.dotplot(\n",
++    "    adata_raw_qc,\n",
++    "    var_names=pbmc_markers,\n",
++    "    groupby='leiden',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    show=False,\n",
++    ")\n",
++    "# for tick in f['mainplot_ax'].get_xticklabels():\n",
++    "#     tick.set_rotation(70)\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# just plot the log2 of the ratio of one isoform to another, with a divergent colormap\n",
++    "\n",
++    "adata_qc.X = adata_qc.layers['cellbender'].copy()\n",
++    "sc.pp.normalize_total(adata_qc)\n",
++    "sc.pp.log1p(adata_qc)\n",
++    "adata_qc.layers['cellbender_norm'] = adata_qc.X.copy()\n",
++    "\n",
++    "adata_qc.X = adata_qc.layers['cellranger'].copy()\n",
++    "sc.pp.normalize_total(adata_qc)\n",
++    "sc.pp.log1p(adata_qc)\n",
++    "adata_qc.layers['cellranger_norm'] = adata_qc.X.copy()\n",
++    "\n",
++    "cr_ro_vals = np.array(adata_qc.layers['cellranger']\n",
++    "                   [:, adata_qc.var_names == 'CD45RO_TotalSeqB'].todense()).squeeze()\n",
++    "cr_ra_vals = np.array(adata_qc.layers['cellranger']\n",
++    "                   [:, adata_qc.var_names == 'CD45RA_TotalSeqB'].todense()).squeeze()\n",
++    "\n",
++    "cb_ro_vals = np.array(adata_qc.layers['cellbender']\n",
++    "                   [:, adata_qc.var_names == 'CD45RO_TotalSeqB'].todense()).squeeze()\n",
++    "cb_ra_vals = np.array(adata_qc.layers['cellbender']\n",
++    "                   [:, adata_qc.var_names == 'CD45RA_TotalSeqB'].todense()).squeeze()\n",
++    "\n",
++    "adata_qc.obs['log_ratio_CD45RA_CD45RO_cellranger'] = np.log2(cr_ra_vals / (cr_ro_vals + 1e-4) + 1e-4)\n",
++    "adata_qc.obs['log_ratio_CD45RA_CD45RO_cellbender'] = np.log2(cb_ra_vals / (cb_ro_vals + 1e-4) + 1e-4)\n",
++    "\n",
++    "for g in ['log_ratio_CD45RA_CD45RO_cellranger', 'log_ratio_CD45RA_CD45RO_cellbender']:\n",
++    "\n",
++    "    print('cellranger, normalized and log scaled')\n",
++    "    plt.figure(figsize=(3, 3))\n",
++    "    sc.pl.embedding(adata_qc, basis='umap', vmin=-15, vmax=15, ax=plt.gca(),\n",
++    "                    color=g, color_map='RdYlGn', s=10, alpha=0.75, show=False)\n",
++    "    plt.title(('CellBender' if ('cellbender' in g) else 'Raw') + ':\\nlog2 ( CD45RA / CD45RO )')\n",
++    "#     savefig(f'pbmc5k_{g}.pdf')\n",
++    "    plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### CD20 UMAP"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "cd20_features = ['MS4A1', 'CD20_TotalSeqB']\n",
++    "\n",
++    "print('cellranger, normalized and log scaled')\n",
++    "sc.pl.embedding(adata_qc, basis='umap', layer='cellranger_norm',\n",
++    "                color=cd20_features, color_map='Oranges', vmin=0)#, vmax=20)\n",
++    "\n",
++    "print('cellbender, normalized and log scaled')\n",
++    "sc.pl.embedding(adata_qc, basis='umap', layer='cellbender_norm',\n",
++    "                color=cd20_features, color_map='Oranges', vmin=0)#, vmax=20)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### b. CITEseq after CellBender"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# this is FPR 0.1\n",
++    "\n",
++    "f = sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=matched_antibody_features,\n",
++    "    groupby='leiden',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    colorbar_title='Log expression\\nin group',\n",
++    "    var_group_rotation=0,\n",
++    "    show=False,\n",
++    ")\n",
++    "for tick in f['mainplot_ax'].get_xticklabels():\n",
++    "    if tick.get_text().endswith('_TotalSeqB'):\n",
++    "        tick.set_color('red')\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_dotplot_cellbender_0.1.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Will skip genes with very low expression, since there is not much to show or benchmark in those cases.\n",
++    "\n",
++    "- CD34 with max expression 0.0016538869822397828\n",
++    "\n",
++    "- CD80 with max expression 0.008617527782917023\n",
++    "\n",
++    "- TNFRSF9 with max expression 0.023860281333327293\n",
++    "\n",
++    "- CD274 with max expression 0.02070119045674801\n",
++    "\n",
++    "- PDCD1 with max expression 0.04665709286928177"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# also re-order them so that genes with similar expression patterns are close\n",
++    "\n",
++    "matched_antibody_features_expressed = [\n",
++    "    'ITGAM', 'CD11b_TotalSeqB',\n",
++    "    'CD14', 'CD14_TotalSeqB',\n",
++    "    'CD86', 'CD86_TotalSeqB',\n",
++    "\n",
++    "    'CD4', 'CD4_TotalSeqB',\n",
++    "    'PTPRC', 'CD45RA_TotalSeqB', 'CD45RO_TotalSeqB',\n",
++    "    'SELL', 'CD62L_TotalSeqB',\n",
++    "\n",
++    "    'CD3G','CD3_TotalSeqB',\n",
++    "    'CD27', 'CD27_TotalSeqB',\n",
++    "    'CD28', 'CD28_TotalSeqB',\n",
++    "    'IL7R', 'CD127_TotalSeqB',\n",
++    "    'ICOS', 'CD278_TotalSeqB',\n",
++    "\n",
++    "    'TIGIT', 'TIGIT_TotalSeqB',\n",
++    "    'NCR1', 'CD335_TotalSeqB',\n",
++    "    'NCAM1', 'CD56_TotalSeqB',\n",
++    "    'FCGR3A', 'CD16_TotalSeqB',\n",
++    "\n",
++    "    'CD19', 'CD19_TotalSeqB',\n",
++    "    'MS4A1', 'CD20_TotalSeqB',\n",
++    "    'HLA-DRA', 'HLA-DR_TotalSeqB',\n",
++    "    'IL2RA', 'CD25_TotalSeqB',\n",
++    "\n",
++    "    'FUT4', 'CD15_TotalSeqB',\n",
++    "\n",
++    "    'CD8A', 'CD8a_TotalSeqB',\n",
++    "    'CCR7', 'CD197_TotalSeqB',\n",
++    "    'SELL', 'CD62L_TotalSeqB',\n",
++    "\n",
++    "    'CD69', 'CD69_TotalSeqB',\n",
++    "]"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# do the dotplot computation using scanpy\n",
++    "\n",
++    "sc.set_figure_params(fontsize=18, vector_friendly=True)\n",
++    "\n",
++    "dp = sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=matched_antibody_features_expressed,\n",
++    "    groupby='leiden',\n",
++    "    layer='cellbender',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    colorbar_title='Log expression\\nin group',\n",
++    "    var_group_rotation=0,\n",
++    "    dot_min=0,\n",
++    "    dot_max=1,\n",
++    "    show=False,\n",
++    "    return_fig=True,\n",
++    ")\n",
++    "\n",
++    "# dataframes of dot size and dot color\n",
++    "dc = dp.dot_color_df.copy()\n",
++    "ds = dp.dot_size_df.copy()\n",
++    "\n",
++    "# add in empty columns at the appropriate places to split things up\n",
++    "for i in reversed([2, 4, 6, 8, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47]):\n",
++    "    ds.insert(loc=i, column='', value=np.nan, allow_duplicates=True)\n",
++    "    dc.insert(loc=i, column='', value=np.nan, allow_duplicates=True)\n",
++    "\n",
++    "col_ab = [c for c in ds.columns.tolist() if c.endswith('_TotalSeqB')]\n",
++    "col_not_ab = [c for c in ds.columns.tolist() if not c.endswith('_TotalSeqB')]\n",
++    "col_gene = [c for c in ds.columns.tolist() if ((not c.endswith('_TotalSeqB')) and (c != ''))]\n",
++    "col_not_gene = [c for c in ds.columns.tolist() if not ((not c.endswith('_TotalSeqB')) and (c != ''))]\n",
++    "\n",
++    "# to compute \"normalize\"\n",
++    "plt.figure(figsize=(7, 4))\n",
++    "normalize_ab, _, _ = make_scanpy_doplot(dot_size=ds[col_ab],\n",
++    "                                        dot_color=dc[col_ab],\n",
++    "                                        dot_ax=plt.gca(),\n",
++    "                                        vmin=0,\n",
++    "                                        vmax=2.21,  # max val\n",
++    "                                        cmap='Reds')\n",
++    "plt.show()\n",
++    "\n",
++    "plt.figure(figsize=(7, 4))\n",
++    "normalize_gene, _, _ = make_scanpy_doplot(dot_size=ds[col_gene],\n",
++    "                                          dot_color=dc[col_gene],\n",
++    "                                          dot_ax=plt.gca(),\n",
++    "                                          vmin=0,\n",
++    "                                          vmax=1.44,  # max val\n",
++    "                                          cmap='Blues')\n",
++    "plt.show()\n",
++    "\n",
++    "# the combined plot\n",
++    "plt.figure(figsize=(20, 4))\n",
++    "ds_only_ab = ds.copy()\n",
++    "ds_only_ab[col_not_ab] = 0\n",
++    "dc_only_ab = dc.copy()\n",
++    "dc_only_ab[col_not_ab] = 0\n",
++    "make_scanpy_doplot(dot_size=ds_only_ab,\n",
++    "                   dot_color=dc_only_ab,\n",
++    "                   dot_ax=plt.gca(),\n",
++    "                   cmap='Reds')\n",
++    "\n",
++    "ds_only_gene = ds.copy()\n",
++    "ds_only_gene[col_not_gene] = 0\n",
++    "dc_only_gene = dc.copy()\n",
++    "dc_only_gene[col_not_gene] = 0\n",
++    "make_scanpy_doplot(dot_size=ds_only_gene,\n",
++    "                   dot_color=dc_only_gene,\n",
++    "                   dot_ax=plt.gca(),\n",
++    "                   cmap='Blues')\n",
++    "plt.gca().set_ylabel('Leiden cluster')\n",
++    "\n",
++    "# add nice little dividing lines to guide the eye\n",
++    "a = 0\n",
++    "for x in [2, 4, 6, 8, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47]:\n",
++    "    plt.plot([x + a + 0.5, x + a + 0.5], [0, 15], color='lightgray', lw=1)\n",
++    "    a += 1\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_dotplot_cellbender_0.1.pdf')\n",
++    "\n",
++    "plt.show()\n",
++    "\n",
++    "# size legend\n",
++    "plt.figure(figsize=(2, 1))\n",
++    "dp._plot_size_legend(plt.gca())\n",
++    "# savefig('pbmc5k_citeseq_dotplot_cellbender_0.1_dot_size_legend.pdf')\n",
++    "plt.show()\n",
++    "\n",
++    "# colorbars\n",
++    "plt.figure(figsize=(2, 0.2))\n",
++    "dp.cmap = 'Reds'\n",
++    "dp._plot_colorbar(plt.gca(), normalize_ab)\n",
++    "# savefig('pbmc5k_citeseq_dotplot_cellbender_0.1_primary_colorbar.pdf')\n",
++    "plt.show()\n",
++    "\n",
++    "plt.figure(figsize=(2, 0.2))\n",
++    "dp.cmap = 'Blues'\n",
++    "dp._plot_colorbar(plt.gca(), normalize_gene)\n",
++    "# savefig('pbmc5k_citeseq_dotplot_cellbender_0.1_secondary_colorbar.pdf')\n",
++    "plt.show()\n",
++    "\n",
++    "sc.set_figure_params(fontsize=12, vector_friendly=True)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### a. CITEseq CellRanger"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# do the dotplot computation using scanpy\n",
++    "\n",
++    "sc.set_figure_params(fontsize=18, vector_friendly=True)\n",
++    "\n",
++    "dp = sc.pl.dotplot(\n",
++    "    adata_qc,\n",
++    "    var_names=matched_antibody_features_expressed,\n",
++    "    groupby='leiden',\n",
++    "    layer='cellranger',\n",
++    "    log=True,\n",
++    "    vmin=-0.5,\n",
++    "    color_map='Blues',\n",
++    "    colorbar_title='Log expression\\nin group',\n",
++    "    var_group_rotation=0,\n",
++    "    dot_min=0,\n",
++    "    dot_max=1,\n",
++    "    show=True,\n",
++    "    return_fig=True,\n",
++    ")\n",
++    "\n",
++    "# dataframes of dot size and dot color\n",
++    "dc = dp.dot_color_df.copy()\n",
++    "ds = dp.dot_size_df.copy()\n",
++    "\n",
++    "# add in empty columns at the appropriate places to split things up\n",
++    "for i in reversed([2, 4, 6, 8, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47]):\n",
++    "    ds.insert(loc=i, column='', value=np.nan, allow_duplicates=True)\n",
++    "    dc.insert(loc=i, column='', value=np.nan, allow_duplicates=True)\n",
++    "\n",
++    "col_ab = [c for c in ds.columns.tolist() if c.endswith('_TotalSeqB')]\n",
++    "col_not_ab = [c for c in ds.columns.tolist() if not c.endswith('_TotalSeqB')]\n",
++    "col_gene = [c for c in ds.columns.tolist() if ((not c.endswith('_TotalSeqB')) and (c != ''))]\n",
++    "col_not_gene = [c for c in ds.columns.tolist() if not ((not c.endswith('_TotalSeqB')) and (c != ''))]\n",
++    "\n",
++    "# to compute \"normalize\"\n",
++    "plt.figure(figsize=(7, 4))\n",
++    "normalize_ab, _, _ = make_scanpy_doplot(dot_size=ds[col_ab],\n",
++    "                                        dot_color=dc[col_ab],\n",
++    "                                        dot_ax=plt.gca(),\n",
++    "                                        vmin=0,\n",
++    "                                        vmax=2.21,  # max val\n",
++    "                                        cmap='Reds')\n",
++    "plt.show()\n",
++    "\n",
++    "plt.figure(figsize=(7, 4))\n",
++    "normalize_gene, _, _ = make_scanpy_doplot(dot_size=ds[col_gene],\n",
++    "                                          dot_color=dc[col_gene],\n",
++    "                                          dot_ax=plt.gca(),\n",
++    "                                          vmin=0,\n",
++    "                                          vmax=1.44,  # max val\n",
++    "                                          cmap='Blues')\n",
++    "plt.show()\n",
++    "\n",
++    "# the combined plot\n",
++    "plt.figure(figsize=(20, 4))\n",
++    "ds_only_ab = ds.copy()\n",
++    "ds_only_ab[col_not_ab] = 0\n",
++    "dc_only_ab = dc.copy()\n",
++    "dc_only_ab[col_not_ab] = 0\n",
++    "make_scanpy_doplot(dot_size=ds_only_ab,\n",
++    "                   dot_color=dc_only_ab,\n",
++    "                   dot_ax=plt.gca(),\n",
++    "                   cmap='Reds')\n",
++    "\n",
++    "ds_only_gene = ds.copy()\n",
++    "ds_only_gene[col_not_gene] = 0\n",
++    "dc_only_gene = dc.copy()\n",
++    "dc_only_gene[col_not_gene] = 0\n",
++    "make_scanpy_doplot(dot_size=ds_only_gene,\n",
++    "                   dot_color=dc_only_gene,\n",
++    "                   dot_ax=plt.gca(),\n",
++    "                   cmap='Blues')\n",
++    "plt.gca().set_ylabel('Leiden cluster')\n",
++    "\n",
++    "# add nice little dividing lines to guide the eye\n",
++    "a = 0\n",
++    "for x in [2, 4, 6, 8, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47]:\n",
++    "    plt.plot([x + a + 0.5, x + a + 0.5], [0, 15], color='lightgray', lw=1)\n",
++    "    a += 1\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_dotplot_raw.pdf')\n",
++    "\n",
++    "plt.show()\n",
++    "\n",
++    "# size legend\n",
++    "plt.figure(figsize=(2, 1))\n",
++    "dp._plot_size_legend(plt.gca())\n",
++    "# savefig('pbmc5k_citeseq_dotplot_raw_dot_size_legend.pdf')\n",
++    "plt.show()\n",
++    "\n",
++    "# colorbars\n",
++    "plt.figure(figsize=(2, 0.2))\n",
++    "dp.cmap = 'Reds'\n",
++    "dp.color_legend_title = 'Log antibody counts'\n",
++    "dp._plot_colorbar(plt.gca(), normalize_ab)\n",
++    "# savefig('pbmc5k_citeseq_dotplot_raw_primary_colorbar.pdf')\n",
++    "plt.show()\n",
++    "\n",
++    "plt.figure(figsize=(2, 0.2))\n",
++    "dp.cmap = 'Blues'\n",
++    "dp.color_legend_title = 'Log gene counts'\n",
++    "dp._plot_colorbar(plt.gca(), normalize_gene)\n",
++    "# savefig('pbmc5k_citeseq_dotplot_raw_secondary_colorbar.pdf')\n",
++    "plt.show()\n",
++    "\n",
++    "sc.set_figure_params(fontsize=12, vector_friendly=True)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### c, d. CITEseq Pearson correlations"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "raw_correlation_threshold = 1\n",
++    "raw_gene_expression_threshold = 0.2"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "adata_qc"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# gather a dataframe with all the information we need\n",
++    "\n",
++    "genes = matched_antibody_features[0::2]\n",
++    "antibodies = matched_antibody_features[1::2]\n",
++    "\n",
++    "def get_feature_counts(adata, layer, feature) -> np.ndarray:\n",
++    "    \"\"\"Obtain feature counts as a vector\"\"\"\n",
++    "    return np.array(adata.layers[layer][:, adata.var_names == feature].todense()).squeeze()\n",
++    "\n",
++    "df_counts = adata_qc.obs[['leiden']].copy()\n",
++    "\n",
++    "for feature in genes + antibodies:\n",
++    "    df_counts[feature + '_raw'] = get_feature_counts(adata_qc, layer='cellranger', feature=feature)\n",
++    "    df_counts[feature] = get_feature_counts(adata_qc, layer='cellbender', feature=feature)\n",
++    "\n",
++    "df_log_counts = adata_qc.obs[['leiden']].copy()\n",
++    "\n",
++    "for feature in genes + antibodies:\n",
++    "    df_log_counts[feature + '_raw'] = np.log1p(get_feature_counts(adata_qc, layer='cellranger', feature=feature))\n",
++    "    df_log_counts[feature] = np.log1p(get_feature_counts(adata_qc, layer='cellbender', feature=feature))\n",
++    "\n",
++    "# feature means across clusters\n",
++    "df_frac_expressing = df_counts.groupby('leiden').agg(lambda x: np.mean(x > 0))\n",
++    "\n",
++    "# feature means across clusters\n",
++    "df_means = df_log_counts.groupby('leiden').mean()\n",
++    "\n",
++    "# standard error of the mean\n",
++    "df_std_means = (df_log_counts.groupby('leiden').std()\n",
++    "                / df_log_counts.groupby('leiden').count().apply(np.sqrt))\n",
++    "df_means"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "class GridPlot:\n",
++    "\n",
++    "    def __init__(self,\n",
++    "                 grid_shape,\n",
++    "                 figsize,\n",
++    "                 xlabel,\n",
++    "                 ylabel):\n",
++    "        assert grid_shape is not None, 'Must initialize with a grid_shape'\n",
++    "        self.fig = plt.figure(figsize=figsize)\n",
++    "        print('Grid plot initialized')\n",
++    "        self.grid_shape = grid_shape\n",
++    "        self.xlabel = xlabel\n",
++    "        self.ylabel = ylabel\n",
++    "        self.axes = []\n",
++    "        self._i = 1\n",
++    "\n",
++    "    def add_plot(self):\n",
++    "        \"\"\"Command for creating a grid plot piecemeal\"\"\"\n",
++    "\n",
++    "        is_left_edge = ((self._i - 1) % self.grid_shape[1] == 0)\n",
++    "        is_bottom_row = (self._i - self.grid_shape[1] > 0) or (self.grid_shape[0] == 1)  # currently\n",
++    "\n",
++    "        ax = self.fig.add_subplot(self.grid_shape[0], self.grid_shape[1], self._i)\n",
++    "        self.axes.append({'ax': ax, 'is_left_edge': is_left_edge, 'is_bottom_row': is_bottom_row})\n",
++    "\n",
++    "        if is_left_edge:\n",
++    "            ax.set_ylabel(self.ylabel)\n",
++    "        if is_bottom_row:\n",
++    "            ax.set_xlabel(self.xlabel)\n",
++    "            self.axes[self._i - self.grid_shape[1] - 1]['ax'].set_xlabel('')\n",
++    "            self.axes[self._i - self.grid_shape[1] - 1]['is_bottom_row'] = False\n",
++    "\n",
++    "        self._i += 1"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0,
++     13,
++     30,
++     122
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "def fit_taking_xerr_into_account(x, y, xerr):\n",
++    "    \"\"\"Fit a line using weighted OLS\"\"\"\n",
++    "    fit = np.polyfit(x, y, deg=1)\n",
++    "    m = fit[0]\n",
++    "    b = fit[1]\n",
++    "    induced_yerr = xerr * m\n",
++    "    weights = 1./(induced_yerr + 0.01)\n",
++    "    fit = np.polyfit(x, y, w=weights, deg=1)\n",
++    "    m = fit[0]\n",
++    "    b = fit[1]\n",
++    "    return (m, b)\n",
++    "\n",
++    "\n",
++    "def scale_data(x, y, xerr, yerr):\n",
++    "    \"\"\"Apply scaling to collapse to line\"\"\"\n",
++    "\n",
++    "    # get data on same relative scale\n",
++    "    x_rescaled = x / np.std(x)\n",
++    "    xerr_rescaled = xerr / np.std(x)\n",
++    "    y_rescaled = y / np.std(y)\n",
++    "    yerr_rescaled = yerr / np.std(y)\n",
++    "\n",
++    "    # make slope 1\n",
++    "    m, _ = fit_taking_xerr_into_account(x_rescaled, y_rescaled, xerr_rescaled)\n",
++    "    y_rescaled = y_rescaled / m\n",
++    "    yerr_rescaled = yerr_rescaled / m\n",
++    "\n",
++    "    return x_rescaled, y_rescaled, xerr_rescaled, yerr_rescaled\n",
++    "\n",
++    "\n",
++    "def make_gridplot(df_means,\n",
++    "                  df_std_means,\n",
++    "                  skip_abs,\n",
++    "                  use_raw,\n",
++    "                  scaled,\n",
++    "                  hard_ymax=None,\n",
++    "                  hard_xmax=None,\n",
++    "                  grid_shape=(6, 7), figsize=(12, 12), ms=10):\n",
++    "\n",
++    "    cmap = cc.glasbey\n",
++    "\n",
++    "    grid = GridPlot(\n",
++    "        grid_shape=grid_shape,\n",
++    "        figsize=figsize,\n",
++    "        xlabel=('Scaled ' if scaled else '') + 'log1p RNA',\n",
++    "        ylabel=('Scaled ' if scaled else '') + 'log1p Antibody',\n",
++    "    )  # initialize\n",
++    "\n",
++    "    antibodies = [c for c in df_means.columns\n",
++    "                  if (('TotalSeqB' in c) and ('_raw' not in c))]\n",
++    "    lookup_gene_dict = dict(zip(matched_antibody_features[1::2], matched_antibody_features[::2]))\n",
++    "    print(lookup_gene_dict)\n",
++    "    genes = [lookup_gene_dict[a] for a in antibodies]\n",
++    "\n",
++    "    abs_with_low_correlation = []\n",
++    "    abs_with_low_gene_expression = []\n",
++    "\n",
++    "    for i, (g, p, c) in enumerate(zip(genes, antibodies, cmap)):\n",
++    "\n",
++    "        if p in skip_abs:\n",
++    "            continue\n",
++    "\n",
++    "        x = df_means[g + ('_raw' if use_raw else '')]\n",
++    "        x_err = df_std_means[g + ('_raw' if use_raw else '')]\n",
++    "        y = df_means[p + ('_raw' if use_raw else '')]\n",
++    "        y_err = df_std_means[p + ('_raw' if use_raw else '')]\n",
++    "\n",
++    "        if x.max() < raw_gene_expression_threshold:\n",
++    "            abs_with_low_gene_expression.append(p)\n",
++    "\n",
++    "        if scaled:\n",
++    "            x, y, x_err, y_err = scale_data(x, y, x_err, y_err)\n",
++    "\n",
++    "        grid.add_plot()\n",
++    "        plt.errorbar(x=x, y=y, xerr=x_err, yerr=y_err,\n",
++    "                     linestyle='', marker='.', ms=ms, color=c)\n",
++    "        m, b = fit_taking_xerr_into_account(x, y, x_err)\n",
++    "        plt.plot([0, x.max()], [b, b + m * x.max()], '-', color=c, alpha=0.75, lw=0.5)\n",
++    "        plt.title(p)\n",
++    "        plt.xlim(left=0)\n",
++    "        xlims = plt.gca().get_xlim()\n",
++    "        plt.xlim(left=-1 * (xlims[1] - xlims[0]) / 20)\n",
++    "        if hard_xmax is not None:\n",
++    "            plt.xlim(right=hard_xmax)\n",
++    "        plt.ylim(bottom=0)\n",
++    "        ylims = plt.gca().get_ylim()\n",
++    "        plt.ylim(bottom=-1 * (ylims[1] - ylims[0]) / 20)\n",
++    "        if hard_ymax is not None:\n",
++    "            plt.ylim(top=hard_ymax)\n",
++    "        plt.grid(False)\n",
++    "\n",
++    "#         print(f'{p}: correlation {m}')\n",
++    "        if m <= raw_correlation_threshold:\n",
++    "            abs_with_low_correlation.append(p)\n",
++    "\n",
++    "    if scaled:\n",
++    "        # make all axis limits the same\n",
++    "        xmax = 0\n",
++    "        ymax = 0\n",
++    "        for axis in grid.axes:\n",
++    "            ax = axis['ax']\n",
++    "            xmax = ax.get_xlim()[1] if (ax.get_xlim()[1] > xmax) else xmax\n",
++    "            ymax = ax.get_ylim()[1] if (ax.get_ylim()[1] > ymax) else ymax\n",
++    "        if hard_xmax is not None:\n",
++    "            xmax = hard_xmax\n",
++    "        if hard_ymax is not None:\n",
++    "            ymax = hard_ymax\n",
++    "        for axis in grid.axes:\n",
++    "            ax = axis['ax']\n",
++    "            ax.set_xlim([-1 * xmax / 20, xmax])\n",
++    "            ax.set_ylim([-1 * ymax / 20, ymax])\n",
++    "            if not axis['is_left_edge']:\n",
++    "                ticks = ax.get_yticks()\n",
++    "                ax.set_yticklabels(['' for t in ticks])\n",
++    "            if not axis['is_bottom_row']:\n",
++    "                ticks = ax.get_xticks()\n",
++    "                ax.set_xticklabels(['' for t in ticks])\n",
++    "    plt.tight_layout()\n",
++    "\n",
++    "    return abs_with_low_correlation, abs_with_low_gene_expression, grid\n",
++    "\n",
++    "\n",
++    "def make_nongridplot(df_means,\n",
++    "                     df_std_means,\n",
++    "                     skip_abs,\n",
++    "                     use_raw,\n",
++    "                     ms=10):\n",
++    "\n",
++    "    cmap = cc.glasbey\n",
++    "\n",
++    "    antibodies = [c for c in df_means.columns\n",
++    "                  if (('TotalSeqB' in c) and ('_raw' not in c))]\n",
++    "    lookup_gene_dict = dict(zip(matched_antibody_features[1::2], matched_antibody_features[::2]))\n",
++    "    print(lookup_gene_dict)\n",
++    "    genes = [lookup_gene_dict[a] for a in antibodies]\n",
++    "\n",
++    "    all_x = []\n",
++    "    all_y = []\n",
++    "\n",
++    "    for i, (g, p, c) in enumerate(zip(genes, antibodies, cmap)):\n",
++    "\n",
++    "        if p in skip_abs:\n",
++    "            continue\n",
++    "\n",
++    "        x = df_means[g + ('_raw' if use_raw else '')]\n",
++    "        x_err = df_std_means[g + ('_raw' if use_raw else '')]\n",
++    "        y = df_means[p + ('_raw' if use_raw else '')]\n",
++    "        y_err = df_std_means[p + ('_raw' if use_raw else '')]\n",
++    "\n",
++    "        x, y, x_err, y_err = scale_data(x, y, x_err, y_err)\n",
++    "        all_x.extend(x)\n",
++    "        all_y.extend(y)\n",
++    "\n",
++    "        plt.errorbar(x=x, y=y, xerr=x_err, yerr=y_err,\n",
++    "                     linestyle='', marker='o', ms=ms, color=c,\n",
++    "                     elinewidth=0.5, label=p.replace('_TotalSeqB', ''),\n",
++    "                     markeredgecolor='none', alpha=0.9)\n",
++    "#         plt.plot(x, y, '.', ms=ms, color=c)\n",
++    "#         m, b = fit_taking_xerr_into_account(x, y, x_err)\n",
++    "#         plt.plot([0, 4.5], [b, m * 4.5 + b], '-', color=c)\n",
++    "\n",
++    "    plt.draw()\n",
++    "\n",
++    "    fit = np.polyfit(all_x, all_y, deg=1)\n",
++    "    m = fit[0]\n",
++    "    b = fit[1]\n",
++    "    plt.plot([0, 4.5], [b, m * 4.5 + b], 'k-', lw=3)\n",
++    "\n",
++    "    plt.xlabel('Scaled log1p RNA count per cluster')\n",
++    "    plt.ylabel('Scaled log1p Antibody count per cluster')\n",
++    "    plt.title('Raw' if use_raw else 'CellBender')\n",
++    "\n",
++    "    plt.grid(False)\n",
++    "    plt.tight_layout()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "scrolled": false
++   },
++   "outputs": [],
++   "source": [
++    "abs_low_corr, abs_low_mrna, grid = make_gridplot(df_means, df_std_means, skip_abs=[],\n",
++    "                                                 grid_shape=(4, 8), figsize=(15, 8),\n",
++    "                                                 use_raw=True, scaled=False)\n",
++    "for axis_dict in grid.axes:\n",
++    "    axis_dict['ax'].set_title(axis_dict['ax'].get_title().replace('_TotalSeqB', ''))\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_modalities_scatterplot_per_antibody_raw.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "abs_low_corr"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "abs_low_mrna"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "_, _, grid = make_gridplot(\n",
++    "    df_means, df_std_means,\n",
++    "    skip_abs=[], grid_shape=(4, 8), figsize=(15, 8),\n",
++    "    use_raw=False, scaled=False,\n",
++    ")\n",
++    "\n",
++    "for axis_dict in grid.axes:\n",
++    "    axis_dict['ax'].set_title(axis_dict['ax'].get_title().replace('_TotalSeqB', ''))\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_modalities_scatterplot_per_antibody.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sc.set_figure_params(fontsize=14, vector_friendly=True)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "plt.figure(figsize=(4, 8))\n",
++    "\n",
++    "plt.subplot(2, 1, 1)\n",
++    "\n",
++    "make_nongridplot(\n",
++    "    df_means,\n",
++    "    df_std_means,\n",
++    "    skip_abs=abs_low_corr + abs_low_mrna,\n",
++    "    use_raw=True,\n",
++    "    ms=5,\n",
++    ")\n",
++    "plt.ylim(top=6.5)\n",
++    "plt.xticks([0, 1, 2, 3, 4], labels=['', '', '', '', ''])\n",
++    "plt.xlabel('')\n",
++    "\n",
++    "plt.subplot(2, 1, 2)\n",
++    "\n",
++    "make_nongridplot(\n",
++    "    df_means,\n",
++    "    df_std_means,\n",
++    "    skip_abs=abs_low_corr + abs_low_mrna,\n",
++    "    use_raw=False,\n",
++    "    ms=5,\n",
++    ")\n",
++    "plt.ylim(top=6.5)\n",
++    "plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), frameon=False)\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_modalities_scatterplot.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {
++    "code_folding": [
++     0
++    ]
++   },
++   "outputs": [],
++   "source": [
++    "def get_pearson_correlations(df, antibodies, matched_antibody_features):\n",
++    "\n",
++    "    corr = []\n",
++    "    raw_corr = []\n",
++    "    labels = []\n",
++    "\n",
++    "    for p in antibodies:\n",
++    "        y = df[p].values\n",
++    "        gene = matched_antibody_features[np.where(np.array(matched_antibody_features) == p)[0].item() - 1]\n",
++    "        x = df[gene].values\n",
++    "        print(f'{gene}: {p}')\n",
++    "        corr.append(corr_pearson(x, y)[0])\n",
++    "\n",
++    "        y_raw = df[p + '_raw'].values\n",
++    "        x_raw = df[gene + '_raw'].values\n",
++    "        raw_corr.append(corr_pearson(x_raw, y_raw)[0])\n",
++    "\n",
++    "        labels.append(p.replace('_TotalSeqB', ''))\n",
++    "\n",
++    "    return labels, raw_corr, corr"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "xticklabels, raw_corr, cb_corr = get_pearson_correlations(\n",
++    "    df=df_frac_expressing,\n",
++    "    antibodies=antibodies,\n",
++    "    matched_antibody_features=matched_antibody_features,\n",
++    ")"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "plt.figure(figsize=(3, 8))\n",
++    "\n",
++    "width = 0.2\n",
++    "xticks = np.arange(len(raw_corr))\n",
++    "\n",
++    "plt.barh(y=xticks + width / 1.5, width=np.maximum(0, raw_corr)[::-1],\n",
++    "         height=width, color='black', label='Raw')\n",
++    "plt.barh(y=xticks - width / 1.5, width=np.maximum(0, cb_corr)[::-1],\n",
++    "         height=width, color='tab:cyan', label='CellBender')\n",
++    "\n",
++    "plt.plot([0, 0], [-1, len(xticks)], color='lightgray', lw=0.75)\n",
++    "plt.grid(False)\n",
++    "plt.yticks(ticks=xticks, labels=xticklabels[::-1])\n",
++    "plt.ylim([-1, len(xticks)])\n",
++    "plt.xlim([-0.1, 1.1])\n",
++    "plt.xlabel('Pearson correlation between\\nfraction of cells per cluster\\nexpressing antibody and RNA')\n",
++    "plt.legend(fontsize=10, loc='center left', bbox_to_anchor=(1, 0.5))\n",
++    "plt.ylabel('Antibody')\n",
++    "\n",
++    "# savefig('pbmc5k_citeseq_modalities_pearson_frac.pdf')\n",
++    "\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": []
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.10.13"
++  },
++  "toc": {
++   "base_numbering": 1,
++   "nav_menu": {},
++   "number_sections": true,
++   "sideBar": true,
++   "skip_h1_title": false,
++   "title_cell": "Table of Contents",
++   "title_sidebar": "Contents",
++   "toc_cell": false,
++   "toc_position": {
++    "height": "calc(100% - 180px)",
++    "left": "10px",
++    "top": "150px",
++    "width": "298px"
++   },
++   "toc_section_display": true,
++   "toc_window_display": true
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 4
++}
+diff --git a/benchmarking/run_notebook.py b/benchmarking/run_notebook.py
+new file mode 100644
+index 00000000..33dda59f
+--- /dev/null
++++ b/benchmarking/run_notebook.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python3
++"""Execute the benchmarking notebook via Papermill, injecting GCS output paths."""
++
++import argparse
++import json
++
++import papermill as pm
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--git-commit", required=True)
++    parser.add_argument("--outputs-file", required=True, help="JSON file from submit_benchmarks.py")
++    parser.add_argument("--input-notebook", required=True)
++    parser.add_argument("--output-notebook", required=True)
++    args = parser.parse_args()
++
++    with open(args.outputs_file) as f:
++        outputs = json.load(f)
++
++    pm.execute_notebook(
++        args.input_notebook,
++        args.output_notebook,
++        parameters={
++            "git_commit": args.git_commit,
++            "outputs_json": json.dumps(outputs),
++        },
++        kernel_name="python3",
++    )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/benchmarking/submit_benchmarks.py b/benchmarking/submit_benchmarks.py
+new file mode 100644
+index 00000000..1fb7c35d
+--- /dev/null
++++ b/benchmarking/submit_benchmarks.py
+@@ -0,0 +1,318 @@
++#!/usr/bin/env python3
++"""Submit CellBender benchmarks as Google Batch GPU jobs and poll until completion.
++
++Outputs a JSON file mapping {sample_name: gcs_output_dir} on success.
++Exits with code 1 if any job fails.
++
++Usage:
++    python benchmarking/submit_benchmarks.py \
++        --git-hash abc1234 \
++        --run-id 10234567890-1 \
++        --outputs-file benchmarking/outputs.json
++"""
++
++import argparse
++import json
++import re
++import sys
++import time
++
++from google.cloud import batch_v1
++
++PROJECT = "broad-dsde-methods"
++REGION = "us-east1"
++SERVICE_ACCOUNT = "cellbender-benchmarking@broad-dsde-methods.iam.gserviceaccount.com"
++DOCKER_IMAGE = "us.gcr.io/broad-dsde-methods/cellbender:latest"
++
++BENCHMARK_JOBS = [
++    {
++        "sample": "pbmc8k",
++        "input": "gs://broad-dsde-methods-sfleming/cellbender_test/pbmc8k_raw_gene_bc_matrices.h5",
++        "fpr": None,
++        "truth": None,
++    },
++    {
++        "sample": "hgmm12k",
++        "input": "gs://broad-dsde-methods-sfleming/cellbender_test/hgmm_12k_raw_gene_bc_matrices.h5",
++        "fpr": None,
++        "truth": None,
++    },
++    {
++        "sample": "pbmc5k",
++        "input": "gs://broad-dsde-methods-sfleming/cellbender_test/5k_pbmc_protein_v3_nextgem_raw_feature_bc_matrix.h5",
++        "fpr": "0.1",
++        "truth": None,
++    },
++    {
++        "sample": "rat6k",
++        "input": "gs://broad-dsde-methods-sfleming/cellbender_test/PCL_rat_A_LA6_raw_feature_bc_matrix.h5",
++        "fpr": None,
++        "truth": None,
++    },
++    {
++        "sample": "s7",
++        "input": "gs://broad-dsde-methods-sfleming/cellbender_test/s7.h5",
++        "fpr": None,
++        "truth": "gs://broad-dsde-methods-sfleming/cellbender_test/s7_truth.h5",
++    },
++]
++
++
++def build_job_script(
++    git_hash: str,
++    input_gcs: str,
++    sample: str,
++    output_gcs_dir: str,
++    fpr: str | None,
++    truth_gcs: str | None,
++) -> str:
++    lines = [
++        "set -e",
++        f"gsutil cp {input_gcs} /tmp/input.h5",
++    ]
++
++    if truth_gcs:
++        lines.append(f"gsutil cp {truth_gcs} /tmp/truth.h5")
++
++    # dev_git_hash__ mechanism: uninstall pre-installed CellBender, clone the
++    # target commit, and reinstall from source so runtime code matches the SHA
++    # being benchmarked.
++    lines += [
++        "pip uninstall -y cellbender",
++        "git clone -q https://github.com/broadinstitute/CellBender.git /tmp/CellBender",
++        "cd /tmp/CellBender",
++        f"git checkout -q {git_hash}",
++        "pip install -U pip setuptools",
++        "pip install --no-cache-dir -U -e /tmp/CellBender",
++        "pip list",
++        "cd /tmp",
++        "python3 -c \"import torch; assert torch.cuda.is_available(), 'CUDA unavailable — GPU driver not configured'\"",
++    ]
++
++    cmd_parts = [
++        "cellbender remove-background",
++        "    --input /tmp/input.h5",
++        f"    --output /tmp/{sample}_out.h5",
++        "    --cuda",
++        "    --checkpoint-mins 200",
++        "    --exclude-feature-types Peaks",
++    ]
++    if fpr:
++        cmd_parts.append(f"    --fpr {fpr}")
++    if truth_gcs:
++        cmd_parts.append("    --truth /tmp/truth.h5")
++
++    lines.append(" \\\n".join(cmd_parts))
++    lines.append(f"gsutil -m cp /tmp/{sample}_out* {output_gcs_dir}/")
++
++    return "\n".join(lines)
++
++
++def make_job_id(run_id: str, sample: str) -> str:
++    raw = f"bm-{run_id}-{sample}"
++    sanitized = re.sub(r"[^a-z0-9\-]", "-", raw.lower())
++    sanitized = re.sub(r"-+", "-", sanitized).strip("-")
++    return sanitized[:63]
++
++
++def submit_job(
++    client: batch_v1.BatchServiceClient,
++    job_id: str,
++    script: str,
++    machine_type: str | None,
++    gpu_type: str,
++    cpu_count: int | None,
++    memory_gb: int | None,
++) -> batch_v1.Job:
++    runnable = batch_v1.Runnable()
++    runnable.container.image_uri = DOCKER_IMAGE
++    runnable.container.commands = ["/bin/bash", "-c", script]
++
++    task_spec = batch_v1.TaskSpec()
++    task_spec.runnables = [runnable]
++
++    # When no machine type is given, set CPU/memory hints and let Batch choose
++    # a compatible N1 instance for the requested GPU.
++    if not machine_type and (cpu_count or memory_gb):
++        if cpu_count:
++            task_spec.compute_resource.cpu_milli = cpu_count * 1000
++        if memory_gb:
++            task_spec.compute_resource.memory_mib = memory_gb * 1024
++
++    task_group = batch_v1.TaskGroup()
++    task_group.task_count = 1
++    task_group.task_spec = task_spec
++
++    instances = batch_v1.AllocationPolicy.InstancePolicyOrTemplate()
++    instances.install_gpu_drivers = True
++    if machine_type:
++        instances.policy.machine_type = machine_type
++    instances.policy.accelerators = [batch_v1.AllocationPolicy.Accelerator(type_=gpu_type, count=1)]
++
++    location = batch_v1.AllocationPolicy.LocationPolicy()
++    location.allowed_locations = [
++        "zones/us-east1-d",
++        "zones/us-east1-c",
++        "zones/us-central1-a",
++        "zones/us-central1-c",
++    ]
++
++    # The Batch job VMs run as this SA so they can read/write the GCS bucket.
++    # Prerequisite: run once to allow the SA to act as itself:
++    #   gcloud iam service-accounts add-iam-policy-binding \
++    #     cellbender-benchmarking@broad-dsde-methods.iam.gserviceaccount.com \
++    #     --role=roles/iam.serviceAccountUser \
++    #     --member="serviceAccount:cellbender-benchmarking@broad-dsde-methods.iam.gserviceaccount.com"
++    allocation_policy = batch_v1.AllocationPolicy()
++    allocation_policy.instances = [instances]
++    allocation_policy.location = location
++    allocation_policy.service_account.email = SERVICE_ACCOUNT
++
++    job = batch_v1.Job()
++    job.task_groups = [task_group]
++    job.allocation_policy = allocation_policy
++    job.logs_policy.destination = batch_v1.LogsPolicy.Destination.CLOUD_LOGGING
++
++    return client.create_job(
++        batch_v1.CreateJobRequest(
++            parent=f"projects/{PROJECT}/locations/{REGION}",
++            job_id=job_id,
++            job=job,
++        )
++    )
++
++
++def poll_until_done(
++    client: batch_v1.BatchServiceClient,
++    job_names: list[str],
++    poll_interval: int,
++) -> dict[str, str]:
++    terminal = {"SUCCEEDED", "FAILED", "DELETION_IN_PROGRESS"}
++    final: dict[str, str] = {}
++
++    while len(final) < len(job_names):
++        for name in job_names:
++            if name in final:
++                continue
++            state = client.get_job(name=name).status.state.name
++            if state in terminal:
++                final[name] = state
++                print(f"[done] {name.split('/')[-1]}: {state}", flush=True)
++
++        if len(final) < len(job_names):
++            remaining = len(job_names) - len(final)
++            print(
++                f"[poll] {remaining} job(s) still running, checking again in {poll_interval}s...",
++                flush=True,
++            )
++            time.sleep(poll_interval)
++
++    return final
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--git-hash", required=True, help="Git SHA or branch to benchmark")
++    parser.add_argument(
++        "--run-id",
++        default=time.strftime("%Y%m%d%H%M%S"),
++        help="Unique suffix for Batch job IDs (default: timestamp)",
++    )
++    parser.add_argument(
++        "--output-bucket",
++        default="gs://broad-dsde-methods-sfleming/cellbender_test/benchmarks",
++    )
++    parser.add_argument("--outputs-file", default="outputs.json")
++    parser.add_argument("--poll-interval", type=int, default=60)
++
++    hw = parser.add_argument_group(
++        "hardware",
++        "Machine type takes precedence; cpu-count/memory-gb are used only when "
++        "machine-type is omitted, as resource hints for Batch to auto-select a machine.",
++    )
++    hw.add_argument(
++        "--machine-type",
++        default="n1-highmem-8",
++        help="GCP machine type (default: n1-highmem-8 = 8 vCPU / 52 GB). Examples: n1-highmem-16, n1-standard-8.",
++    )
++    hw.add_argument(
++        "--gpu-type",
++        default="nvidia-tesla-t4",
++        help="GCP GPU accelerator type (default: nvidia-tesla-t4). Also valid: nvidia-tesla-k80.",
++    )
++    hw.add_argument(
++        "--cpu-count",
++        type=int,
++        default=None,
++        help="CPU count hint (used only when --machine-type is not set).",
++    )
++    hw.add_argument(
++        "--memory-gb",
++        type=int,
++        default=None,
++        help="Memory in GB hint (used only when --machine-type is not set).",
++    )
++
++    args = parser.parse_args()
++
++    # A machine type of the sentinel default means the user didn't override it.
++    # Treat an explicitly cleared machine type (empty string from workflow) the
++    # same as absent.
++    machine_type: str | None = args.machine_type or None
++
++    client = batch_v1.BatchServiceClient()
++
++    output_dirs: dict[str, str] = {}
++    job_names: list[str] = []
++
++    hw_desc = f"machine={machine_type or 'auto'}, gpu={args.gpu_type}"
++    if not machine_type and (args.cpu_count or args.memory_gb):
++        hw_desc += f", cpu={args.cpu_count}, memory={args.memory_gb}GB"
++    print(f"Hardware: {hw_desc}", flush=True)
++
++    for job_def in BENCHMARK_JOBS:
++        sample = job_def["sample"]
++        output_gcs_dir = f"{args.output_bucket.rstrip('/')}/{args.git_hash}/{sample}"
++        output_dirs[sample] = output_gcs_dir
++
++        job_id = make_job_id(args.run_id, sample)
++        script = build_job_script(
++            git_hash=args.git_hash,
++            input_gcs=job_def["input"],
++            sample=sample,
++            output_gcs_dir=output_gcs_dir,
++            fpr=job_def["fpr"],
++            truth_gcs=job_def["truth"],
++        )
++
++        print(f"Submitting {job_id} ...", flush=True)
++        job = submit_job(
++            client,
++            job_id,
++            script,
++            machine_type=machine_type,
++            gpu_type=args.gpu_type,
++            cpu_count=args.cpu_count,
++            memory_gb=args.memory_gb,
++        )
++        job_names.append(job.name)
++        print(f"  -> {job.name}", flush=True)
++
++    print(f"\nPolling {len(job_names)} jobs every {args.poll_interval}s ...\n", flush=True)
++    final_states = poll_until_done(client, job_names, args.poll_interval)
++
++    failed = [n for n, s in final_states.items() if s != "SUCCEEDED"]
++    if failed:
++        print("\nFailed jobs:", file=sys.stderr)
++        for name in failed:
++            print(f"  {name}: {final_states[name]}", file=sys.stderr)
++        sys.exit(1)
++
++    with open(args.outputs_file, "w") as f:
++        json.dump(output_dirs, f, indent=2)
++
++    print(f"\nAll jobs succeeded. Output paths written to {args.outputs_file}.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/cellbender/remove_background/report.py b/cellbender/remove_background/report.py
+index ab8c19a1..7539f3db 100644
+--- a/cellbender/remove_background/report.py
++++ b/cellbender/remove_background/report.py
+@@ -271,13 +271,13 @@ def generate_summary_plots(
+         plt.figure(figsize=(10, 4))
+         plt.subplot(1, 2, 1)
+         plt.semilogx(adata.var[f"n_{input_layer_key}_cells"], adata.var["fraction_remaining_cells"], "k.", ms=1)
+-        plt.ylim([-0.05, 1.05])
++        plt.ylim([-0.05, 1.05])  # type: ignore [call-overload]
+         plt.xlabel("Number of counts in raw data")
+         plt.ylabel("Fraction of counts remaining")
+         plt.title("Genes: removal of counts\nfrom (inferred) cell-containing droplets")
+         plt.subplot(1, 2, 2)
+         plt.semilogx(adata.var[f"n_{input_layer_key}_cells"], adata.var["fraction_remaining_cells_truth"], "k.", ms=1)
+-        plt.ylim([-0.05, 1.05])
++        plt.ylim([-0.05, 1.05])  # type: ignore [call-overload]
+         plt.xlabel("Number of counts in raw data")
+         plt.ylabel("Truth: fraction of counts remaining")
+         plt.title("Genes: truth")
+@@ -292,7 +292,7 @@ def generate_summary_plots(
+             "k.",
+             ms=1,
+         )
+-        plt.ylim([-1.05, 1.05])
++        plt.ylim([-1.05, 1.05])  # type: ignore [call-overload]
+         plt.xlabel("Number of counts in raw data")
+         plt.ylabel("Residual fraction of counts remaining")
+         plt.title("Genes: residual")
+@@ -1827,8 +1827,8 @@ def cell_roc_count_roc(
+     plt.plot(fpr, tpr, "o")
+     plt.ylabel("fraction of true cells called")
+     plt.xlabel("fraction of called cells that are really empty")
+-    plt.ylim([-0.05, 1.05])
+-    plt.xlim([-0.05, 1.05])
++    plt.ylim([-0.05, 1.05])  # type: ignore [call-overload]
++    plt.xlim([-0.05, 1.05])  # type: ignore [call-overload]
+     plt.title("Cell identification")
+     plt.show()
+ 
+@@ -1958,8 +1958,8 @@ def plot_roc_points(
+     plt.plot([1 - spec_mean, 1 - spec_mean], [sens_mean - sens_stdv, sens_mean + sens_stdv], **kwargs)
+     plt.ylabel("sensitivity = TP / (TP + FN)\ntrue positive rate")
+     plt.xlabel("1 - specificity = 1 - TN / (TN + FP)\nfalse positive rate")
+-    plt.ylim([-0.05, 1.05])
+-    plt.xlim([-0.05, 1.05])
++    plt.ylim([-0.05, 1.05])  # type: ignore [call-overload]
++    plt.xlim([-0.05, 1.05])  # type: ignore [call-overload]
+     plt.title(title)
+ 
+     if show:
+@@ -2024,7 +2024,7 @@ def plot_summary(loss: Dict[str, Dict[str, Any]], umi_counts: np.ndarray, p: np.
+         plt.gca().twinx()
+         plt.plot(p[count_order], ".:", color="red", alpha=0.3, rasterized=True)
+         plt.ylabel("Cell probability", color="red")
+-        plt.ylim([-0.05, 1.05])
++        plt.ylim([-0.05, 1.05])  # type: ignore [call-overload]
+         plt.title("Determination of which barcodes contain cells")
+     else:
+         plt.title("The subset of barcodes used for training")
+diff --git a/pyproject.toml b/pyproject.toml
+index dc209654..20293e9c 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -55,6 +55,7 @@ testpaths = ["tests"]
+ 
+ [tool.ruff]
+ line-length = 120
++exclude = ["benchmarking/cellbender_benchmarking.ipynb"]
+ 
+ [tool.ruff.lint]
+ select = ["E", "W", "F", "I"]
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index fbf86720..a974745a 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+@@ -2,3 +2,4 @@ pytest
+ scikit-learn
+ ruff==0.15.12
+ mypy==1.20.2
++numpy<2.1
+diff --git a/tests/benchmarking/README.md b/tests/benchmarking/README.md
+deleted file mode 100644
+index e52c1423..00000000
+--- a/tests/benchmarking/README.md
++++ /dev/null
+@@ -1,62 +0,0 @@
+-# Benchmarking CellBender versions and changes
+-
+-## Running benchmarking tests
+-
+-There is a benchmarking WDL in /cellbender/remove_background/tests/benchmarking called 
+-`benchmark.wdl`.  This can be run using a local installation of cromshell
+-(`conda install -c bioconda cromshell`) by running the python script in 
+-`run_benchmark.py` as in
+-
+-```console
+-python run_benchmark.py \
+-    --git "v0.2.1" \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/pbmc8k_raw_gene_bc_matrices.h5" \
+-    --sample pbmc8k
+-```
+-
+-The `--git` input can be a full commit sha or a tag or a branch.  Anything that 
+-can be pip installed via `pip install -y git+https://github.com/broadinstitute/CellBender.git@<SOMETHING>`
+-
+-(The caveat here is that older versions of CellBender cannot be installed from 
+-github in this way, so this is a test that will work moving forward from 
+-commit `cb2d209d5aedffe71e28947bc5b7859600aef64d`)
+-
+-### Datasets from the paper
+-
+-To re-run the datasets that were analyzed in the CellBender paper, plus 
+-several other interesting benchmarks, try running
+-
+-```console
+-./run_usual_benchmarks.sh b9d2953c76c538d13549290bd986af4e6a1780d5
+-```
+-
+-You can check their status via `cromshell` using
+-
+-```console
+-cromshell list -u | tail -n 5
+-```
+-
+-## Validation of outputs
+-
+-Validation is comprised of a Terra notebook in the following workspace:
+-https://app.terra.bio/#workspaces/broad-firecloud-dsde-methods/sfleming_dev
+-
+-To prepare a data table for the Terra workspace (once all jobs 
+-have completed):
+-
+-```console
+-python run_benchmark_result_tabulation.py \
+-    --workflows b9d2953c76c538d13549290bd986af4e6a1780d5 \
+-    --output samples.tsv
+-```
+-
+-where, for example, `b9d2953c76c538d13549290bd986af4e6a1780d5` is 
+-the git hash used to run `run_usual_benchmarks.sh`. (The script will `grep` 
+-the local cromshell database for all runs that match. More than one search 
+-term can be used.)
+-
+-Then manually upload the `samples.tsv` to Terra as a data table.
+-
+-Open the validation notebook and enter the git commit 
+-`b9d2953c76c538d13549290bd986af4e6a1780d5` at the top.  Then 
+-run the entire notebook to produce plots.
+diff --git a/tests/benchmarking/benchmark.wdl b/tests/benchmarking/benchmark.wdl
+deleted file mode 100644
+index 6a0781b8..00000000
+--- a/tests/benchmarking/benchmark.wdl
++++ /dev/null
+@@ -1,29 +0,0 @@
+-version 1.0
+-
+-import "cellbender_remove_background.wdl" as cellbender
+-
+-## Copyright Broad Institute, 2023
+-##
+-## LICENSING :
+-## This script is released under the WDL source code license (BSD-3)
+-## (see LICENSE in https://github.com/openwdl/wdl).
+-
+-
+-workflow run_cellbender_benchmark {
+-    input {
+-        String? git_hash
+-    }
+-
+-    call cellbender.run_cellbender_remove_background_gpu as cb {
+-        input:
+-            dev_git_hash__=git_hash
+-
+-    }
+-
+-    output {
+-        File log = cb.log
+-        File summary_pdf = cb.pdf
+-        Array[File] html_report_array = cb.report_array
+-        Array[File] h5_array = cb.h5_array
+-    }
+-}
+diff --git a/tests/benchmarking/cuda_check_inputs.json b/tests/benchmarking/cuda_check_inputs.json
+deleted file mode 100644
+index b9a3c46b..00000000
+--- a/tests/benchmarking/cuda_check_inputs.json
++++ /dev/null
+@@ -1,4 +0,0 @@
+-{
+-  "check_pytorch_cuda_status.run_check_pytorch_cuda_status.docker_image": "us.gcr.io/broad-dsde-methods/cellbender:20230427"
+-}
+-
+diff --git a/tests/benchmarking/docker_image_check_cuda_status.wdl b/tests/benchmarking/docker_image_check_cuda_status.wdl
+deleted file mode 100644
+index 91ae2777..00000000
+--- a/tests/benchmarking/docker_image_check_cuda_status.wdl
++++ /dev/null
+@@ -1,41 +0,0 @@
+-version 1.0
+-
+-## Copyright Broad Institute, 2023
+-##
+-## LICENSING :
+-## This script is released under the WDL source code license (BSD-3)
+-## (see LICENSE in https://github.com/openwdl/wdl).
+-
+-task run_check_pytorch_cuda_status {
+-    input {
+-        String docker_image
+-        Int? hardware_boot_disk_size_GB = 20
+-        String? hardware_zones = "us-east1-d us-east1-c us-central1-a us-central1-c us-west1-b"
+-        String? hardware_gpu_type = "nvidia-tesla-t4"
+-        Int? hardware_premptible_tries = 2
+-        Int? hardware_max_retries = 0
+-        String? nvidia_driver_version = "470.82.01"  # need >=465.19.01 for CUDA 11.3
+-    }
+-    command {
+-        set -e
+-        python <<CODE
+-        import torch
+-        assert torch.cuda.is_available()
+-        CODE
+-    }
+-    runtime {
+-        docker: "${docker_image}"
+-        bootDiskSizeGb: hardware_boot_disk_size_GB
+-        zones: "${hardware_zones}"
+-        gpuCount: 1
+-        gpuType: "${hardware_gpu_type}"
+-        nvidiaDriverVersion: "${nvidia_driver_version}"
+-        preemptible: hardware_premptible_tries
+-        maxRetries: hardware_max_retries
+-    }
+-}
+-
+-
+-workflow check_pytorch_cuda_status {
+-    call run_check_pytorch_cuda_status
+-}
+diff --git a/tests/benchmarking/run_benchmark_result_tabulation.py b/tests/benchmarking/run_benchmark_result_tabulation.py
+deleted file mode 100644
+index dd2daa19..00000000
+--- a/tests/benchmarking/run_benchmark_result_tabulation.py
++++ /dev/null
+@@ -1,145 +0,0 @@
+-"""Tabulate outputs from CellBender benchmarking as a samples.tsv for Terra
+-Example:
+-    $ conda activate cromshell
+-    $ python run_benchmark_result_tabulation.py \
+-        --workflows 2927346f4c513a217ac8ad076e494dd1adbf70e1 \
+-        --output "samples.tsv"
+-"""
+-
+-import argparse
+-import os
+-import re
+-import subprocess
+-import sys
+-from typing import List, Optional, Tuple, Union
+-
+-import pandas as pd
+-
+-
+-def get_parser() -> argparse.ArgumentParser:
+-    parser = argparse.ArgumentParser(
+-        description="Create a Terra-compatible data table TSV from cromshell benchmarking outputs.",
+-    )
+-    parser.add_argument(
+-        "-w",
+-        "--workflows",
+-        type=str,
+-        required=True,
+-        dest="grep",
+-        help="grep to choose workflows from the cromshell database",
+-    )
+-    parser.add_argument(
+-        "-n", "--note", type=str, required=True, dest="note", help="Annotation describing the git commit"
+-    )
+-    parser.add_argument("-o", "--output", type=str, required=True, dest="output_file", help="Output TSV file")
+-
+-    return parser
+-
+-
+-def find_cromshell_workflow_ids_dates(grep: str) -> Tuple[List[str], List[str]]:
+-    """Find workflows in the cromshell database matching some string"""
+-
+-    date_col = 0
+-    workflow_id_col = 2
+-
+-    # use cromshell list to get the database, then comb through it
+-    out = subprocess.run(["cromshell", "list"], capture_output=True)
+-    s = out.stdout.decode()
+-    _RE_COMBINE_WHITESPACE = re.compile(r"(?a: +)")
+-    s = _RE_COMBINE_WHITESPACE.sub(" ", s).strip()
+-    greps = grep.split(" ")  # separately match all search elements (space delimited)
+-    selected_rows = [r for r in s.split("\n") if all([g in r for g in greps])]
+-
+-    for r in selected_rows:
+-        if "Succeeded" not in r:
+-            print(f"WARNING: Skipping\n{r}\nbecause the run has not completed")
+-    selected_rows = [r for r in selected_rows if ("Succeeded" in r)]
+-
+-    workflow_ids = [r.split(" ")[workflow_id_col] for r in selected_rows]
+-    dates = [r.split(" ")[date_col] for r in selected_rows]
+-
+-    return workflow_ids, dates
+-
+-
+-def get_cromshell_output_h5(workflow: str, grep: str = "_out.h5") -> Union[str, List[str]]:
+-    """Use cromshell list-outputs to get the relevant file gsURL"""
+-
+-    output = grep_from_command(["cromshell", "list-outputs", workflow], grep=grep)
+-    out = output.decode().lstrip("run_cellbender_benchmark.h5_array: ").rstrip("\n").split("\n")
+-    if len(out) > 1:
+-        return out
+-    else:
+-        return out[0]
+-
+-
+-def sample_name_from_h5(h5: str | List[str]) -> str:
+-    """Get sample name by parsing h5 file name"""
+-    h5_str = h5[0] if isinstance(h5, list) else h5
+-    return os.path.basename(h5_str).replace("_out.h5", "")
+-
+-
+-def grep_from_command(command: List[str], grep: str) -> bytes:
+-    """Pipe a command to grep and give the output"""
+-    ps = subprocess.Popen(command, stdout=subprocess.PIPE)
+-    output = subprocess.check_output(["grep", grep], stdin=ps.stdout)
+-    ps.wait()
+-    return output
+-
+-
+-def metadata_from_workflow_id(workflow: str) -> Tuple[str, str, Optional[str]]:
+-    """Get other metadata for a workflow id: git hash, input file, truth file"""
+-
+-    # git hash
+-    output = grep_from_command(["cromshell", "metadata", workflow], grep='"git_hash":')
+-    git_hash = output.decode().split('"git_hash": ')[-1].lstrip('"').split('"')[0]
+-
+-    # input file
+-    output = grep_from_command(
+-        ["cromshell", "metadata", workflow], grep="run_cellbender_benchmark.cb.input_file_unfiltered"
+-    )
+-    input_file = "gs://" + output.decode().split("gs://")[-1].split('"')[0]
+-
+-    # truth file
+-    output = grep_from_command(["cromshell", "metadata", workflow], grep="run_cellbender_benchmark.cb.truth_file")
+-    if "null" not in output.decode():
+-        truth_file = "gs://" + output.decode().split("gs://")[-1].split('"')[0]
+-    else:
+-        truth_file = None
+-
+-    return git_hash, input_file, truth_file
+-
+-
+-if __name__ == "__main__":
+-    # handle input arguments
+-    parser = get_parser()
+-    args = parser.parse_args(sys.argv[1:])
+-    # args = validate_args(args)
+-
+-    workflow_ids, dates = find_cromshell_workflow_ids_dates(args.grep)
+-    output_h5s = [get_cromshell_output_h5(id) for id in workflow_ids]
+-    samples = [sample_name_from_h5(h5) for h5 in output_h5s]
+-    list_of_tuples = [metadata_from_workflow_id(id) for id in workflow_ids]
+-    if len(list_of_tuples) > 0:
+-        git_hashes, input_h5s, truth_h5s = zip(*list_of_tuples)
+-
+-        run_ids = [sample + "_" + git for sample, git in zip(samples, git_hashes)]
+-
+-        df = pd.DataFrame(
+-            data={
+-                "entity:sample_id": run_ids,
+-                "git_commit": git_hashes,
+-                "sample": samples,
+-                "output_h5": output_h5s,
+-                "input_h5": input_h5s,
+-                "truth_h5": truth_h5s,
+-                "cromwell_workflow_id": workflow_ids,
+-                "date_time": dates,
+-                "note": args.note,
+-            }
+-        )
+-
+-        df.to_csv(args.output_file, sep="\t", index=False)
+-    else:
+-        print("No submissions selected")
+-
+-    sys.exit(0)
+diff --git a/tests/benchmarking/run_usual_benchmarks.sh b/tests/benchmarking/run_usual_benchmarks.sh
+deleted file mode 100755
+index 98c50f7a..00000000
+--- a/tests/benchmarking/run_usual_benchmarks.sh
++++ /dev/null
+@@ -1,74 +0,0 @@
+-#!/bin/bash
+-
+-# Example run:
+-# $ ./run_usual_benchmarks.sh "v0.2.1"
+-
+-GIT_HASH=$1
+-
+-# from the paper ==========================
+-
+-# 10x Genomics pbmc8k
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/pbmc8k_raw_gene_bc_matrices.h5" \
+-    --sample "pbmc8k"
+-
+-# 10x Genomics hgmm12k
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/hgmm_12k_raw_gene_bc_matrices.h5" \
+-    --sample "hgmm12k"
+-
+-# 10x Genomics pbmc5k CITE-seq
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/5k_pbmc_protein_v3_nextgem_raw_feature_bc_matrix.h5" \
+-    --sample "pbmc5k" \
+-    --fpr "0.1"
+-
+-# Broad PCL rat6k
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/PCL_rat_A_LA6_raw_feature_bc_matrix.h5" \
+-    --sample "rat6k"
+-
+-# Simulation s1
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/s1.h5" \
+-    --truth "gs://broad-dsde-methods-sfleming/cellbender_test/s1_truth.h5" \
+-    --sample "s1"
+-
+-# Simulation s4
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/s4.h5" \
+-    --truth "gs://broad-dsde-methods-sfleming/cellbender_test/s4_truth.h5" \
+-    --sample "s4" \
+-    --fpr "0.2"
+-
+-# Simulation s7, hgmm
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/s7.h5" \
+-    --truth "gs://broad-dsde-methods-sfleming/cellbender_test/s7_truth.h5" \
+-    --sample "s7"
+-
+-# additional datasets ========================
+-
+-# Broad PCL human PV dataset, hard time calling high-count cells in v0.2.0, wobbly learning curve
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/PCL_human_PV_1817_ls.h5" \
+-    --sample "pv20k"
+-
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/PCL_human_PV_1799_BPV.h5" \
+-    --sample "pv15k"
+-
+-# public data from Caroline Porter, high UMI count cells called empty
+-python run_benchmark.py \
+-    --git $GIT_HASH \
+-    --input "gs://broad-dsde-methods-sfleming/cellbender_test/cporter_20230331_N18_Epi_A.h5" \
+-    --sample "epi2k"

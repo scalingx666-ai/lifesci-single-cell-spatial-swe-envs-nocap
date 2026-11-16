@@ -1,0 +1,342 @@
+diff --git a/docs/release-notes/0.15.1.md b/docs/release-notes/0.15.1.md
+index 4db6c9c91..5e4050f02 100644
+--- a/docs/release-notes/0.15.1.md
++++ b/docs/release-notes/0.15.1.md
+@@ -14,6 +14,7 @@
+ * Fixes `pp.bbknn` connectivities diverging from upstream `bbknn`: per-batch neighbours are now sorted by distance before `fuzzy_simplicial_set` (so weights no longer collapse near 1.0), and the default `trim` matches upstream (`10 * neighbors_within_batch * n_batches`). Trimming kernel no longer crashes for large `trim`, and a new block-cooperative sort kernel is auto-dispatched for large `trim` for substantial speedups {pr}`659` {smaller}`S Dicks`
+ * Fixes float64 precision loss in `pp.normalize_pearson_residuals` on CSR/CSC input {pr}`658` {smaller}`A Mikaeili & S Dicks`
+ * Fixes Harmony CUDA kernels to avoid misaligned vector loads on odd-PC or offset-contiguous inputs and prevent a shared-memory race in column-sum reductions. {pr}`668` {smaller}`S Dicks`
++* Fix integer overflow in `co_occurrence` for very larg datasets {pr}`671` {smaller}`S Dicks`
+ 
+ ```{rubric} Misc
+ ```
+diff --git a/src/rapids_singlecell/_cuda/cooc/cooc.cu b/src/rapids_singlecell/_cuda/cooc/cooc.cu
+index 001816d2d..018d88ad0 100644
+--- a/src/rapids_singlecell/_cuda/cooc/cooc.cu
++++ b/src/rapids_singlecell/_cuda/cooc/cooc.cu
+@@ -9,7 +9,6 @@ using namespace nb::literals;
+ // Size constants
+ static constexpr int WARP_SIZE = 32;
+ static constexpr int FLOAT32_SIZE = 4;
+-static constexpr int INT32_SIZE = 4;
+ 
+ // Cell tile sizes for B-tile caching (2 floats per cell = 8 bytes)
+ // Larger tiles reduce iterations but increase shared memory usage
+@@ -39,7 +38,7 @@ static size_t compute_shared_mem(int cell_tile, int l_pad,
+                                  int warps_per_block) {
+     size_t b_tile_bytes = static_cast<size_t>(cell_tile) * 2 * FLOAT32_SIZE;
+     size_t warp_hist_bytes =
+-        static_cast<size_t>(warps_per_block) * l_pad * INT32_SIZE;
++        static_cast<size_t>(warps_per_block) * l_pad * sizeof(cooc_count_t);
+     return b_tile_bytes + warp_hist_bytes;
+ }
+ 
+@@ -114,7 +113,7 @@ template <int CELL_TILE>
+ static void launch_csr_catpairs_kernel(
+     const float* spatial, const float* thresholds, const int* cat_offsets,
+     const int* cell_indices, const int* pair_left, const int* pair_right,
+-    int* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
++    cooc_count_t* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
+     int l_pad, int block_size, size_t shared_mem, cudaStream_t stream) {
+     dim3 grid(num_pairs, blocks_per_pair);
+     dim3 block(block_size);
+@@ -130,7 +129,7 @@ static void launch_csr_catpairs_kernel(
+ static void dispatch_csr_catpairs(
+     const float* spatial, const float* thresholds, const int* cat_offsets,
+     const int* cell_indices, const int* pair_left, const int* pair_right,
+-    int* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
++    cooc_count_t* counts, int num_pairs, int k, int l_val, int blocks_per_pair,
+     int cell_tile, int block_size, size_t shared_mem, cudaStream_t stream) {
+     // Compute l_pad (padded to multiple of 32)
+     int l_pad = ((l_val + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+@@ -186,9 +185,9 @@ static void dispatch_csr_catpairs(
+ // Pairwise kernel launch
+ static inline void launch_count_pairwise(const float* spatial,
+                                          const float* thresholds,
+-                                         const int* labels, int* result, int n,
+-                                         int k, int l_val,
+-                                         cudaStream_t stream) {
++                                         const int* labels,
++                                         cooc_count_t* result, int n, int k,
++                                         int l_val, cudaStream_t stream) {
+     dim3 grid(n);
+     dim3 block(32);
+     occur_count_kernel_pairwise<<<grid, block, 0, stream>>>(
+@@ -197,8 +196,8 @@ static inline void launch_count_pairwise(const float* spatial,
+ }
+ 
+ // Shared memory reduction launch
+-static inline bool launch_reduce_shared(const int* result, float* out, int k,
+-                                        int l_val, int format,
++static inline bool launch_reduce_shared(const cooc_count_t* result, float* out,
++                                        int k, int l_val, int format,
+                                         cudaStream_t stream) {
+     int device = 0;
+     cudaGetDevice(&device);
+@@ -220,9 +219,10 @@ static inline bool launch_reduce_shared(const int* result, float* out, int k,
+ }
+ 
+ // Global memory reduction launch
+-static inline void launch_reduce_global(const int* result, float* inter_out,
+-                                        float* out, int k, int l_val,
+-                                        int format, cudaStream_t stream) {
++static inline void launch_reduce_global(const cooc_count_t* result,
++                                        float* inter_out, float* out, int k,
++                                        int l_val, int format,
++                                        cudaStream_t stream) {
+     dim3 grid(l_val);
+     dim3 block(32);
+     size_t smem = static_cast<size_t>(k) * sizeof(float);
+@@ -241,9 +241,9 @@ void register_bindings(nb::module_& m) {
+            gpu_array_c<const int, Device> cell_indices,
+            gpu_array_c<const int, Device> pair_left,
+            gpu_array_c<const int, Device> pair_right,
+-           gpu_array_c<int, Device> counts, int num_pairs, int k, int l_val,
+-           int blocks_per_pair, int cell_tile, int block_size, int shared_mem,
+-           std::uintptr_t stream) {
++           gpu_array_c<cooc_count_t, Device> counts, int num_pairs, int k,
++           int l_val, int blocks_per_pair, int cell_tile, int block_size,
++           int shared_mem, std::uintptr_t stream) {
+             dispatch_csr_catpairs(
+                 spatial.data(), thresholds.data(), cat_offsets.data(),
+                 cell_indices.data(), pair_left.data(), pair_right.data(),
+@@ -261,7 +261,7 @@ void register_bindings(nb::module_& m) {
+         [](gpu_array_c<const float, Device> spatial,
+            gpu_array_c<const float, Device> thresholds,
+            gpu_array_c<const int, Device> labels,
+-           gpu_array_c<int, Device> result, int n, int k, int l_val,
++           gpu_array_c<cooc_count_t, Device> result, int n, int k, int l_val,
+            std::uintptr_t stream) {
+             launch_count_pairwise(spatial.data(), thresholds.data(),
+                                   labels.data(), result.data(), n, k, l_val,
+@@ -272,7 +272,7 @@ void register_bindings(nb::module_& m) {
+ 
+     m.def(
+         "reduce_shared",
+-        [](gpu_array_c<const int, Device> result,
++        [](gpu_array_c<const cooc_count_t, Device> result,
+            gpu_array_c<float, Device> out, int k, int l_val, int format,
+            std::uintptr_t stream) {
+             return launch_reduce_shared(result.data(), out.data(), k, l_val,
+@@ -283,7 +283,7 @@ void register_bindings(nb::module_& m) {
+ 
+     m.def(
+         "reduce_global",
+-        [](gpu_array_c<const int, Device> result,
++        [](gpu_array_c<const cooc_count_t, Device> result,
+            gpu_array_c<float, Device> inter_out, gpu_array_c<float, Device> out,
+            int k, int l_val, int format, std::uintptr_t stream) {
+             launch_reduce_global(result.data(), inter_out.data(), out.data(), k,
+diff --git a/src/rapids_singlecell/_cuda/cooc/kernels_cooc.cuh b/src/rapids_singlecell/_cuda/cooc/kernels_cooc.cuh
+index 4786647d1..41c1879d4 100644
+--- a/src/rapids_singlecell/_cuda/cooc/kernels_cooc.cuh
++++ b/src/rapids_singlecell/_cuda/cooc/kernels_cooc.cuh
+@@ -2,12 +2,15 @@
+ 
+ #include <cuda_runtime.h>
+ 
++// CUDA's 64-bit integer atomicAdd overload is for unsigned long long.
++using cooc_count_t = unsigned long long;
++
+ // Fallback pairwise kernel (for when shared memory is insufficient for CSR
+ // kernel)
+ __global__ void occur_count_kernel_pairwise(
+     const float* __restrict__ spatial, const float* __restrict__ thresholds,
+-    const int* __restrict__ label_idx, int* __restrict__ result, int n, int k,
+-    int l_val) {
++    const int* __restrict__ label_idx, cooc_count_t* __restrict__ result, int n,
++    int k, int l_val) {
+     int i = blockIdx.x;
+     int s = i % 2;
+     if (i >= n) return;
+@@ -37,16 +40,16 @@ __global__ void occur_count_kernel_pairwise(
+             if (dist_sq <= thresholds[r]) {
+                 int index =
+                     low * (k * l_val * 2) + high * l_val * 2 + r + offset;
+-                atomicAdd(&result[index], 1);
++                atomicAdd(&result[index], 1ULL);
+             }
+         }
+     }
+ }
+ 
+ // Reduction kernel using shared memory (for small k)
+-__global__ void occur_reduction_kernel_shared(const int* __restrict__ result,
+-                                              float* __restrict__ out, int k,
+-                                              int l_val, int format) {
++__global__ void occur_reduction_kernel_shared(
++    const cooc_count_t* __restrict__ result, float* __restrict__ out, int k,
++    int l_val, int format) {
+     // Each block handles one threshold index.
+     int r_th = blockIdx.x;  // threshold index
+ 
+@@ -157,10 +160,9 @@ __global__ void occur_reduction_kernel_shared(const int* __restrict__ result,
+ }
+ 
+ // Reduction kernel using global memory (for large k)
+-__global__ void occur_reduction_kernel_global(const int* __restrict__ result,
+-                                              float* __restrict__ inter_out,
+-                                              float* __restrict__ out, int k,
+-                                              int l_val, int format) {
++__global__ void occur_reduction_kernel_global(
++    const cooc_count_t* __restrict__ result, float* __restrict__ inter_out,
++    float* __restrict__ out, int k, int l_val, int format) {
+     // Each block handles one threshold index.
+     int r_th = blockIdx.x;  // threshold index
+     if (r_th >= l_val) return;
+@@ -271,20 +273,20 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
+     const float* __restrict__ spatial, const float* __restrict__ thresholds,
+     const int* __restrict__ cat_offsets, const int* __restrict__ cell_indices,
+     const int* __restrict__ pair_left, const int* __restrict__ pair_right,
+-    int* __restrict__ counts, int k, int l_val, int blocks_per_pair,
++    cooc_count_t* __restrict__ counts, int k, int l_val, int blocks_per_pair,
+     int l_pad) {
+     // Shared memory layout:
+     // - B-tile coords: CELL_TILE * 2 floats
+-    // - Warp histograms: warps_per_block * l_pad ints
++    // - Warp histograms: warps_per_block * l_pad counters
+     extern __shared__ char smem[];
+     float* smem_b = reinterpret_cast<float*>(smem);
+-    int* shared_hist =
+-        reinterpret_cast<int*>(smem + CELL_TILE * 2 * sizeof(float));
++    cooc_count_t* shared_hist =
++        reinterpret_cast<cooc_count_t*>(smem + CELL_TILE * 2 * sizeof(float));
+ 
+     const int lane = threadIdx.x & 31;
+     const int warp_id = threadIdx.x >> 5;
+     const int warps_per_block = blockDim.x >> 5;
+-    int* warp_hist = shared_hist + warp_id * l_pad;
++    cooc_count_t* warp_hist = shared_hist + warp_id * l_pad;
+ 
+     // Zero per-warp histograms
+     for (int r = lane; r < l_pad; r += 32) {
+@@ -360,7 +362,7 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
+                         lo = mid + 1;
+                 }
+                 if (lo < l_val) {
+-                    atomicAdd(&warp_hist[lo], 1);
++                    atomicAdd(&warp_hist[lo], 1ULL);
+                 }
+             }
+         }
+@@ -371,7 +373,7 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
+     if (warp_id == 0) {
+         // Sum each bin across warps into warp0's histogram
+         for (int r = lane; r < l_pad; r += 32) {
+-            int sum = 0;
++            cooc_count_t sum = 0;
+             for (int w = 0; w < warps_per_block; ++w) {
+                 sum += shared_hist[w * l_pad + r];
+             }
+@@ -381,7 +383,7 @@ __global__ void occur_count_kernel_csr_catpairs_tiled(
+ 
+         // Inclusive scan (cumulative) along thresholds
+         if (threadIdx.x == 0) {
+-            int acc = 0;
++            cooc_count_t acc = 0;
+             for (int r = 0; r < l_val; ++r) {
+                 acc += shared_hist[r];
+                 shared_hist[r] = acc;
+diff --git a/src/rapids_singlecell/_utils/_multi_gpu.py b/src/rapids_singlecell/_utils/_multi_gpu.py
+index 3f6ae5cd8..baafd75c6 100644
+--- a/src/rapids_singlecell/_utils/_multi_gpu.py
++++ b/src/rapids_singlecell/_utils/_multi_gpu.py
+@@ -152,6 +152,7 @@ def _split_pairs(
+     # Load-balanced split based on work per pair
+     # Off-diagonal (i != j): work = n_i * n_j
+     # Diagonal (i == i): work = n_i * (n_i - 1) / 2  (within-group, no self-pairs)
++    group_sizes = group_sizes.astype(cp.int64, copy=False)
+     sizes_left = group_sizes[pair_left]
+     sizes_right = group_sizes[pair_right]
+     is_diagonal = pair_left == pair_right
+@@ -164,8 +165,8 @@ def _split_pairs(
+     total_work = cumulative_work[-1]
+ 
+     # Find split points at 1/n_devices, 2/n_devices, ... of total work
+-    targets = total_work * cp.arange(1, n_devices) / n_devices
+-    split_indices = cp.searchsorted(cumulative_work, targets).get()
++    targets = total_work * cp.arange(1, n_devices, dtype=cp.int64) // n_devices
++    split_indices = cp.searchsorted(cumulative_work, targets, side="right").get()
+ 
+     # Split arrays at those indices
+     left_splits = cp.split(pair_left, split_indices)
+diff --git a/src/rapids_singlecell/squidpy_gpu/_co_oc.py b/src/rapids_singlecell/squidpy_gpu/_co_oc.py
+index e14c247ed..7f1b3462e 100644
+--- a/src/rapids_singlecell/squidpy_gpu/_co_oc.py
++++ b/src/rapids_singlecell/squidpy_gpu/_co_oc.py
+@@ -193,7 +193,7 @@ def _co_occurrence_helper(
+ 
+     # Fallback to the standard kernel if fast=False or shared memory was insufficient
+     if not use_fast_kernel:
+-        counts = cp.zeros((k, k, l_val * 2), dtype=cp.int32)
++        counts = cp.zeros((k, k, l_val * 2), dtype=cp.uint64)
+         _co.count_pairwise(
+             spatial,
+             thresholds=thresholds,
+@@ -280,10 +280,24 @@ def _co_occurrence_gpu(
+         of shape (k, k, l_val), and use_fast_kernel indicates if the optimized
+         kernel was used (False means shared memory was insufficient).
+     """
++    kernel_configs = {}
++    valid_device_ids = []
++    for device_id in device_ids:
++        with cp.cuda.Device(device_id):
++            kernel_config = _co.get_kernel_config(l_val, n_cells, k)
++        if kernel_config is not None:
++            kernel_configs[device_id] = kernel_config
++            valid_device_ids.append(device_id)
++
++    if not valid_device_ids:
++        return cp.zeros((k, k, l_val), dtype=cp.uint64), False
++
++    device_ids = valid_device_ids
+     n_devices = len(device_ids)
++    source_device_id = spatial.device.id
+ 
+     # Split pairs across devices with load balancing
+-    group_sizes = cp.diff(cat_offsets)
++    group_sizes = cp.diff(cat_offsets).astype(cp.int64)
+     pair_chunks = _split_pairs(pair_left, pair_right, n_devices, group_sizes)
+ 
+     # Phase 1: Create streams and start async data transfer to all devices
+@@ -302,7 +316,7 @@ def _co_occurrence_gpu(
+ 
+             with streams[device_id]:
+                 # Replicate data to this device (async on stream)
+-                if device_id == device_ids[0]:
++                if device_id == source_device_id:
+                     dev_spatial = spatial
+                     dev_thresholds = thresholds
+                     dev_cat_offsets = cat_offsets
+@@ -318,7 +332,7 @@ def _co_occurrence_gpu(
+                 dev_pair_right = cp.asarray(chunk_right)
+ 
+                 # Initialize local counts array
+-                dev_counts = cp.zeros((k, k, l_val), dtype=cp.int32)
++                dev_counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
+ 
+                 device_data.append(
+                     {
+@@ -344,12 +358,7 @@ def _co_occurrence_gpu(
+             # Wait for data transfer to complete on this device
+             streams[device_id].synchronize()
+ 
+-            # Get kernel configuration for this device
+-            kernel_config = _co.get_kernel_config(l_val, n_cells, k)
+-            if kernel_config is None:
+-                # Shared memory insufficient, fall back to pairwise kernel
+-                return cp.zeros((k, k, l_val), dtype=cp.int32), False
+-
++            kernel_config = kernel_configs[device_id]
+             cell_tile, _l_pad, block_size, shared_mem = kernel_config
+             blocks_per_pair = _calculate_blocks_per_pair(data["n_pairs"])
+ 
+@@ -380,7 +389,7 @@ def _co_occurrence_gpu(
+ 
+     # Phase 4: Aggregate counts on first device
+     with cp.cuda.Device(device_ids[0]):
+-        counts = cp.zeros((k, k, l_val), dtype=cp.int32)
++        counts = cp.zeros((k, k, l_val), dtype=cp.uint64)
+         for data in device_data:
+             if data is not None:
+                 dev0_counts = cp.asarray(data["counts"])

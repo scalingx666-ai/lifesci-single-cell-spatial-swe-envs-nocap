@@ -1,0 +1,359 @@
+diff --git a/DESCRIPTION b/DESCRIPTION
+index 594b664..73c3758 100644
+--- a/DESCRIPTION
++++ b/DESCRIPTION
+@@ -1,7 +1,7 @@
+ Package: zellkonverter
+ Title: Conversion between scRNA-seq objects
+-Version: 0.0.0.9014
+-Date: 2020-06-30
++Version: 0.0.0.9015
++Date: 2020-07-02
+ Authors@R: 
+     c(person(given = "Luke",
+              family = "Zappia",
+diff --git a/NAMESPACE b/NAMESPACE
+index 5069b51..9d56253 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -12,6 +12,7 @@ importFrom(DelayedArray,is_sparse)
+ importFrom(Matrix,sparseMatrix)
+ importFrom(Matrix,t)
+ importFrom(S4Vectors,DataFrame)
++importFrom(S4Vectors,make_zero_col_DFrame)
+ importFrom(S4Vectors,metadata)
+ importFrom(basilisk,basiliskRun)
+ importFrom(basilisk,getBasiliskShared)
+diff --git a/NEWS.md b/NEWS.md
+index 537661e..f4e70eb 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -1,5 +1,19 @@
+ # zellkonverter (development version)
+ 
++## zellkonverter 0.0.0.9015 (2020-07-02)
++
++* Skip `AnnData` matrices without a transposable R counterpart
++* Only replace skipped matrices when `use_hdf5 = TRUE` in `readH5AD()`
++  (Fixes #12)
++* Additional tests for sparse matrices
++
++## zellkonverter 0.0.0.9014 (2020-06-30)
++
++* Allow assay skipping when converting from `SingleCellExperiment` to `AnnData`
++* Allow skipping of assays that aren't **numpy** friendly in `writeH5AD()`
++* Wait for **basilisk** process shutdown to release `.h5ad` file
++* Updates to documentation and tests
++
+ ## zellkonverter 0.0.0.9013 (2020-06-25)
+ 
+ * Improve conversion between `SingleCellExperiment` and `AnnData` (See #8)
+diff --git a/R/konverter.R b/R/konverter.R
+index b2a660e..cb6476c 100644
+--- a/R/konverter.R
++++ b/R/konverter.R
+@@ -19,11 +19,15 @@
+ #' empty sparse matrices are created instead and the user is expected to fill in
+ #' the assays on the Python side.
+ #'
+-#' For `AnnData2SCE()`, an error is raised if there is no corresponding R format
+-#' for a matrix in the AnnData object. If `skip_assays = TRUE`, no error is
+-#' given and empty sparse matrices are created for each assay. The user is
+-#' expected to fill in the assays on the R side, see [`readH5AD()`] for an
+-#' example.
++#' For `AnnData2SCE()`, a warning is raised if there is no corresponding R format
++#' for a matrix in the AnnData object, and an empty sparse matrix is created 
++#' instead as a placeholder. If `skip_assays = NA`, no warning is emitted
++#' but variables are created in the [`int_metadata()`] of the output to specify
++#' which assays were skipped.
++#' If `skip_assays = TRUE`, empty sparse matrices are created for all assays,
++#' regardless of whether they might be convertible to an R format or not. 
++#' In both cases, the user is expected to fill in the assays on the R side, 
++#' see [`readH5AD()`] for an example. 
+ #'
+ #' We attempt to convert between items in the \linkS4class{SingleCellExperiment}
+ #' [`metadata()`] slot and the `AnnData` `uns` slot. If an item cannot be
+@@ -77,46 +81,42 @@ NULL
+ #' instead.
+ #'
+ #' @export
+-#' @importFrom Matrix t sparseMatrix
+ #' @importFrom methods selectMethod is
+-#' @importFrom S4Vectors DataFrame
++#' @importFrom S4Vectors DataFrame make_zero_col_DFrame
+ #' @importFrom reticulate import_builtins
+ AnnData2SCE <- function(adata, skip_assays = FALSE) {
+     py_builtins <- import_builtins()
+ 
+-    if (!skip_assays) {
+-        x_mat <- adata$X
+-        t_FUN <- selectMethod("t", signature = class(x_mat), optional = TRUE)
+-        if (is.null(t_FUN)) {
+-            stop("assay matrices do not support transposition")
+-        }
+-        x_mat <- t_FUN(x_mat)
+-    } else {
+-        dims <- unlist(adata$X$shape)
+-        fake_mat <- sparseMatrix(
+-            i    = integer(0),
+-            j    = integer(0),
+-            x    = numeric(0),
+-            dims = rev(dims)
+-        )
+-        x_mat <- fake_mat
+-    }
++    dims <- unlist(adata$shape)
++    dims <- rev(dims)
++
++    x_out <- .extract_or_skip_assay(
++        skip_assays = skip_assays, 
++        dims        = dims, 
++        mat         = adata$X, 
++        name        = "'X' matrix"
++    )
+ 
++    x_mat <- x_out$mat
+     colnames(x_mat) <- adata$obs_names$to_list()
+     rownames(x_mat) <- adata$var_names$to_list()
++    skipped_x <- x_out$skipped
+ 
+     assays_list <- list(X = x_mat)
+     layer_names <- names(py_builtins$dict(adata$layers))
++    skipped_layers <- character(0)
+ 
+-    if (length(layer_names) > 0) {
+-        for (layer_name in layer_names) {
+-            if (!skip_assays) {
+-                layer_mat <- t(adata$layers$get(layer_name))
+-            } else {
+-                layer_mat <- fake_mat
+-            }
+-            assays_list[[layer_name]] <- layer_mat
++    for (layer_name in layer_names) {
++        layer_out <- .extract_or_skip_assay(
++            skip_assays = skip_assays,
++            dims        = dims, 
++            mat         = adata$layers$get(layer_name), 
++            name        = sprintf("'%s' layer matrix", layer_name)
++        )
++        if (layer_out$skipped) {
++            skipped_layers <- c(skipped_layers, layer_name)
+         }
++        assays_list[[layer_name]] <- layer_out$mat
+     }
+ 
+     uns_data <- adata$uns$data
+@@ -124,7 +124,7 @@ AnnData2SCE <- function(adata, skip_assays = FALSE) {
+     meta_list <- list()
+     for (item_name in names(uns_data)) {
+         item <- uns_data[[item_name]]
+-        if (!(is(item, "python.builtin.object"))) {
++        if (!is(item, "python.builtin.object")) {
+             meta_list[[item_name]] <- item
+         } else {
+             warning("the '", item_name, "' item in 'uns' cannot be converted ",
+@@ -132,21 +132,21 @@ AnnData2SCE <- function(adata, skip_assays = FALSE) {
+         }
+     }
+ 
+-    varp_list <- lapply(py_builtins$dict(adata$varp), function(v) {v$todense()})
+-    obsp_list <- lapply(py_builtins$dict(adata$obsp), function(v) {v$todense()})
++    varp_list <- lapply(py_builtins$dict(adata$varp), function(v) v$todense())
++    obsp_list <- lapply(py_builtins$dict(adata$obsp), function(v) v$todense())
+ 
+     row_data <- DataFrame(adata$var)
+     varm_list <- py_builtins$dict(adata$varm)
+     if (length(varm_list) > 0) {
+         # Create an empty DataFrame with the correct number of rows
+-        varm_df <- DataFrame(matrix(, nrow = adata$n_vars, ncol = 0))
++        varm_df <- make_zero_col_DFrame(adata$n_vars)
+         for (varm_name in names(varm_list)) {
+             varm_df[[varm_name]] <- varm_list[[varm_name]]
+         }
+         row_data$varm <- varm_df
+     }
+ 
+-    SingleCellExperiment(
++    output <- SingleCellExperiment(
+         assays      = assays_list,
+         rowData     = row_data,
+         colData     = adata$obs,
+@@ -155,6 +155,46 @@ AnnData2SCE <- function(adata, skip_assays = FALSE) {
+         rowPairs    = varp_list,
+         colPairs    = obsp_list
+     )
++
++    # Specifying which assays got skipped, if the skipping was variable.
++    if (is.na(skip_assays)) {
++        int_metadata(output)$skipped_x <- skipped_x
++        int_metadata(output)$skipped_layers <- skipped_layers
++    }
++
++    output
++}
++
++#' @importFrom Matrix t
++.extract_or_skip_assay <- function(skip_assays, dims, mat, name) {
++    skipped <- FALSE
++
++    if (isTRUE(skip_assays)) {
++        # Value of 'mat' is never used so the promise never evaluates; thus,
++        # skip_assays=TRUE avoids any actual transfer of content from Python.
++        mat <- .make_fake_mat(dims)
++    } else {
++        mat <- try(t(mat), silent=TRUE)
++        if (is(mat, "try-error")) {
++            if (isFALSE(skip_assays)) {
++                warning(name, " does not support transposition and has been skipped")
++            }
++            mat <- .make_fake_mat(dims)
++            skipped <- TRUE
++        }
++    }
++
++    list(mat=mat, skipped=skipped)
++}
++
++#' @importFrom Matrix sparseMatrix
++.make_fake_mat <- function(dims) {
++    sparseMatrix(
++        i    = integer(0),
++        j    = integer(0),
++        x    = numeric(0),
++        dims = dims
++    )
+ }
+ 
+ #' @rdname AnnData-Conversion
+@@ -164,6 +204,7 @@ AnnData2SCE <- function(adata, skip_assays = FALSE) {
+ #' AnnData object. If `NULL`, the first assay of `sce` will be used by default.
+ #'
+ #' @export
++#' @importFrom Matrix t
+ #' @importFrom utils capture.output
+ #' @importFrom S4Vectors metadata
+ #' @importFrom reticulate import r_to_py
+@@ -183,12 +224,7 @@ SCE2AnnData <- function(sce, X_name = NULL, skip_assays = FALSE) {
+         X <- t(assay(sce, X_name))
+         X <- .makeNumpyFriendly(X)
+     } else {
+-        X <- fake_mat <- sparseMatrix(
+-            i    = integer(0),
+-            j    = integer(0),
+-            x    = numeric(0),
+-            dims = rev(dim(sce))
+-        )
++        X <- fake_mat <- .make_fake_mat(rev(dim(sce)))
+     }
+     adata <- anndata$AnnData(X = X)
+ 
+diff --git a/R/read.R b/R/read.R
+index 43bec67..92d8590 100644
+--- a/R/read.R
++++ b/R/read.R
+@@ -68,13 +68,18 @@ readH5AD <- function(file, use_hdf5 = FALSE) {
+             }
+         }
+ 
+-        assay(output, "X", withDimnames = FALSE) <- HDF5Array::HDF5Array(file,
+-                                                                         "X")
+-        for (assay_name in setdiff(assayNames(output), "X")) {
++        if (int_metadata(output)$skipped_x) {
++            assay(output, "X", withDimnames = FALSE) <- HDF5Array::HDF5Array(
++                file, "X")
++        }
++        int_metadata(output)$skipped_x <- NULL
++
++        for (assay_name in int_metadata(output)$skipped_layers) {
+             hdf5_layer <- HDF5Array::HDF5Array(file,
+                                                file.path("layers", assay_name))
+             assay(output, assay_name, withDimnames = FALSE) <- hdf5_layer
+         }
++        int_metadata(output)$skipped_layers <- NULL
+     }
+ 
+     output
+@@ -84,5 +89,5 @@ readH5AD <- function(file, use_hdf5 = FALSE) {
+ .H5ADreader <- function(file, backed = FALSE) {
+     anndata <- import("anndata")
+     adata <- anndata$read_h5ad(file, backed = backed)
+-    AnnData2SCE(adata, skip_assays = backed)
++    AnnData2SCE(adata, skip_assays = if (backed) NA else FALSE)
+ }
+diff --git a/man/AnnData-Conversion.Rd b/man/AnnData-Conversion.Rd
+index 8840ed7..072208b 100644
+--- a/man/AnnData-Conversion.Rd
++++ b/man/AnnData-Conversion.Rd
+@@ -49,11 +49,15 @@ other matrices are converted into ordinary matrices. If \code{skip_assays = TRUE
+ empty sparse matrices are created instead and the user is expected to fill in
+ the assays on the Python side.
+ 
+-For \code{AnnData2SCE()}, an error is raised if there is no corresponding R format
+-for a matrix in the AnnData object. If \code{skip_assays = TRUE}, no error is
+-given and empty sparse matrices are created for each assay. The user is
+-expected to fill in the assays on the R side, see \code{\link[=readH5AD]{readH5AD()}} for an
+-example.
++For \code{AnnData2SCE()}, a warning is raised if there is no corresponding R format
++for a matrix in the AnnData object, and an empty sparse matrix is created
++instead as a placeholder. If \code{skip_assays = NA}, no warning is emitted
++but variables are created in the \code{\link[=int_metadata]{int_metadata()}} of the output to specify
++which assays were skipped.
++If \code{skip_assays = TRUE}, empty sparse matrices are created for all assays,
++regardless of whether they might be convertible to an R format or not.
++In both cases, the user is expected to fill in the assays on the R side,
++see \code{\link[=readH5AD]{readH5AD()}} for an example.
+ 
+ We attempt to convert between items in the \linkS4class{SingleCellExperiment}
+ \code{\link[=metadata]{metadata()}} slot and the \code{AnnData} \code{uns} slot. If an item cannot be
+diff --git a/tests/testthat/test-read.R b/tests/testthat/test-read.R
+index 314cd8b..d1a0448 100644
+--- a/tests/testthat/test-read.R
++++ b/tests/testthat/test-read.R
+@@ -24,6 +24,18 @@ test_that("Reading H5AD works with HDF5Arrays", {
+     expect_s4_class(sce <- readH5AD(file, use_hdf5 = TRUE), "SingleCellExperiment")
+ })
+ 
++test_that("Reading H5AD works with a mixture of sparse and HDF5Arrays", {
++    sce <- readH5AD(file)
++    assay(sce, "more") <- as(assay(sce, "X"), "dgCMatrix")
++
++    temp <- tempfile(fileext=".h5ad")
++    writeH5AD(sce, temp)
++
++    backed <- readH5AD(temp, use_hdf5 = TRUE)
++    expect_s4_class(DelayedArray::seed(assay(backed)), "HDF5ArraySeed")
++    expect_s4_class(assay(backed, "more"), "dgCMatrix")
++})
++
+ test_that("readH5AD works in a separate process", {
+     oldshare <- basilisk::getBasiliskShared()
+     basilisk::setBasiliskShared(FALSE)
+diff --git a/tests/testthat/test-write.R b/tests/testthat/test-write.R
+index d657d83..2bab171 100644
+--- a/tests/testthat/test-write.R
++++ b/tests/testthat/test-write.R
+@@ -35,6 +35,24 @@ test_that("writeH5AD works as expected", {
+     expect_identical(col_data, colData(sce))
+ })
+ 
++test_that("writeH5AD works as expected with sparse matrices", {
++    mat <- assay(sce)
++    counts(sce) <- as(mat, "dgCMatrix")
++    logcounts(sce) <- counts(sce) * 10
++    assay(sce, "random") <- mat # throwing in a dense matrix in a mixture.
++
++    temp <- tempfile(fileext = '.h5ad')
++    writeH5AD(sce, temp)
++    expect_true(file.exists(temp))
++
++    # Reading it back out again. Hopefully we didn't lose anything important.
++    out <- readH5AD(temp)
++    
++    expect_identical(counts(sce), assay(out, "X"))
++    expect_identical(logcounts(sce), logcounts(out))
++    expect_identical(assay(sce, "random"), assay(out, "random"))
++})
++
+ test_that("writeH5AD works with assay skipping", {
+     temp <- tempfile(fileext = '.h5ad')
+     writeH5AD(sce, temp, skip_assays = TRUE)

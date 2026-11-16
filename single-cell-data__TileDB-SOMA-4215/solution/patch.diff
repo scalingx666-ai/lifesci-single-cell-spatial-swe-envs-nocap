@@ -1,0 +1,599 @@
+diff --git a/apis/python/HISTORY.md b/apis/python/HISTORY.md
+index 898e9f9502..ed845043aa 100644
+--- a/apis/python/HISTORY.md
++++ b/apis/python/HISTORY.md
+@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ - \[[#4125](https://github.com/single-cell-data/TileDB-SOMA/pull/4125)\] Add delete mode specified by `mode='d'`.
+ - \[[#4205](https://github.com/single-cell-data/TileDB-SOMA/pull/4205)\] Add `delete_cells` method to `SparseNDArray`, `DataFrame`, and `PointCloudDataFrame`.
+ - \[[#4212](https://github.com/single-cell-data/TileDB-SOMA/pull/4212)\] Add `type` read-only property to `DenseNDArray` and `SparseNDArray`.
++- \[[#4215](https://github.com/single-cell-data/TileDB-SOMA/pull/4215)\] Add `var_axis_delete` and `obs_axis_delete` to `Experiment`.
+ 
+ ### Changed
+ 
+diff --git a/apis/python/src/tiledbsoma/_experiment.py b/apis/python/src/tiledbsoma/_experiment.py
+index dc7077d136..180031949f 100644
+--- a/apis/python/src/tiledbsoma/_experiment.py
++++ b/apis/python/src/tiledbsoma/_experiment.py
+@@ -9,16 +9,25 @@
+ import functools
+ from typing import ClassVar
+ 
+-from somacore import experiment, query
++import attrs
++import pyarrow as pa
++from somacore import experiment, options, query
+ 
+ from . import _tdb_handles
+ from ._collection import Collection, CollectionBase
+ from ._dataframe import DataFrame
++from ._dense_nd_array import DenseNDArray
++from ._exception import SOMAError
++from ._geometry_dataframe import GeometryDataFrame
+ from ._indexer import IntIndexer
+ from ._measurement import Measurement
++from ._point_cloud_dataframe import PointCloudDataFrame
+ from ._query import ExperimentAxisQuery
+ from ._scene import Scene
+ from ._soma_object import AnySOMAObject
++from ._sparse_nd_array import SparseNDArray
++from .options import SOMATileDBContext
++from .options._tiledb_create_write_options import TileDBDeleteOptions
+ 
+ 
+ class Experiment(
+@@ -98,3 +107,265 @@ def axis_query(
+                 context=self.context,
+             ),
+         )
++
++    def obs_axis_delete(
++        self,
++        coords: options.SparseDFCoords = (),
++        *,
++        value_filter: str | None = None,
++        platform_config: options.PlatformConfig | None = None,
++    ) -> None:
++        """Delete observations (obs axis elements only) from all predefined sub-objects within an Experiment.
++
++        This operation affects all Measurements within an Experiment. Deleted observations are specified:
++
++        - by ``obs`` DataFrame soma_joinid: a sequence of soma_joinid or a slice
++        - or, by ``obs`` DataFrame value filter / query condition
++
++        Sub-objects affected by this operation:
++
++        - exp.obs - delete matching DataFrame elements by soma_joinid
++        - exp.obs_spatial_presence - delete matching DataFrame elements by soma_joinid
++        - exp.ms[*].X[*] - delete matching SparseNDMatrix values, joining on the soma_dim_0 dimension
++        - exp.ms[*].obsm[*] - delete matching SparseNDMatrix values, joining on the soma_dim_0 dimension
++        - exp.ms[*].obsp[*] - delete matching SparseNDMatrix values, joining on the soma_dim_0 and soma_dim_1 dimension
++        - exp.spatial[*].obsl[*] - delete matching DataFrame elements, joining on the soma_joinid dimension
++
++        The following sub-objects are unaffected by this operation:
++
++        - exp.ms[*].var
++        - exp.ms[*].varm[*]
++        - exp.ms[*].varp[*]
++        - any user-defined arrays within the collection
++
++        If any affected sub-objects are of type DenseNDArray (dense TileDB array), the entire operation results in an error.
++
++        Either ``coords`` or ``value_filter`` must be provided. When both ``coords`` and ``value_filter`` are provided,
++        the observations that match both constraints will be removed.
++
++        For example, to delete observations where ``n_genes > 1000`` and ``n_counts < 2000``:
++            >>> with tiledbsoma.Experiment.open(experiment_uri, mode="d") as exp:
++            ...     exp.obs_axis_delete(value_filter="n_genes > 1000 and n_counts < 2000")
++
++        Note: Deleting observations does not change the size of the current domain or possible enumeration values.
++
++        Args:
++            coords:
++                A per-dimension ``Sequence`` of scalar, slice, sequence of scalar or
++                `Arrow IntegerArray <https://arrow.apache.org/docs/python/generated/pyarrow.IntegerArray.html>` values
++                defining the region to read.
++            value_filter:
++                An optional [value filter] to apply to the results.
++                Defaults to no filter.
++        """
++        # build a list of arrays from which cells will be deleted.
++        candidates = _create_obs_axis_candidates(self)
++
++        # preemptive error checks
++        if platform_config is not None and not isinstance(platform_config, TileDBDeleteOptions):
++            raise TypeError(
++                f"Invalid PlatformConfig with type {type(platform_config)}. Must have type {TileDBDeleteOptions.__name__}."
++            )
++
++        # query
++        joinids = _query_joinids(self.obs.uri, coords, value_filter, self.context)
++
++        # delete
++        _delete_cells(candidates, joinids, platform_config=platform_config)
++
++    def var_axis_delete(
++        self,
++        measurement_name: str,
++        coords: options.SparseDFCoords = (),
++        *,
++        value_filter: str | None = None,
++        platform_config: options.PlatformConfig | None = None,
++    ) -> None:
++        """Delete variables (``var`` axis elements only) from all predefined sub-objects within a single user-specified Measurement.
++
++        Deleted features are specified:
++
++        - by ``var`` DataFrame joinid: a sequence of joinid or a slice
++        - by ``var`` DataFrame value filter / query condition
++
++        Sub-objects affected by this operation, given a named Measurement (ms_name):
++
++        - exp.ms[*ms_name*].var - delete matching DataFrame elements
++        - exp.ms[*ms_name*].var_spatial_presence - delete matching DataFrame elements, joining on the soma_joinid dimension
++        - exp.ms[*ms_name*].X[*] - delete matching SparseNDMatrix values, joining on the soma_dim_1 dimension
++        - exp.ms[*ms_name*].varm[*] - delete matching SparseNDMatrix values, joining on the soma_dim_0 dimension
++        - exp.ms[*ms_name*].varp[*] - delete matching SparseNDMatrix values, joining on the soma_dim_0 and soma_dim_1 dimensions
++        - exp.spatial[*].varl[*ms_name*][*] - delete matching PointCloudDataFrame/GeometryDataFrame elements, joining on the soma_joinid dimension
++
++        The following Measurement sub-objects are unaffected by this operation:
++
++        - exp.ms[*ms_name*].obsm[*]
++        - exp.ms[*ms_name*].obsp[*]
++
++        If any affected sub-objects are a DenseNDArray (dense TileDB array), the entire operation results in an error.
++
++        Either ``coords`` or ``value_filter`` must be provided. When both ``coords`` and ``value_filter`` are provided,
++        the variables that match both constraints will be removed.
++
++        For example, to delete observations where ``feature_biotype == 'gene'``:
++            >>> with tiledbsoma.Experiment.open(experiment_uri, mode="d") as exp:
++            ...     exp.var_axis_delete(value_filter="feature_biotype == 'gene'")
++
++        Note: Deleting variables does not change the size of the current domain or possible enumeration values.
++
++        Args:
++            coords:
++                A per-dimension ``Sequence`` of scalar, slice, sequence of scalar or
++                `Arrow IntegerArray <https://arrow.apache.org/docs/python/generated/pyarrow.IntegerArray.html>` values
++                defining the region to read.
++            value_filter:
++                An optional [value filter] to apply to the results.
++                Defaults to no filter.
++        """
++        # build a list of arrays from which cells will be deleted.
++        candidates = _create_var_axis_candidates(self, measurement_name)
++
++        # preemptive error checks
++        if platform_config is not None and not isinstance(platform_config, TileDBDeleteOptions):
++            raise TypeError(
++                f"Invalid PlatformConfig with type {type(platform_config)}. Must have type {TileDBDeleteOptions.__name__}."
++            )
++
++        # query
++        joinids = _query_joinids(self.ms[measurement_name].var.uri, coords, value_filter, self.context)
++
++        # delete
++        _delete_cells(candidates, joinids, platform_config=platform_config)
++
++
++@attrs.define(frozen=True)
++class _ArrayDelMd:
++    """Private helper class for axis deletes."""
++
++    obj: DataFrame | SparseNDArray | PointCloudDataFrame | GeometryDataFrame
++    name: str  # human-readable name
++    join_on: tuple[str, ...]
++    joinid_max: tuple[int, ...]
++
++
++def _append_if_supported(
++    candidates: list[_ArrayDelMd], obj: AnySOMAObject, name: str, join_on: tuple[str, ...]
++) -> None:
++    """Private method.
++
++    Append the candidate array to the final selection list if:
++
++    - not a dense array
++    - is one of the supported types
++    - contains the expected join-on column.
++
++    Primary goal here is to be graceful when the user has added ad hoc or otherwise
++    surprising objects to the various Experiment sub-collections (e.g., obsm). While
++    this should never occur, in practice it may.
++
++    Dense array specifically causes an error. The other conditions cause the array
++    in question to be ignored silently.
++    """
++    if isinstance(obj, DenseNDArray):
++        raise SOMAError(f"Delete operation not permitted on dense array: {name}")
++    if isinstance(obj, GeometryDataFrame):
++        raise NotImplementedError(f"Delete operation not permitted on GeometryDataFrame: {name}")
++
++    if not isinstance(obj, (DataFrame, SparseNDArray, PointCloudDataFrame)):
++        return
++    if not all(obj.schema.get_field_index(col_name) >= 0 for col_name in join_on):
++        return
++
++    if isinstance(obj, SparseNDArray):
++        joinid_max = [obj.shape[int(col_name.removeprefix("soma_dim_"))] - 1 for col_name in join_on]
++    else:
++        # dataframe-esque
++        joinid_max = [obj.domain[obj.index_column_names.index(col_name)][1] for col_name in join_on]
++
++    candidates.append(_ArrayDelMd(obj=obj, name=name, join_on=join_on, joinid_max=tuple(joinid_max)))
++
++
++def _create_obs_axis_candidates(exp: Experiment) -> list[_ArrayDelMd]:
++    """Generate a list of candidate arrays for an obs axis delete."""
++    arr: AnySOMAObject
++    candidates: list[_ArrayDelMd] = []
++    if "obs_spatial_presence" in exp:
++        _append_if_supported(candidates, exp.obs_spatial_presence, "obs_spatial_presence", ("soma_joinid",))
++    for ms_name, ms in exp.ms.items():
++        if "X" in ms:
++            for key, arr in ms.X.items():
++                _append_if_supported(candidates, arr, f"ms[{ms_name}].X[{key}]", ("soma_dim_0",))
++        if "obsm" in ms:
++            for key, arr in ms.obsm.items():
++                _append_if_supported(candidates, arr, f"ms[{ms_name}].obsm[{key}]", ("soma_dim_0",))
++        if "obsp" in ms:
++            for key, arr in ms.obsp.items():
++                _append_if_supported(candidates, arr, f"ms[{ms_name}].obsp[{key}]", ("soma_dim_0", "soma_dim_1"))
++    if "spatial" in exp:
++        for scene_name, sc in exp.spatial.items():
++            if "obsl" in sc:
++                for key, arr in sc.obsl.items():
++                    _append_if_supported(candidates, arr, f"spatial[{scene_name}].obsl[{key}]", ("soma_joinid",))
++
++    _append_if_supported(candidates, exp.obs, "obs", ("soma_joinid",))
++    return candidates
++
++
++def _create_var_axis_candidates(exp: Experiment, ms_name: str) -> list[_ArrayDelMd]:
++    """Generate a list of candidate arrays for a var axis delete."""
++    arr: AnySOMAObject
++    if ms_name not in exp.ms:
++        raise ValueError(f"Measurement name {ms_name} does not exist in the experiment")
++
++    candidates: list[_ArrayDelMd] = []
++    if "var_spatial_presence" in exp.ms[ms_name]:
++        _append_if_supported(
++            candidates, exp.ms[ms_name].var_spatial_presence, f"ms[{ms_name}].var_spatial_presence", ("soma_joinid",)
++        )
++    if "X" in exp.ms[ms_name]:
++        for key, arr in exp.ms[ms_name].X.items():
++            _append_if_supported(candidates, arr, f"ms[{ms_name}].X[{key}]", ("soma_dim_1",))
++    if "varm" in exp.ms[ms_name]:
++        for key, arr in exp.ms[ms_name].varm.items():
++            _append_if_supported(candidates, arr, f"ms[{ms_name}].varm[{key}]", ("soma_dim_0",))
++    if "varp" in exp.ms[ms_name]:
++        for key, arr in exp.ms[ms_name].varp.items():
++            _append_if_supported(candidates, arr, f"ms[{ms_name}].varp[{key}]", ("soma_dim_0", "soma_dim_1"))
++    if "spatial" in exp:
++        for scene_name, sc in exp.spatial.items():
++            if ("varl" in sc) and (ms_name in sc.varl):
++                for key, arr in sc.varl[ms_name].items():
++                    _append_if_supported(
++                        candidates, arr, f"spatial[{scene_name}].varl[{ms_name}][{key}]", ("soma_joinid",)
++                    )
++
++    _append_if_supported(candidates, exp.ms[ms_name].var, f"ms[{ms_name}].var", ("soma_joinid",))
++    return candidates
++
++
++def _query_joinids(
++    uri: str, coords: options.SparseDFCoords, value_filter: str | None, context: SOMATileDBContext
++) -> pa.Int64Array:
++    with DataFrame.open(uri, context=context) as df:
++        return (
++            df.read(coords, value_filter=value_filter, column_names=["soma_joinid"])
++            .concat()
++            .column("soma_joinid")
++            .combine_chunks()
++        )
++
++
++def _delete_cells(
++    candidates: list[_ArrayDelMd], joinids: pa.Int64Array, platform_config: TileDBDeleteOptions | None = None
++) -> None:
++    if not len(joinids):
++        return
++
++    for arr_md in candidates:
++        for join_on, joinid_max in zip(arr_md.join_on, arr_md.joinid_max):
++            dim_idx = arr_md.obj.schema.get_field_index(join_on)
++            coords = [slice(None)] * (dim_idx + 1)
++            coords[dim_idx] = pa.compute.filter(joinids, pa.compute.less_equal(joinids, joinid_max))
++
++            # Delete each join_on dimension separately, as we have no outer join
++            arr_md.obj.delete_cells(tuple(coords), platform_config=platform_config)
+diff --git a/apis/python/tests/test_experiment_axis_delete.py b/apis/python/tests/test_experiment_axis_delete.py
+new file mode 100644
+index 0000000000..ac472dd31b
+--- /dev/null
++++ b/apis/python/tests/test_experiment_axis_delete.py
+@@ -0,0 +1,284 @@
++import pathlib
++import shutil
++
++import pyarrow as pa
++import pytest
++
++import tiledbsoma as soma
++
++from ._util import ROOT_DATA_DIR
++from .test_experiment_query_spatial import soma_spatial_experiment  # noqa: F401
++
++
++@pytest.mark.parametrize(
++    "experiment_path",
++    [
++        ROOT_DATA_DIR / "soma-experiment-versions-2025-04-04" / ver / "pbmc3k_processed"
++        for ver in ("1.12.3", "1.14.5", "1.15.0", "1.15.7", "1.7.3")
++    ],
++)
++@pytest.mark.parametrize(
++    "coords",
++    [
++        (slice(None),),  # all
++        (),  # none
++        (slice(10, 100),),
++        (list(range(0, 1000, 7)),),
++    ],
++)
++@pytest.mark.parametrize(
++    "value_filter",
++    [
++        None,  # no filter
++        "n_genes > 500",
++        "louvain == 'B cells' and n_genes < 500",
++    ],
++)
++def test_experiment_obs_axis_delete_from_pbmc3k(
++    tmp_path, soma_tiledb_context, experiment_path, coords, value_filter
++) -> None:
++    """Test on PBMC3K dataset of various vintages."""
++
++    # Make a copy of the Experiment as to not write over the original
++    exp_path = pathlib.PosixPath(experiment_path)
++    uri = (tmp_path / exp_path.name).as_posix()
++    shutil.copytree(exp_path, uri)
++
++    # Grab the list of joinids we expect to be deleted
++    with soma.Experiment.open(uri, mode="r", context=soma_tiledb_context) as exp:
++        joinids = (
++            exp.obs.read(
++                coords=coords,
++                value_filter=value_filter,
++                column_names=["soma_joinid"],
++            )
++            .concat()
++            .column("soma_joinid")
++            .combine_chunks()
++        )
++    assert len(joinids)  # just in case we mess up the test params
++
++    # Do the delete
++    with soma.Experiment.open(uri, mode="d", context=soma_tiledb_context) as exp:
++        exp.obs_axis_delete(coords, value_filter=value_filter)
++
++    # Verify the result
++    with soma.Experiment.open(uri, mode="r", context=soma_tiledb_context) as exp:
++        assert len(exp.obs.read(coords=(joinids,)).concat()) == 0
++        for ms in exp.ms.values():
++            for arr in ms.X.values():
++                assert len(arr.read(coords=(joinids,)).tables().concat()) == 0
++            if "obsm" in ms:
++                for arr in ms.obsm.values():
++                    assert len(arr.read(coords=(joinids,)).tables().concat()) == 0
++            if "obsp" in ms:
++                for arr in ms.obsp.values():
++                    assert len(arr.read(coords=(joinids, slice(None))).tables().concat()) == 0
++                    assert len(arr.read(coords=(slice(None), joinids)).tables().concat()) == 0
++
++        # we don't expect these in this dataset
++        assert "obs_spatial_presence" not in exp
++        assert "spatial" not in exp
++
++
++@pytest.mark.parametrize(
++    "experiment_path",
++    [
++        ROOT_DATA_DIR / "soma-experiment-versions-2025-04-04" / ver / "pbmc3k_processed"
++        for ver in ("1.12.3", "1.14.5", "1.15.0", "1.15.7", "1.7.3")
++    ],
++)
++@pytest.mark.parametrize(
++    "coords",
++    [
++        (slice(None),),  # all
++        (),  # none
++        (slice(10, 100),),
++        (list(range(0, 1000, 7)),),
++    ],
++)
++@pytest.mark.parametrize(
++    "value_filter",
++    [
++        None,  # no filter
++        "n_cells > 500",
++        "var_id in ['PRDX1', 'TMED5', 'CDA', 'C1QA', 'C1QC', 'C1QB', 'ZNF436']",
++    ],
++)
++def test_experiment_var_axis_delete_from_pbmc3k(
++    tmp_path, soma_tiledb_context, experiment_path, coords, value_filter
++) -> None:
++    """Test on PBMC3K dataset of various vintages."""
++
++    # Make a copy of the Experiment as to not write over the original
++    exp_path = pathlib.PosixPath(experiment_path)
++    uri = (tmp_path / exp_path.name).as_posix()
++    shutil.copytree(exp_path, uri)
++
++    measurement_name = "RNA"
++
++    # Grab the list of joinids we expect to be deleted
++    with soma.Experiment.open(uri, mode="r", context=soma_tiledb_context) as exp:
++        joinids = (
++            exp.ms[measurement_name]
++            .var.read(
++                coords=coords,
++                value_filter=value_filter,
++                column_names=["soma_joinid"],
++            )
++            .concat()
++            .column("soma_joinid")
++            .combine_chunks()
++        )
++    assert len(joinids)  # just in case we mess up the test params
++
++    # Do the delete
++    with soma.Experiment.open(uri, mode="d", context=soma_tiledb_context) as exp:
++        exp.var_axis_delete(measurement_name, coords, value_filter=value_filter)
++
++    # Verify the result
++    with soma.Experiment.open(uri, mode="r", context=soma_tiledb_context) as exp:
++        assert len(exp.ms[measurement_name].var.read(coords=(joinids,)).concat()) == 0
++        for arr in exp.ms[measurement_name].X.values():
++            assert len(arr.read(coords=(slice(None), joinids)).tables().concat()) == 0
++        if "varm" in exp.ms[measurement_name]:
++            for arr in exp.ms[measurement_name].varm.values():
++                assert len(arr.read(coords=(joinids,)).tables().concat()) == 0
++        if "varp" in exp.ms[measurement_name]:
++            for arr in exp.ms[measurement_name].varp.values():
++                assert len(arr.read(coords=(joinids, slice(None))).tables().concat()) == 0
++                assert len(arr.read(coords=(slice(None), joinids)).tables().concat()) == 0
++
++        # we don't expect these in this dataset
++        assert "var_spatial_presence" not in exp.ms[measurement_name]
++        assert "spatial" not in exp
++
++    # ALSO verify we did not touch the other measurements
++    with soma.open(experiment_path.as_posix(), context=soma_tiledb_context) as orig_exp:
++        for ms_name in exp.ms:
++            if ms_name == measurement_name:
++                continue
++            assert exp.ms[ms_name].var.count == orig_exp.ms[ms_name].var.count
++            for arr_name in exp.ms[ms_name].X:
++                assert exp.ms[ms_name].X[arr_name].nnz == orig_exp.ms[ms_name].X[arr_name].nnz
++
++
++@pytest.mark.spatialdata
++def test_experiment_obs_axis_delete_spatial(soma_spatial_experiment, soma_tiledb_context, tmp_path) -> None:  # noqa: F811
++    # Make a copy of the Experiment as to not write over the original
++    exp_path = pathlib.PosixPath(soma_spatial_experiment.uri.removeprefix("file://"))
++    uri = (tmp_path / exp_path.name).as_posix()
++    shutil.copytree(exp_path.as_posix(), uri)
++
++    ms_name = "RNA"
++    with soma.open(uri, mode="r", context=soma_tiledb_context) as exp:
++        original_var_joinids = exp.ms[ms_name].var.read(column_names=["soma_joinid"]).concat().column("soma_joinid")
++
++    with soma.open(uri, mode="d", context=soma_tiledb_context) as exp:
++        exp.obs_axis_delete(value_filter="soma_joinid >= 33")
++
++    exp.reopen(mode="r")
++    assert (exp.obs.read().concat().to_pandas()["soma_joinid"] < 33).all()
++    assert exp.ms[ms_name].var.read(column_names=["soma_joinid"]).concat().column("soma_joinid") == original_var_joinids
++    assert (exp.obs_spatial_presence.read().concat().to_pandas()["soma_joinid"] < 33).all()
++    for ms in exp.ms.values():
++        for arr in ms.X.values():
++            assert (arr.read().tables().concat().to_pandas()["soma_dim_0"] < 33).all()
++    for sc in exp.spatial.values():
++        for arr in sc.obsl.values():
++            assert (arr.read().concat().to_pandas()["soma_joinid"] < 33).all()
++
++
++@pytest.mark.spatialdata
++def test_experiment_var_axis_delete_spatial(soma_spatial_experiment, soma_tiledb_context, tmp_path) -> None:  # noqa: F811
++    # Make a copy of the Experiment as to not write over the original
++    exp_path = pathlib.PosixPath(soma_spatial_experiment.uri.removeprefix("file://"))
++    uri = (tmp_path / exp_path.name).as_posix()
++    shutil.copytree(exp_path.as_posix(), uri)
++
++    ms_name = "RNA"
++    with soma.open(uri, mode="r", context=soma_tiledb_context) as exp:
++        original_obs_joinids = exp.obs.read(column_names=["soma_joinid"]).concat().column("soma_joinid")
++        original_var_joinids = exp.ms[ms_name].var.read(column_names=["soma_joinid"]).concat().column("soma_joinid")
++
++    with soma.open(uri, mode="d", context=soma_tiledb_context) as exp:
++        exp.var_axis_delete(measurement_name="RNA", value_filter="soma_joinid >= 33")
++
++    exp.reopen(mode="r")
++    assert exp.obs.read(column_names=["soma_joinid"]).concat().column("soma_joinid") == original_obs_joinids
++    assert (exp.ms[ms_name].var.read().concat().to_pandas()["soma_joinid"] < 33).all()
++    assert exp.obs_spatial_presence.read().concat().column("soma_joinid") == original_obs_joinids
++    for ms_key, ms_val in exp.ms.items():
++        if ms_key == ms_name:
++            assert (ms_val.var_spatial_presence.read().concat().to_pandas()["soma_joinid"] < 33).all()
++
++        else:
++            assert (ms_val.var_spatial_presence.read()).concat().to_pandas()["soma_joinid"] == original_var_joinids
++
++    for arr in exp.ms[ms_name].X.values():
++        assert (arr.read().tables().concat().to_pandas()["soma_dim_1"] < 33).all()
++    for sc in exp.spatial.values():
++        for sc_ms_name, sc_ms_df in sc.varl.items():
++            if sc_ms_name == ms_name:
++                for arr in sc_ms_df.values():
++                    assert (arr.read().concat().to_pandas()["soma_joinid"] < 33).all()
++
++
++@pytest.mark.parametrize(
++    "slot,make_shape",
++    [
++        ("obsm", lambda exp_shape: (exp_shape[0], 10, 2)),
++        ("obsp", lambda exp_shape: (exp_shape[0], exp_shape[0])),
++        ("X", lambda exp_shape: exp_shape),
++    ],
++)
++def test_obs_axis_delete_catches_dense_arrays(tmp_path, soma_tiledb_context, slot, make_shape) -> None:
++    # start with a test dataset, modify and confirm expected error occurs
++
++    # Make a copy of the Experiment as to not write over the original
++    exp_path = ROOT_DATA_DIR / "soma-experiment-versions-2025-04-04" / "1.15.7" / "pbmc3k_processed"
++    uri = (tmp_path / exp_path.name).as_posix()
++    shutil.copytree(exp_path, uri)
++
++    ms_name = "RNA"
++    with soma.open(uri, context=soma_tiledb_context, mode="r") as exp:
++        n_obs, n_vars = exp.obs.count, exp.ms[ms_name].var.count
++
++    with soma.open(uri, context=soma_tiledb_context, mode="w") as exp:
++        slot_collection = (
++            exp.ms[ms_name].add_new_collection(slot) if slot not in exp.ms[ms_name] else exp.ms[ms_name][slot]
++        )
++        slot_collection.add_new_dense_ndarray("test", type=pa.float32(), shape=make_shape((n_obs, n_vars)))
++
++    with soma.open(uri, context=soma_tiledb_context, mode="d") as exp, pytest.raises(soma.SOMAError):
++        exp.obs_axis_delete(coords=(slice(0, 10),))
++
++
++@pytest.mark.parametrize(
++    "slot,make_shape",
++    [
++        ("varm", lambda exp_shape: (exp_shape[0], 10, 2)),
++        ("varp", lambda exp_shape: (exp_shape[0], exp_shape[0])),
++        ("X", lambda exp_shape: exp_shape),
++    ],
++)
++def test_var_axis_delete_catches_dense_arrays(tmp_path, soma_tiledb_context, slot, make_shape) -> None:
++    # start with a test dataset, modify and confirm expected error occurs
++
++    # Make a copy of the Experiment as to not write over the original
++    exp_path = ROOT_DATA_DIR / "soma-experiment-versions-2025-04-04" / "1.15.7" / "pbmc3k_processed"
++    uri = (tmp_path / exp_path.name).as_posix()
++    shutil.copytree(exp_path, uri)
++
++    ms_name = "RNA"
++    with soma.open(uri, context=soma_tiledb_context, mode="r") as exp:
++        n_obs, n_vars = exp.obs.count, exp.ms[ms_name].var.count
++
++    with soma.open(uri, context=soma_tiledb_context, mode="w") as exp:
++        slot_collection = (
++            exp.ms[ms_name].add_new_collection(slot) if slot not in exp.ms[ms_name] else exp.ms[ms_name][slot]
++        )
++        slot_collection.add_new_dense_ndarray("test", type=pa.float32(), shape=make_shape((n_obs, n_vars)))
++
++    with soma.open(uri, context=soma_tiledb_context, mode="d") as exp, pytest.raises(soma.SOMAError, match=slot):
++        exp.var_axis_delete(ms_name, coords=(slice(0, 10),))

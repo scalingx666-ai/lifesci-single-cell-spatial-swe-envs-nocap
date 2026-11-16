@@ -1,0 +1,215 @@
+diff --git a/main.py b/main.py
+index 4f9dc9f5..0a59f23c 100644
+--- a/main.py
++++ b/main.py
+@@ -16,8 +16,8 @@
+ 
+ from src.nichejepa.utils.distributed import init_distributed
+ from src.nichejepa.train import train
+-from src.nichejepa.eval import evaluation
+-from src.nichejepa.utils.config_utils import create_params_from_YAML_wandb_config, prepare_dataset
++from src.nichejepa.infer import infer
++from src.nichejepa.utils.config import create_params_from_YAML_wandb_config, prepare_dataset
+ 
+ # Setup argument parsing
+ def parse_arguments():
+diff --git a/src/nichejepa/infer.py b/src/nichejepa/infer.py
+index 9b1ac372..724fdce1 100644
+--- a/src/nichejepa/infer.py
++++ b/src/nichejepa/infer.py
+@@ -214,11 +214,12 @@ def infer(args: dict,
+     all_cell_gene_emb_dict = {}
+     all_neighborhood_gene_emb_dict = {}
+ 
+-    for itr, (udata, masks_enc, masks_pred) in tqdm(enumerate(loader)):
++    for itr, (udata, masks_enc, masks_pred, masks_attention) in tqdm(enumerate(loader)):
+         # Load cell neighborhood tokens and segmentation label to the specified
+         # device
+         cell_neighborhood_tokens = udata[0].to(device, non_blocking=True)
+         seg_label = udata[1].to(device, non_blocking=True)
++        masks_attention = masks_attention.to(device, non_blocking=True)
+ 
+         # Load niche and cell type labels based on specified sequence lengths
+         if (args['data']['seq_len_cell'] > 0) & (
+@@ -234,7 +235,7 @@ def infer(args: dict,
+         with torch.cuda.amp.autocast(dtype=torch.bfloat16,
+                                      enabled=args['meta']['use_bfloat16']):
+             emb_list = target_encoder.module.return_multi_layer_emb(
+-                cell_neighborhood_tokens, seg_label)
++                cell_neighborhood_tokens, seg_label, masks_attention=masks_attention)
+         
+             if feature_norm:
+                 # Normalize last layer like in training
+diff --git a/src/nichejepa/masks/multigene.py b/src/nichejepa/masks/multigene.py
+index 43b4c939..0d9664b5 100644
+--- a/src/nichejepa/masks/multigene.py
++++ b/src/nichejepa/masks/multigene.py
+@@ -228,12 +228,14 @@ def __call__(self,
+             Sampled context masks collated by batch.
+         collated_masks_target:
+             Sampled target masks collated by batch.
++        collated_masks_attention:
++            masks_attention by batch.
+         """
+         B = len(batch)
+ 
+         collated_batch = torch.utils.data.default_collate(batch)
+ 
+-        collated_masks_target, collated_masks_context = [], []
++        collated_masks_target, collated_masks_context, collated_masks_attention = [], [], []
+ 
+         # Initialize variables to track the minimum length of masks across the
+         # batch
+@@ -246,6 +248,8 @@ def __call__(self,
+         g.manual_seed(seed)  # Ensure reproducibility by setting the seed
+ 
+         for i in range(B):
++            # Create a collated_masks_attention
++            collated_masks_attention.append((batch[i][0]!=0).int())
+             # Initialize lists to store target masks and their complements for
+             # the current observation
+             masks_target_complement = []
+@@ -307,5 +311,7 @@ def __call__(self,
+                                   for cm_list in collated_masks_context]
+         collated_masks_context = torch.utils.data.default_collate(
+             collated_masks_context)
++        collated_masks_attention = torch.utils.data.default_collate(
++                collated_masks_attention).unsqueeze(1).unsqueeze(1)
+ 
+-        return collated_batch, collated_masks_context, collated_masks_target
++        return collated_batch, collated_masks_context, collated_masks_target, collated_masks_attention
+diff --git a/src/nichejepa/masks/segment_masking.py b/src/nichejepa/masks/segment_masking.py
+index 081f8306..74b1cb16 100644
+--- a/src/nichejepa/masks/segment_masking.py
++++ b/src/nichejepa/masks/segment_masking.py
+@@ -183,7 +183,7 @@ def __call__(self, batch: Tuple[torch.Tensor, torch.Tensor, str]) -> Tuple[torch
+         # Collate the batch using default PyTorch collate function
+         collated_batch = torch.utils.data.default_collate(batch)
+ 
+-        collated_masks_target, collated_masks_context = [], []
++        collated_masks_target, collated_masks_context, collated_masks_attention = [], [], []
+ 
+         # Variables to track the minimum length of masks across the batch
+         keep_tokens_target = self.seq_len
+@@ -206,6 +206,7 @@ def __call__(self, batch: Tuple[torch.Tensor, torch.Tensor, str]) -> Tuple[torch
+             # Append the masks for the current observation to the collated lists
+             collated_masks_target.append(masks_target)
+             collated_masks_context.append(masks_context)
++            collated_masks_attention.append((batch[i][0]!=0).int())
+ 
+         # Trim masks to the minimum size across the batch and collate them
+         collated_masks_target = [[cm[:keep_tokens_target] for cm in cm_list] for cm_list in collated_masks_target]
+@@ -214,5 +215,7 @@ def __call__(self, batch: Tuple[torch.Tensor, torch.Tensor, str]) -> Tuple[torch
+         collated_masks_context = [[cm[:keep_tokens_context] for cm in cm_list] for cm_list in collated_masks_context]
+         # Step 2: Use default_collate to create a batch
+         collated_masks_context = torch.utils.data.default_collate(collated_masks_context)
+-        return collated_batch, collated_masks_context, collated_masks_target
++        #create masked attention
++        collated_masks_attention = torch.utils.data.default_collate(collated_masks_attention).unsqueeze(1).unsqueeze(1)
++        return collated_batch, collated_masks_context, collated_masks_target,  collated_masks_attention
+     
+diff --git a/src/nichejepa/models/gene_transformer.py b/src/nichejepa/models/gene_transformer.py
+index 2f8069a9..15409b06 100644
+--- a/src/nichejepa/models/gene_transformer.py
++++ b/src/nichejepa/models/gene_transformer.py
+@@ -538,7 +538,8 @@ def _init_weights(self, m):
+     def forward(self,
+                 x: torch.Tensor,
+                 seg_label: torch.Tensor,
+-                masks: Optional[Union[list, torch.Tensor]]=None
++                masks: Optional[Union[list, torch.Tensor]]=None,
++                masks_attention: Optional[torch.Tensor]=None 
+                 ) -> torch.Tensor:
+         """
+         Run encoder forward pass on a batch of input token sequences. For each 
+@@ -557,7 +558,8 @@ def forward(self,
+         masks:
+             List of N_MASKS tensors containing indices (within the sequence) of
+             tokens to keep with shape (BATCH_SIZE, MASK_SIZE).
+-
++        masks_attention:
++            Tensor containing input for mask attention 
+         Returns
+         -----------
+         x:
+@@ -584,7 +586,10 @@ def forward(self,
+         
+         # Run forward prop
+         for i, blk in enumerate(self.blocks):
+-            x = blk(x)
++            if masks_attention is not None:
++               x = blk(x, masks=masks_attention)
++            else:
++               x = blk(x)
+         if self.norm is not None:
+             x = self.norm(x)
+ 
+@@ -644,7 +649,8 @@ def return_gene_emb(self,
+     def return_multi_layer_emb(self,
+                                x: torch.Tensor,
+                                seg_label: torch.Tensor,
+-                               masks: Optional[Union[list, torch.Tensor]]=None
++                               masks: Optional[Union[list, torch.Tensor]]=None,
++                               masks_attention: Optional[torch.Tensor]=None 
+                                ) -> list:
+         """
+         Run encoder forward pass on a batch of input token sequences, applying
+@@ -663,6 +669,8 @@ def return_multi_layer_emb(self,
+         masks:
+             List of N_MASKS tensors containing indices (within the sequence) of
+             tokens to keep with shape (BATCH_SIZE, MASK_SIZE).
++        masks_attention:
++            Tensor containing input for mask attention 
+ 
+         Returns
+         -----------
+@@ -691,7 +699,10 @@ def return_multi_layer_emb(self,
+         n_blocks = len(self.blocks)
+         emb_list = []
+         for i, blk in enumerate(self.blocks):
+-            x = blk(x)
++            if masks_attention is not None:
++               x = blk(x, masks=masks_attention)
++            else:
++               x = blk(x) 
+             if (i == (n_blocks - 1)) and (self.norm is not None):
+                 x = self.norm(x)
+             emb_list.append(x)
+diff --git a/src/nichejepa/train.py b/src/nichejepa/train.py
+index 229e1aba..f81af6cc 100644
+--- a/src/nichejepa/train.py
++++ b/src/nichejepa/train.py
+@@ -327,7 +327,7 @@ def save_checkpoint(epoch):
+         maskB_meter = AverageMeter()
+         time_meter = AverageMeter()
+ 
+-        for itr, (udata, masks_enc, masks_pred) in enumerate(train_loader):
++        for itr, (udata, masks_enc, masks_pred,  masks_attention) in enumerate(train_loader):
+             def load_cell_neighborhoods():
+                 # -- unsupervised imgs
+                 cell_neighborhood_tokens = udata[0].to(device,
+@@ -335,8 +335,9 @@ def load_cell_neighborhoods():
+                 seg_label = udata[1].to(device, non_blocking=True)                 
+                 masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
+                 masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
+-                return (cell_neighborhood_tokens, seg_label,  masks_1, masks_2)
+-            cell_neighborhood_tokens, seg_label, masks_enc, masks_pred = load_cell_neighborhoods()
++                masks_3 = masks_attention.to(device, non_blocking=True)
++                return (cell_neighborhood_tokens, seg_label,  masks_1, masks_2, masks_3)
++            cell_neighborhood_tokens, seg_label, masks_enc, masks_pred, masks_attention = load_cell_neighborhoods()
+             maskA_meter.update(len(masks_enc[0][0]))
+             maskB_meter.update(len(masks_pred[0][0]))
+ 
+@@ -349,9 +350,11 @@ def forward_target():
+                         # Encode all cell neighborhood tokens
+                         h = target_encoder(
+                             cell_neighborhood_tokens,
+-                            seg_label) # output (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
++                            seg_label,
++                            masks_attention=masks_attention) # output (BATCH_SIZE, SEQ_LEN, EMBED_DIM)
+                                        # if no <cls> token (BATCH_SIZE,
+                                        # SEQ_LEN+1, EMBED_DIM) otherwise
++                                       # masks_attention
+                         # Normalize over feature dim
+                         h = F.layer_norm(h, (h.size(-1),))
+                         # Only keep encoded targets (masked genes of h)

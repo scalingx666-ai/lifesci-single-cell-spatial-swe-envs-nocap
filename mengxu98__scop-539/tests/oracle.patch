@@ -1,0 +1,420 @@
+diff --git a/NEWS.md b/NEWS.md
+index 61724a8a9..1eb029bb9 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -58,6 +58,10 @@
+     isolate PHATE/MAGIC with compatible pandas, separate TensorFlow from JAX,
+     and keep scCODA's compatible `rpy2` version. PHATE supports an already active
+     Python environment through an isolated call, preserving its warnings.
++  * Scope Python conflict checks to the requested dependency closure, warn about
++    unrelated legacy conflicts, pin compatible JAX companions, and retain installation errors.
++    Restrict scVI/moscot rejection to explicit environment requests and pass caller verbosity
++    through dependency checks.
+   * Resolve Seurat t-SNE explicitly in integration workflows. Pass graph/neighbor
+     inputs only to supported reductions. Treat destiny's legacy Matrix coercions
+     as warnings in `RunDM()`, restoring caller options.
+diff --git a/R/PrepareEnv.R b/R/PrepareEnv.R
+index 58e426c68..f1ea41222 100644
+--- a/R/PrepareEnv.R
++++ b/R/PrepareEnv.R
+@@ -76,7 +76,14 @@ PrepareEnv <- function(
+   }
+   components_missing <- missing(components)
+   components <- norm_env_components(components)
++  modules <- trimws(as.character(unlist(modules, use.names = FALSE)))
+   modules <- normalize_env_modules(modules = modules)
++  if ("python" %in% components && all(c("scvi", "moscot") %in% modules)) {
++    log_message(
++      "The moscot JAX profile is incompatible with scvi-tools 1.3.3 pinned to JAX 0.4.38. Prepare these modules in separate environments.",
++      message_type = "error"
++    )
++  }
+   r_status <- NULL
+   if ("r" %in% components) {
+     r_status <- ensure_env_r_packages(
+@@ -492,13 +499,13 @@ PrepareEnv <- function(
+ 
+   valid <- exist_python_pkgs(packages, envname = envname, conda = conda, verbose = FALSE)
+   if (!length(valid) || !all(valid)) {
+-    stop("Python environment requirements are not satisfied: ", paste(names(valid)[!valid], collapse = ", "), call. = FALSE)
++    log_message("Python environment requirements are not satisfied: {.val {names(valid)[!valid]}}", message_type = "error")
+   }
+   if (any(c("scipy", "scenicplus") %in% names(packages))) {
+     ensure_scipy_runtime(python, pip_options = pip_options)
+   }
+   status <- get_namespace_fun("reticulate", "system2t")(python, c("-m", "pip", "check"))
+-  if (status != 0L) stop("Python dependency conflicts remain in environment: ", envname, call. = FALSE)
++  if (status != 0L) check_python_dependencies(python, pip_packages, envname, verbose = verbose)
+ 
+   if (isTRUE(configure_runtime)) {
+     assert_python_runtime_switchable(
+@@ -718,11 +725,11 @@ env_module_requirements <- function() {
+     scvi = env_python_spec(
+       c(
+         "scvi-tools" = "scvi-tools==1.3.3",
+-        "jax" = "jax[cpu]==0.4.38"
++        scvi_jax_requirements()
+       ),
+       methods = c(
+         "scvi-tools" = if (is_windows()) "pip" else "conda",
+-        "jax" = "pip"
++        stats::setNames(rep("pip", length(scvi_jax_requirements())), names(scvi_jax_requirements()))
+       )
+     ),
+     glue = env_python_spec(
+@@ -761,10 +768,11 @@ env_module_requirements <- function() {
+     ),
+     cell2fate = env_python_spec(
+       c(
++        "jax" = "jax==0.4.10",
+         "jaxlib" = "jaxlib==0.4.10",
+         "cell2fate" = "git+https://github.com/BayraktarLab/cell2fate.git"
+       ),
+-      methods = c("jaxlib" = "conda", "cell2fate" = "pip")
++      methods = c("jax" = "pip", "jaxlib" = "conda", "cell2fate" = "pip")
+     ),
+     commot = env_python_spec(c(
+       "commot" = "git+https://github.com/zcang/COMMOT.git"
+@@ -3327,9 +3335,9 @@ ensure_windows_scvi_support <- function(
+     return(invisible(FALSE))
+   }
+ 
+-  jax_requirement <- c("jax" = "jax[cpu]==0.4.38")
++  jax_requirement <- scvi_jax_requirements()
+ 
+-  if (isTRUE(exist_python_pkgs(
++  if (all(exist_python_pkgs(
+     jax_requirement,
+     envname = envname,
+     conda = conda
+diff --git a/R/check_packages.R b/R/check_packages.R
+index 3d3ea7f38..7d3a7b91d 100644
+--- a/R/check_packages.R
++++ b/R/check_packages.R
+@@ -88,7 +88,13 @@ check_python <- function(
+           ...
+         )
+       },
+-      error = identity
++      error = function(e) {
++        detail <- conditionMessage(e)
++        log_message(
++          "Python package installation failed in {.file {envname}}: {detail}",
++          message_type = "error"
++        )
++      }
+     )
+ 
+     pkg_installed <- exist_python_pkgs(
+@@ -285,10 +291,13 @@ resolve_requested_python_packages <- function(
+   } else {
+     if (is_windows()) "3.11-1" else "3.10-1"
+   }
+-  requirements <- env_requirements(
+-    version = version,
+-    include_optional = TRUE
+-  )
++  requested <- vapply(packages, function(pkg) parse_python_requirement(pkg)$name, "")
++  modules <- if ("moscot" %in% requested) {
++    "moscot"
++  } else {
++    setdiff(normalize_env_modules(include_optional = TRUE), "moscot")
++  }
++  requirements <- env_requirements(version = version, modules = modules)
+   package_versions <- requirements$packages
+ 
+   resolved <- vapply(
+@@ -914,3 +923,78 @@ remove_single_python_package <- function(
+   )
+   FALSE
+ }
++
++check_python_dependencies <- function(python, packages, envname, verbose = NULL) {
++  output <- tempfile("pip-check-")
++  on.exit(unlink(output), add = TRUE)
++  status <- get_namespace_fun("reticulate", "system2t")(
++    python, c("-m", "pip", "check"), stdout = output, stderr = output
++  )
++  if (status == 0L) {
++    return(invisible(TRUE))
++  }
++  diagnostics <- trimws(readLines(output, warn = FALSE))
++  diagnostics <- diagnostics[nzchar(diagnostics)]
++  closure <- python_dependency_closure(python, packages)
++  pattern <- "^([[:alnum:]][[:alnum:]_.-]*) [^[:space:]]+ (has requirement |requires |is not supported on this platform)"
++  recognized <- grepl(pattern, diagnostics)
++  owners <- canonical_python_distribution_name(sub(" .*", "", diagnostics))
++  relevant <- !recognized | owners %in% closure
++  detail <- paste(diagnostics, collapse = "\n")
++  if (status != 1L || !length(diagnostics) || any(relevant)) {
++    log_message(
++      "Python dependency check failed in environment {.val {envname}}; conflicts affecting the requested dependency closure or unclassified failures remain:\n{detail}",
++      message_type = "error"
++    )
++  }
++  log_message(
++    "Unrelated legacy Python dependency conflicts in environment {.val {envname}}:\n{detail}\nCreate a separate environment for the affected module, or rebuild it with PrepareEnv(force = TRUE) after preserving needed data.",
++    message_type = "warning",
++    verbose = verbose
++  )
++  invisible(TRUE)
++}
++
++python_dependency_closure <- function(python, packages) {
++  pending <- vapply(seq_along(packages), function(i) {
++    parse_python_requirement(packages[[i]], fallback_name = names(packages)[i])$name
++  }, "")
++  pending <- canonical_python_distribution_name(pending)
++  closure <- character(0)
++  system2t <- get_namespace_fun("reticulate", "system2t")
++  output <- tempfile("dependency-closure-")
++  errors <- tempfile("dependency-errors-")
++  on.exit(unlink(c(output, errors)), add = TRUE)
++  while (length(pending <- setdiff(unique(pending[nzchar(pending)]), closure))) {
++    closure <- c(closure, pending)
++    status <- system2t(
++      python, c("-m", "pip", "show", pending), stdout = output, stderr = errors
++    )
++    detail <- readLines(errors, warn = FALSE)
++    detail <- detail[nzchar(trimws(detail)) & !grepl("Package\\(s\\) not found", detail)]
++    if (status != 0L && length(detail)) {
++      log_message(
++        "Unable to determine the requested Python dependency closure:\n{paste(detail, collapse = '\n')}",
++        message_type = "error"
++      )
++    }
++    requires <- grep("^Requires:", readLines(output, warn = FALSE), value = TRUE)
++    pending <- canonical_python_distribution_name(
++      unlist(strsplit(sub("^Requires:", "", requires), ","), use.names = FALSE)
++    )
++  }
++  sort(closure)
++}
++
++scvi_jax_requirements <- function() {
++  c(
++    jax = "jax[cpu]==0.4.38",
++    jaxlib = "jaxlib==0.4.38",
++    numpyro = "numpyro==0.17.0",
++    optax = "optax==0.2.5",
++    flax = "flax==0.10.4",
++    chex = "chex==0.1.89",
++    "orbax-checkpoint" = "orbax-checkpoint==0.8.0",
++    tensorstore = "tensorstore==0.1.65"
++  )
++}
+diff --git a/tests/testthat/test-prepare-env-requirements.R b/tests/testthat/test-prepare-env-requirements.R
+index ee219305b..9e5c95bd2 100644
+--- a/tests/testthat/test-prepare-env-requirements.R
++++ b/tests/testthat/test-prepare-env-requirements.R
+@@ -203,3 +203,210 @@ test_that("full SCENIC+ preparation verifies Git pins in an existing environment
+   )
+   expect_error(PrepareEnv(envname = root, conda = "conda", modules = "scenicplus", configure_runtime = FALSE), "Git pins verified")
+ })
++
++mock_dependency_check <- function(output, status = 1L, closure = c("cellrank", "pygpcca", "jinja2", "pandas"), .env = parent.frame()) {
++  testthat::local_mocked_bindings(
++    get_namespace_fun = function(package, name) {
++      expect_identical(c(package, name), c("reticulate", "system2t"))
++      function(command, args, stdout = "", stderr = "") {
++        if (identical(args, c("-m", "pip", "check"))) {
++          writeLines(output, stdout)
++          return(status)
++        }
++        writeLines(paste("Requires:", paste(closure, collapse = ", ")), stdout)
++        writeLines(character(), stderr)
++        0L
++      }
++    },
++    .package = "scop",
++    .env = .env
++  )
++}
++
++test_that("Python conflicts in the transitive closure remain fatal", {
++  mock_dependency_check(c(
++    "pygpcca 1.0.4 has requirement jinja2==3.0.3, but you have jinja2 3.1.6.",
++    "numpyro 0.20.1 has requirement jax>=0.7.0, but you have jax 0.4.38."
++  ))
++  expect_error(
++    check_python_dependencies("python", "cellrank==2.0.7", "test-env"),
++    "pygpcca.*jinja2"
++  )
++})
++
++test_that("Python conflicts in directly requested packages remain fatal", {
++  mock_dependency_check("cellrank 2.0.7 requires pygpcca, which is not installed.")
++  expect_error(
++    check_python_dependencies("python", "cellrank==2.0.7", "test-env"),
++    "cellrank.*pygpcca"
++  )
++})
++
++test_that("unrelated Python conflicts warn even when a dependency is shared", {
++  withr::local_options(log_message.verbose = FALSE)
++  mock_dependency_check(c(
++    "numpyro 0.20.1 has requirement jax>=0.7.0, but you have jax 0.4.38.",
++    "scprep 1.2.3 has requirement pandas<2.1,>=0.25, but you have pandas 2.2.0."
++  ))
++  expect_warning(
++    result <- check_python_dependencies("python", "cellrank==2.0.7", "test-env", verbose = TRUE),
++    "(?s)numpyro.*scprep.*PrepareEnv\\(force[[:space:]]*=[[:space:]]*TRUE\\)",
++    perl = TRUE
++  )
++  expect_true(result)
++})
++
++test_that("Python dependency checks pass without conflicts", {
++  mock_dependency_check("No broken requirements found.", status = 0L)
++  expect_no_warning(
++    result <- check_python_dependencies("python", "cellrank==2.0.7", "test-env")
++  )
++  expect_true(result)
++})
++
++test_that("unrecognized pip failures cannot be downgraded", {
++  mock_dependency_check("ERROR: invalid distribution metadata")
++  expect_error(
++    check_python_dependencies("python", "cellrank==2.0.7", "test-env"),
++    "invalid distribution metadata"
++  )
++})
++
++test_that("unexpected pip exit codes remain fatal", {
++  mock_dependency_check(
++    "scprep 1.2.3 has requirement pandas<2.1, but you have pandas 2.2.0.",
++    status = 2L
++  )
++  expect_error(
++    check_python_dependencies("python", "cellrank==2.0.7", "test-env"),
++    "Python dependency check failed"
++  )
++})
++
++test_that("dependency metadata failures remain fatal", {
++  testthat::local_mocked_bindings(
++    get_namespace_fun = function(package, name) {
++      function(command, args, stdout, stderr) {
++        writeLines("", stdout)
++        writeLines("Cannot read Requires-Dist", stderr)
++        1L
++      }
++    },
++    .package = "scop"
++  )
++  expect_error(
++    python_dependency_closure("python", "cellrank"),
++    "Cannot[[:space:]]+read[[:space:]]+Requires-Dist"
++  )
++})
++
++test_that("Python installation preserves original exceptions with verbose disabled", {
++  testthat::local_mocked_bindings(
++    resolve_conda = identity,
++    unique_python_requirements = function(packages, envname, conda) packages,
++    env_exist = function(conda, envname) TRUE,
++    exist_python_pkgs = function(packages, envname, conda, verbose) stats::setNames(FALSE, packages),
++    conda_install = function(conda, packages, envname, pip, pip_options, ...) {
++      stop("Original resolver failure: incompatible jaxlib wheel")
++    },
++    .package = "scop"
++  )
++  expect_error(
++    check_python("jaxlib==0.4.38", envname = "test-env", conda = "conda", verbose = FALSE),
++    "Original[[:space:]]+resolver[[:space:]]+failure:[[:space:]]+incompatible[[:space:]]+jaxlib[[:space:]]+wheel"
++  )
++})
++
++test_that("scVI and Cell2location share a compatible JAX profile", {
++  scvi <- env_requirements(version = "3.11-1", modules = "scvi")$packages
++  location <- env_requirements(version = "3.11-1", modules = "cell2location")$packages
++  expected <- c(
++    jax = "jax[cpu]==0.4.38", jaxlib = "jaxlib==0.4.38",
++    numpyro = "numpyro==0.17.0", optax = "optax==0.2.5",
++    flax = "flax==0.10.4", chex = "chex==0.1.89",
++    "orbax-checkpoint" = "orbax-checkpoint==0.8.0", tensorstore = "tensorstore==0.1.65"
++  )
++  expect_identical(scvi[names(expected)], expected)
++  expect_identical(location[names(expected)], expected)
++  fate <- env_requirements(modules = "cell2fate")$packages
++  expect_identical(fate[["jax"]], "jax==0.4.10")
++  expect_identical(fate[["jaxlib"]], "jaxlib==0.4.10")
++})
++
++test_that("moscot cannot silently override the scVI JAX profile", {
++  for (version in c("3.10-1", "3.11-1", "3.12-1")) {
++    expect_error(
++      PrepareEnv(version = version, modules = c("scvi", "moscot")),
++      "separate environments"
++    )
++    expect_error(
++      PrepareEnv(version = version, modules = c("cell2location", "moscot")),
++      "separate environments"
++    )
++  }
++  for (version in c("3.11-1", "3.12-1")) {
++    requirements <- env_requirements(version = version, modules = "moscot")$packages
++    expect_identical(sub("jax==", "", requirements[["jax"]]), sub("jaxlib==", "", requirements[["jaxlib"]]))
++  }
++})
++
++test_that("ordinary package lookup does not combine incompatible JAX profiles", {
++  testthat::local_mocked_bindings(
++    is_windows = function() FALSE,
++    resolve_conda = identity,
++    ensure_conda = function(conda) TRUE,
++    env_exist = function(conda, envname) TRUE,
++    conda_python = function(envname, conda) "python",
++    python_minor_version = function(python_path) "3.11",
++    installed_python_pkgs = function(envname, conda, verbose) {
++      data.frame(package = "cellrank", version = "2.0.7")
++    },
++    build_env_cache_spec = function(...) stop("requirements resolved"),
++    .package = "scop"
++  )
++  expect_identical(
++    unname(resolve_requested_python_packages("jax", envname = "test-env", conda = "conda")),
++    "jax[cpu]==0.4.38"
++  )
++  expect_identical(
++    unname(resolve_requested_python_packages("moscot", envname = "test-env", conda = "conda")),
++    "moscot==0.5.2"
++  )
++  expect_identical(
++    exist_python_pkgs("cellrank==2.0.7", envname = "test-env", conda = "conda", verbose = FALSE),
++    c("cellrank==2.0.7" = TRUE)
++  )
++  for (module in c("cellrank", "scvi", "moscot")) {
++    expect_error(
++      PrepareEnv(envname = "test-env", conda = "conda", version = "3.11-1", modules = module),
++      "requirements resolved"
++    )
++  }
++})
++
++test_that("installed metadata follows transitive dependencies, markers and cycles", {
++  python <- Sys.which("python3")
++  if (!nzchar(python)) skip("python3 is unavailable")
++  probe <- suppressWarnings(system2(python, c("-m", "pip", "--version"), stdout = TRUE, stderr = TRUE))
++  if (!is.null(attr(probe, "status"))) skip("pip is unavailable")
++  directory <- withr::local_tempdir()
++  requires <- list(
++    "closure-root" = c("closure-middle[feature]", "closure-middle", "closure-inactive; python_version < '2'"),
++    "closure-middle" = c("closure-leaf", "closure-extra; extra == 'feature'", "closure-root"),
++    "closure-leaf" = character(),
++    "closure-extra" = character()
++  )
++  for (name in names(requires)) {
++    path <- file.path(directory, paste0(gsub("-", "_", name), "-1.0.dist-info"))
++    dir.create(path)
++    writeLines(c(
++      "Metadata-Version: 2.1", paste("Name:", name), "Version: 1.0",
++      sprintf("Requires-Dist: %s", requires[[name]])
++    ), file.path(path, "METADATA"))
++  }
++  withr::local_envvar(c(PYTHONPATH = directory))
++  expect_setequal(
++    python_dependency_closure(python, "Closure_Root==1.0"),
++    c("closure-root", "closure-middle", "closure-leaf")
++  )
++})
