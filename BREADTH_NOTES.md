@@ -9,9 +9,9 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: single-cell-spatial.
 | Domain candidates (deduped) | 497 |
 | After active+star+noise filter | 304 |
 | Final target list (cap unlimited) | 304 |
-| Repos with >=1 task | 202 |
-| Repos with 0 tasks | 48 |
-| Total tasks (unlimited (no per-repo cap)) | 6871 |
+| Repos with >=1 task | 203 |
+| Repos with 0 tasks | 47 |
+| Total tasks (unlimited (no per-repo cap)) | 6909 |
 
 ## Generation
 
@@ -23,7 +23,7 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: single-cell-spatial.
 - Overlap with the 3 published cancer editions is allowed (user decision);
   domains are independent selections, not a partition of one repo set.
 
-## Zero-yield repos (informational, 48)
+## Zero-yield repos (informational, 47)
 
 - theislab/single-cell-best-practices
 - test-time-training/discover
@@ -33,7 +33,6 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: single-cell-spatial.
 - zezhishao/DailyArXiv
 - kpatel427/YouTubeTutorials
 - carmonalab/ProjecTILs
-- scverse/liana
 - TobaccoDB/iPscDB
 - GuangyuWangLab2021/Loki
 - CelVoxes/ceLLama

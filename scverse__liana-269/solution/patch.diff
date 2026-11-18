@@ -1,0 +1,361 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f2db5f8c..1bc900db 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,16 @@
+ 
+ ## Unreleased
+ 
++### Fixed
++
++- **`li.rs.get_metalinks` and `li.rs.get_hcop_orthologs` no longer download into the working directory.** Both wrote their file to `os.getcwd()`, so calling either from a checkout dropped an untracked artifact into the repo, changing directory silently re-downloaded, and two processes in one directory raced on the same path. Both go through :func:`pooch.retrieve` now, as the rest of scverse does, caching under :attr:`scanpy.settings.datasetdir` alongside what `li.ds` fetches; `_download_metalinksdb` takes a `cache_dir` for callers that want their own. MetaLinksDB is checked against a pinned `sha256`, so a truncated or corrupted copy is re-fetched rather than served from the cache forever -- the previous code only rejected a file of length zero. Neither call had passed a timeout, so a stalled server blocked indefinitely.
++
++- `li.rs.get_metalinks_values` opened two connections to the database and closed one.
++
++### Packaging
++
++- **`requests` dropped from `[extras]`.** Nothing imports it since the downloads moved to `pooch`, which brings it along in any case.
++
+ ### Changed
+ 
+ - **LRIC groups its edge list by counting sort.** The group key is a cell-type pair crossed with a radius tile, so it spans a few hundred values over tens of millions of edges; placing each edge in one pass beats paying a factor of `log(n_edges)` for the same order. Ascending traversal keeps ties in input order, so the result matches the stable sort it replaces exactly, and the group offsets fall out of the histogram rather than a second search over the sorted keys. `li.mt.lric(groupby=...)` goes from 5.4 s to 3.2 s on 14k spots over 36M edges.
+diff --git a/pyproject.toml b/pyproject.toml
+index c738675c..a8bdd96a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -57,7 +57,6 @@ optional-dependencies.extras = [
+   "omnipath>=1.0.6",
+   "pydeseq2>=0.3.5",
+   "pyscipopt>=5.2.1",
+-  "requests>=2.25.1",
+   "squidpy>=1.5",      # backs li.mt.MistyData / spatial_neighbors (lazy-imported)
+ ]
+ # Runtime deps to execute the tutorial notebooks under docs/notebooks on CPU.
+@@ -225,6 +224,7 @@ untyped_calls_exclude = [
+   "numba",
+   "omnipath",
+   "plotnine",
++  "pooch",
+   "pydeseq2",
+   "scanpy",
+   "sklearn",
+@@ -261,6 +261,7 @@ module = [
+   "numba.*",
+   "omnipath.*",
+   "plotnine.*",
++  "pooch.*",
+   "pydeseq2.*",
+   "scanpy.*",
+   "session_info2.*",
+diff --git a/src/liana/resource/_orthology.py b/src/liana/resource/_orthology.py
+index 7be51b3a..50d8b91a 100644
+--- a/src/liana/resource/_orthology.py
++++ b/src/liana/resource/_orthology.py
+@@ -1,11 +1,10 @@
+-import os
+-import urllib.request
+ from itertools import product
++from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+-
+-from liana._core._common import _logg
++import pooch
++import scanpy as sc
+ 
+ _HCOP_BASE = "https://storage.googleapis.com/public-download-files/hcop"
+ 
+@@ -214,7 +213,7 @@ def translate_resource(
+ def get_hcop_orthologs(
+     target_organism: str = "mouse",
+     url: str | None = None,
+-    filename: str | None = None,
++    filename: str | Path | None = None,
+     min_evidence: int = 3,
+     columns: list[str] | None = None,
+ ) -> pd.DataFrame:
+@@ -273,13 +272,13 @@ def get_hcop_orthologs(
+         url = f"{_HCOP_BASE}/human_{target_organism}_hcop_fifteen_column.txt.gz"
+     # check if exists
+     if filename is None:
+-        filename = os.path.basename(url.split("/")[-1])
+-    if not os.path.exists(filename):
+-        urllib.request.urlretrieve(url, filename)
++        path = Path(pooch.retrieve(url, known_hash=None, fname=url.rsplit("/", 1)[-1], path=sc.settings.datasetdir))
+     else:
+-        _logg(f"File {filename} already exists. Skipping download.", level="info")
++        path = Path(filename)
++        if not path.exists():
++            pooch.retrieve(url, known_hash=None, fname=path.name, path=path.parent)
+ 
+-    mapping = pd.read_csv(filename, sep="\t")
++    mapping = pd.read_csv(path, sep="\t")
+     mapping["evidence"] = mapping["support"].apply(lambda x: len(x.split(",")))
+     mapping = mapping[mapping["evidence"] >= min_evidence]
+ 
+diff --git a/src/liana/resource/get_metalinks.py b/src/liana/resource/get_metalinks.py
+index ba9d8043..ffaec5ea 100644
+--- a/src/liana/resource/get_metalinks.py
++++ b/src/liana/resource/get_metalinks.py
+@@ -1,59 +1,42 @@
+-import os
+ import sqlite3
++from pathlib import Path
+ 
+ import pandas as pd
++import pooch
++import scanpy as sc
+ 
+-from liana._core._common import _check_if_installed, _logg
++from liana._core._common import _logg
+ 
++_METALINKS_URL = "https://github.com/scverse/liana/releases/download/metalinksdb/metalinksdb.db"
++_METALINKS_HASH = "sha256:84df58e659cd0fe318b10f6d5d7ac1f16806b1088701fccf4260e78ba0982513"
+ 
+-def _download_metalinksdb(verbose: bool = True) -> str:
++
++def _download_metalinksdb(cache_dir: str | Path | None = None, verbose: bool = True) -> Path:
+     """
+     Ensures the Metalinksdb is downloaded and available for use.
+ 
+-    If the Metalinks database is not present in the current working directory, it downloads it.
++    Parameters
++    ----------
++    cache_dir
++        Directory the database is cached in, defaulting to :attr:`scanpy.settings.datasetdir`.
++    verbose
++        Verbosity flag.
+ 
+     Returns
+     -------
+     The path to the downloaded database file.
+     """
+-    requests = _check_if_installed("requests")
+-
+-    # GitHub Releases URL (CI-friendly, no WAF issues)
+-    METALINKS_URL = "https://github.com/scverse/liana/releases/download/metalinksdb/metalinksdb.db"
+-
+-    db_file_name = "metalinksdb.db"
+-    db_path = os.path.join(os.getcwd(), db_file_name)
+-
+-    if os.path.exists(db_path):
+-        if os.path.getsize(db_path) == 0:
+-            _logg("Existing database file is empty. Removing and re-downloading...", verbose=verbose)
+-            os.remove(db_path)
+-        else:
+-            return db_path
+-
+-    _logg("Downloading database...", verbose=verbose)
+-    try:
+-        response = requests.get(METALINKS_URL, stream=True, allow_redirects=True)
+-        response.raise_for_status()
+-
+-        with open(db_path, "wb") as f:
+-            for chunk in response.iter_content(chunk_size=8192):
+-                f.write(chunk)
+-
+-        # Validate the downloaded file
+-        file_size = os.path.getsize(db_path)
+-        if file_size == 0:
+-            os.remove(db_path)
+-            raise RuntimeError("Downloaded file is empty. Please check the URL and try again.")
+-
+-        _logg(f"Database downloaded and saved to {db_path} ({file_size} bytes).", verbose=verbose)
+-    except (requests.exceptions.RequestException, OSError, RuntimeError) as e:
+-        # Clean up failed download
+-        if os.path.exists(db_path):
+-            os.remove(db_path)
+-        raise RuntimeError(f"Failed to download database: {e}") from e
+-
+-    return db_path
++    _logg("Retrieving database...", verbose=verbose)
++
++    return Path(
++        pooch.retrieve(
++            _METALINKS_URL,
++            known_hash=_METALINKS_HASH,
++            fname="metalinksdb.db",
++            path=sc.settings.datasetdir if cache_dir is None else cache_dir,
++            progressbar=verbose,
++        )
++    )
+ 
+ 
+ def _format_clauses(
+@@ -68,7 +51,7 @@ def _format_clauses(
+ 
+ 
+ def get_metalinks(
+-    db_path: str | None = None,
++    db_path: str | Path | None = None,
+     types: str | list[str] | None = None,
+     cell_location: str | list[str] | None = None,
+     tissue_location: str | list[str] | None = None,
+@@ -123,9 +106,8 @@ def get_metalinks(
+             biospecimen_location="Blood",
+         )
+     """
+-    if db_path is None:
+-        db_path = _download_metalinksdb()
+-    conn = sqlite3.connect(db_path)
++    path = Path(db_path) if db_path is not None else _download_metalinksdb()
++    conn = sqlite3.connect(path)
+ 
+     # Adjusted SELECT statement to exclude the source column
+     base_query = """
+@@ -218,10 +200,8 @@ def get_metalinks_values(table_name: str, column_name: str, db_path: str | None
+ 
+         get_metalinks_values(table_name="tissue_location", column_name="tissue_location")
+     """
+-    if db_path is None:
+-        db_path = _download_metalinksdb()
+-    conn = sqlite3.connect(db_path)
+-    conn = sqlite3.connect(db_path)
++    path = Path(db_path) if db_path is not None else _download_metalinksdb()
++    conn = sqlite3.connect(path)
+     cursor = conn.cursor()
+ 
+     query = f"SELECT DISTINCT {column_name} FROM {table_name};"
+@@ -253,9 +233,8 @@ def describe_metalinks(db_path: str | None = None, return_output: bool = False)
+ 
+         describe_metalinks()
+     """
+-    if db_path is None:
+-        db_path = _download_metalinksdb()
+-    conn = sqlite3.connect(db_path)
++    path = Path(db_path) if db_path is not None else _download_metalinksdb()
++    conn = sqlite3.connect(path)
+     cursor = conn.cursor()
+ 
+     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+diff --git a/tests/resource/conftest.py b/tests/resource/conftest.py
+index 6197a452..fc4f0744 100644
+--- a/tests/resource/conftest.py
++++ b/tests/resource/conftest.py
+@@ -3,35 +3,16 @@
+ These are the only tests that reach the network, and they cache what they download under ``tests/.cache``.
+ 
+ CI runs the suite with ``pytest -n auto``, which gives every xdist worker its own session and so its own copy of these session-scoped fixtures.
+-The cache directory is shared between them, so each download goes to a path private to the process and is then moved into place with :func:`os.replace`, which is atomic: a worker either sees the finished file or none at all, never a partial one.
++Both downloads go through :func:`pooch.retrieve`, which writes to a temporary file and moves it into place, so a worker sees either the finished file or none at all.
+ """
+ 
+ from __future__ import annotations
+ 
+-import contextlib
+-import os
+ import pathlib
+-import shutil
+-import sqlite3
+ 
+ import pytest
+ 
+ 
+-def _readable_sqlite(path: pathlib.Path) -> bool:
+-    """Whether `path` is a non-empty SQLite database that passes a quick check.
+-
+-    SQLite reads an empty file as a valid empty database, hence the size check.
+-    """
+-    if path.stat().st_size == 0:
+-        return False
+-
+-    try:
+-        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as conn:
+-            return bool(conn.execute("pragma quick_check").fetchone()[0] == "ok")
+-    except sqlite3.Error:
+-        return False
+-
+-
+ @pytest.fixture(scope="session")
+ def download_cache() -> pathlib.Path:
+     """Directory the tests download their (large) external files to, once."""
+@@ -43,30 +24,10 @@ def download_cache() -> pathlib.Path:
+ 
+ @pytest.fixture(scope="session")
+ def metalinks_db(download_cache: pathlib.Path) -> str:
+-    """Path to MetaLinksDB, downloaded on first use.
+-
+-    ``_download_metalinksdb`` has no path argument and always writes to the
+-    working directory, hence the ``chdir``. It only rejects an empty file, so
+-    a download cut off part-way would otherwise be cached forever.
+-    """
++    """Path to MetaLinksDB, downloaded on first use."""
+     from liana.resource.get_metalinks import _download_metalinksdb
+ 
+-    path = download_cache / "metalinksdb.db"
+-    if path.exists() and not _readable_sqlite(path):
+-        path.unlink(missing_ok=True)
+-
+-    if not path.exists():
+-        staging = download_cache / f".part-{os.getpid()}-metalinksdb"
+-        staging.mkdir(parents=True, exist_ok=True)
+-        cwd = os.getcwd()
+-        os.chdir(staging)
+-        try:
+-            os.replace(_download_metalinksdb(verbose=False), path)
+-        finally:
+-            os.chdir(cwd)
+-            shutil.rmtree(staging, ignore_errors=True)
+-
+-    return str(path)
++    return str(_download_metalinksdb(cache_dir=download_cache, verbose=False))
+ 
+ 
+ @pytest.fixture(scope="session")
+@@ -75,13 +36,6 @@ def hcop_file(download_cache: pathlib.Path) -> str:
+     from liana.resource import get_hcop_orthologs
+ 
+     path = download_cache / "human_mouse_hcop_fifteen_column.txt.gz"
+-
+-    if not path.exists():
+-        part = path.with_name(f".part-{os.getpid()}-{path.name}")
+-        try:
+-            get_hcop_orthologs(target_organism="mouse", filename=str(part), min_evidence=0)
+-            os.replace(part, path)
+-        finally:
+-            part.unlink(missing_ok=True)
++    get_hcop_orthologs(target_organism="mouse", filename=path, min_evidence=0)
+ 
+     return str(path)
+diff --git a/tests/resource/test_orthology.py b/tests/resource/test_orthology.py
+index 76ef44b4..af22bb48 100644
+--- a/tests/resource/test_orthology.py
++++ b/tests/resource/test_orthology.py
+@@ -82,18 +82,29 @@ def test_get_hcop(hcop_file: str) -> None:
+ 
+ 
+ @pytest.mark.network
+-def test_get_hcop_derives_filename_from_url(
++def test_get_hcop_caches_under_datasetdir(
+     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, hcop_file: str
+ ) -> None:
+-    """Omitting `filename` downloads to a local file named after the URL."""
++    """Omitting `filename` downloads to a file named after the URL, under scanpy's dataset directory."""
+     import shutil
+-    import urllib.request
+ 
+-    # serve the cached copy instead of hitting the network again
+-    monkeypatch.setattr(urllib.request, "urlretrieve", lambda url, filename: shutil.copyfile(hcop_file, filename))
+-    monkeypatch.chdir(tmp_path)
++    import pooch
++    import scanpy as sc
+ 
+-    derived = get_hcop_orthologs(columns=None, min_evidence=0)
++    def _fake_retrieve(url: str, known_hash: str | None, fname: str, path: pathlib.Path) -> str:
++        target = pathlib.Path(path) / fname
++        target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copyfile(hcop_file, target)
++        return str(target)
++
++    monkeypatch.setattr(pooch, "retrieve", _fake_retrieve)
++
++    original = sc.settings.datasetdir
++    sc.settings.datasetdir = tmp_path
++    try:
++        derived = get_hcop_orthologs(columns=None, min_evidence=0)
++    finally:
++        sc.settings.datasetdir = original
+ 
+     assert [p.name for p in tmp_path.iterdir()] == ["human_mouse_hcop_fifteen_column.txt.gz"]
+     pd.testing.assert_frame_equal(derived, get_hcop_orthologs(filename=hcop_file, columns=None, min_evidence=0))

@@ -12,10 +12,10 @@ Part of the lifesci-* multi-domain series. Published in parallel:
 
 - Build: expansion (no per-repo cap expansion)
 - Target repositories: 250
-- Repositories with tasks: 202
-- Total tasks: 6871
+- Repositories with tasks: 203
+- Total tasks: 6909
 - Max tasks per repository: 204 (unlimited (no per-repo cap))
-- Repositories with zero yield: 48 (kept in list, never faked)
+- Repositories with zero yield: 47 (kept in list, never faked)
 - All targets: stars >= 50, pushed since 2023-01-01, not archived, noise-filtered
 
 ## Selection
@@ -61,13 +61,3 @@ Hugging Face by repo2rlenv push.
   publishing need neither Docker nor an LLM key.
 - Hardcoded provider keys found in upstream PR diffs were redacted for public
   release. Licenses follow each source repository; generated with Repo2RLEnv.
-
-## Snapshot scope
-
-This release is a **partial snapshot** of an unfinished generation run.
-
-- Generation-complete flag: generation_complete_expansion.flag - **ABSENT** (not faked)
-- Bank progress at snapshot: **26225 / 100000** tasks (26.2%)
-- This domain: **6871** tasks from **202** repositories
-
-See PARTIAL_SNAPSHOT.md for the full statement.
